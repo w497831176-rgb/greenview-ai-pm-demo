@@ -1,0 +1,2511 @@
+"""
+Property SQLite Database
+========================
+
+Lightweight SQLite storage for work orders, knowledge docs, and badcases.
+Database file lives on a mounted volume so it persists across container restarts.
+"""
+
+import json
+import os
+import sqlite3
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+# Persist DB on the mounted volume so data survives container restarts.
+DB_DIR = Path(os.getenv("PROPERTY_DATA_DIR", "/app/data"))
+DB_DIR.mkdir(parents=True, exist_ok=True)
+DB_PATH = DB_DIR / "property_demo.db"
+
+
+def now_cn(fmt: str = "%Y-%m-%d %H:%M:%S") -> str:
+    """Return current Beijing time as a formatted string."""
+    cn_tz = timezone(timedelta(hours=8))
+    return datetime.now(cn_tz).strftime(fmt)
+
+
+def now_cn_dt() -> datetime:
+    """Return current Beijing time as a datetime object."""
+    cn_tz = timezone(timedelta(hours=8))
+    return datetime.now(cn_tz)
+
+
+def _get_conn():
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db():
+    """Create tables and seed demo data if empty."""
+    conn = _get_conn()
+    cursor = conn.cursor()
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS work_orders (
+            id TEXT PRIMARY KEY,
+            room_id TEXT NOT NULL,
+            contact_name TEXT,
+            contact_phone TEXT,
+            issue_type TEXT,
+            issue_desc TEXT,
+            urgency TEXT,
+            status TEXT,
+            appointment_time TEXT,
+            created_at TEXT,
+            updated_at TEXT,
+            assigned_to TEXT,
+            completion_note TEXT,
+            rating INTEGER
+        )
+        """
+    )
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS knowledge_docs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT,
+            content TEXT,
+            category TEXT,
+            index_status TEXT DEFAULT 'pending',
+            chunk_count INTEGER DEFAULT 0,
+            is_indexed INTEGER DEFAULT 1,
+            chunk_size INTEGER DEFAULT 512,
+            chunk_overlap INTEGER DEFAULT 64,
+            split_strategy TEXT DEFAULT 'auto'
+        )
+        """
+    )
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS badcases (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT,
+            description TEXT,
+            category TEXT,
+            status TEXT,
+            created_at TEXT
+        )
+        """
+    )
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS skills (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            description TEXT,
+            instructions TEXT,
+            category TEXT,
+            enabled INTEGER DEFAULT 1,
+            trigger_condition TEXT,
+            skill_metadata TEXT,
+            storage_path TEXT,
+            created_at TEXT,
+            updated_at TEXT
+        )
+        """
+    )
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS mcp_servers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            command TEXT,
+            args TEXT,
+            env TEXT,
+            description TEXT,
+            enabled INTEGER DEFAULT 1,
+            is_builtin INTEGER DEFAULT 0,
+            created_at TEXT,
+            updated_at TEXT
+        )
+        """
+    )
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS mcp_tools (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            server_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            description TEXT,
+            input_schema TEXT NOT NULL,
+            tool_metadata TEXT,
+            UNIQUE(server_id, name),
+            FOREIGN KEY (server_id) REFERENCES mcp_servers(id)
+        )
+        """
+    )
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS agents (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            agent_id TEXT NOT NULL UNIQUE,
+            name TEXT NOT NULL,
+            description TEXT,
+            instructions TEXT,
+            category TEXT,
+            enabled INTEGER DEFAULT 1,
+            model_id TEXT,
+            created_at TEXT,
+            updated_at TEXT
+        )
+        """
+    )
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS agent_skills (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            agent_id TEXT NOT NULL,
+            skill_id INTEGER NOT NULL,
+            UNIQUE(agent_id, skill_id)
+        )
+        """
+    )
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS agent_tools (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            agent_id TEXT NOT NULL,
+            tool_name TEXT NOT NULL,
+            config TEXT,
+            UNIQUE(agent_id, tool_name)
+        )
+        """
+    )
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS retrieval_settings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            top_k INTEGER DEFAULT 5,
+            keyword_weight REAL DEFAULT 0.3,
+            semantic_weight REAL DEFAULT 0.7,
+            rrf_k INTEGER DEFAULT 60,
+            enable_rerank INTEGER DEFAULT 0,
+            rerank_model TEXT,
+            score_threshold REAL DEFAULT 0.0,
+            created_at TEXT,
+            updated_at TEXT
+        )
+        """
+    )
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS model_configs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            model_id TEXT NOT NULL UNIQUE,
+            name TEXT NOT NULL,
+            provider TEXT,
+            api_key TEXT,
+            base_url TEXT,
+            model_params TEXT,
+            is_default INTEGER DEFAULT 0,
+            enabled INTEGER DEFAULT 1,
+            description TEXT,
+            created_at TEXT,
+            updated_at TEXT
+        )
+        """
+    )
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS badcase_actions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            badcase_id INTEGER NOT NULL,
+            action_type TEXT NOT NULL,
+            action_detail TEXT,
+            status_before TEXT,
+            status_after TEXT,
+            created_by TEXT,
+            created_at TEXT,
+            FOREIGN KEY (badcase_id) REFERENCES badcases(id)
+        )
+        """
+    )
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS knowledge_drafts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            badcase_id INTEGER,
+            title TEXT,
+            content TEXT,
+            category TEXT,
+            status TEXT DEFAULT 'draft',
+            created_at TEXT,
+            updated_at TEXT
+        )
+        """
+    )
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS chat_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            role TEXT NOT NULL,
+            content TEXT,
+            token_count INTEGER DEFAULT 0,
+            token_detail TEXT,
+            citations TEXT,
+            activated_skills TEXT,
+            created_at TEXT
+        )
+        """
+    )
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS chat_sessions (
+            session_id TEXT PRIMARY KEY,
+            handoff_status TEXT DEFAULT 'none',
+            handoff_reason TEXT,
+            handoff_requested_at TEXT,
+            handoff_active_at TEXT,
+            handoff_resolved_at TEXT,
+            assigned_to TEXT,
+            created_at TEXT,
+            updated_at TEXT
+        )
+        """
+    )
+
+    # Migration: add token_detail column to existing chat_messages table.
+    try:
+        cursor.execute("ALTER TABLE chat_messages ADD COLUMN token_detail TEXT")
+    except sqlite3.OperationalError:
+        pass
+
+    # Migration: add citations / activated_skills columns to existing chat_messages table.
+    try:
+        cursor.execute("ALTER TABLE chat_messages ADD COLUMN citations TEXT")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        cursor.execute("ALTER TABLE chat_messages ADD COLUMN activated_skills TEXT")
+    except sqlite3.OperationalError:
+        pass
+
+    # Migration: add RAG columns to existing knowledge_docs table.
+    for col, dtype in [
+        ("index_status", "TEXT DEFAULT 'pending'"),
+        ("chunk_count", "INTEGER DEFAULT 0"),
+        ("is_indexed", "INTEGER DEFAULT 1"),
+        ("chunk_size", "INTEGER DEFAULT 512"),
+        ("chunk_overlap", "INTEGER DEFAULT 64"),
+        ("split_strategy", "TEXT DEFAULT 'auto'"),
+    ]:
+        try:
+            cursor.execute(f"ALTER TABLE knowledge_docs ADD COLUMN {col} {dtype}")
+        except sqlite3.OperationalError:
+            pass
+
+    # Migration: add Skill metadata columns to existing skills table.
+    for col, dtype in [
+        ("trigger_condition", "TEXT"),
+        ("skill_metadata", "TEXT"),
+        ("storage_path", "TEXT"),
+    ]:
+        try:
+            cursor.execute(f"ALTER TABLE skills ADD COLUMN {col} {dtype}")
+        except sqlite3.OperationalError:
+            pass
+
+    # Migration: add is_builtin column to existing mcp_servers table.
+    try:
+        cursor.execute("ALTER TABLE mcp_servers ADD COLUMN is_builtin INTEGER DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass
+
+    # Migration: add evidence / source fields to existing badcases table.
+    for col, dtype in [
+        ("evidence", "TEXT"),
+        ("source_message_id", "INTEGER"),
+        ("session_id", "TEXT"),
+        ("root_cause", "TEXT"),
+        ("fix_plan", "TEXT"),
+        ("verified_by", "TEXT"),
+        ("verified_at", "TEXT"),
+        ("closed_at", "TEXT"),
+        ("rejected_reason", "TEXT"),
+        ("updated_at", "TEXT"),
+    ]:
+        try:
+            cursor.execute(f"ALTER TABLE badcases ADD COLUMN {col} {dtype}")
+        except sqlite3.OperationalError:
+            pass
+
+    # Migration: add model_id column to skills table for per-skill model routing.
+    try:
+        cursor.execute("ALTER TABLE skills ADD COLUMN model_id TEXT")
+    except sqlite3.OperationalError:
+        pass
+
+    # Migration: add tool_metadata column to mcp_tools table.
+    try:
+        cursor.execute("ALTER TABLE mcp_tools ADD COLUMN tool_metadata TEXT")
+    except sqlite3.OperationalError:
+        pass
+
+    # Migration: ensure unique index for mcp_tools (server_id, name).
+    try:
+        cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_mcp_tools_server_name ON mcp_tools(server_id, name)")
+    except sqlite3.OperationalError:
+        pass
+
+    conn.commit()
+
+    # Seed data only if tables are empty
+    cursor.execute("SELECT COUNT(*) FROM work_orders")
+    if cursor.fetchone()[0] == 0:
+        _seed_work_orders(cursor)
+        _seed_knowledge(cursor)
+        _seed_badcases(cursor)
+        conn.commit()
+
+    cursor.execute("SELECT COUNT(*) FROM skills")
+    if cursor.fetchone()[0] == 0:
+        _seed_skills(cursor)
+        conn.commit()
+
+    cursor.execute("SELECT COUNT(*) FROM mcp_servers")
+    if cursor.fetchone()[0] == 0:
+        _seed_mcp_servers(cursor)
+        conn.commit()
+
+    cursor.execute("SELECT COUNT(*) FROM agents")
+    if cursor.fetchone()[0] == 0:
+        _seed_agents(cursor)
+        conn.commit()
+
+    cursor.execute("SELECT COUNT(*) FROM retrieval_settings")
+    if cursor.fetchone()[0] == 0:
+        _seed_retrieval_settings(cursor)
+        conn.commit()
+
+    cursor.execute("SELECT COUNT(*) FROM model_configs")
+    if cursor.fetchone()[0] == 0:
+        _seed_model_configs(cursor)
+        conn.commit()
+
+    conn.close()
+
+
+def _seed_work_orders(cursor):
+    orders = [
+        ("WO-20260710-001", "3-2-1201", "王先生", "13800138001", "水电", "卫生间天花板滴水，怀疑楼上漏水", "紧急", "待派单", "2026-07-11 09:00", "2026-07-10 14:30", "2026-07-10 14:30", None, None, None),
+        ("WO-20260710-002", "5-1-802", "李女士", "13800138002", "门窗", "入户门锁无法反锁", "中", "待处理", "2026-07-11 10:00", "2026-07-10 15:00", "2026-07-10 15:00", "张师傅", None, None),
+        ("WO-20260710-003", "2-3-1503", "张先生", "13800138003", "公区", "电梯按钮失灵，按了没反应", "高", "处理中", "2026-07-10 16:00", "2026-07-10 13:00", "2026-07-10 15:30", "李师傅", "已更换按钮面板，测试中", None),
+        ("WO-20260710-004", "8-2-601", "陈女士", "13800138004", "家户", "客厅吊灯不亮，已自行更换灯泡仍不亮", "低", "已完成", "2026-07-10 10:00", "2026-07-09 16:00", "2026-07-10 11:00", "王师傅", "线路接触不良，已修复", 5),
+        ("WO-20260710-005", "1-1-1102", "刘先生", "13800138005", "水电", "厨房下水道反水，污水外溢", "高", "待派单", "2026-07-11 08:00", "2026-07-10 16:00", "2026-07-10 16:00", None, None, None),
+        ("WO-20260710-006", "6-3-902", "赵女士", "13800138006", "门窗", "卧室窗户密封条老化，漏风严重", "中", "处理中", "2026-07-11 14:00", "2026-07-10 10:00", "2026-07-10 16:00", "张师傅", "已测量尺寸，待更换密封条", None),
+        ("WO-20260710-007", "4-2-1205", "孙先生", "13800138007", "公区", "楼道灯不亮，影响夜间出行", "低", "已完成", "2026-07-10 09:00", "2026-07-09 09:00", "2026-07-09 15:00", "李师傅", "更换声控灯，恢复正常", 4),
+        ("WO-20260710-008", "9-1-1501", "周先生", "13800138008", "水电", "空调一开就跳闸，怀疑电路过载", "紧急", "待派单", "2026-07-10 18:00", "2026-07-10 17:00", "2026-07-10 17:00", None, None, None),
+        ("WO-20260710-009", "3-1-602", "吴先生", "13800138009", "家户", "次卧墙面起皮，约 30x40cm 面积", "低", "待处理", "2026-07-12 10:00", "2026-07-10 11:00", "2026-07-10 11:00", "王师傅", None, None),
+        ("WO-20260710-010", "7-2-1103", "郑女士", "13800138010", "公区", "小区门禁无法刷卡，多位业主反馈", "中", "处理中", "2026-07-10 15:00", "2026-07-10 12:00", "2026-07-10 14:00", "李师傅", "已联系门禁厂商远程排查", None),
+    ]
+    cursor.executemany(
+        """
+        INSERT INTO work_orders
+        (id, room_id, contact_name, contact_phone, issue_type, issue_desc, urgency, status,
+         appointment_time, created_at, updated_at, assigned_to, completion_note, rating)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        orders,
+    )
+
+
+def _seed_knowledge(cursor):
+    docs = [
+        (
+            '物业维修服务承诺',
+            """绿景智服物业维修服务承诺
+
+第一章 服务宗旨
+
+绿景智服始终秉持“业主至上、服务第一”的宗旨，以专业化、标准化、人性化的维修服务，为业主创造安全、舒适、便捷的居住环境。我们承诺对业主报修事项高度重视，做到响应及时、处理高效、结果可追溯，确保每一项维修服务都让业主满意。
+
+第二章 响应时效承诺
+
+一、紧急维修：包括燃气泄漏、火灾、触电、电梯困人、严重漏水、水管爆裂、电路起火等可能危及人身财产安全的事项。接到报修后，物业客服中心在 5 分钟内完成工单登记并通知工程人员，工程人员 30 分钟内到场处置，必要时同步联系 119、120、燃气公司等专业救援力量。
+
+二、一般维修：包括灯具不亮、门锁损坏、门窗漏风、墙面起皮、洁具漏水、开关插座故障等日常维修。接到报修后，客服中心在 30 分钟内完成派单，工程人员 2 小时内响应并与业主确认上门时间，原则上 24 小时内上门维修。
+
+三、公共部位维修：包括电梯故障、楼道灯不亮、门禁失灵、消防设施异常、公共管道堵塞等。物业巡查发现或接到报修后，立即设置安全警示，一般故障 24 小时内修复，重大故障 72 小时内修复并公示维修进度。
+
+第三章 维修质量承诺
+
+一、维修人员上门时统一着装、佩戴工牌、携带完整工具和常用配件，入户前穿戴鞋套，维修过程中保持现场整洁。
+
+二、维修完成后，维修人员应当清理作业现场，向业主说明维修内容、使用注意事项，并请业主现场验收签字。
+
+三、一般维修项目实行 30 天质保期，同一故障在质保期内重复发生的，免费再次维修；涉及材料更换的，材料质保期按照国家相关规定及供应商承诺执行。
+
+四、因维修质量问题导致业主财产损失的，由物业承担相应赔偿责任；因业主使用不当或第三方原因导致的损坏，物业协助维修，费用由责任方承担。
+
+第四章 收费透明承诺
+
+一、业主专有部分维修，物业在上门前明确告知收费标准和预计费用，维修完成后提供明细清单，由业主确认后收取费用。
+
+二、公共区域设施设备维修不向业主个人收取费用，所需费用从物业服务费、公共收益或住宅专项维修资金中列支。
+
+三、严禁维修人员私自收费、加价或收受红包，业主有权拒绝任何未公示的收费项目，并可向物业服务中心投诉举报。
+
+第五章 信息沟通承诺
+
+一、业主可通过 AI 助手、物业 24 小时值班电话、微信公众号、物业服务中心前台等多种渠道报修。
+
+二、维修工单生成后，业主可通过上述渠道实时查询工单状态、维修人员信息、预计完成时间。
+
+三、维修完成后 24 小时内，物业客服人员进行回访，了解业主满意度，收集改进意见。
+
+第六章 投诉与复修
+
+一、业主对维修服务不满意的，可在维修完成后 7 日内提出复修申请，物业应当在 24 小时内安排人员上门核查并免费复修。
+
+二、业主对维修收费有异议的，可向物业服务中心申请复核，物业应当在 3 个工作日内出具书面说明。
+
+三、业主对物业维修服务有投诉的，可拨打物业监督电话、向业主委员会反映或通过政府 12345 热线投诉，物业应当在 24 小时内响应并在 3 个工作日内反馈处理结果。
+
+第七章 服务纪律
+
+一、维修人员应当遵守职业道德，文明礼貌，不得推诿、拖延或拒绝合理维修请求。
+
+二、维修人员应当保护业主隐私，不得泄露业主家庭信息、房屋状况等敏感信息。
+
+三、维修人员不得向业主推销商品或服务，不得接受业主宴请、礼品或任何形式的回扣。
+
+第八章 附则
+
+本承诺自发布之日起实施，适用于绿景智服所服务小区的所有业主。物业将根据实际服务情况和业主反馈，定期修订完善本承诺，确保服务标准持续提升。""",
+            '服务承诺',
+        ),
+        (
+            '维修收费标准',
+            """绿景智服维修收费标准（业主专有部分）
+
+第一章 总则
+
+为规范维修收费行为，保障业主知情权，维护业主和物业服务企业的合法权益，根据《物业管理条例》《物业服务收费管理办法》等规定，结合本小区实际情况，制定本维修收费标准。本标准适用于业主专有部分的日常维修、养护及小修服务，公共区域设施设备维修不向业主收取费用。
+
+第二章 收费构成
+
+维修收费一般由以下部分构成：
+
+一、上门费：维修人员上门勘查、诊断的费用，按次收取，已包含基本检测和简单调试。
+
+二、维修费：维修人员实际作业产生的工时费用，根据维修项目复杂程度、所需工时确定。
+
+三、材料费：更换或新增的零配件、材料费用，按照实际使用数量和单价计算。
+
+四、特殊作业费：涉及高空作业、夜间作业、停水停电配合等特殊情况的附加费用。
+
+五、税金：按照国家税务规定开具发票的税费。
+
+第三章 水电类维修收费标准
+
+一、上门费：50 元/次。
+
+二、普通维修：50-200 元/项，包括更换水龙头、角阀、软管、下水器、普通灯具、开关面板、插座等。
+
+三、中等维修：200-400 元/项，包括疏通下水道、更换马桶配件、维修淋浴花洒、更换浴霸、检修电路分支等。
+
+四、复杂维修：400-800 元/项，包括重新布线、更换配电箱空开、查找隐蔽电路故障、维修地暖分水器、更换热水器进出水阀门等。
+
+五、材料费：水龙头 30-200 元/个，角阀 20-80 元/个，软管 15-60 元/根，LED 吸顶灯 50-300 元/个，开关插座 10-80 元/个，空开 30-150 元/个，具体以品牌和规格为准。
+
+第四章 门窗类维修收费标准
+
+一、上门费：30 元/次。
+
+二、普通维修：30-150 元/项，包括调整门窗合页、更换把手、润滑轨道、更换密封条、更换纱窗压条等。
+
+三、中等维修：150-400 元/项，包括更换门锁、更换滑轮、更换玻璃压条、修复窗框变形、更换闭门器等。
+
+四、复杂维修：400-800 元/项，包括整体拆换入户门、更换大面积玻璃、更换断桥铝窗扇、修复防盗门门框等。
+
+五、材料费：普通门锁 80-300 元/把，防盗门锁芯 100-500 元/个，合页 20-80 元/副，密封条 10-30 元/米，滑轮 30-150 元/个，玻璃按面积和厚度计价。
+
+第五章 家户类维修收费标准
+
+一、上门费：30 元/次。
+
+二、灯具维修：普通灯具更换 30-100 元/盏，吊灯安装 80-300 元/盏，大型水晶灯或智能灯具安装按实际协商。
+
+三、墙面维修：小面积修补 50-150 元/处，局部重新粉刷 30-80 元/平方米，铲除重做 80-150 元/平方米。
+
+四、洁具维修：马桶普通维修 50-200 元/项，更换马桶 200-500 元/个（不含马桶），洗手盆维修 50-200 元/项。
+
+五、家具五金维修：柜门铰链更换 20-50 元/个，抽屉轨道更换 50-150 元/副，晾衣架维修 50-200 元/项。
+
+六、维修费按实际工时和材料计算，上门前维修人员应当向业主说明预估费用，业主确认后方可施工。
+
+第六章 免费维修范围
+
+以下情形不收取上门费和维修费，仅收取材料费（如产生）：
+
+一、房屋尚在质量保修期内，且属于开发商保修范围的维修项目。
+
+二、因物业公共管道、公共线路故障导致业主户内受损，经物业确认属实的。
+
+三、物业组织的设施设备统一检修、保养项目。
+
+四、老年业主、残障业主等特殊群体的简单维修，经物业服务中心登记备案后可减免上门费。
+
+第七章 收费程序与发票
+
+一、维修完成后，维修人员填写《维修服务单》，列明上门费、维修费、材料费、合计金额，由业主签字确认。
+
+二、业主可通过现金、微信、支付宝、刷卡等方式缴费，物业应当场或于 3 个工作日内开具正规发票。
+
+三、业主对收费有异议的，可先支付无争议部分，争议部分由物业服务中心在 3 个工作日内复核并书面答复。
+
+第八章 价格调整与公示
+
+一、本收费标准由物业服务企业制定，经业主大会或业主委员会审议通过后实施。
+
+二、收费标准调整前，物业应当提前 30 日在小区显著位置公示，并征求业主意见。
+
+三、本标准未尽事宜，由业主与物业协商确定，协商不成的可依法申请调解或仲裁。""",
+            '收费标准',
+        ),
+        (
+            '维修责任划分说明',
+            """绿景智服物业维修责任划分说明
+
+第一章 总则
+
+为明确物业维修过程中业主、物业服务企业及相关方的责任边界，减少维修纠纷，根据《中华人民共和国民法典》《物业管理条例》《住宅专项维修资金管理办法》等法律法规，结合本小区实际情况，制定本说明。
+
+第二章 业主专有部分维修责任
+
+一、业主专有部分是指业主房屋内部及围护结构以内、专属于业主使用的区域，包括户内墙面、地面、顶棚、门窗、水电管线、灯具、洁具、空调室内机、地暖盘管、入户门及门锁等。
+
+二、业主专有部分的日常维护、小修及因业主使用不当导致的损坏，由业主承担维修责任和费用。
+
+三、业主在装修过程中擅自拆改承重墙、破坏防水层、改变房屋使用功能导致的损坏，由业主自行承担修复责任和由此造成的一切损失。
+
+四、业主专有部分的设施设备超过质保期后发生自然老化、损坏的，由业主承担维修或更换费用；仍在质保期内的，由建设单位或销售单位负责维修。
+
+五、业主出租房屋的，应当与承租人约定维修责任；未约定的，按照法律规定和租赁惯例处理，业主对承租人造成的损坏负有连带维修责任。
+
+第三章 建筑物共有部分维修责任
+
+一、建筑物共有部分是指由全体业主共同所有或共同使用的部分，包括建筑物基础、承重结构、外墙、屋顶、楼梯间、走廊、电梯井、管道井、公共门厅、消防设施、公共照明、门禁系统、监控系统等。
+
+二、共有部分的日常维护、小修由物业服务企业负责，费用从物业服务费中列支。
+
+三、共有部分的中修、大修、更新、改造，经业主共同决定后，可使用住宅专项维修资金；未建立维修资金或资金不足的，由相关业主按建筑面积分摊。
+
+四、因物业服务企业日常维护不到位导致共有部分损坏的，由物业服务企业承担维修责任；因不可抗力、第三方侵权或业主共同使用不当导致损坏的，由责任方或相关业主承担。
+
+第四章 公共设施设备维修责任
+
+一、小区公共设施设备包括道路、绿化、停车场、健身设施、儿童游乐设施、垃圾分类设施、快递柜、充电桩、公共厕所、会所设施等。
+
+二、公共设施设备的日常养护、小修由物业服务企业负责，费用从物业服务费或公共收益中列支。
+
+三、公共设施设备的大修、更新、改造，应当编制方案，经业主大会同意后实施，可使用公共收益或住宅专项维修资金。
+
+四、因市政供水、供电、供气、供热、通信等单位管理维护的设施设备发生故障的，由相应单位负责维修，物业协助联系和现场配合。
+
+第五章 相邻关系导致的维修责任
+
+一、因楼上业主专有部分漏水、渗水导致楼下业主房屋受损的，由楼上业主承担维修责任和赔偿责任，物业协助协调、取证和维修。
+
+二、因公共管道堵塞导致多户业主房屋反水、受损的，由相关业主或物业按照责任比例承担维修费用；无法确定具体责任人的，由受益业主共同分摊。
+
+三、因相邻业主装修、改造、使用不当影响他人房屋安全的，由责任方承担维修和赔偿责任，物业有权制止违规行为并报告相关部门。
+
+第六章 质保期内的维修责任
+
+一、新建住宅在质量保修期内出现的质量问题，由建设单位负责维修；业主应当保留购房合同、质保书等相关资料，便于维权。
+
+二、质保期内，业主发现质量问题可先向物业报修，物业应当在 24 小时内转告建设单位或其委托的维修单位。
+
+三、建设单位拖延或拒绝维修的，业主可向住房城乡建设主管部门投诉，也可依法向人民法院提起诉讼。
+
+第七章 责任争议处理
+
+一、维修责任存在争议的，由物业工程人员上门勘查，结合现场情况、维修记录、相关证据作出初步判定。
+
+二、当事人对初步判定有异议的，可共同委托具有资质的第三方鉴定机构进行鉴定，鉴定费用由申请方预付，最终由责任方承担。
+
+三、争议期间，为防止损失扩大，物业可先行组织应急维修，相关费用由最终确定的责任方承担。
+
+第八章 附则
+
+本说明自发布之日起实施，适用于绿景智服所服务小区。业主、物业服务企业及相关方应当遵守本说明，共同维护小区良好的维修秩序。""",
+            '责任划分',
+        ),
+        (
+            '常见维修问题 FAQ',
+            """绿景智服常见维修问题 FAQ
+
+Q1：家里漏水了怎么办？
+A：首先关闭户内总水阀，防止损失扩大；然后拍照记录漏水位置和受损情况；如果是楼上漏水导致楼下受损，及时通知物业，物业会协调楼上业主共同处理；最后通过 AI 助手、物业电话或前台提交维修工单，等待工程人员上门。
+
+Q2：电路跳闸怎么处理？
+A：先关闭正在使用的大功率电器，然后尝试复位空气开关。如果复位后立即再次跳闸，说明线路可能存在短路、过载或漏电故障，应停止使用相关电器，联系物业电工上门检查，切勿自行拆改配电箱。
+
+Q3：门锁坏了能免费修吗？
+A：入户门锁属于业主专有部分，一般需要业主承担上门费和材料费。具体收费标准可参考《维修收费标准》。如果门锁损坏是因质量问题且在质保期内，可联系销售商或开发商免费维修。
+
+Q4：墙面起皮、发霉是什么原因？
+A：墙面起皮、发霉常见原因包括：室内潮湿通风不良、外墙渗水、楼上漏水、装修基层处理不当等。建议先排查水源，处理渗漏问题后再进行墙面修复，否则容易反复。
+
+Q5：卫生间地漏返味怎么办？
+A：地漏返味通常是因为水封干涸、地漏密封不严或排水管道负压。可定期向地漏补水保持水封，更换防臭地漏芯，或联系物业检查排水管道通气和密封情况。
+
+Q6：客厅吊灯不亮，换了灯泡也不行？
+A：可能是灯座接触不良、驱动电源损坏或线路开关故障。建议先检查开关和线路是否有电，若无法自行判断，可报修物业电工上门检测，避免高空作业危险。
+
+Q7：厨房下水道堵塞怎么解决？
+A：轻微堵塞可尝试使用皮搋子或管道疏通剂；如果堵塞严重或反复发生，可能是主排水管或存水弯内有油污、异物堆积，应联系物业使用专业工具疏通，不建议自行拆卸公共管道。
+
+Q8：窗户漏风、漏雨如何处理？
+A：窗户漏风通常是密封条老化或窗框变形，可更换密封条或调整窗扇；漏雨可能是排水孔堵塞、密封胶开裂或外墙渗水，需要物业工程人员上门查找原因后维修。
+
+Q9：空调一开就跳闸是什么原因？
+A：可能是空调功率过大导致线路过载、空调内部短路、插座接触不良或空开容量不足。建议暂时停用空调，联系物业电工或专业空调维修人员上门检查，切勿强行使用。
+
+Q10：家中暖气不热怎么办？
+A：首先检查户内暖气阀门是否开启，排气阀是否积气；其次检查滤网是否堵塞；如果整栋楼或小区普遍不热，可能是供热企业运行问题，应联系供热公司；如仅为户内问题，可报修物业协助处理。
+
+Q11：公共区域灯不亮应该找谁？
+A：楼道、电梯厅、地下车库等公共区域的照明属于物业维护范围，业主可通过 AI 助手、物业电话或前台报修，物业应当在 24 小时内修复。
+
+Q12：发现电梯异常怎么办？
+A：发现电梯运行异响、困人、门无法关闭等异常情况，应立即停止使用，并通过电梯内紧急呼叫按钮或物业 24 小时电话报告。物业将通知电梯维保单位尽快到场处理，必要时启动应急预案。
+
+Q13：报修后多久能上门？
+A：紧急维修 30 分钟内到场，一般维修 24 小时内上门，公共部位维修一般 24 小时内修复。具体以《物业维修服务承诺》为准。
+
+Q14：维修完成后如何验收？
+A：维修人员完成维修后应当清理现场，向业主说明维修内容和使用注意事项，请业主现场试用并签字确认。如不满意，可在 7 日内申请复修。
+
+Q15：对维修费用有异议怎么办？
+A：可在维修前要求维修人员说明预估费用和收费依据，维修后核对明细清单。如有异议，可向物业服务中心申请复核，物业应当在 3 个工作日内书面答复。""",
+            'FAQ',
+        ),
+        (
+            '紧急维修处理流程',
+            """绿景智服紧急维修处理流程
+
+第一章 紧急维修范围
+
+紧急维修是指可能对业主人身安全、财产安全或公共安全造成 immediate 威胁的突发故障和事故，主要包括但不限于以下情形：
+
+一、燃气泄漏：闻到燃气异味、燃气报警器报警、燃气管道破损等。
+
+二、火灾：室内或公共区域出现明火、浓烟、电器起火等。
+
+三、触电：人员触电、电线裸露、配电设施冒烟等。
+
+四、严重漏水：水管爆裂、暖气爆管、楼上大量漏水导致楼下严重受损等。
+
+五、电梯困人：业主或乘客被困在电梯轿厢内无法自行脱困。
+
+六、高空坠物风险：外墙装饰物脱落、阳台构件松动、玻璃幕墙破损等。
+
+七、门禁或消防系统全面失效：小区主出入口门禁失灵、消防水泵无法启动、消防报警系统瘫痪等。
+
+第二章 业主应急措施
+
+一、发现紧急情况时，业主应首先确保自身和家人安全，迅速撤离危险区域。
+
+二、燃气泄漏时，严禁开关电器、使用明火、拨打手机，应立即开窗通风，关闭燃气总阀，到室外安全地点拨打燃气公司抢修电话和物业电话。
+
+三、发生火灾时，如火势较小可使用灭火器扑救，火势较大应立即拨打 119 并撤离，切勿乘坐电梯。
+
+四、发生触电时，应先切断电源，用干燥绝缘物使触电者脱离电源，立即拨打 120 急救电话。
+
+五、电梯困人时，应保持冷静，按下轿厢内紧急呼叫按钮或拨打物业电话，切勿强行扒门、撬门或自行攀爬。
+
+第三章 物业接报与响应
+
+一、物业 24 小时值班电话和 AI 助手均受理紧急报修，接到报修后应立即记录报修人、地址、紧急类型、现场情况、联系方式。
+
+二、紧急报修应在 5 分钟内完成工单登记并通知工程人员、秩序维护人员和项目经理。
+
+三、工程人员应在 30 分钟内携带必要工具和应急物资到场，秩序维护人员应同步赶赴现场维护秩序、疏散人群、设置警戒区域。
+
+四、涉及燃气、消防、电梯等专业救援的，物业应立即拨打 119、120、燃气公司、电梯维保单位电话，并安排人员到出入口引导救援车辆。
+
+第四章 现场处置流程
+
+一、工程人员到场后应迅速评估险情，采取切断水、电、气等紧急措施，防止事故扩大。
+
+二、燃气泄漏处置：关闭总阀、开窗通风、疏散人员、禁止明火和电器操作，等待燃气公司专业人员到场检测修复。
+
+三、火灾处置：组织初期扑救，启动消防泵、排烟风机，引导人员疏散，配合消防队灭火。
+
+四、触电处置：切断电源后，对伤者进行心肺复苏等急救，等待 120 到场。
+
+五、严重漏水处置：关闭相应阀门，使用抽水泵排水，转移受损物品，评估受损范围，协调责任方维修。
+
+六、电梯困人处置：安抚被困人员，使用专业钥匙和工具解救，解救后检查电梯故障原因，确认安全后方可恢复运行。
+
+第五章 后续跟进
+
+一、紧急处置完成后，工程人员应在 2 小时内填写《紧急维修记录表》，详细记录事件经过、处置措施、使用材料、现场照片等。
+
+二、物业应在 24 小时内联系受损业主，了解损失情况，协助业主进行保险理赔或责任追偿。
+
+三、需要后续维修的，应在 24 小时内制定维修方案，明确责任方、费用来源和完成时限，并告知相关业主。
+
+四、紧急维修完成后 48 小时内，物业应进行回访，确认业主满意度，收集改进建议。
+
+第六章 预防与演练
+
+一、物业应定期对供水、供电、供气、消防、电梯等设施设备进行巡检和维护，每月至少一次全面检查，发现隐患及时整改。
+
+二、物业应建立应急物资储备，包括发电机、抽水泵、应急照明、灭火器、沙袋、警示标识等，定期检查更新。
+
+三、物业应每年至少组织一次消防应急演练和一次电梯困人救援演练，提高员工应急处置能力。
+
+四、物业应通过公告栏、微信公众号、业主群等渠道向业主宣传安全常识和紧急联系方式，提高业主自救互救能力。
+
+第七章 责任与追责
+
+一、因物业日常维护不到位、应急响应不及时导致事故扩大的，由物业服务企业承担相应责任。
+
+二、因业主使用不当、违规装修、私改管线等原因导致紧急事故的，由业主承担相应责任和损失。
+
+三、因第三方施工单位、设备维保单位、市政供应单位等原因导致事故的，由责任方承担相应责任，物业协助业主维权。
+
+第八章 附则
+
+本流程自发布之日起实施，适用于绿景智服所服务小区。物业应根据实际情况和演练反馈，不断完善应急预案，确保紧急维修工作快速、有序、有效。""",
+            '紧急流程',
+        ),
+    ]
+    cursor.executemany(
+        "INSERT INTO knowledge_docs (title, content, category) VALUES (?, ?, ?)",
+        docs,
+    )
+
+
+def _seed_badcases(cursor):
+    cases = [
+        (
+            "AI 错误回答「漏水维修免费」",
+            "业主询问'楼上漏水你们负责修吗'，AI 回答'漏水属于物业责任，免费维修'。实际应根据责任划分判定，专有部分漏水一般由业主承担费用。",
+            "RAG 幻觉",
+            "已修复",
+            "2026-07-09 10:00",
+        ),
+        (
+            "AI 未识别'空调跳闸'为紧急问题",
+            "业主反馈'空调一开就跳闸'，AI 仅按一般工单处理，未识别电路安全隐患。",
+            "意图识别错误",
+            "修复中",
+            "2026-07-09 14:00",
+        ),
+        (
+            "AI 把'窗户漏风'错误分类为'水电'",
+            "业主描述'卧室窗户漏风'，AI 创建的工单 issue_type 被填为'水电'，导致派单错误。",
+            "分类错误",
+            "待处理",
+            "2026-07-10 09:00",
+        ),
+    ]
+    cursor.executemany(
+        "INSERT INTO badcases (title, description, category, status, created_at) VALUES (?, ?, ?, ?, ?)",
+        cases,
+    )
+
+
+def _seed_skills(cursor):
+    now = now_cn("%Y-%m-%d %H:%M")
+    skills = [
+        (
+            "维修工单处理",
+            "帮助业主创建维修工单、查询进度、解答维修相关问题。",
+            "你是物业维修助手，帮助业主报修、查询工单、解答维修相关问题。",
+            "业务技能",
+            1,
+            "用户要报修、查询工单、创建工单、维修进度",
+            now,
+            now,
+        ),
+        (
+            "知识库问答",
+            "基于物业维修知识库回答收费标准、责任划分、服务承诺等问题。",
+            "回答收费标准、维修责任、服务承诺时，必须基于知识库原文；知识库未命中时明确说'需要人工确认'。",
+            "业务技能",
+            1,
+            "用户询问物业服务、收费标准、维修责任、小区规定等知识性问题",
+            now,
+            now,
+        ),
+        (
+            "孩子托管服务",
+            "当业主询问孩子托管服务时激活",
+            "当业主询问孩子托管服务时，表达可以全天候8点到晚上21点托管，每天都可，服务项目为免费项目，具体请咨询管理处电话077512345678",
+            "业务技能",
+            1,
+            "用户提到孩子托管、儿童托管、托管服务",
+            now,
+            now,
+        ),
+        (
+            "宠物托管",
+            "当业主询问宠物托管时激活",
+            "当业主询问宠物托管服务时，表达可以全天候24小时托管，每天都可，服务项目为100元/天，具体请咨询管理处电话077512345678",
+            "业务技能",
+            1,
+            "用户提到宠物托管、宠物寄养、宠物服务",
+            now,
+            now,
+        ),
+    ]
+    cursor.executemany(
+        "INSERT INTO skills (name, description, instructions, category, enabled, trigger_condition, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        skills,
+    )
+
+
+
+def _seed_mcp_servers(cursor):
+    now = now_cn("%Y-%m-%d %H:%M")
+    servers = [
+        (
+            "weather-server",
+            "python",
+            json.dumps(["/app/tools/weather_mcp_server.py"]),
+            None,
+            "天气查询 MCP Server，用于查询实时天气辅助维修决策。",
+            1,
+            1,
+            now,
+            now,
+        ),
+        (
+            "calendar-server",
+            "python",
+            json.dumps(["/app/tools/calendar_mcp_server.py"]),
+            None,
+            "日历查询 MCP Server，用于获取当前日期。",
+            1,
+            1,
+            now,
+            now,
+        ),
+        (
+            "calculator-server",
+            "python",
+            json.dumps(["/app/tools/calculator_mcp_server.py"]),
+            None,
+            "计算器 MCP Server，用于执行数学计算。",
+            1,
+            1,
+            now,
+            now,
+        ),
+        (
+            "db-query-server",
+            "python",
+            json.dumps(["/app/tools/db_query_mcp_server.py"]),
+            None,
+            "数据库查询 MCP Server，用于只读查询工单数据。",
+            1,
+            1,
+            now,
+            now,
+        ),
+    ]
+    cursor.executemany(
+        "INSERT INTO mcp_servers (name, command, args, env, description, enabled, is_builtin, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        servers,
+    )
+
+
+def _seed_agents(cursor):
+    now = now_cn("%Y-%m-%d %H:%M")
+    agents = [
+        (
+            "router",
+            "路由 Agent",
+            "负责识别业主意图并分发给合适的垂直 Agent。",
+            "你是一个意图分类专家。根据用户问题，从以下类别中选择最相关的一个：maintenance（维修/工单）、billing（费用/缴费）、complaint（投诉/纠纷）、customer_service（一般客服/咨询）、other（其他/无法判断）。只输出一个分类标签和一句话理由。",
+            "orchestration",
+            1,
+            None,
+            now,
+            now,
+        ),
+        (
+            "maintenance",
+            "维修 Agent",
+            "处理维修报修、工单创建与查询。",
+            "你是物业维修助手，帮助业主报修、查询工单、解答维修相关问题。",
+            "vertical",
+            1,
+            None,
+            now,
+            now,
+        ),
+        (
+            "billing",
+            "费用 Agent",
+            "处理缴费、收费标准、费用争议咨询。",
+            "你是物业费用助手，负责解答收费标准、缴费方式、费用争议。涉及费用争议时建议转人工。",
+            "vertical",
+            1,
+            None,
+            now,
+            now,
+        ),
+        (
+            "complaint",
+            "投诉 Agent",
+            "处理业主投诉、邻里纠纷、责任争议。",
+            "你是物业投诉处理助手，负责安抚业主情绪、记录投诉要点、协调人工跟进。不要自行判定责任。",
+            "vertical",
+            1,
+            None,
+            now,
+            now,
+        ),
+        (
+            "customer_service",
+            "客服 Agent",
+            "处理一般咨询、小区规定、服务承诺。",
+            "你是物业客服助手，负责解答小区服务、联系方式、一般规定等咨询。",
+            "vertical",
+            1,
+            None,
+            now,
+            now,
+        ),
+    ]
+    cursor.executemany(
+        """
+        INSERT INTO agents
+        (agent_id, name, description, instructions, category, enabled, model_id, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        agents,
+    )
+
+
+def _seed_retrieval_settings(cursor):
+    now = now_cn("%Y-%m-%d %H:%M")
+    cursor.execute(
+        """
+        INSERT INTO retrieval_settings
+        (name, top_k, keyword_weight, semantic_weight, rrf_k, enable_rerank, rerank_model, score_threshold, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        ("default", 5, 0.3, 0.7, 60, 0, None, 0.0, now, now),
+    )
+
+
+def _seed_model_configs(cursor):
+    now = now_cn("%Y-%m-%d %H:%M")
+    configs = [
+        (
+            "deepseek-v4-pro",
+            "DeepSeek V4 Pro",
+            "deepseek",
+            None,
+            "https://api.deepseek.com",
+            json.dumps({"use_thinking": True}),
+            1,
+            1,
+            "深度思考模型，适合复杂推理和维修决策。",
+            now,
+            now,
+        ),
+        (
+            "deepseek-v4-flash",
+            "DeepSeek V4 Flash",
+            "deepseek",
+            None,
+            "https://api.deepseek.com",
+            json.dumps({"use_thinking": False}),
+            0,
+            1,
+            "快速响应模型，适合简单问答和初筛。",
+            now,
+            now,
+        ),
+    ]
+    cursor.executemany(
+        """
+        INSERT INTO model_configs
+        (model_id, name, provider, api_key, base_url, model_params, is_default, enabled, description, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        configs,
+    )
+
+
+def create_work_order(
+    work_order_id: str,
+    room_id: str,
+    issue_type: str,
+    issue_desc: str,
+    urgency: str,
+    contact_name: str,
+    contact_phone: str,
+    appointment_time: str,
+    status: str = "待派单",
+) -> Dict[str, Any]:
+    now = now_cn("%Y-%m-%d %H:%M")
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        INSERT INTO work_orders
+        (id, room_id, contact_name, contact_phone, issue_type, issue_desc, urgency, status,
+         appointment_time, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (work_order_id, room_id, contact_name, contact_phone, issue_type, issue_desc, urgency, status, appointment_time, now, now),
+    )
+    conn.commit()
+    conn.close()
+    return get_work_order(work_order_id)
+
+
+def get_work_order(work_order_id: str) -> Optional[Dict[str, Any]]:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM work_orders WHERE id = ?", (work_order_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def list_work_orders(
+    status: Optional[str] = None,
+    room_id: Optional[str] = None,
+    date_prefix: Optional[str] = None,
+    limit: int = 100,
+) -> List[Dict[str, Any]]:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    query = "SELECT * FROM work_orders WHERE 1=1"
+    params = []
+    if status:
+        query += " AND status = ?"
+        params.append(status)
+    if room_id:
+        query += " AND room_id = ?"
+        params.append(room_id)
+    if date_prefix:
+        query += " AND id LIKE ?"
+        params.append(f"WO-{date_prefix}-%")
+    query += " ORDER BY created_at DESC LIMIT ?"
+    params.append(limit)
+    cursor.execute(query, params)
+    rows = cursor.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def update_work_order_status(
+    work_order_id: str,
+    status: str,
+    assigned_to: Optional[str] = None,
+    completion_note: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    now = now_cn("%Y-%m-%d %H:%M")
+    conn = _get_conn()
+    cursor = conn.cursor()
+
+    fields = ["status = ?", "updated_at = ?"]
+    params = [status, now]
+    if assigned_to is not None:
+        fields.append("assigned_to = ?")
+        params.append(assigned_to)
+    if completion_note is not None:
+        fields.append("completion_note = ?")
+        params.append(completion_note)
+
+    params.append(work_order_id)
+    cursor.execute(
+        f"UPDATE work_orders SET {', '.join(fields)} WHERE id = ?",
+        params,
+    )
+    conn.commit()
+    conn.close()
+    return get_work_order(work_order_id)
+
+
+# -----------------------------------------------------------------------------
+# Knowledge docs CRUD
+# -----------------------------------------------------------------------------
+
+
+def create_knowledge_doc(
+    title: str,
+    content: str,
+    category: str,
+    index_status: str = "pending",
+    chunk_size: int = 512,
+    chunk_overlap: int = 64,
+    split_strategy: str = "auto",
+) -> Dict[str, Any]:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        INSERT INTO knowledge_docs
+        (title, content, category, index_status, chunk_size, chunk_overlap, split_strategy)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (title, content, category, index_status, chunk_size, chunk_overlap, split_strategy),
+    )
+    doc_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return get_knowledge_doc(doc_id)
+
+
+def get_knowledge_doc(doc_id: int) -> Optional[Dict[str, Any]]:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM knowledge_docs WHERE id = ?", (doc_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def list_knowledge_docs() -> List[Dict[str, Any]]:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM knowledge_docs ORDER BY id")
+    rows = cursor.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def update_knowledge_doc(
+    doc_id: int,
+    title: str,
+    content: str,
+    category: str,
+    index_status: Optional[str] = None,
+    chunk_size: Optional[int] = None,
+    chunk_overlap: Optional[int] = None,
+    split_strategy: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    conn = _get_conn()
+    cursor = conn.cursor()
+
+    fields = ["title = ?", "content = ?", "category = ?"]
+    params = [title, content, category]
+    if index_status is not None:
+        fields.append("index_status = ?")
+        params.append(index_status)
+    if chunk_size is not None:
+        fields.append("chunk_size = ?")
+        params.append(chunk_size)
+    if chunk_overlap is not None:
+        fields.append("chunk_overlap = ?")
+        params.append(chunk_overlap)
+    if split_strategy is not None:
+        fields.append("split_strategy = ?")
+        params.append(split_strategy)
+
+    params.append(doc_id)
+    cursor.execute(
+        f"UPDATE knowledge_docs SET {', '.join(fields)} WHERE id = ?",
+        params,
+    )
+    conn.commit()
+    conn.close()
+    return get_knowledge_doc(doc_id)
+
+
+def set_knowledge_doc_indexed(doc_id: int, index_status: str, chunk_count: int):
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute(
+        "UPDATE knowledge_docs SET index_status = ?, chunk_count = ? WHERE id = ?",
+        (index_status, chunk_count, doc_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def set_knowledge_doc_indexed_flag(doc_id: int, is_indexed: bool):
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute(
+        "UPDATE knowledge_docs SET is_indexed = ? WHERE id = ?",
+        (1 if is_indexed else 0, doc_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def delete_knowledge_doc(doc_id: int) -> bool:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM knowledge_docs WHERE id = ?", (doc_id,))
+    deleted = cursor.rowcount > 0
+    conn.commit()
+    conn.close()
+    return deleted
+
+
+def search_knowledge(query: str, top_k: int = 3) -> List[Dict[str, Any]]:
+    """Simple keyword search over knowledge docs."""
+    rows = list_knowledge_docs()
+    query_terms = [q for q in query.split() if q]
+    scored = []
+    for row in rows:
+        text = f"{row['title']} {row['content']}".lower()
+        score = sum(1 for q in query_terms if q.lower() in text)
+        if score > 0:
+            scored.append((score, row))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [item[1] for item in scored[:top_k]]
+
+
+# -----------------------------------------------------------------------------
+# Badcases CRUD
+# -----------------------------------------------------------------------------
+
+
+def create_badcase(
+    title: str,
+    description: str,
+    category: str = "other",
+    status: str = "pending",
+    created_at: Optional[str] = None,
+    evidence: Optional[str] = None,
+    source_message_id: Optional[int] = None,
+    session_id: Optional[str] = None,
+    root_cause: Optional[str] = None,
+    fix_plan: Optional[str] = None,
+) -> Dict[str, Any]:
+    now = created_at or now_cn("%Y-%m-%d %H:%M")
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        INSERT INTO badcases
+        (title, description, category, status, created_at, evidence, source_message_id, session_id, root_cause, fix_plan)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (title, description, category, status, now, evidence, source_message_id, session_id, root_cause, fix_plan),
+    )
+    case_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return get_badcase(case_id)
+
+
+def get_badcase(case_id: int) -> Optional[Dict[str, Any]]:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM badcases WHERE id = ?", (case_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def list_badcases(status: Optional[str] = None, category: Optional[str] = None) -> List[Dict[str, Any]]:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    query = "SELECT * FROM badcases WHERE 1=1"
+    params = []
+    if status:
+        query += " AND status = ?"
+        params.append(status)
+    if category:
+        query += " AND category = ?"
+        params.append(category)
+    query += " ORDER BY created_at DESC"
+    cursor.execute(query, params)
+    rows = cursor.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def update_badcase(
+    case_id: int,
+    title: Optional[str] = None,
+    description: Optional[str] = None,
+    category: Optional[str] = None,
+    status: Optional[str] = None,
+    evidence: Optional[str] = None,
+    root_cause: Optional[str] = None,
+    fix_plan: Optional[str] = None,
+    verified_by: Optional[str] = None,
+    rejected_reason: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    now = now_cn("%Y-%m-%d %H:%M")
+    conn = _get_conn()
+    cursor = conn.cursor()
+
+    fields = ["updated_at = ?"]
+    params = [now]
+    for col, val in [
+        ("title", title),
+        ("description", description),
+        ("category", category),
+        ("status", status),
+        ("evidence", evidence),
+        ("root_cause", root_cause),
+        ("fix_plan", fix_plan),
+        ("verified_by", verified_by),
+        ("rejected_reason", rejected_reason),
+    ]:
+        if val is not None:
+            fields.append(f"{col} = ?")
+            params.append(val)
+
+    if status == "closed":
+        fields.append("closed_at = ?")
+        params.append(now)
+    if status == "verifying" and verified_by:
+        fields.append("verified_at = ?")
+        params.append(now)
+
+    params.append(case_id)
+    cursor.execute(
+        f"UPDATE badcases SET {', '.join(fields)} WHERE id = ?",
+        params,
+    )
+    conn.commit()
+    conn.close()
+    return get_badcase(case_id)
+
+
+def delete_badcase(case_id: int) -> bool:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM badcases WHERE id = ?", (case_id,))
+    deleted = cursor.rowcount > 0
+    conn.commit()
+    conn.close()
+    return deleted
+
+
+# ---------------------------------------------------------------------------
+# Badcase Actions
+# ---------------------------------------------------------------------------
+
+
+def add_badcase_action(
+    badcase_id: int,
+    action_type: str,
+    action_detail: Optional[str] = None,
+    status_before: Optional[str] = None,
+    status_after: Optional[str] = None,
+    created_by: Optional[str] = None,
+) -> Dict[str, Any]:
+    now = now_cn("%Y-%m-%d %H:%M")
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        INSERT INTO badcase_actions
+        (badcase_id, action_type, action_detail, status_before, status_after, created_by, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (badcase_id, action_type, action_detail, status_before, status_after, created_by, now),
+    )
+    action_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return get_badcase_action(action_id)
+
+
+def get_badcase_action(action_id: int) -> Optional[Dict[str, Any]]:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM badcase_actions WHERE id = ?", (action_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def list_badcase_actions(badcase_id: int) -> List[Dict[str, Any]]:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT * FROM badcase_actions WHERE badcase_id = ? ORDER BY id ASC",
+        (badcase_id,),
+    )
+    rows = cursor.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# Knowledge Drafts
+# ---------------------------------------------------------------------------
+
+
+def create_knowledge_draft(
+    badcase_id: Optional[int],
+    title: str,
+    content: str,
+    category: str = "未分类",
+    status: str = "draft",
+) -> Dict[str, Any]:
+    now = now_cn("%Y-%m-%d %H:%M")
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        INSERT INTO knowledge_drafts
+        (badcase_id, title, content, category, status, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (badcase_id, title, content, category, status, now, now),
+    )
+    draft_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return get_knowledge_draft(draft_id)
+
+
+def get_knowledge_draft(draft_id: int) -> Optional[Dict[str, Any]]:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM knowledge_drafts WHERE id = ?", (draft_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def list_knowledge_drafts(status: Optional[str] = None) -> List[Dict[str, Any]]:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    query = "SELECT * FROM knowledge_drafts WHERE 1=1"
+    params = []
+    if status:
+        query += " AND status = ?"
+        params.append(status)
+    query += " ORDER BY created_at DESC"
+    cursor.execute(query, params)
+    rows = cursor.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def update_knowledge_draft(
+    draft_id: int,
+    title: Optional[str] = None,
+    content: Optional[str] = None,
+    category: Optional[str] = None,
+    status: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    now = now_cn("%Y-%m-%d %H:%M")
+    conn = _get_conn()
+    cursor = conn.cursor()
+    fields = ["updated_at = ?"]
+    params = [now]
+    for col, val in [("title", title), ("content", content), ("category", category), ("status", status)]:
+        if val is not None:
+            fields.append(f"{col} = ?")
+            params.append(val)
+    params.append(draft_id)
+    cursor.execute(
+        f"UPDATE knowledge_drafts SET {', '.join(fields)} WHERE id = ?",
+        params,
+    )
+    conn.commit()
+    conn.close()
+    return get_knowledge_draft(draft_id)
+
+
+def delete_knowledge_draft(draft_id: int) -> bool:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM knowledge_drafts WHERE id = ?", (draft_id,))
+    deleted = cursor.rowcount > 0
+    conn.commit()
+    conn.close()
+    return deleted
+
+
+# -----------------------------------------------------------------------------
+# Skills CRUD
+# -----------------------------------------------------------------------------
+
+
+def create_skill(
+    name: str,
+    description: str,
+    instructions: str,
+    category: str,
+    enabled: bool = True,
+    trigger_condition: str = "",
+    skill_metadata: Optional[Dict[str, Any]] = None,
+    storage_path: str = "",
+    model_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    now = now_cn("%Y-%m-%d %H:%M")
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        INSERT INTO skills
+        (name, description, instructions, category, enabled, trigger_condition, skill_metadata, storage_path, model_id, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            name,
+            description,
+            instructions,
+            category,
+            1 if enabled else 0,
+            trigger_condition,
+            json.dumps(skill_metadata, ensure_ascii=False) if skill_metadata else None,
+            storage_path,
+            model_id,
+            now,
+            now,
+        ),
+    )
+    skill_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return get_skill(skill_id)
+
+
+def _parse_skill_metadata(row: Dict[str, Any]) -> Dict[str, Any]:
+    raw = row.get("skill_metadata")
+    if raw:
+        try:
+            return json.loads(raw)
+        except Exception:
+            return {}
+    return {}
+
+
+def get_skill(skill_id: int) -> Optional[Dict[str, Any]]:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM skills WHERE id = ?", (skill_id,))
+    row = cursor.fetchone()
+    conn.close()
+    if not row:
+        return None
+    row = _row_with_bool(row, "enabled")
+    row["skill_metadata"] = _parse_skill_metadata(row)
+    return row
+
+
+def get_skill_by_name(name: str) -> Optional[Dict[str, Any]]:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM skills WHERE name = ? LIMIT 1", (name,))
+    row = cursor.fetchone()
+    conn.close()
+    if not row:
+        return None
+    row = _row_with_bool(row, "enabled")
+    row["skill_metadata"] = _parse_skill_metadata(row)
+    return row
+
+
+def list_skills() -> List[Dict[str, Any]]:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM skills ORDER BY id")
+    rows = cursor.fetchall()
+    conn.close()
+    result = []
+    for r in rows:
+        r = _row_with_bool(r, "enabled")
+        r["skill_metadata"] = _parse_skill_metadata(r)
+        result.append(r)
+    return result
+
+
+def update_skill(
+    skill_id: int,
+    name: str,
+    description: str,
+    instructions: str,
+    category: str,
+    enabled: bool,
+    trigger_condition: str = "",
+    skill_metadata: Optional[Dict[str, Any]] = None,
+    storage_path: str = "",
+    model_id: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    now = now_cn("%Y-%m-%d %H:%M")
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        UPDATE skills SET
+            name = ?, description = ?, instructions = ?, category = ?, enabled = ?,
+            trigger_condition = ?, skill_metadata = ?, storage_path = ?, model_id = ?, updated_at = ?
+        WHERE id = ?
+        """,
+        (
+            name,
+            description,
+            instructions,
+            category,
+            1 if enabled else 0,
+            trigger_condition,
+            json.dumps(skill_metadata, ensure_ascii=False) if skill_metadata else None,
+            storage_path,
+            model_id,
+            now,
+            skill_id,
+        ),
+    )
+    conn.commit()
+    conn.close()
+    return get_skill(skill_id)
+
+
+def delete_skill(skill_id: int) -> bool:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM skills WHERE id = ?", (skill_id,))
+    deleted = cursor.rowcount > 0
+    conn.commit()
+    conn.close()
+    return deleted
+
+
+# -----------------------------------------------------------------------------
+# MCP Servers CRUD
+# -----------------------------------------------------------------------------
+
+
+def create_mcp_server(
+    name: str,
+    command: str,
+    args: Optional[List[str]],
+    env: Optional[Dict[str, str]],
+    description: str,
+    enabled: bool = True,
+) -> Dict[str, Any]:
+    now = now_cn("%Y-%m-%d %H:%M")
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO mcp_servers (name, command, args, env, description, enabled, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            name,
+            command,
+            json.dumps(args) if args is not None else None,
+            json.dumps(env) if env is not None else None,
+            description,
+            1 if enabled else 0,
+            now,
+            now,
+        ),
+    )
+    server_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return get_mcp_server(server_id)
+
+
+def get_mcp_server(server_id: int) -> Optional[Dict[str, Any]]:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM mcp_servers WHERE id = ?", (server_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return _parse_json_fields(row, "enabled", ["args", "env"], {"args": [], "env": {}}) if row else None
+
+
+def list_mcp_servers() -> List[Dict[str, Any]]:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM mcp_servers ORDER BY id")
+    rows = cursor.fetchall()
+    conn.close()
+    return [_parse_json_fields(r, "enabled", ["args", "env"], {"args": [], "env": {}}) for r in rows]
+
+
+def update_mcp_server(
+    server_id: int,
+    name: str,
+    command: str,
+    args: Optional[List[str]],
+    env: Optional[Dict[str, str]],
+    description: str,
+    enabled: bool,
+) -> Optional[Dict[str, Any]]:
+    now = now_cn("%Y-%m-%d %H:%M")
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute(
+        "UPDATE mcp_servers SET name = ?, command = ?, args = ?, env = ?, description = ?, enabled = ?, updated_at = ? WHERE id = ?",
+        (
+            name,
+            command,
+            json.dumps(args) if args is not None else None,
+            json.dumps(env) if env is not None else None,
+            description,
+            1 if enabled else 0,
+            now,
+            server_id,
+        ),
+    )
+    conn.commit()
+    conn.close()
+    return get_mcp_server(server_id)
+
+
+def delete_mcp_server(server_id: int) -> bool:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM mcp_servers WHERE id = ?", (server_id,))
+    deleted = cursor.rowcount > 0
+    conn.commit()
+    conn.close()
+    return deleted
+
+
+def _row_with_bool(row: sqlite3.Row, field: str) -> Dict[str, Any]:
+    """Convert 0/1 integer to boolean for named field."""
+    d = dict(row)
+    if field in d:
+        d[field] = bool(d[field])
+    return d
+
+
+def _parse_json_fields(row: sqlite3.Row, bool_field: str, json_fields: List[str], defaults: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert boolean field and parse JSON strings for given fields."""
+    d = _row_with_bool(row, bool_field)
+    for f in json_fields:
+        if f in d:
+            try:
+                d[f] = json.loads(d[f]) if d[f] is not None else defaults.get(f)
+            except (json.JSONDecodeError, TypeError):
+                d[f] = defaults.get(f)
+    return d
+
+
+# Chat Messages
+# -----------------------------------------------------------------------------
+
+
+def save_chat_message(
+    session_id: str,
+    role: str,
+    content: str,
+    token_count: int = 0,
+    token_detail: Optional[Dict[str, Any]] = None,
+    citations: Optional[List[Dict[str, Any]]] = None,
+    activated_skills: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    now = now_cn()
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO chat_messages (session_id, role, content, token_count, token_detail, citations, activated_skills, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            session_id,
+            role,
+            content,
+            token_count,
+            json.dumps(token_detail) if token_detail else None,
+            json.dumps(citations) if citations else None,
+            json.dumps(activated_skills) if activated_skills else None,
+            now,
+        ),
+    )
+    message_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return get_chat_message(message_id)
+
+
+def get_chat_message(message_id: int) -> Optional[Dict[str, Any]]:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM chat_messages WHERE id = ?", (message_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def list_chat_messages(session_id: str) -> List[Dict[str, Any]]:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT * FROM chat_messages WHERE session_id = ? ORDER BY id ASC",
+        (session_id,),
+    )
+    rows = cursor.fetchall()
+    conn.close()
+    messages = []
+    for r in rows:
+        msg = dict(r)
+        for json_col in ("token_detail", "citations", "activated_skills"):
+            if msg.get(json_col):
+                try:
+                    msg[json_col] = json.loads(msg[json_col])
+                except Exception:
+                    pass
+        messages.append(msg)
+    return messages
+
+
+def delete_chat_messages(session_id: str) -> bool:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM chat_messages WHERE session_id = ?", (session_id,))
+    deleted = cursor.rowcount > 0
+    conn.commit()
+    conn.close()
+    return deleted
+
+
+# -----------------------------------------------------------------------------
+# Chat Sessions & Human Handoff
+# -----------------------------------------------------------------------------
+
+
+def ensure_chat_session(session_id: str) -> Dict[str, Any]:
+    """Create a chat session row if it doesn't exist."""
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM chat_sessions WHERE session_id = ?", (session_id,))
+    row = cursor.fetchone()
+    if not row:
+        now = now_cn()
+        cursor.execute(
+            "INSERT INTO chat_sessions (session_id, handoff_status, created_at, updated_at) VALUES (?, ?, ?, ?)",
+            (session_id, "none", now, now),
+        )
+        conn.commit()
+        cursor.execute("SELECT * FROM chat_sessions WHERE session_id = ?", (session_id,))
+        row = cursor.fetchone()
+    conn.close()
+    return dict(row) if row else {"session_id": session_id, "handoff_status": "none"}
+
+
+def request_handoff(session_id: str, reason: str) -> Dict[str, Any]:
+    """Mark a session as waiting for human takeover."""
+    ensure_chat_session(session_id)
+    now = now_cn()
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        UPDATE chat_sessions
+        SET handoff_status = 'requested',
+            handoff_reason = ?,
+            handoff_requested_at = ?,
+            updated_at = ?
+        WHERE session_id = ?
+        """,
+        (reason, now, now, session_id),
+    )
+    conn.commit()
+    conn.close()
+    return get_chat_session(session_id)
+
+
+def activate_handoff(session_id: str, assigned_to: str) -> Dict[str, Any]:
+    """Mark a handoff as actively taken by a staff member."""
+    now = now_cn()
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        UPDATE chat_sessions
+        SET handoff_status = 'active',
+            assigned_to = ?,
+            handoff_active_at = ?,
+            updated_at = ?
+        WHERE session_id = ?
+        """,
+        (assigned_to, now, now, session_id),
+    )
+    conn.commit()
+    conn.close()
+    return get_chat_session(session_id)
+
+
+def resolve_handoff(session_id: str) -> Dict[str, Any]:
+    """Resolve a handoff request."""
+    now = now_cn()
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        UPDATE chat_sessions
+        SET handoff_status = 'resolved',
+            handoff_resolved_at = ?,
+            updated_at = ?
+        WHERE session_id = ?
+        """,
+        (now, now, session_id),
+    )
+    conn.commit()
+    conn.close()
+    return get_chat_session(session_id)
+
+
+def get_chat_session(session_id: str) -> Optional[Dict[str, Any]]:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM chat_sessions WHERE session_id = ?", (session_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def list_handoff_sessions(status: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Return chat sessions that need or are under human takeover."""
+    conn = _get_conn()
+    cursor = conn.cursor()
+    if status:
+        cursor.execute(
+            "SELECT * FROM chat_sessions WHERE handoff_status = ? ORDER BY handoff_requested_at DESC",
+            (status,),
+        )
+    else:
+        cursor.execute(
+            "SELECT * FROM chat_sessions WHERE handoff_status IN ('requested', 'active') ORDER BY handoff_requested_at DESC"
+        )
+    rows = cursor.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def is_handoff_active(session_id: str) -> bool:
+    """Return True if the session is under active human takeover."""
+    session = get_chat_session(session_id)
+    return session is not None and session.get("handoff_status") == "active"
+
+
+def is_handoff_requested(session_id: str) -> bool:
+    """Return True if the session has a pending handoff request."""
+    session = get_chat_session(session_id)
+    return session is not None and session.get("handoff_status") == "requested"
+
+
+# ---------------------------------------------------------------------------
+# Agents CRUD
+# ---------------------------------------------------------------------------
+
+
+def create_agent(
+    agent_id: str,
+    name: str,
+    description: str = "",
+    instructions: str = "",
+    category: str = "vertical",
+    enabled: bool = True,
+    model_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    now = now_cn("%Y-%m-%d %H:%M")
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        INSERT INTO agents
+        (agent_id, name, description, instructions, category, enabled, model_id, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (agent_id, name, description, instructions, category, 1 if enabled else 0, model_id, now, now),
+    )
+    row_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return get_agent(row_id)
+
+
+def get_agent(agent_row_id: int) -> Optional[Dict[str, Any]]:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM agents WHERE id = ?", (agent_row_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return _row_with_bool(row, "enabled") if row else None
+
+
+def get_agent_by_agent_id(agent_id: str) -> Optional[Dict[str, Any]]:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM agents WHERE agent_id = ?", (agent_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return _row_with_bool(row, "enabled") if row else None
+
+
+def list_agents(category: Optional[str] = None) -> List[Dict[str, Any]]:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    query = "SELECT * FROM agents WHERE 1=1"
+    params = []
+    if category:
+        query += " AND category = ?"
+        params.append(category)
+    query += " ORDER BY id"
+    cursor.execute(query, params)
+    rows = cursor.fetchall()
+    conn.close()
+    return [_row_with_bool(r, "enabled") for r in rows]
+
+
+def update_agent(
+    agent_row_id: int,
+    name: Optional[str] = None,
+    description: Optional[str] = None,
+    instructions: Optional[str] = None,
+    category: Optional[str] = None,
+    enabled: Optional[bool] = None,
+    model_id: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    now = now_cn("%Y-%m-%d %H:%M")
+    conn = _get_conn()
+    cursor = conn.cursor()
+    fields = ["updated_at = ?"]
+    params = [now]
+    for col, val in [
+        ("name", name),
+        ("description", description),
+        ("instructions", instructions),
+        ("category", category),
+        ("model_id", model_id),
+    ]:
+        if val is not None:
+            fields.append(f"{col} = ?")
+            params.append(val)
+    if enabled is not None:
+        fields.append("enabled = ?")
+        params.append(1 if enabled else 0)
+    params.append(agent_row_id)
+    cursor.execute(
+        f"UPDATE agents SET {', '.join(fields)} WHERE id = ?",
+        params,
+    )
+    conn.commit()
+    conn.close()
+    return get_agent(agent_row_id)
+
+
+def delete_agent(agent_row_id: int) -> bool:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM agents WHERE id = ?", (agent_row_id,))
+    deleted = cursor.rowcount > 0
+    conn.commit()
+    conn.close()
+    return deleted
+
+
+def set_agent_skills(agent_id: str, skill_ids: List[int]):
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM agent_skills WHERE agent_id = ?", (agent_id,))
+    for skill_id in skill_ids:
+        cursor.execute(
+            "INSERT INTO agent_skills (agent_id, skill_id) VALUES (?, ?)",
+            (agent_id, skill_id),
+        )
+    conn.commit()
+    conn.close()
+
+
+def get_agent_skills(agent_id: str) -> List[int]:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute("SELECT skill_id FROM agent_skills WHERE agent_id = ?", (agent_id,))
+    rows = cursor.fetchall()
+    conn.close()
+    return [r["skill_id"] for r in rows]
+
+
+def set_agent_tools(agent_id: str, tools: List[Dict[str, Any]]):
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM agent_tools WHERE agent_id = ?", (agent_id,))
+    for tool in tools:
+        cursor.execute(
+            "INSERT INTO agent_tools (agent_id, tool_name, config) VALUES (?, ?, ?)",
+            (agent_id, tool["tool_name"], json.dumps(tool.get("config"), ensure_ascii=False) if tool.get("config") else None),
+        )
+    conn.commit()
+    conn.close()
+
+
+def get_agent_tools(agent_id: str) -> List[Dict[str, Any]]:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM agent_tools WHERE agent_id = ?", (agent_id,))
+    rows = cursor.fetchall()
+    conn.close()
+    result = []
+    for r in rows:
+        d = dict(r)
+        if d.get("config"):
+            try:
+                d["config"] = json.loads(d["config"])
+            except Exception:
+                pass
+        result.append(d)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Retrieval Settings CRUD
+# ---------------------------------------------------------------------------
+
+
+def get_retrieval_settings(name: str = "default") -> Optional[Dict[str, Any]]:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM retrieval_settings WHERE name = ?", (name,))
+    row = cursor.fetchone()
+    conn.close()
+    if not row:
+        return None
+    r = _row_with_bool(row, "enable_rerank")
+    return r
+
+
+def update_retrieval_settings(
+    name: str = "default",
+    top_k: Optional[int] = None,
+    keyword_weight: Optional[float] = None,
+    semantic_weight: Optional[float] = None,
+    rrf_k: Optional[int] = None,
+    enable_rerank: Optional[bool] = None,
+    rerank_model: Optional[str] = None,
+    score_threshold: Optional[float] = None,
+) -> Optional[Dict[str, Any]]:
+    now = now_cn("%Y-%m-%d %H:%M")
+    existing = get_retrieval_settings(name)
+    if not existing:
+        conn = _get_conn()
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO retrieval_settings
+            (name, top_k, keyword_weight, semantic_weight, rrf_k, enable_rerank, rerank_model, score_threshold, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                name,
+                top_k or 5,
+                keyword_weight if keyword_weight is not None else 0.3,
+                semantic_weight if semantic_weight is not None else 0.7,
+                rrf_k or 60,
+                1 if enable_rerank else 0,
+                rerank_model,
+                score_threshold if score_threshold is not None else 0.0,
+                now,
+                now,
+            ),
+        )
+        conn.commit()
+        conn.close()
+        return get_retrieval_settings(name)
+
+    conn = _get_conn()
+    cursor = conn.cursor()
+    fields = ["updated_at = ?"]
+    params = [now]
+    for col, val in [
+        ("top_k", top_k),
+        ("keyword_weight", keyword_weight),
+        ("semantic_weight", semantic_weight),
+        ("rrf_k", rrf_k),
+        ("rerank_model", rerank_model),
+        ("score_threshold", score_threshold),
+    ]:
+        if val is not None:
+            fields.append(f"{col} = ?")
+            params.append(val)
+    if enable_rerank is not None:
+        fields.append("enable_rerank = ?")
+        params.append(1 if enable_rerank else 0)
+    params.append(name)
+    cursor.execute(
+        f"UPDATE retrieval_settings SET {', '.join(fields)} WHERE name = ?",
+        params,
+    )
+    conn.commit()
+    conn.close()
+    return get_retrieval_settings(name)
+
+
+# ---------------------------------------------------------------------------
+# Model Configs CRUD
+# ---------------------------------------------------------------------------
+
+
+def create_model_config(
+    model_id: str,
+    name: str,
+    provider: str = "deepseek",
+    api_key: Optional[str] = None,
+    base_url: Optional[str] = None,
+    model_params: Optional[Dict[str, Any]] = None,
+    is_default: bool = False,
+    enabled: bool = True,
+    description: str = "",
+) -> Dict[str, Any]:
+    now = now_cn("%Y-%m-%d %H:%M")
+    conn = _get_conn()
+    cursor = conn.cursor()
+    if is_default:
+        cursor.execute("UPDATE model_configs SET is_default = 0")
+    cursor.execute(
+        """
+        INSERT INTO model_configs
+        (model_id, name, provider, api_key, base_url, model_params, is_default, enabled, description, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            model_id,
+            name,
+            provider,
+            api_key,
+            base_url,
+            json.dumps(model_params, ensure_ascii=False) if model_params else None,
+            1 if is_default else 0,
+            1 if enabled else 0,
+            description,
+            now,
+            now,
+        ),
+    )
+    row_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return get_model_config(row_id)
+
+
+def get_model_config(config_id: int) -> Optional[Dict[str, Any]]:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM model_configs WHERE id = ?", (config_id,))
+    row = cursor.fetchone()
+    conn.close()
+    if not row:
+        return None
+    return _parse_model_config(row)
+
+
+def get_model_config_by_model_id(model_id: str) -> Optional[Dict[str, Any]]:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM model_configs WHERE model_id = ?", (model_id,))
+    row = cursor.fetchone()
+    conn.close()
+    if not row:
+        return None
+    return _parse_model_config(row)
+
+
+def get_default_model_config() -> Optional[Dict[str, Any]]:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM model_configs WHERE is_default = 1 AND enabled = 1 LIMIT 1")
+    row = cursor.fetchone()
+    conn.close()
+    if not row:
+        conn = _get_conn()
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM model_configs WHERE enabled = 1 ORDER BY id LIMIT 1")
+        row = cursor.fetchone()
+        conn.close()
+    if not row:
+        return None
+    return _parse_model_config(row)
+
+
+def _parse_model_config(row: sqlite3.Row) -> Dict[str, Any]:
+    d = _row_with_bool(row, "enabled")
+    d = _row_with_bool(d, "is_default")
+    if d.get("model_params"):
+        try:
+            d["model_params"] = json.loads(d["model_params"])
+        except Exception:
+            d["model_params"] = {}
+    else:
+        d["model_params"] = {}
+    return d
+
+
+def list_model_configs() -> List[Dict[str, Any]]:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM model_configs ORDER BY id")
+    rows = cursor.fetchall()
+    conn.close()
+    return [_parse_model_config(r) for r in rows]
+
+
+def update_model_config(
+    config_id: int,
+    name: Optional[str] = None,
+    provider: Optional[str] = None,
+    api_key: Optional[str] = None,
+    base_url: Optional[str] = None,
+    model_params: Optional[Dict[str, Any]] = None,
+    is_default: Optional[bool] = None,
+    enabled: Optional[bool] = None,
+    description: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    now = now_cn("%Y-%m-%d %H:%M")
+    conn = _get_conn()
+    cursor = conn.cursor()
+    if is_default:
+        cursor.execute("UPDATE model_configs SET is_default = 0")
+    fields = ["updated_at = ?"]
+    params = [now]
+    for col, val in [
+        ("name", name),
+        ("provider", provider),
+        ("api_key", api_key),
+        ("base_url", base_url),
+        ("description", description),
+    ]:
+        if val is not None:
+            fields.append(f"{col} = ?")
+            params.append(val)
+    if model_params is not None:
+        fields.append("model_params = ?")
+        params.append(json.dumps(model_params, ensure_ascii=False))
+    if is_default is not None:
+        fields.append("is_default = ?")
+        params.append(1 if is_default else 0)
+    if enabled is not None:
+        fields.append("enabled = ?")
+        params.append(1 if enabled else 0)
+    params.append(config_id)
+    cursor.execute(
+        f"UPDATE model_configs SET {', '.join(fields)} WHERE id = ?",
+        params,
+    )
+    conn.commit()
+    conn.close()
+    return get_model_config(config_id)
+
+
+def set_default_model_config(config_id: int) -> Optional[Dict[str, Any]]:
+    return update_model_config(config_id, is_default=True)
+
+
+def delete_model_config(config_id: int) -> bool:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM model_configs WHERE id = ?", (config_id,))
+    deleted = cursor.rowcount > 0
+    conn.commit()
+    conn.close()
+    return deleted
+
+
+# ---------------------------------------------------------------------------
+# MCP Tools CRUD & Discovery
+# ---------------------------------------------------------------------------
+
+
+def save_mcp_tool(
+    server_id: int,
+    name: str,
+    description: str = "",
+    input_schema: Optional[Dict[str, Any]] = None,
+    tool_metadata: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        INSERT INTO mcp_tools (server_id, name, description, input_schema, tool_metadata)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(server_id, name) DO UPDATE SET
+            description = excluded.description,
+            input_schema = excluded.input_schema,
+            tool_metadata = excluded.tool_metadata
+        """,
+        (
+            server_id,
+            name,
+            description,
+            json.dumps(input_schema, ensure_ascii=False) if input_schema else "{}",
+            json.dumps(tool_metadata, ensure_ascii=False) if tool_metadata else None,
+        ),
+    )
+    tool_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return get_mcp_tool(tool_id)
+
+
+def get_mcp_tool(tool_id: int) -> Optional[Dict[str, Any]]:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM mcp_tools WHERE id = ?", (tool_id,))
+    row = cursor.fetchone()
+    conn.close()
+    if not row:
+        return None
+    return _parse_mcp_tool(row)
+
+
+def _parse_mcp_tool(row: sqlite3.Row) -> Dict[str, Any]:
+    d = dict(row)
+    for col in ("input_schema", "tool_metadata"):
+        if d.get(col):
+            try:
+                d[col] = json.loads(d[col])
+            except Exception:
+                pass
+    return d
+
+
+def list_mcp_tools(server_id: Optional[int] = None) -> List[Dict[str, Any]]:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    if server_id is not None:
+        cursor.execute("SELECT * FROM mcp_tools WHERE server_id = ? ORDER BY id", (server_id,))
+    else:
+        cursor.execute("SELECT * FROM mcp_tools ORDER BY id")
+    rows = cursor.fetchall()
+    conn.close()
+    return [_parse_mcp_tool(r) for r in rows]
+
+
+def delete_mcp_tools_for_server(server_id: int):
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM mcp_tools WHERE server_id = ?", (server_id,))
+    conn.commit()
+    conn.close()
+
+
+def toggle_mcp_server_enabled(server_id: int, enabled: bool) -> Optional[Dict[str, Any]]:
+    now = now_cn("%Y-%m-%d %H:%M")
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute(
+        "UPDATE mcp_servers SET enabled = ?, updated_at = ? WHERE id = ?",
+        (1 if enabled else 0, now, server_id),
+    )
+    conn.commit()
+    conn.close()
+    return get_mcp_server(server_id)
