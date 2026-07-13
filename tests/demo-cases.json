@@ -1,0 +1,240 @@
+{
+  "version": "V1.2",
+  "status_enum": ["not_run", "passed", "failed", "blocked"],
+  "cases": {
+    "router_and_agents": [
+      {
+        "id": "I-01",
+        "title": "维修意图路由",
+        "query": "我家客厅吊灯不亮了，派个人来修一下",
+        "expected_intent": "maintenance",
+        "expected_agent": "维修 Agent",
+        "status": "not_run",
+        "evidence": "SSE event: route 返回 intent 与 current_agent"
+      },
+      {
+        "id": "I-04",
+        "title": "费用意图路由",
+        "query": "物业费多少钱一平米，怎么缴费",
+        "expected_intent": "billing",
+        "expected_agent": "费用 Agent",
+        "status": "not_run",
+        "evidence": "SSE event: route 返回 intent 与 current_agent"
+      },
+      {
+        "id": "I-07",
+        "title": "投诉意图路由",
+        "query": "楼上晚上十一点还在弹钢琴，我要投诉",
+        "expected_intent": "complaint",
+        "expected_agent": "投诉 Agent",
+        "status": "not_run",
+        "evidence": "SSE event: route 返回 intent 与 current_agent"
+      }
+    ],
+    "skill": [
+      {
+        "id": "S-01",
+        "title": "维修工单 Skill 触发",
+        "query": "帮我报修卫生间水管漏水",
+        "expected_skill": "维修工单处理",
+        "status": "not_run",
+        "evidence": "AI 气泡底部显示已调用 Skill"
+      },
+      {
+        "id": "S-02",
+        "title": "词序反转触发",
+        "query": "托管宠物怎么收费",
+        "expected_skill": "宠物服务",
+        "status": "not_run",
+        "evidence": "AI 气泡底部显示已调用 Skill"
+      },
+      {
+        "id": "S-03",
+        "title": "Skill 工具调用",
+        "query": "门口路灯不亮了，请安排维修",
+        "expected_tool": "create_work_order",
+        "status": "not_run",
+        "evidence": "SSE event: done 中 tool_calls 包含 create_work_order"
+      }
+    ],
+    "rag": [
+      {
+        "id": "R-01",
+        "title": "服务承诺引用",
+        "query": "小区物业服务承诺的响应时间是多少",
+        "expected_doc_substring": "服务承诺",
+        "status": "not_run",
+        "evidence": "回答末尾显示引用卡片"
+      },
+      {
+        "id": "R-02",
+        "title": "物业费引用",
+        "query": "物业费收费标准是什么",
+        "expected_doc_substring": "物业费",
+        "status": "not_run",
+        "evidence": "回答末尾显示引用卡片"
+      },
+      {
+        "id": "R-03",
+        "title": "装修押金引用",
+        "query": "装修押金怎么退",
+        "expected_doc_substring": "装修",
+        "status": "not_run",
+        "evidence": "回答末尾显示引用卡片"
+      }
+    ],
+    "hybrid_retrieval_and_rerank": [
+      {
+        "id": "R-04",
+        "title": "停车管理混合检索",
+        "query": "停车管理规定有哪些",
+        "expected_doc_substring": "停车",
+        "status": "not_run",
+        "evidence": "检索调试页显示 BM25 + 向量 + RRF 结果"
+      },
+      {
+        "id": "R-05",
+        "title": "宠物饲养语义检索",
+        "query": "宠物饲养需要注意什么",
+        "expected_doc_substring": "宠物",
+        "status": "not_run",
+        "evidence": "检索调试页显示 BM25 + 向量 + RRF 结果"
+      },
+      {
+        "id": "R-08",
+        "title": "水电费代缴检索",
+        "query": "水电费代缴怎么办理",
+        "expected_doc_substring": "水电费",
+        "status": "not_run",
+        "evidence": "检索调试页显示 BM25 + 向量 + RRF 结果"
+      }
+    ],
+    "model_config_and_ab": [
+      {
+        "id": "M-01",
+        "title": "模型列表脱敏",
+        "api": "GET /api/model-configs",
+        "check": "所有返回项的 api_key 为空或缺失",
+        "status": "not_run",
+        "evidence": "接口响应无 api_key 字段"
+      },
+      {
+        "id": "M-02",
+        "title": "默认模型为 Flash",
+        "api": "GET /api/model-configs/default",
+        "check": "model_id 包含 flash",
+        "status": "not_run",
+        "evidence": "接口响应显示 deepseek-v4-flash"
+      },
+      {
+        "id": "M-03",
+        "title": "Skill A/B 对比",
+        "api": "POST /api/skills/{id}/test",
+        "check": "同一 query 在 Flash 与 Pro 下均有输出",
+        "status": "not_run",
+        "evidence": "Skill 测试页两次输出结果"
+      }
+    ],
+    "mcp_tool": [
+      {
+        "id": "T-01",
+        "title": "MCP Server 发现",
+        "api": "GET /api/mcp/servers",
+        "check": "返回已配置的 MCP Server 列表",
+        "status": "not_run",
+        "evidence": "平台管理 MCP Server 列表"
+      },
+      {
+        "id": "T-02",
+        "title": "MCP 工具发现",
+        "api": "GET /api/mcp/tools",
+        "check": "返回可用工具名称列表",
+        "status": "not_run",
+        "evidence": "Agent 编辑页可选工具列表"
+      },
+      {
+        "id": "T-03",
+        "title": "天气工具调用",
+        "query": "今天适合晾衣服吗",
+        "expected_tool": "get_weather",
+        "status": "not_run",
+        "evidence": "SSE event: done 中 tool_calls 包含 get_weather"
+      }
+    ],
+    "badcase_loop": [
+      {
+        "id": "B-01",
+        "title": "词序反转 Badcase",
+        "query": "托管宠物怎么收费",
+        "expected_skill": "宠物服务",
+        "status": "not_run",
+        "evidence": "Badcase 库记录 + 复测通过"
+      },
+      {
+        "id": "B-02",
+        "title": "RAG 未召回 Badcase",
+        "query": "装修押金退还流程",
+        "expected_doc_substring": "装修",
+        "status": "not_run",
+        "evidence": "Badcase 库记录 + 复测通过"
+      },
+      {
+        "id": "B-03",
+        "title": "点踩生成 Badcase",
+        "query": "任意对话",
+        "action": "点击 👎",
+        "status": "not_run",
+        "evidence": "Badcase 库新增一条待分析记录"
+      }
+    ],
+    "human_ai_collaboration": [
+      {
+        "id": "H-01",
+        "title": "工单自动创建",
+        "query": "帮我报修卫生间水管漏水",
+        "expected_status": "待处理",
+        "status": "not_run",
+        "evidence": "员工 Tab 待办工单出现新记录"
+      },
+      {
+        "id": "H-02",
+        "title": "员工接管",
+        "action": "点击工单详情「接管」",
+        "expected_status": "处理中",
+        "status": "not_run",
+        "evidence": "工单状态变为处理中，AI 暂停自动回复"
+      },
+      {
+        "id": "H-03",
+        "title": "工单完成同步",
+        "action": "员工标记完成",
+        "expected_status": "已完成",
+        "status": "not_run",
+        "evidence": "业主 Tab 我的工单状态同步为已完成"
+      }
+    ],
+    "multimodal_repair": [
+      {
+        "id": "V-01",
+        "title": "图片上传",
+        "action": "业主上传故障图片",
+        "status": "not_run",
+        "evidence": "前端图片预览与发送"
+      },
+      {
+        "id": "V-02",
+        "title": "图片理解",
+        "action": "多模态模型解析图片",
+        "status": "not_run",
+        "evidence": "AI 返回图片中识别到的故障描述"
+      },
+      {
+        "id": "V-03",
+        "title": "工单字段预填",
+        "action": "基于图片信息预填工单",
+        "status": "not_run",
+        "evidence": "工单描述中体现图片识别结果"
+      }
+    ]
+  }
+}
