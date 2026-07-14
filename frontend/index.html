@@ -224,6 +224,7 @@
       chatStreaming: false,
       chatHandoff: false,
       currentAiMessage: null,
+      currentRoute: null,
       workOrders: {},
       knowledgeDocs: [],
       badcases: [],
@@ -290,18 +291,30 @@
     }
 
     function statusBadge(status) {
-      const map = {
+      const styleMap = {
+        'pending': 'bg-amber-50 text-amber-700 border-amber-200',
+        'classified': 'bg-indigo-50 text-indigo-700 border-indigo-200',
+        'fixing': 'bg-brand-50 text-brand-700 border-brand-200',
+        'verifying': 'bg-sky-50 text-sky-700 border-sky-200',
+        'closed': 'bg-slate-100 text-slate-600 border-slate-200',
+        'rejected': 'bg-red-50 text-red-700 border-red-200',
         '待派单': 'bg-amber-50 text-amber-700 border-amber-200',
-        '待处理': 'bg-sky-50 text-sky-700 border-sky-200',
+        '待处理': 'bg-amber-50 text-amber-700 border-amber-200',
         '处理中': 'bg-brand-50 text-brand-700 border-brand-200',
         '已完成': 'bg-slate-100 text-slate-600 border-slate-200',
         '已修复': 'bg-brand-50 text-brand-700 border-brand-200',
-        '修复中': 'bg-brand-50 text-brand-700 border-brand-200',
-        '待处理': 'bg-amber-50 text-amber-700 border-amber-200',
         '已关闭': 'bg-slate-100 text-slate-600 border-slate-200',
         '已驳回': 'bg-red-50 text-red-700 border-red-200'
       };
-      return `<span class="px-2.5 py-1 rounded-full text-xs font-medium border ${map[status] || 'bg-slate-100 text-slate-600 border-slate-200'}">${status}</span>`;
+      const labelMap = {
+        'pending': '待处理',
+        'classified': '已分类',
+        'fixing': '修复中',
+        'verifying': '验证中',
+        'closed': '已关闭',
+        'rejected': '已驳回'
+      };
+      return `<span class="px-2.5 py-1 rounded-full text-xs font-medium border ${styleMap[status] || 'bg-slate-100 text-slate-600 border-slate-200'}">${labelMap[status] || status}</span>`;
     }
 
     function urgencyBadge(level) {
@@ -451,11 +464,12 @@
       }, '提交');
     }
 
-    function renderAiMessageTags(skills, tools, agent) {
+    function renderAiMessageTags(skills, tools, agent, routeReason = '', routeIntent = '') {
       const tags = [];
-      if (skills && skills.length) tags.push(`<span class="px-1.5 py-0.5 bg-brand-50 text-brand-600 rounded text-[10px]">已调用 Skill：${escapeHtml(skills.join('、'))}</span>`);
-      if (tools && tools.length) tags.push(`<span class="px-1.5 py-0.5 bg-gold-50 text-gold-600 rounded text-[10px]">已调用工具：${escapeHtml(tools.join('、'))}</span>`);
+      if (routeReason) tags.push(`<span class="px-1.5 py-0.5 bg-slate-100 text-slate-600 rounded text-[10px]" title="${escapeHtml(routeIntent || '')}">路由原因：${escapeHtml(routeReason)}</span>`);
       if (agent) tags.push(`<span class="px-1.5 py-0.5 bg-indigo-50 text-indigo-600 rounded text-[10px]">当前处理 Agent：${escapeHtml(agent)}</span>`);
+      if (skills && skills.length) tags.push(`<span class="px-1.5 py-0.5 bg-brand-50 text-brand-600 rounded text-[10px]">已命中 Skill：${escapeHtml(skills.join('、'))}</span>`);
+      if (tools && tools.length) tags.push(`<span class="px-1.5 py-0.5 bg-gold-50 text-gold-600 rounded text-[10px]">已调用工具：${escapeHtml(tools.map(t => typeof t === 'string' ? t : (t.name || t.tool_name || JSON.stringify(t))).join('、'))}</span>`);
       return tags.length ? `<div class="flex flex-wrap items-center gap-1 mt-2">${tags.join('')}</div>` : '';
     }
 
@@ -647,8 +661,9 @@
       container.innerHTML = `
         <div class="h-full flex flex-col max-w-3xl mx-auto w-full">
           ${pageHeader('AI 物业维修助手', '24 小时在线，帮您解答维修、报修、收费等问题')
-            .replace('sticky top-0 z-10', '')
-            .replace('max-w-6xl mx-auto', 'max-w-3xl mx-auto')}
+            .replace('sticky top-0 z-10', 'relative')
+            .replace('max-w-6xl mx-auto', 'max-w-3xl mx-auto')
+            .replace('</p>', '</p><button id="chat-refresh-btn" type="button" class="absolute right-6 top-1/2 -translate-y-1/2 text-xs text-slate-500 hover:text-brand-600 flex items-center gap-1"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>刷新</button>')}
           <div class="flex-1 overflow-y-auto chat-scroll p-4 md:p-6" id="chat-messages">
             <div id="chat-message-list" class="w-full space-y-5">
               <div class="flex gap-3 welcome-message">
@@ -732,6 +747,15 @@
         } catch (err) {
           showToast('转人工失败，请重试', 'error');
         }
+      });
+
+      $('#chat-refresh-btn').addEventListener('click', async () => {
+        if (STATE.chatStreaming) {
+          showToast('流式回复中，请稍后再刷新', 'error');
+          return;
+        }
+        await restoreChatMessages();
+        showToast('会话已刷新', 'success');
       });
 
       restoreChatMessages();
@@ -825,6 +849,8 @@
         </div>
         <div class="bg-white rounded-2xl rounded-tl-sm shadow-soft px-4 py-3 max-w-[85%] min-w-0 border border-slate-100">
           <div class="markdown-body text-sm text-slate-700 break-words ai-message-content"></div>
+          <div class="ai-message-route-status text-[10px] text-slate-400 mt-1"></div>
+          <div class="ai-message-tool-status text-[10px] text-slate-500 mt-1"></div>
           <div class="typing-indicator flex gap-1 mt-2 ai-message-typing">
             <span class="w-1.5 h-1.5 bg-slate-400 rounded-full typing-dot"></span>
             <span class="w-1.5 h-1.5 bg-slate-400 rounded-full typing-dot"></span>
@@ -934,7 +960,10 @@
           if (upBtn) upBtn.onclick = () => sendThumbFeedback(messageId, 'thumb_up');
           if (downBtn) downBtn.onclick = () => openThumbFeedbackModal(messageId);
           const tagsEl = footer.querySelector('.ai-message-tags');
-          if (tagsEl) tagsEl.innerHTML = renderAiMessageTags(activatedSkills, tools, agent);
+          if (tagsEl) {
+            const route = STATE.currentRoute || {};
+            tagsEl.innerHTML = renderAiMessageTags(activatedSkills, tools, agent, route.reason || '', route.intent || '');
+          }
           // Append citation footnotes below the footer row.
           const existingFootnotes = footer.parentElement.querySelector('.ai-message-footnotes');
           if (existingFootnotes) existingFootnotes.remove();
@@ -956,6 +985,7 @@
     async function sendChatMessage(text) {
       appendUserMessage(text);
       STATE.chatStreaming = true;
+      STATE.currentRoute = null;
       const btn = $('#chat-send');
       if (btn) btn.disabled = true;
 
@@ -970,26 +1000,67 @@
           body: JSON.stringify({ message: text, session_id: STATE.chatSessionId, user_id: 'web-user' })
         });
 
+        if (!response.ok) {
+          let errText = '';
+          try { errText = await response.text(); } catch (e) {}
+          throw new Error(`服务暂时不可用（HTTP ${response.status}${errText ? ': ' + errText.slice(0, 200) : ''}）`);
+        }
+
         const reader = response.body.getReader();
         const decoder = new TextDecoder();
+        let buffer = '';
 
         while (true) {
           const { done, value } = await reader.read();
           if (done) break;
-          const chunk = decoder.decode(value, { stream: true });
-          const events = chunk.split('\n\n').filter(e => e.trim());
+          buffer += decoder.decode(value, { stream: true });
+
+          // Extract complete SSE events split by double newlines.
+          const events = [];
+          let idx;
+          while ((idx = buffer.indexOf('\n\n')) !== -1) {
+            events.push(buffer.slice(0, idx));
+            buffer = buffer.slice(idx + 2);
+          }
+
           for (const event of events) {
-            const lines = event.split('\n');
-            const eventType = lines[0].replace('event: ', '');
-            const dataLine = lines.find(l => l.startsWith('data:'));
-            if (!dataLine) continue;
-            const data = JSON.parse(dataLine.replace('data: ', ''));
+            if (!event.trim()) continue;
+            let eventType = '';
+            const dataLines = [];
+            for (const line of event.split('\n')) {
+              if (line.startsWith('event:')) eventType = line.slice(6).trim();
+              else if (line.startsWith('data:')) dataLines.push(line.slice(5).trim());
+            }
+            if (dataLines.length === 0) continue;
+
+            let data;
+            try {
+              data = JSON.parse(dataLines.join('\n'));
+            } catch (e) {
+              console.warn('SSE data parse error:', e, dataLines.join('\n'));
+              continue;
+            }
+
             if (eventType === 'start') {
               STATE.chatSessionId = data.session_id;
               try { localStorage.setItem('chatSessionId', data.session_id); } catch (e) {}
+            } else if (eventType === 'route') {
+              STATE.currentRoute = {
+                intent: data.intent || '',
+                reason: data.reason || '',
+                current_agent: data.current_agent || ''
+              };
+              const statusEl = placeholder.querySelector('.ai-message-route-status');
+              if (statusEl) statusEl.textContent = `路由：${data.reason || data.intent || ''} → ${data.current_agent || ''}`;
             } else if (eventType === 'delta') {
-              accumulated += data.content;
+              if (data.current_agent && STATE.currentRoute) STATE.currentRoute.current_agent = data.current_agent;
+              accumulated += (data.content || '');
               updateAiMessage(accumulated);
+            } else if (eventType === 'tool_calls') {
+              if (data.current_agent && STATE.currentRoute) STATE.currentRoute.current_agent = data.current_agent;
+              const toolNames = (data.tool_calls || []).map(t => typeof t === 'string' ? t : (t.name || t.tool_name || JSON.stringify(t))).join('、');
+              const statusEl = placeholder.querySelector('.ai-message-tool-status');
+              if (statusEl) statusEl.textContent = toolNames ? `调用工具：${toolNames}` : '';
             } else if (eventType === 'done') {
               updateAiMessage(
                 accumulated,
@@ -999,8 +1070,8 @@
                 data.token_detail || null,
                 data.citations || null,
                 data.activated_skills || null,
-                data.tools || null,
-                data.agent || null
+                data.tool_calls || null,
+                data.current_agent || (STATE.currentRoute && STATE.currentRoute.current_agent) || null
               );
               if (data.handoff) {
                 STATE.chatHandoff = true;
@@ -1014,8 +1085,7 @@
         }
       } catch (err) {
         console.error('Chat error:', err);
-        accumulated += '\n\n[连接失败，请稍后重试]';
-        updateAiMessage(accumulated, true);
+        updateAiMessage((accumulated ? accumulated + '\n\n' : '') + `[${err.message || '连接失败，请稍后重试'}]`, true);
       } finally {
         STATE.chatStreaming = false;
         const btn = $('#chat-send');
@@ -1324,7 +1394,7 @@
                     <td class="px-4 py-3 text-slate-700">${escapeHtml(s.handoff_reason || '-')}</td>
                     <td class="px-4 py-3 text-slate-500 text-xs">${formatTimeLabel(s.handoff_requested_at)}</td>
                     <td class="px-4 py-3 flex gap-2">
-                      <button data-session="${escapeHtml(s.session_id)}" class="handoff-view-btn text-xs px-3 py-1.5 bg-brand-600 hover:bg-brand-700 text-white rounded-lg transition-colors">${s.handoff_status === 'active' ? '继续回复' : '接管'}</button>
+                      <button data-session="${escapeHtml(s.session_id)}" data-status="${escapeHtml(s.handoff_status)}" class="handoff-view-btn text-xs px-3 py-1.5 bg-brand-600 hover:bg-brand-700 text-white rounded-lg transition-colors">${s.handoff_status === 'active' ? '继续回复' : '接管'}</button>
                       ${s.handoff_status === 'active' ? `<button data-session="${escapeHtml(s.session_id)}" class="handoff-resolve-btn text-xs px-3 py-1.5 bg-green-600 hover:bg-green-700 text-white rounded-lg transition-colors">完结</button>` : ''}
                     </td>
                   </tr>
@@ -1334,7 +1404,24 @@
           </div>
         `;
         $$('.handoff-view-btn').forEach(btn => {
-          btn.addEventListener('click', () => openHandoffReplyModal(btn.dataset.session));
+          btn.addEventListener('click', async () => {
+            const sessionId = btn.dataset.session;
+            if (btn.dataset.status !== 'active') {
+              // Take over the session first.
+              try {
+                const res = await fetch(`${API_BASE}/api/chat/handoff`, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ session_id: sessionId, reason: '工作人员接管会话' })
+                });
+                if (!res.ok) throw new Error('接管失败');
+              } catch (err) {
+                showToast('接管失败：' + err.message, 'error');
+                return;
+              }
+            }
+            openHandoffReplyModal(sessionId);
+          });
         });
         $$('.handoff-resolve-btn').forEach(btn => {
           btn.addEventListener('click', () => resolveHandoff(btn.dataset.session));
@@ -1349,24 +1436,27 @@
       modal.className = 'fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4';
       modal.id = 'handoff-reply-modal';
       modal.innerHTML = `
-        <div class="bg-white rounded-2xl shadow-2xl w-full max-w-lg overflow-hidden">
-          <div class="px-6 py-4 border-b border-slate-100 flex items-center justify-between">
-            <h3 class="text-lg font-semibold text-slate-900">人工回复</h3>
+        <div class="bg-white rounded-2xl shadow-2xl w-full max-w-2xl max-h-[90vh] flex flex-col overflow-hidden">
+          <div class="px-6 py-4 border-b border-slate-100 flex items-center justify-between shrink-0">
+            <h3 class="text-lg font-semibold text-slate-900">人工回复 · ${escapeHtml(sessionId)}</h3>
             <button class="handoff-modal-close text-slate-400 hover:text-slate-600">&times;</button>
           </div>
-          <div class="p-6 space-y-4">
-            <div>
-              <label class="block text-xs font-medium text-slate-600 mb-1">工作人员姓名</label>
-              <input id="handoff-staff-name" type="text" value="张师傅" class="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm focus:outline-none focus:border-brand-400 focus:ring-2 focus:ring-brand-100">
+          <div class="p-6 overflow-y-auto flex-1 min-h-0">
+            <div id="handoff-context" class="mb-4">${loadingState()}</div>
+            <div class="border-t border-slate-200 pt-4 space-y-4">
+              <div>
+                <label class="block text-xs font-medium text-slate-600 mb-1">工作人员姓名</label>
+                <input id="handoff-staff-name" type="text" value="张师傅" class="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm focus:outline-none focus:border-brand-400 focus:ring-2 focus:ring-brand-100">
+              </div>
+              <div>
+                <label class="block text-xs font-medium text-slate-600 mb-1">回复内容</label>
+                <textarea id="handoff-reply-text" rows="3" placeholder="请输入回复内容..." class="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm focus:outline-none focus:border-brand-400 focus:ring-2 focus:ring-brand-100 resize-none"></textarea>
+              </div>
             </div>
-            <div>
-              <label class="block text-xs font-medium text-slate-600 mb-1">回复内容</label>
-              <textarea id="handoff-reply-text" rows="4" placeholder="请输入回复内容..." class="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm focus:outline-none focus:border-brand-400 focus:ring-2 focus:ring-brand-100 resize-none"></textarea>
-            </div>
-            <div class="flex justify-end gap-2">
-              <button class="handoff-modal-close px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg text-sm">取消</button>
-              <button id="handoff-reply-submit" class="px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white rounded-lg text-sm">发送回复</button>
-            </div>
+          </div>
+          <div class="px-6 py-4 border-t border-slate-100 flex justify-end gap-2 shrink-0">
+            <button class="handoff-modal-close px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg text-sm">取消</button>
+            <button id="handoff-reply-submit" class="px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white rounded-lg text-sm">发送回复</button>
           </div>
         </div>
       `;
@@ -1375,6 +1465,61 @@
       const closeModal = () => modal.remove();
       $$('.handoff-modal-close').forEach(btn => btn.addEventListener('click', closeModal));
       modal.addEventListener('click', e => { if (e.target === modal) closeModal(); });
+
+      function renderHandoffContextMessage(msg) {
+        const time = formatTimeLabel(msg.created_at);
+        if (msg.role === 'user') {
+          return `
+            <div class="mb-3">
+              <p class="text-[10px] text-slate-500 mb-0.5">业主 · ${time}</p>
+              <div class="bg-slate-50 rounded-lg p-2.5 text-sm text-slate-700 whitespace-pre-wrap border border-slate-200">${escapeHtml(msg.content || '')}</div>
+            </div>
+          `;
+        }
+        if (msg.role === 'staff') {
+          return `
+            <div class="mb-3">
+              <p class="text-[10px] text-indigo-500 mb-0.5">工作人员 · ${time}</p>
+              <div class="bg-indigo-50 rounded-lg p-2.5 text-sm text-slate-700 whitespace-pre-wrap border border-indigo-100">${escapeHtml(msg.content || '')}</div>
+            </div>
+          `;
+        }
+        if (msg.role === 'assistant') {
+          const clean = stripThinking(msg.content || '');
+          const tags = renderAiMessageTags(msg.activated_skills, msg.tools, msg.agent);
+          const footnotes = renderCitations(msg.citations);
+          return `
+            <div class="mb-3">
+              <p class="text-[10px] text-brand-500 mb-0.5">AI · ${time}</p>
+              <div class="bg-brand-50 rounded-lg p-2.5 text-sm text-slate-700 border border-brand-100">
+                <div class="markdown-body text-sm text-slate-700 break-words">${marked.parse(clean)}</div>
+                ${tags}
+                ${footnotes}
+              </div>
+            </div>
+          `;
+        }
+        return '';
+      }
+
+      async function loadContext() {
+        const container = $('#handoff-context');
+        if (!container) return;
+        container.innerHTML = loadingState();
+        try {
+          const res = await fetch(`${API_BASE}/api/chat/history?session_id=${encodeURIComponent(sessionId)}`);
+          if (!res.ok) throw new Error('加载失败');
+          const data = await res.json();
+          const messages = data.messages || [];
+          if (messages.length === 0) {
+            container.innerHTML = '<p class="text-sm text-slate-500">暂无会话消息</p>';
+            return;
+          }
+          container.innerHTML = messages.map(renderHandoffContextMessage).join('');
+        } catch (err) {
+          container.innerHTML = `<p class="text-sm text-red-600">加载上下文失败：${escapeHtml(err.message)}</p>`;
+        }
+      }
 
       $('#handoff-reply-submit').addEventListener('click', async () => {
         const staffName = $('#handoff-staff-name').value.trim() || '物业工作人员';
@@ -1397,6 +1542,8 @@
           showToast('发送失败，请重试', 'error');
         }
       });
+
+      loadContext();
     }
 
     async function resolveHandoff(sessionId) {
@@ -1556,65 +1703,35 @@
           $('#knowledge-content').innerHTML = `
             <div class="bg-white rounded-2xl shadow-soft border border-slate-200 p-5 max-w-2xl">
               <form id="retrieval-settings-form" class="space-y-5">
-                <div>
-                  <label class="block text-sm font-medium text-slate-700 mb-2">检索模式</label>
-                  <div class="flex flex-wrap gap-4">
-                    <label class="flex items-center gap-2 text-sm text-slate-700 cursor-pointer">
-                      <input type="radio" name="rs-mode" value="hybrid" ${s.mode === 'hybrid' ? 'checked' : ''} class="text-brand-600 focus:ring-brand-500"> 混合检索
-                    </label>
-                    <label class="flex items-center gap-2 text-sm text-slate-700 cursor-pointer">
-                      <input type="radio" name="rs-mode" value="semantic" ${s.mode === 'semantic' ? 'checked' : ''} class="text-brand-600 focus:ring-brand-500"> 仅语义
-                    </label>
-                    <label class="flex items-center gap-2 text-sm text-slate-700 cursor-pointer">
-                      <input type="radio" name="rs-mode" value="keyword" ${s.mode === 'keyword' ? 'checked' : ''} class="text-brand-600 focus:ring-brand-500"> 仅关键词
-                    </label>
-                  </div>
-                </div>
-                ${formInput('Top-K', 'rs-topk', s.top_k != null ? String(s.top_k) : '3', '如：3', 'number')}
-                <div class="space-y-4">
-                  <div>
-                    <label class="block text-sm font-medium text-slate-700 mb-1">语义阈值 <span id="rs-semantic-val" class="font-mono text-slate-500">${s.semantic_threshold != null ? s.semantic_threshold : 0.5}</span></label>
-                    <input id="rs-semantic-threshold" type="range" min="0" max="1" step="0.05" value="${s.semantic_threshold != null ? s.semantic_threshold : 0.5}" class="w-full accent-brand-600">
-                  </div>
-                  <div>
-                    <label class="block text-sm font-medium text-slate-700 mb-1">关键词阈值 <span id="rs-keyword-val" class="font-mono text-slate-500">${s.keyword_threshold != null ? s.keyword_threshold : 0.5}</span></label>
-                    <input id="rs-keyword-threshold" type="range" min="0" max="1" step="0.05" value="${s.keyword_threshold != null ? s.keyword_threshold : 0.5}" class="w-full accent-brand-600">
-                  </div>
-                  <div>
-                    <label class="block text-sm font-medium text-slate-700 mb-1">融合阈值 <span id="rs-fusion-val" class="font-mono text-slate-500">${s.fusion_threshold != null ? s.fusion_threshold : 0.5}</span></label>
-                    <input id="rs-fusion-threshold" type="range" min="0" max="1" step="0.05" value="${s.fusion_threshold != null ? s.fusion_threshold : 0.5}" class="w-full accent-brand-600">
-                  </div>
-                </div>
-                ${formSwitch('重排序', 'rs-rerank', !!s.rerank)}
+                ${formInput('Top-K', 'rs-topk', s.top_k != null ? String(s.top_k) : '5', '如：5', 'number')}
+                ${formInput('关键词权重（0-1）', 'rs-keyword-weight', s.keyword_weight != null ? String(s.keyword_weight) : '0.3', '如：0.3', 'number')}
+                ${formInput('语义权重（0-1）', 'rs-semantic-weight', s.semantic_weight != null ? String(s.semantic_weight) : '0.7', '如：0.7', 'number')}
+                ${formInput('RRF 融合参数 K', 'rs-rrf-k', s.rrf_k != null ? String(s.rrf_k) : '60', '如：60', 'number')}
+                ${formSwitch('启用重排序', 'rs-enable-rerank', !!s.enable_rerank)}
+                ${formInput('重排序模型', 'rs-rerank-model', s.rerank_model || '', '如：cross-encoder/ms-marco-MiniLM-L-6-v2')}
+                ${formInput('相似度阈值（可选）', 'rs-score-threshold', s.score_threshold != null ? String(s.score_threshold) : '', '如：0.5', 'number')}
                 <div class="pt-2">
                   <button type="submit" class="px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white rounded-xl text-sm transition-colors">保存设置</button>
                 </div>
               </form>
             </div>
           `;
-          function bindSlider(id, valId) {
-            const input = $(id);
-            const val = $(valId);
-            input.addEventListener('input', () => { val.textContent = input.value; });
-          }
-          bindSlider('#rs-semantic-threshold', '#rs-semantic-val');
-          bindSlider('#rs-keyword-threshold', '#rs-keyword-val');
-          bindSlider('#rs-fusion-threshold', '#rs-fusion-val');
           $('#retrieval-settings-form').addEventListener('submit', async (e) => {
             e.preventDefault();
             const payload = {
-              mode: document.querySelector('input[name="rs-mode"]:checked')?.value || 'hybrid',
-              top_k: parseInt($('#rs-topk').value || '3', 10),
-              semantic_threshold: parseFloat($('#rs-semantic-threshold').value),
-              keyword_threshold: parseFloat($('#rs-keyword-threshold').value),
-              fusion_threshold: parseFloat($('#rs-fusion-threshold').value),
-              rerank: $('#rs-rerank').checked
+              top_k: parseInt($('#rs-topk').value || '5', 10),
+              keyword_weight: parseFloat($('#rs-keyword-weight').value),
+              semantic_weight: parseFloat($('#rs-semantic-weight').value),
+              rrf_k: parseInt($('#rs-rrf-k').value || '60', 10),
+              enable_rerank: $('#rs-enable-rerank').checked,
+              rerank_model: $('#rs-rerank-model').value.trim() || null,
+              score_threshold: $('#rs-score-threshold').value.trim() ? parseFloat($('#rs-score-threshold').value) : null
             };
             try {
               await apiPost('/api/knowledge/retrieval-settings', payload);
               showToast('检索设置已保存');
             } catch (err) {
-              showToast('保存失败', 'error');
+              showToast('保存失败：' + err.message, 'error');
             }
           });
         } catch (err) {
@@ -1627,16 +1744,21 @@
           <div class="bg-white rounded-2xl shadow-soft border border-slate-200 p-4">
             <h3 class="text-sm font-semibold text-slate-900 mb-3">${title} <span class="text-xs font-normal text-slate-400">(${results.length})</span></h3>
             <div class="space-y-3">
-              ${results.length === 0 ? '<p class="text-xs text-slate-400">无结果</p>' : results.map((r, i) => `
+              ${results.length === 0 ? '<p class="text-xs text-slate-400">无结果</p>' : results.map((r, i) => {
+                const docId = r.doc_id || r.id || '';
+                const docTitle = r.doc_title || r.title || '未知文档';
+                const chunkIdx = r.chunk_index != null ? r.chunk_index : '';
+                return `
                 <div class="bg-slate-50 rounded-xl p-3 border border-slate-200">
                   <div class="flex items-center justify-between mb-1">
-                    <span class="text-xs font-semibold text-slate-500">#${i + 1} ${escapeHtml(r.doc_title || '未知文档')}</span>
+                    <span class="text-xs font-semibold text-slate-500">#${i + 1} ${escapeHtml(docTitle)}</span>
                     <span class="text-xs font-mono text-slate-600">score ${typeof r.score === 'number' ? r.score.toFixed(3) : '-'}</span>
                   </div>
                   <p class="text-xs text-slate-700 mb-2 max-h-20 overflow-hidden">${escapeHtml((r.content || '').slice(0, 180))}${(r.content || '').length > 180 ? '...' : ''}</p>
-                  <button class="debug-view-chunk text-xs text-brand-600 hover:text-brand-700 underline" data-doc-id="${r.doc_id || ''}" data-chunk-index="${r.chunk_index != null ? r.chunk_index : ''}">查看分片</button>
+                  <button class="debug-view-chunk text-xs text-brand-600 hover:text-brand-700 underline" data-doc-id="${docId}" data-chunk-index="${chunkIdx}">查看分片</button>
                 </div>
-              `).join('')}
+              `;
+              }).join('')}
             </div>
           </div>
         `;
@@ -1649,7 +1771,8 @@
               <input id="debug-query" type="text" placeholder="输入检索问题..." class="flex-1 px-4 py-2.5 bg-white border border-slate-200 rounded-xl text-sm focus:outline-none focus:border-brand-400 focus:ring-2 focus:ring-brand-100">
               <button type="submit" class="px-4 py-2.5 bg-brand-600 hover:bg-brand-700 text-white rounded-xl text-sm transition-colors">检索</button>
             </form>
-            <div id="debug-results" class="grid grid-cols-1 lg:grid-cols-3 gap-4"></div>
+            <div id="debug-rerank-note" class="hidden text-xs text-slate-500 bg-slate-50 rounded-lg p-3 border border-slate-200"></div>
+            <div id="debug-results" class="grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-4 gap-4"></div>
           </div>
         `;
         $('#retrieval-debug-form').addEventListener('submit', async (e) => {
@@ -1659,15 +1782,35 @@
             showToast('请输入检索问题', 'error');
             return;
           }
-          $('#debug-results').innerHTML = `<div class="col-span-3 flex justify-center py-10 text-slate-400"><div class="w-8 h-8 border-2 border-slate-200 border-t-brand-500 rounded-full animate-spin mr-2"></div>检索中...</div>`;
+          $('#debug-results').innerHTML = `<div class="col-span-full flex justify-center py-10 text-slate-400"><div class="w-8 h-8 border-2 border-slate-200 border-t-brand-500 rounded-full animate-spin mr-2"></div>检索中...</div>`;
+          $('#debug-rerank-note').classList.add('hidden');
           try {
             const data = await apiPost('/api/knowledge/retrieval-debug', { query });
-            $('#debug-results').innerHTML = renderDebugColumn('关键词检索', data.keyword_results || []) + renderDebugColumn('语义检索', data.semantic_results || []) + renderDebugColumn('融合结果', data.fusion_results || []);
+            const settings = data.settings || {};
+            const rerankEnabled = !!settings.enable_rerank;
+            const rerankReturned = Array.isArray(data.reranked_results) && data.reranked_results.length > 0;
+            const noteEl = $('#debug-rerank-note');
+            noteEl.classList.remove('hidden');
+            if (rerankEnabled && rerankReturned) {
+              noteEl.textContent = `重排序已启用（模型：${settings.rerank_model || '默认'}），下方展示重排后的结果。`;
+              noteEl.className = 'text-xs text-brand-600 bg-brand-50 rounded-lg p-3 border border-brand-100';
+            } else if (rerankEnabled && !rerankReturned) {
+              noteEl.textContent = '重排序开关已启用，但后端本次未返回重排序结果，下方展示 RRF 融合结果。';
+              noteEl.className = 'text-xs text-amber-600 bg-amber-50 rounded-lg p-3 border border-amber-100';
+            } else {
+              noteEl.textContent = '重排序未启用，下方展示关键词、语义、RRF 融合及最终结果。';
+              noteEl.className = 'text-xs text-slate-500 bg-slate-50 rounded-lg p-3 border border-slate-200';
+            }
+            $('#debug-results').innerHTML =
+              renderDebugColumn('关键词检索', data.keyword_results || []) +
+              renderDebugColumn('语义检索', data.semantic_results || []) +
+              renderDebugColumn('RRF 融合', data.fused_results || []) +
+              renderDebugColumn('最终结果', data.results || []);
             $$('.debug-view-chunk').forEach(btn => {
               btn.addEventListener('click', () => showCitationChunk(Number(btn.dataset.docId), btn.dataset.chunkIndex));
             });
           } catch (err) {
-            $('#debug-results').innerHTML = '<div class="col-span-3 text-sm text-red-600">检索失败</div>';
+            $('#debug-results').innerHTML = `<div class="col-span-full text-sm text-red-600">检索失败：${escapeHtml(err.message)}</div>`;
           }
         });
       }
@@ -1778,6 +1921,14 @@
     }
 
     async function renderBadcasesPage(container) {
+      const categoryLabels = {
+        knowledge: '知识缺失/错误',
+        skill: 'Skill 缺陷',
+        model: '模型回复质量',
+        tool: '工具调用失败',
+        other: '其他'
+      };
+
       container.innerHTML = `
         <div class="max-w-6xl mx-auto p-4 md:p-6 space-y-5">
           <div class="max-w-6xl mx-auto pb-4 flex items-end justify-between">
@@ -1791,23 +1942,23 @@
               <label class="block text-xs text-slate-500 mb-1">状态</label>
               <select id="badcase-filter-status" class="w-full px-3 py-2 bg-white border border-slate-200 rounded-xl text-sm focus:outline-none focus:border-brand-400">
                 <option value="">全部状态</option>
-                <option value="待处理">待处理</option>
-                <option value="处理中">处理中</option>
-                <option value="已关闭">已关闭</option>
-                <option value="已驳回">已驳回</option>
+                <option value="pending">待处理</option>
+                <option value="classified">已分类</option>
+                <option value="fixing">修复中</option>
+                <option value="verifying">验证中</option>
+                <option value="closed">已关闭</option>
+                <option value="rejected">已驳回</option>
               </select>
             </div>
             <div class="flex-1 min-w-[180px]">
               <label class="block text-xs text-slate-500 mb-1">分类</label>
               <select id="badcase-filter-category" class="w-full px-3 py-2 bg-white border border-slate-200 rounded-xl text-sm focus:outline-none focus:border-brand-400">
                 <option value="">全部分类</option>
-                <option value="RAG 幻觉">RAG 幻觉</option>
-                <option value="意图识别错误">意图识别错误</option>
-                <option value="工具调用错误">工具调用错误</option>
-                <option value="缺少信息">缺少信息</option>
-                <option value="信息错误">信息错误</option>
-                <option value="答非所问">答非所问</option>
-                <option value="其他">其他</option>
+                <option value="knowledge">知识缺失/错误</option>
+                <option value="skill">Skill 缺陷</option>
+                <option value="model">模型回复质量</option>
+                <option value="tool">工具调用失败</option>
+                <option value="other">其他</option>
               </select>
             </div>
             <button id="badcase-filter-btn" class="px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white rounded-xl text-sm transition-colors">筛选</button>
@@ -1821,7 +1972,7 @@
         const category = $('#badcase-filter-category').value;
         $('#badcases-content').innerHTML = loadingState();
         try {
-          let path = '/api/knowledge/badcases';
+          let path = '/api/badcases';
           const params = [];
           if (status) params.push(`status=${encodeURIComponent(status)}`);
           if (category) params.push(`category=${encodeURIComponent(category)}`);
@@ -1849,7 +2000,7 @@
                     ${cases.map(c => `
                       <tr class="hover:bg-slate-50/70 transition-colors">
                         <td class="px-4 py-3 font-medium text-slate-900 max-w-xs truncate" title="${escapeHtml(c.query)}">${escapeHtml((c.query || '').slice(0, 80))}${(c.query || '').length > 80 ? '...' : ''}</td>
-                        <td class="px-4 py-3"><span class="text-xs px-2 py-1 bg-slate-100 text-slate-600 rounded-full">${escapeHtml(c.category)}</span></td>
+                        <td class="px-4 py-3"><span class="text-xs px-2 py-1 bg-slate-100 text-slate-600 rounded-full">${escapeHtml(categoryLabels[c.category] || c.category || '-')}</span></td>
                         <td class="px-4 py-3">${statusBadge(c.status)}</td>
                         <td class="px-4 py-3 text-slate-500 text-xs">${formatTimeLabel(c.created_at)}</td>
                         <td class="px-4 py-3">
@@ -1892,13 +2043,34 @@
         renderContent();
         return;
       }
+      const categoryLabels = {
+        knowledge: '知识缺失/错误',
+        skill: 'Skill 缺陷',
+        model: '模型回复质量',
+        tool: '工具调用失败',
+        other: '其他'
+      };
+
+      async function runAction(path, body, successText) {
+        try {
+          await apiPost(path, body || {});
+          showToast(successText, 'success');
+          await loadDetail();
+        } catch (err) {
+          showToast('操作失败：' + err.message, 'error');
+        }
+      }
+
       container.innerHTML = `
         <div class="max-w-6xl mx-auto p-4 md:p-6 space-y-5">
           <div class="flex items-center gap-3 mb-2">
             <button id="badcase-detail-back" class="p-2 hover:bg-slate-200 rounded-lg text-slate-600 transition-colors">
               <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"></path></svg>
             </button>
-            <h2 class="text-xl font-semibold text-slate-900">Badcase 详情</h2>
+            <div>
+              <h2 class="text-xl font-semibold text-slate-900">Badcase #${id}</h2>
+              <p class="text-sm text-slate-500">状态：${statusBadge('pending')}</p>
+            </div>
           </div>
           <div id="badcase-detail-content">${loadingState()}</div>
         </div>
@@ -1912,85 +2084,135 @@
 
       async function loadDetail() {
         try {
-          const data = await apiGet(`/api/knowledge/badcases/${id}`);
-          const bc = data.badcase || {};
+          const data = await apiGet(`/api/badcases/${id}`);
+          const bc = data.badcase || data;
+          const drafts = bc.knowledge_drafts || bc.drafts || [];
+          const isClosed = bc.status === 'closed' || bc.status === 'rejected';
           $('#badcase-detail-content').innerHTML = `
             <div class="space-y-4">
+              <div class="bg-white rounded-2xl shadow-soft border border-slate-200 p-5 flex flex-wrap gap-3 items-center justify-between">
+                <div class="text-sm text-slate-500">当前状态：<span class="font-medium text-slate-800">${statusBadge(bc.status)}</span></div>
+                <div class="text-xs text-slate-400">状态流转：pending → classified → fixing → verifying → closed / rejected</div>
+              </div>
               <div class="grid grid-cols-1 lg:grid-cols-3 gap-4">
                 <div class="bg-white rounded-2xl shadow-soft border border-slate-200 p-5">
-                  <h3 class="font-semibold text-slate-900 mb-3">原始对话上下文</h3>
-                  <div class="space-y-4 text-sm">
-                    <div>
-                      <p class="text-xs text-slate-400 mb-1">用户问题</p>
-                      <p class="text-slate-800 bg-slate-50 rounded-lg p-3">${escapeHtml(bc.query || '-')}</p>
-                    </div>
-                    <div>
-                      <p class="text-xs text-slate-400 mb-1">AI 回答</p>
-                      <div class="text-slate-700 bg-slate-50 rounded-lg p-3 whitespace-pre-line">${marked.parse(escapeHtml(bc.ai_response || '-'))}</div>
-                    </div>
-                    <div>
-                      <p class="text-xs text-slate-400 mb-1">反馈原因</p>
-                      <p class="text-red-600 bg-red-50 rounded-lg p-3">${escapeHtml(bc.feedback_reason || '-')}</p>
+                  <h3 class="font-semibold text-slate-900 mb-3">原始问题</h3>
+                  <p class="text-sm text-slate-700 whitespace-pre-wrap bg-slate-50 rounded-lg p-3 border border-slate-200">${escapeHtml(bc.query || bc.title || '-')}</p>
+                </div>
+                <div class="bg-white rounded-2xl shadow-soft border border-slate-200 p-5">
+                  <h3 class="font-semibold text-slate-900 mb-3">AI 回答</h3>
+                  <div class="text-sm text-slate-700 whitespace-pre-wrap bg-slate-50 rounded-lg p-3 border border-slate-200">${escapeHtml(bc.ai_response || '（无回答内容）')}</div>
+                </div>
+                <div class="bg-white rounded-2xl shadow-soft border border-slate-200 p-5">
+                  <h3 class="font-semibold text-slate-900 mb-3">点踩原因 / 反馈</h3>
+                  <div class="text-sm text-slate-700 whitespace-pre-wrap bg-red-50 rounded-lg p-3 border border-red-100">${escapeHtml(bc.feedback_reason || bc.description || '（未填写）')}</div>
+                </div>
+              </div>
+              <div class="grid grid-cols-1 lg:grid-cols-3 gap-4">
+                <div class="bg-white rounded-2xl shadow-soft border border-slate-200 p-5">
+                  <h3 class="font-semibold text-slate-900 mb-3">分类与修复</h3>
+                  <div class="mb-4">
+                    <label class="block text-xs text-slate-500 mb-1">当前分类</label>
+                    <div class="text-sm text-slate-900 font-medium">${escapeHtml(categoryLabels[bc.category] || bc.category || '未分类')}</div>
+                  </div>
+                  <form id="badcase-classify-form" class="space-y-2 mb-4">
+                    <label class="block text-xs text-slate-500">分类调整</label>
+                    <select id="badcase-category" class="w-full px-3 py-2 bg-white border border-slate-200 rounded-xl text-sm focus:outline-none focus:border-brand-400" ${isClosed ? 'disabled' : ''}>
+                      <option value="knowledge" ${bc.category === 'knowledge' ? 'selected' : ''}>知识缺失/错误</option>
+                      <option value="skill" ${bc.category === 'skill' ? 'selected' : ''}>Skill 缺陷</option>
+                      <option value="model" ${bc.category === 'model' ? 'selected' : ''}>模型回复质量</option>
+                      <option value="tool" ${bc.category === 'tool' ? 'selected' : ''}>工具调用失败</option>
+                      <option value="other" ${bc.category === 'other' ? 'selected' : ''}>其他</option>
+                    </select>
+                    <button id="badcase-classify" type="button" class="w-full px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white rounded-xl text-sm transition-colors" ${isClosed ? 'disabled' : ''}>自动分类 / 保存分类</button>
+                  </form>
+                  <div class="space-y-2 border-t border-slate-100 pt-4">
+                    <button id="badcase-darwin" type="button" class="w-full px-4 py-2 bg-gold-500 hover:bg-gold-600 text-white rounded-xl text-sm transition-colors" ${isClosed ? 'disabled' : ''}>Darwin 优化修复方案</button>
+                    <button id="badcase-extract" type="button" class="w-full px-4 py-2 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 rounded-xl text-sm transition-colors" ${isClosed ? 'disabled' : ''}>提取知识草稿</button>
+                    <button id="badcase-retest" type="button" class="w-full px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl text-sm transition-colors" ${isClosed ? 'disabled' : ''}>复测</button>
+                    <div class="flex gap-2">
+                      <button id="badcase-verify-pass" type="button" class="flex-1 px-4 py-2 bg-green-600 hover:bg-green-700 text-white rounded-xl text-sm transition-colors" ${isClosed ? 'disabled' : ''}>验证通过</button>
+                      <button id="badcase-verify-fail" type="button" class="flex-1 px-4 py-2 bg-red-50 hover:bg-red-100 text-red-700 rounded-xl text-sm transition-colors" ${isClosed ? 'disabled' : ''}>验证不通过</button>
                     </div>
                   </div>
+                  ${isClosed ? `<p class="text-xs text-slate-500 mt-3">该 Badcase 已${bc.status === 'rejected' ? '驳回' : '关闭'}，不可继续操作。</p>` : ''}
                 </div>
                 <div class="bg-white rounded-2xl shadow-soft border border-slate-200 p-5">
                   <h3 class="font-semibold text-slate-900 mb-3">根因分析</h3>
-                  <div class="space-y-3">
-                    <div>
-                      <p class="text-xs text-slate-400 mb-1">分类</p>
-                      <p class="text-sm text-slate-800">${escapeHtml(bc.analysis_category || bc.category || '-')}</p>
-                    </div>
-                    <div>
-                      <p class="text-xs text-slate-400 mb-1">证据</p>
-                      <div class="text-sm text-slate-700 bg-slate-50 rounded-lg p-3 whitespace-pre-line">${escapeHtml(bc.analysis_evidence || '暂无分析')}</div>
-                    </div>
-                  </div>
+                  <div class="text-sm text-slate-700 whitespace-pre-wrap bg-slate-50 rounded-lg p-3 border border-slate-200 min-h-[100px]">${escapeHtml(bc.root_cause || '（待分析）')}</div>
                 </div>
                 <div class="bg-white rounded-2xl shadow-soft border border-slate-200 p-5">
-                  <h3 class="font-semibold text-slate-900 mb-3">修复操作</h3>
-                  <div class="space-y-2">
-                    <button data-action="extract" class="badcase-fix-btn w-full px-4 py-2 text-left text-sm bg-slate-50 hover:bg-brand-50 text-slate-700 hover:text-brand-700 rounded-xl transition-colors">提取为知识</button>
-                    <button data-action="darwin" class="badcase-fix-btn w-full px-4 py-2 text-left text-sm bg-slate-50 hover:bg-brand-50 text-slate-700 hover:text-brand-700 rounded-xl transition-colors">调用达尔文 Skill</button>
-                    <button data-action="retry" class="badcase-fix-btn w-full px-4 py-2 text-left text-sm bg-slate-50 hover:bg-brand-50 text-slate-700 hover:text-brand-700 rounded-xl transition-colors">切换模型重试</button>
-                    <button data-action="check-tools" class="badcase-fix-btn w-full px-4 py-2 text-left text-sm bg-slate-50 hover:bg-brand-50 text-slate-700 hover:text-brand-700 rounded-xl transition-colors">检查工具配置</button>
+                  <h3 class="font-semibold text-slate-900 mb-3">修复计划</h3>
+                  <div class="text-sm text-slate-700 whitespace-pre-wrap bg-slate-50 rounded-lg p-3 border border-slate-200 min-h-[100px]">${escapeHtml(bc.fix_plan || '（待生成）')}</div>
+                </div>
+              </div>
+              ${drafts.length ? `
+                <div class="bg-white rounded-2xl shadow-soft border border-slate-200 p-5">
+                  <h3 class="font-semibold text-slate-900 mb-3">知识草稿</h3>
+                  <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
+                    ${drafts.map((d, idx) => `
+                      <div class="bg-slate-50 rounded-xl p-3 border border-slate-200 text-sm">
+                        <div class="font-medium text-slate-900 mb-1">#${idx + 1} ${escapeHtml(d.title || '未命名')}</div>
+                        <div class="text-xs text-slate-500 mb-2">${escapeHtml((d.content || '').slice(0, 100))}${(d.content || '').length > 100 ? '...' : ''}</div>
+                        <button data-draft-id="${d.id}" class="badcase-publish-draft px-3 py-1 bg-brand-600 hover:bg-brand-700 text-white rounded-lg text-xs transition-colors" ${isClosed ? 'disabled' : ''}>发布/应用</button>
+                      </div>
+                    `).join('')}
                   </div>
                 </div>
-              </div>
-              <div class="bg-white rounded-2xl shadow-soft border border-slate-200 p-5 flex flex-wrap gap-3 items-center justify-between">
-                <div class="text-sm text-slate-500">当前状态：<span class="font-medium text-slate-800">${statusBadge(bc.status)}</span></div>
-                <div class="flex gap-2">
-                  <button data-action="retest" class="badcase-status-btn px-4 py-2 bg-brand-50 hover:bg-brand-100 text-brand-700 rounded-xl text-sm transition-colors">重新测试</button>
-                  <button data-action="close" class="badcase-status-btn px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl text-sm transition-colors">标记已关闭</button>
-                  <button data-action="reject" class="badcase-status-btn px-4 py-2 border border-red-200 hover:bg-red-50 text-red-600 rounded-xl text-sm transition-colors">驳回</button>
+              ` : ''}
+              ${(bc.actions || []).length ? `
+                <div class="bg-white rounded-2xl shadow-soft border border-slate-200 p-5">
+                  <h3 class="font-semibold text-slate-900 mb-3">操作历史</h3>
+                  <ul class="space-y-3 text-sm text-slate-700">
+                    ${bc.actions.map(a => `
+                      <li class="border-l-2 border-slate-200 pl-3">
+                        <div class="flex flex-wrap items-center gap-2 text-xs text-slate-500">
+                          <span>${formatTimeLabel(a.created_at)}</span>
+                          ${a.from_status ? `<span>${statusBadge(a.from_status)}</span><span>→</span><span>${statusBadge(a.to_status)}</span>` : ''}
+                        </div>
+                        <div class="mt-1"><b class="font-medium text-slate-900">${escapeHtml(a.action)}</b>
+                          ${a.details && a.details.reason ? `：${escapeHtml(a.details.reason)}` : ''}
+                        </div>
+                      </li>
+                    `).join('')}
+                  </ul>
                 </div>
-              </div>
+              ` : ''}
             </div>
           `;
-          $$('.badcase-fix-btn, .badcase-status-btn').forEach(btn => {
-            btn.addEventListener('click', () => runBadcaseAction(btn.dataset.action));
+
+          $('#badcase-classify').addEventListener('click', () => {
+            const category = $('#badcase-category').value;
+            runAction(`/api/badcases/${id}/classify`, { auto: false, category, reason: `手动分类为 ${category}` }, '已分类');
+          });
+
+          $('#badcase-darwin').addEventListener('click', () => {
+            runAction(`/api/badcases/${id}/darwin-fix`, {}, 'Darwin 优化完成');
+          });
+
+          $('#badcase-extract').addEventListener('click', () => {
+            runAction(`/api/badcases/${id}/extract-knowledge`, {}, '已提取知识草稿');
+          });
+
+          $('#badcase-retest').addEventListener('click', () => {
+            runAction(`/api/badcases/${id}/retest`, {}, '已发起复测');
+          });
+
+          $('#badcase-verify-pass').addEventListener('click', () => {
+            runAction(`/api/badcases/${id}/verify`, { passed: true, note: '前端验证通过' }, '已验证关闭');
+          });
+
+          $('#badcase-verify-fail').addEventListener('click', () => {
+            runAction(`/api/badcases/${id}/verify`, { passed: false, note: '前端验证不通过' }, '已驳回');
+          });
+
+          $$('.badcase-publish-draft').forEach(btn => {
+            btn.addEventListener('click', () => {
+              runAction(`/api/badcases/${id}/publish-draft/${btn.dataset.draftId}`, {}, '草稿已发布');
+            });
           });
         } catch (err) {
-          $('#badcase-detail-content').innerHTML = emptyState('加载详情失败');
-        }
-      }
-
-      async function runBadcaseAction(action) {
-        const endpoints = {
-          extract: 'extract-knowledge',
-          darwin: 'darwin',
-          retry: 'retry',
-          'check-tools': 'check-tools',
-          retest: 'retest',
-          close: 'close',
-          reject: 'reject'
-        };
-        try {
-          await apiPost(`/api/knowledge/badcases/${id}/${endpoints[action]}`, {});
-          showToast('操作已执行');
-          await loadDetail();
-        } catch (err) {
-          showToast('操作失败', 'error');
+          $('#badcase-detail-content').innerHTML = emptyState('加载详情失败：' + escapeHtml(err.message));
         }
       }
 
@@ -2306,19 +2528,20 @@
                 <div id="ab-output-b" class="text-sm text-slate-700 whitespace-pre-wrap min-h-[120px]"></div>
               </div>
             </div>
-            <div class="bg-white rounded-2xl shadow-soft border border-slate-200 p-4 flex flex-wrap items-center justify-between gap-3">
-              <span class="text-sm text-slate-600">哪个回答更好？</span>
-              <div class="flex gap-2">
-                <button type="button" data-winner="a" class="ab-score-btn px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl text-sm transition-colors">模型 A 更好</button>
-                <button type="button" data-winner="b" class="ab-score-btn px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl text-sm transition-colors">模型 B 更好</button>
-                <button type="button" data-winner="tie" class="ab-score-btn px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl text-sm transition-colors">差不多</button>
+            <div class="bg-white rounded-2xl shadow-soft border border-slate-200 p-4 space-y-3">
+              <div class="flex flex-wrap items-center justify-between gap-3">
+                <span class="text-sm text-slate-600">哪个回答更好？（人工记录项）</span>
+                <div class="flex gap-2">
+                  <button type="button" data-winner="a" class="ab-score-btn px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl text-sm transition-colors">模型 A 更好</button>
+                  <button type="button" data-winner="b" class="ab-score-btn px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl text-sm transition-colors">模型 B 更好</button>
+                  <button type="button" data-winner="tie" class="ab-score-btn px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl text-sm transition-colors">差不多</button>
+                </div>
               </div>
+              <div id="ab-metrics" class="text-xs text-slate-400 border-t border-slate-100 pt-2"></div>
             </div>
           </div>
         </div>
       `;
-
-      let currentAbId = null;
 
       $('#model-ab-back').addEventListener('click', () => {
         STATE.subTab = 'models';
@@ -2326,36 +2549,50 @@
         renderContent();
       });
 
+      function renderAbModelResult(result) {
+        if (!result) return '<span class="text-slate-400">无输出</span>';
+        if (result.error) {
+          return `<div class="text-red-600 text-sm"><span class="font-medium">错误：</span>${escapeHtml(result.error)}</div>`;
+        }
+        return `<div class="text-sm text-slate-700 whitespace-pre-wrap">${escapeHtml(result.response || '无输出')}</div>`;
+      }
+
       $('#ab-form').addEventListener('submit', async (e) => {
         e.preventDefault();
-        const query = $('#ab-query').value.trim();
-        if (!query) {
+        const prompt = $('#ab-query').value.trim();
+        if (!prompt) {
           showToast('请输入测试问题', 'error');
           return;
         }
         $('#ab-results').classList.add('hidden');
-        $('#ab-output-a').textContent = '生成中...';
-        $('#ab-output-b').textContent = '生成中...';
+        $('#ab-output-a').innerHTML = '<span class="text-slate-400">生成中...</span>';
+        $('#ab-output-b').innerHTML = '<span class="text-slate-400">生成中...</span>';
         try {
-          const data = await apiPost('/api/models/ab-test', { query, model_a: 'deepseek-v4-flash', model_b: 'deepseek-v4-pro' });
-          currentAbId = data.id;
-          $('#ab-output-a').textContent = data.output_a || '无输出';
-          $('#ab-output-b').textContent = data.output_b || '无输出';
+          const start = performance.now();
+          const data = await apiPost('/api/models/ab-test', { prompt, model_a: 'deepseek-v4-flash', model_b: 'deepseek-v4-pro' });
+          const elapsed = (performance.now() - start).toFixed(0);
+          const modelA = data.model_a || {};
+          const modelB = data.model_b || {};
+          $('#ab-output-a').innerHTML = renderAbModelResult(modelA);
+          $('#ab-output-b').innerHTML = renderAbModelResult(modelB);
+          const costEstimateA = modelA.error ? '-' : '待人工记录';
+          const costEstimateB = modelB.error ? '-' : '待人工记录';
+          $('#ab-metrics').innerHTML = `
+            <span>本次并发总耗时：${elapsed} ms（浏览器测得）</span>
+            <span class="mx-2">|</span>
+            <span>模型 A 成本：${costEstimateA}（人工记录项）</span>
+            <span class="mx-2">|</span>
+            <span>模型 B 成本：${costEstimateB}（人工记录项）</span>
+          `;
           $('#ab-results').classList.remove('hidden');
         } catch (err) {
-          showToast('测试运行失败', 'error');
+          showToast('测试运行失败：' + err.message, 'error');
         }
       });
 
       $$('.ab-score-btn').forEach(btn => {
-        btn.addEventListener('click', async () => {
-          if (!currentAbId) return;
-          try {
-            await apiPost(`/api/models/ab-test/${currentAbId}/score`, { winner: btn.dataset.winner });
-            showToast('评分已提交', 'success');
-          } catch (err) {
-            showToast('评分提交失败', 'error');
-          }
+        btn.addEventListener('click', () => {
+          showToast('人工记录已记：' + (btn.dataset.winner === 'tie' ? '两者差不多' : (btn.dataset.winner === 'a' ? '模型 A 更好' : '模型 B 更好')), 'success');
         });
       });
     }
