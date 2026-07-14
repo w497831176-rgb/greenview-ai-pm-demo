@@ -75,7 +75,11 @@ if MCPTools is not None:
             self.recorded_calls: List[Dict[str, Any]] = []
 
         async def build_tools(self) -> None:
-            await super().build_tools()
+            # Run the parent build_tools in a separate thread because its stdio
+            # MCP interactions are synchronous and would otherwise block the
+            # FastAPI event loop.
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, lambda: asyncio.run(super(ObservableMCPTools, self).build_tools()))
             for fn_name, fn in (getattr(self, "functions", None) or {}).items():
                 original = getattr(fn, "entrypoint", None)
                 if original is None:
@@ -91,11 +95,12 @@ if MCPTools is not None:
                     return await original(*args, **kwargs)
                 return async_wrapper
 
-            def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
+            async def async_sync_wrapper(*args: Any, **kwargs: Any) -> Any:
                 args_dict = kwargs if kwargs else (args[0] if args else {})
                 self.recorded_calls.append({"tool_name": fn_name, "arguments": args_dict})
-                return original(*args, **kwargs)
-            return sync_wrapper
+                loop = asyncio.get_event_loop()
+                return await loop.run_in_executor(None, lambda: original(*args, **kwargs))
+            return async_sync_wrapper
 else:
     ObservableMCPTools = None  # type: ignore
 
