@@ -21,11 +21,25 @@ import uuid
 from urllib.parse import urljoin
 
 import requests
+import urllib3
+
+urllib3.disable_warnings()
+
+# Avoid local proxy interfering with direct NAS access.
+for _k in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+    os.environ.pop(_k, None)
+
+_SESSION = requests.Session()
+_SESSION.verify = False
+_SESSION.proxies = {"http": None, "https": None}
 
 
 def base_url():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--base-url", default=os.getenv("TEST_BASE_URL", "https://maiyouxiong.duckdns.org:18004"))
+    parser.add_argument(
+        "--base-url",
+        default=os.getenv("TEST_BASE_URL", "https://maiyouxiong.myds.me:18004"),
+    )
     args, _ = parser.parse_known_args()
     return args.base_url.rstrip("/")
 
@@ -35,7 +49,7 @@ def sse_chat(base: str, message: str, session_id: str):
     url = f"{base}/api/chat/stream?message={requests.utils.quote(message)}&session_id={session_id}&user_id=acceptance-test"
     events = []
     done_payload = None
-    with requests.get(url, stream=True, timeout=120) as resp:
+    with _SESSION.get(url, stream=True, timeout=180) as resp:
         resp.raise_for_status()
         buffer = ""
         for chunk in resp.iter_content(chunk_size=None):
@@ -66,14 +80,14 @@ def sse_chat(base: str, message: str, session_id: str):
 
 def chat_history(base: str, session_id: str):
     url = f"{base}/api/chat/history?session_id={session_id}"
-    resp = requests.get(url, timeout=30)
+    resp = _SESSION.get(url, timeout=30)
     resp.raise_for_status()
     return resp.json()
 
 
 def retrieval_debug(base: str, query: str):
     url = f"{base}/api/knowledge/retrieval-debug"
-    resp = requests.post(
+    resp = _SESSION.post(
         url,
         json={"query": query, "top_k": 5, "expected_doc_title": "装修管理规定与流程"},
         timeout=30,
