@@ -1228,7 +1228,26 @@ def _migrate_runtime_contract(cursor):
         cursor.execute("DELETE FROM agent_tools WHERE agent_id = ?", (temp_agent_id,))
         cursor.execute("DELETE FROM agents WHERE agent_id = ?", (temp_agent_id,))
 
-    # 4. Rebrand user-facing runtime text.
+    # 5. Remove legacy *_agent duplicates created by the old app/main.py seed.
+    for agent_id, _, name, _, _ in canonical:
+        legacy_id = f"{agent_id}_agent"
+        cursor.execute("SELECT agent_id FROM agents WHERE agent_id = ?", (legacy_id,))
+        if cursor.fetchone():
+            canonical_agent_id = canonical_agent_ids.get(name)
+            if canonical_agent_id:
+                cursor.execute(
+                    "INSERT OR IGNORE INTO agent_skills (agent_id, skill_id) SELECT ?, skill_id FROM agent_skills WHERE agent_id = ?",
+                    (canonical_agent_id, legacy_id),
+                )
+                cursor.execute(
+                    "INSERT OR IGNORE INTO agent_tools (agent_id, tool_name, config) SELECT ?, tool_name, config FROM agent_tools WHERE agent_id = ?",
+                    (canonical_agent_id, legacy_id),
+                )
+            cursor.execute("DELETE FROM agent_skills WHERE agent_id = ?", (legacy_id,))
+            cursor.execute("DELETE FROM agent_tools WHERE agent_id = ?", (legacy_id,))
+            cursor.execute("DELETE FROM agents WHERE agent_id = ?", (legacy_id,))
+
+    # 6. Rebrand user-facing runtime text.
     rebrand_fields = [
         ("knowledge_docs", "title"),
         ("knowledge_docs", "content"),
