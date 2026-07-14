@@ -195,7 +195,10 @@ def advanced_search(
     score_threshold = settings.get("score_threshold", 0.0)
 
     keyword_results = _keyword_search(query, top_k=top_k * 2)
-    semantic_results = _semantic_search(query, top_k=top_k * 2, threshold=None)
+    # Apply the configured similarity threshold to semantic matches before
+    # fusing, so the threshold filters real semantic relevance rather than
+    # the tiny RRF scores produced by rank fusion.
+    semantic_results = _semantic_search(query, top_k=top_k * 2, threshold=score_threshold)
 
     fused = _rrf_fusion(
         keyword_results,
@@ -208,11 +211,7 @@ def advanced_search(
     if enable_rerank:
         fused = _rerank_results(query, fused, model_name=rerank_model)
 
-    # Apply threshold to the RRF score (0-1 scale) for consistent filtering
-    # across keyword and semantic sources.
-    effective_threshold = score_threshold or 0.0
-    filtered = [r for r in fused if r.get("rrf_score", 0) >= effective_threshold]
-    results = filtered[:top_k]
+    results = fused[:top_k]
 
     return {
         "query": query,
@@ -247,7 +246,7 @@ def debug_search(
         "score_threshold": score_threshold or 0.0,
     }
     keyword_results = _keyword_search(query, top_k=top_k * 2)
-    semantic_results = _semantic_search(query, top_k=top_k * 2, threshold=None)
+    semantic_results = _semantic_search(query, top_k=top_k * 2, threshold=score_threshold)
     fused = _rrf_fusion(
         keyword_results,
         semantic_results,
@@ -258,9 +257,7 @@ def debug_search(
     if enable_rerank:
         fused = _rerank_results(query, fused, model_name=rerank_model)
 
-    threshold = score_threshold or 0.0
-    filtered = [r for r in fused if r.get("rrf_score", 0) >= threshold]
-    results = filtered[:top_k]
+    results = fused[:top_k]
 
     titles = [r.get("title") for r in results]
     top1_hit = bool(expected_doc_title and titles and titles[0] == expected_doc_title)
