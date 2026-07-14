@@ -6,6 +6,7 @@ Centralizes the model, database, and environment flags
 so all agents share the same resources.
 """
 
+import json
 from os import getenv
 from typing import Any, Dict, Optional
 
@@ -23,6 +24,11 @@ agent_db = get_postgres_db()
 # Models
 # ---------------------------------------------------------------------------
 
+# Runtime default for all owner-facing chat paths.
+MODEL_ID = "deepseek-v4-flash"
+USE_THINKING = True
+
+
 def _deepseek_api_key() -> str:
     return getenv("DEEPSEEK_API_KEY", "")
 
@@ -31,51 +37,59 @@ def _deepseek_base_url() -> str:
     return getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
 
 
-def build_model(model_id: Optional[str] = None, **overrides) -> DeepSeek:
-    """Build a DeepSeek model instance from DB config or fallback to env defaults.
+def _model_params_from_config(config: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    raw = config.get("model_params") if config else None
+    if not raw:
+        return {}
+    if isinstance(raw, str):
+        try:
+            return json.loads(raw)
+        except Exception:
+            return {}
+    return dict(raw)
 
-    If model_id is provided, look it up in model_configs; otherwise use the
-    default config. Any extra keyword arguments override the stored params.
+
+def build_model(model_id: Optional[str] = None, **overrides) -> DeepSeek:
+    """Build a DeepSeek model instance.
+
+    The single runtime default is ``MODEL_ID`` (deepseek-v4-flash). If a
+    caller passes an explicit ``model_id`` (e.g. deepseek-v4-pro for Darwin),
+    that value is used strictly. SQLite model_configs may supply a fallback
+    api_key/base_url/params, but they can never override the resolved id.
     """
-    config = None
-    if model_id:
-        config = get_model_config_by_model_id(model_id)
+    resolved_id = model_id or MODEL_ID
+
+    # Try to enrich from the matching DB config; otherwise fall back to the
+    # default config only for non-secret metadata. Secrets always come from env.
+    config = get_model_config_by_model_id(resolved_id)
     if not config:
         config = get_default_model_config()
 
-    if config:
-        cfg_id = config.get("model_id") or "deepseek-v4-pro"
-        cfg_params = config.get("model_params") or {}
-        use_thinking = overrides.get("use_thinking", cfg_params.get("use_thinking", True))
-        # Always prefer environment variables for secrets; DB value is a fallback.
-        api_key = overrides.get("api_key") or _deepseek_api_key() or config.get("api_key")
-        base_url = overrides.get("base_url", config.get("base_url") or _deepseek_base_url())
-        return DeepSeek(
-            id=cfg_id,
-            api_key=api_key,
-            base_url=base_url,
-            use_thinking=use_thinking,
-            timeout=120,
-        )
+    cfg_params = _model_params_from_config(config) if config else {}
+    use_thinking = overrides.get(
+        "use_thinking",
+        cfg_params.get("use_thinking", USE_THINKING),
+    )
 
-    # Fallback to environment defaults when no DB config exists.
+    # Environment credentials take precedence over DB-stored secrets.
+    api_key = overrides.get("api_key") or _deepseek_api_key() or (config.get("api_key") if config else None)
+    base_url = overrides.get(
+        "base_url",
+        (config.get("base_url") if config else None) or _deepseek_base_url(),
+    )
+
     return DeepSeek(
-        id=model_id or getenv("DEEPSEEK_MODEL_ID", "deepseek-v4-flash"),
-        api_key=_deepseek_api_key(),
-        base_url=_deepseek_base_url(),
-        use_thinking=overrides.get("use_thinking", True),
+        id=resolved_id,
+        api_key=api_key,
+        base_url=base_url,
+        use_thinking=use_thinking,
+        timeout=120,
     )
 
 
-# Default production model: DeepSeek V4 Flash with reasoning enabled.
-# V4 Pro is reserved for high-quality comparisons (e.g. Skill A/B tests).
-MODEL = DeepSeek(
-    id=getenv("DEEPSEEK_MODEL_ID", "deepseek-v4-flash"),
-    api_key=_deepseek_api_key(),
-    base_url=_deepseek_base_url(),
-    use_thinking=True,
-    timeout=120,
-)
+# Default production model instance: DeepSeek V4 Flash with reasoning enabled.
+# V4 Pro is reserved for explicit calls (A/B tests and Darwin deep-fix).
+MODEL = build_model(MODEL_ID)
 
 # ---------------------------------------------------------------------------
 # Environment

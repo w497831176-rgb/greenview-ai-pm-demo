@@ -7,6 +7,8 @@ that calls flash and pro models concurrently.
 """
 
 import asyncio
+import json
+import os
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, HTTPException
@@ -59,12 +61,28 @@ _SENSITIVE_FIELDS = {"api_key"}
 
 
 def _sanitize_config(config: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    """Return a copy of the config with sensitive fields removed."""
+    """Return a frontend-safe view of the config.
+
+    Never returns api_key. Adds a read-only credential_status so the UI can
+    show whether the shared server-side credential is configured.
+    """
     if not config:
         return None
     safe = dict(config)
     for field in _SENSITIVE_FIELDS:
         safe.pop(field, None)
+
+    model_id = safe.get("model_id") or ""
+    params = safe.get("model_params") or {}
+    if isinstance(params, str):
+        try:
+            params = json.loads(params)
+        except Exception:
+            params = {}
+
+    safe["key"] = model_id
+    safe["thinking_enabled"] = bool(params.get("use_thinking", False))
+    safe["credential_status"] = "server_env" if os.getenv("DEEPSEEK_API_KEY") else "missing"
     return safe
 
 

@@ -23,6 +23,7 @@ from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
+from app.settings import MODEL_ID, USE_THINKING
 from agents.billing import create_billing_agent
 from agents.complaint import create_complaint_agent
 from agents.customer_service import create_customer_service_agent
@@ -540,6 +541,14 @@ async def _stream_agent_response(
             ai_handoff = True
             request_handoff(session_id, "AI 判断需要人工处理")
 
+        # Determine the model actually used for this turn.
+        runtime_model_id = skill_model_id if skill_model_id else MODEL_ID
+        model_selection_reason = (
+            f"skill_model_override:{skill_model_id}"
+            if skill_model_id
+            else "owner-facing default"
+        )
+
         # Persist the assistant message.
         saved = save_chat_message(
             session_id=session_id,
@@ -553,6 +562,9 @@ async def _stream_agent_response(
             route_reason=intent_result.get("reason", ""),
             current_agent=current_agent,
             tool_calls=tool_calls or None,
+            model_id=runtime_model_id,
+            thinking_enabled=USE_THINKING,
+            model_selection_reason=model_selection_reason,
         )
 
         # Send completion event including token metrics, citations, activated skills and agent info.
@@ -569,6 +581,9 @@ async def _stream_agent_response(
             'route_reason': intent_result.get("reason", ""),
             'tool_calls': tool_calls,
             'auto_badcase_id': auto_badcase_id,
+            'model_id': runtime_model_id,
+            'thinking_enabled': USE_THINKING,
+            'model_selection_reason': model_selection_reason,
         }
         yield f"event: done\ndata: {json.dumps(done_payload)}\n\n"
 

@@ -464,8 +464,13 @@
       }, '提交');
     }
 
-    function renderAiMessageTags(skills, tools, agent, routeReason = '', routeIntent = '') {
+    function renderAiMessageTags(skills, tools, agent, routeReason = '', routeIntent = '', modelId = '', thinkingEnabled = null, modelSelectionReason = '') {
       const tags = [];
+      if (modelId) {
+        const modelLabel = modelId === 'deepseek-v4-pro' ? 'Pro' : (modelId === 'deepseek-v4-flash' ? 'Flash' : modelId);
+        const thinkingText = thinkingEnabled ? '· thinking' : '';
+        tags.push(`<span class="px-1.5 py-0.5 bg-purple-50 text-purple-600 rounded text-[10px]" title="${escapeHtml(modelSelectionReason || '')}">模型：${escapeHtml(modelId)}${thinkingText}</span>`);
+      }
       if (routeReason) tags.push(`<span class="px-1.5 py-0.5 bg-slate-100 text-slate-600 rounded text-[10px]" title="${escapeHtml(routeIntent || '')}">路由原因：${escapeHtml(routeReason)}</span>`);
       if (agent) tags.push(`<span class="px-1.5 py-0.5 bg-indigo-50 text-indigo-600 rounded text-[10px]">当前处理 Agent：${escapeHtml(agent)}</span>`);
       if (skills && skills.length) tags.push(`<span class="px-1.5 py-0.5 bg-brand-50 text-brand-600 rounded text-[10px]">已命中 Skill：${escapeHtml(skills.join('、'))}</span>`);
@@ -954,7 +959,7 @@
       return `<div class="flex flex-wrap items-center gap-1 mt-2"><span class="text-[10px] text-slate-400">已调用skill:</span>${tags}</div>`;
     }
 
-    function updateAiMessage(content, done = false, tokenCount = 0, messageId = null, tokenDetail = null, citations = null, activatedSkills = null, tools = null, agent = null) {
+    function updateAiMessage(content, done = false, tokenCount = 0, messageId = null, tokenDetail = null, citations = null, activatedSkills = null, tools = null, agent = null, modelId = '', thinkingEnabled = null, modelSelectionReason = '') {
       const current = STATE.currentAiMessage;
       if (!current) return;
       const contentDiv = current.querySelector('.ai-message-content');
@@ -984,7 +989,7 @@
           const tagsEl = footer.querySelector('.ai-message-tags');
           if (tagsEl) {
             const route = STATE.currentRoute || {};
-            tagsEl.innerHTML = renderAiMessageTags(activatedSkills, tools, agent, route.reason || '', route.intent || '');
+            tagsEl.innerHTML = renderAiMessageTags(activatedSkills, tools, agent, route.reason || '', route.intent || '', modelId, thinkingEnabled, modelSelectionReason);
           }
           // Append citation footnotes below the footer row.
           const existingFootnotes = footer.parentElement.querySelector('.ai-message-footnotes');
@@ -1093,7 +1098,10 @@
                 data.citations || null,
                 data.activated_skills || null,
                 data.tool_calls || null,
-                data.current_agent || (STATE.currentRoute && STATE.currentRoute.current_agent) || null
+                data.current_agent || (STATE.currentRoute && STATE.currentRoute.current_agent) || null,
+                data.model_id || '',
+                data.thinking_enabled || false,
+                data.model_selection_reason || ''
               );
               if (data.handoff) {
                 STATE.chatHandoff = true;
@@ -1146,7 +1154,10 @@
               msg.tool_calls,
               msg.current_agent,
               msg.route_reason,
-              msg.route_intent
+              msg.route_intent,
+              msg.model_id,
+              msg.thinking_enabled,
+              msg.model_selection_reason
             );
           } else if (msg.role === 'staff') {
             appendStaffMessage(msg.content || '', msg.created_at);
@@ -1158,7 +1169,7 @@
       }
     }
 
-    function appendAiMessageFromHistory(content, createdAt, tokenCount, messageId, tokenDetail = null, citations = null, activatedSkills = null, tools = null, agent = null, routeReason = '', routeIntent = '') {
+    function appendAiMessageFromHistory(content, createdAt, tokenCount, messageId, tokenDetail = null, citations = null, activatedSkills = null, tools = null, agent = null, routeReason = '', routeIntent = '', modelId = '', thinkingEnabled = null, modelSelectionReason = '') {
       const container = $('#chat-message-list');
       const div = document.createElement('div');
       div.className = 'flex gap-3 items-start fade-in';
@@ -1171,7 +1182,7 @@
         ? `<span class="cursor-help underline decoration-dotted" title="${escapeHtml(detailText)}">${tokenText}</span>`
         : tokenText;
       const footnotesHtml = renderCitations(citations);
-      const tagsHtml = renderAiMessageTags(activatedSkills, tools, agent, routeReason, routeIntent);
+      const tagsHtml = renderAiMessageTags(activatedSkills, tools, agent, routeReason, routeIntent, modelId, thinkingEnabled, modelSelectionReason);
       div.innerHTML = `
         <div class="w-9 h-9 rounded-full bg-gradient-to-br from-brand-500 to-brand-700 flex items-center justify-center text-white shrink-0 shadow-md">
           <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z"></path></svg>
@@ -2434,7 +2445,7 @@
           <div class="max-w-6xl mx-auto pb-4 flex items-end justify-between">
             <div>
               <h2 class="text-xl font-semibold text-slate-900">模型配置</h2>
-              <p class="text-sm text-slate-500 mt-1">管理大模型 API Key 与默认模型</p>
+              <p class="text-sm text-slate-500 mt-1">查看运行时模型状态与 A/B 测试工具</p>
             </div>
             <button id="model-ab-btn" class="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl text-sm transition-colors flex items-center gap-1.5">
               <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"></path></svg>
@@ -2444,9 +2455,9 @@
           <div class="bg-blue-50 rounded-2xl border border-blue-100 p-4 text-sm text-slate-700">
             <h3 class="font-semibold text-slate-900 mb-2">模型分层说明</h3>
             <ul class="list-disc list-inside space-y-1">
-              <li><b>deepseek-v4-flash</b>：默认文本 Router 与常规垂直 Agent 主力模型，低成本、低延迟。</li>
-              <li><b>deepseek-v4-pro</b>：复杂文本任务、Badcase / Darwin 深度分析、Flash/Pro A/B 对比。</li>
-              <li><b>kimi-k2.6</b>：V1.3 仅用于图片/视频理解，不作为默认聊天模型；当前版本未接入。</li>
+              <li><b>deepseek-v4-flash</b>：业主端所有常规文本链路的运行时默认模型（Router、客服、维修、费用、投诉、RAG 问答、工单创建），开启 thinking。</li>
+              <li><b>deepseek-v4-pro</b>：仅用于后台模型 A/B 测试对比，以及 Badcase / Darwin 深度修复方案生成；不会自动进入普通业主聊天。</li>
+              <li><b>kimi-k2.6</b>：V1.3 图片/视频理解规划，当前版本未接入，不作为默认聊天模型。</li>
             </ul>
           </div>
           <div id="models-content">${loadingState()}</div>
@@ -2460,7 +2471,14 @@
           const models = data.models || [];
           const fixed = ['deepseek-v4-flash', 'deepseek-v4-pro'];
           const modelCards = fixed.map(key => {
-            const m = models.find(x => x.key === key) || { key, name: key === 'deepseek-v4-flash' ? 'DeepSeek V4 flash' : 'DeepSeek V4 pro', api_key_configured: false, is_default: false };
+            const m = models.find(x => x.key === key) || {
+              key,
+              name: key === 'deepseek-v4-flash' ? 'DeepSeek V4 flash' : 'DeepSeek V4 pro',
+              credential_status: 'missing',
+              is_default: false,
+              thinking_enabled: false
+            };
+            const isConfigured = m.credential_status === 'server_env';
             return `
               <div class="bg-white rounded-2xl shadow-soft border border-slate-200 p-5 hover:shadow-md transition-shadow">
                 <div class="flex items-start justify-between mb-3">
@@ -2468,64 +2486,24 @@
                     <h3 class="font-semibold text-slate-900">${escapeHtml(m.name)}</h3>
                     <p class="text-xs text-slate-500 mt-0.5">${escapeHtml(m.key)}</p>
                   </div>
-                  ${m.is_default ? '<span class="px-2 py-1 bg-brand-50 text-brand-600 text-xs rounded-full border border-brand-100">默认</span>' : ''}
+                  ${m.is_default ? '<span class="px-2 py-1 bg-brand-50 text-brand-600 text-xs rounded-full border border-brand-100">运行时默认</span>' : ''}
                 </div>
-                <div class="flex items-center gap-2 mb-4">
-                  <span class="w-2 h-2 rounded-full ${m.api_key_configured ? 'bg-brand-500' : 'bg-slate-300'}"></span>
-                  <span class="text-sm text-slate-600">${m.api_key_configured ? 'API key 已配置' : 'API key 未配置'}</span>
-                </div>
-                <div class="flex gap-2">
-                  <button data-key="${m.key}" class="model-edit-key-btn text-xs px-3 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg transition-colors">编辑 key</button>
-                  ${!m.is_default ? `<button data-key="${m.key}" class="model-set-default-btn text-xs px-3 py-1.5 bg-brand-50 hover:bg-brand-100 text-brand-700 rounded-lg transition-colors">设为默认</button>` : ''}
+                <div class="space-y-2 text-sm">
+                  <div class="flex items-center gap-2">
+                    <span class="w-2 h-2 rounded-full ${isConfigured ? 'bg-brand-500' : 'bg-slate-300'}"></span>
+                    <span class="text-slate-600">${isConfigured ? 'DeepSeek 服务端凭证已配置（共享）' : '服务端凭证缺失'}</span>
+                  </div>
+                  <div class="flex items-center gap-2">
+                    <span class="w-2 h-2 rounded-full ${m.thinking_enabled ? 'bg-brand-500' : 'bg-slate-300'}"></span>
+                    <span class="text-slate-600">${m.thinking_enabled ? 'thinking 已启用' : 'thinking 未启用'}</span>
+                  </div>
                 </div>
               </div>
             `;
           }).join('');
           $('#models-content').innerHTML = `<div class="grid grid-cols-1 md:grid-cols-2 gap-4">${modelCards}</div>`;
-          bindModelActions();
         } catch (err) {
           $('#models-content').innerHTML = emptyState('加载失败，请刷新重试');
-        }
-      }
-
-      function bindModelActions() {
-        $$('.model-edit-key-btn').forEach(btn => {
-          btn.addEventListener('click', () => editModelKey(btn.dataset.key));
-        });
-        $$('.model-set-default-btn').forEach(btn => {
-          btn.addEventListener('click', () => setDefaultModel(btn.dataset.key));
-        });
-      }
-
-      async function editModelKey(modelKey) {
-        const body = `
-          <p class="text-sm text-slate-600 mb-3">${escapeHtml(modelKey)}</p>
-          ${formInput('API Key', 'model-api-key', '', '请输入 API Key', 'password')}
-        `;
-        openModal('编辑模型 API Key', body, async () => {
-          const key = $('#model-api-key').value.trim();
-          if (!key) {
-            showToast('请输入 API Key', 'error');
-            return;
-          }
-          try {
-            await apiPost(`/api/models/${modelKey}/key`, { api_key: key });
-            showToast('API Key 已更新');
-            closeModal();
-            await loadModels();
-          } catch (err) {
-            showToast('保存失败', 'error');
-          }
-        });
-      }
-
-      async function setDefaultModel(modelKey) {
-        try {
-          await apiPost(`/api/models/${modelKey}/default`);
-          showToast('默认模型已更新');
-          await loadModels();
-        } catch (err) {
-          showToast('设置失败', 'error');
         }
       }
 
