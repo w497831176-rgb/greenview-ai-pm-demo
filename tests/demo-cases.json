@@ -1,0 +1,390 @@
+{
+  "version": "V1.2",
+  "status_enum": ["not_run", "passed", "failed", "blocked"],
+  "notes": {
+    "model_timeout_blocker": "2026-07-14 实测 /api/chat/stream 内部模型调用超时（input token 48K），所有依赖 chat stream 的案例当前标记为 blocked，待修复后重跑。",
+    "multimodal_next_version": "V-01~V-03 为 V1.3 规划能力，当前代码未实现，固定保持 not_run。"
+  },
+  "cases": {
+    "router_and_agents": [
+      {
+        "id": "I-01",
+        "title": "维修意图路由",
+        "query": "我家客厅吊灯不亮了，派个人来修一下",
+        "expected_intent": "maintenance",
+        "expected_agent": "维修 Agent",
+        "expected_reason": "用户描述家庭照明设备故障，需要维修",
+        "api": "POST /api/chat/stream",
+        "status": "not_run",
+        "evidence": "SSE event: route 返回 intent=maintenance、current_agent=维修 Agent"
+      },
+      {
+        "id": "I-02",
+        "title": "费用意图路由",
+        "query": "物业费多少钱一平米，怎么缴费",
+        "expected_intent": "billing",
+        "expected_agent": "费用 Agent",
+        "expected_reason": "用户询问物业费用标准与缴费方式",
+        "api": "POST /api/chat/stream",
+        "status": "not_run",
+        "evidence": "SSE event: route 返回 intent=billing、current_agent=费用 Agent"
+      },
+      {
+        "id": "I-03",
+        "title": "投诉意图路由",
+        "query": "楼上晚上十一点还在弹钢琴，我要投诉",
+        "expected_intent": "complaint",
+        "expected_agent": "投诉 Agent",
+        "expected_reason": "业主表达不满并要求投诉处理",
+        "api": "POST /api/chat/stream",
+        "status": "not_run",
+        "evidence": "SSE event: route 返回 intent=complaint、current_agent=投诉 Agent"
+      },
+      {
+        "id": "I-04",
+        "title": "客服意图路由",
+        "query": "小区快递柜几点开门",
+        "expected_intent": "customer_service",
+        "expected_agent": "客服 Agent",
+        "expected_reason": "用户询问小区公共服务信息",
+        "api": "POST /api/chat/stream",
+        "status": "not_run",
+        "evidence": "SSE event: route 返回 intent=customer_service、current_agent=客服 Agent"
+      },
+      {
+        "id": "I-05",
+        "title": "兜底 other 路由",
+        "query": "今天股市怎么样",
+        "expected_intent": "other",
+        "expected_agent": "物业 Agent",
+        "expected_reason": "问题超出物业业务域，走兜底 Agent",
+        "api": "POST /api/chat/stream",
+        "status": "not_run",
+        "evidence": "SSE event: route 返回 intent=other、current_agent=物业 Agent 或建议转人工"
+      }
+    ],
+    "skill": [
+      {
+        "id": "S-01",
+        "title": "新建 Skill 并绑定 Agent",
+        "action": "平台管理 → Skill 管理 → 新建 Skill「维修工单处理」→ 绑定到维修 Agent",
+        "expected": "Skill 成功创建，维修 Agent 的 `available_skills` 包含该 Skill",
+        "api": "POST /api/skills; PUT /api/agents/{id}",
+        "status": "not_run",
+        "evidence": "Skill 列表与 Agent 详情均显示绑定关系"
+      },
+      {
+        "id": "S-02",
+        "title": "Skill 命中触发",
+        "query": "帮我报修卫生间水管漏水",
+        "expected_skill": "维修工单处理",
+        "expected_tool": "create_work_order",
+        "api": "POST /api/chat/stream",
+        "status": "not_run",
+        "evidence": "AI 气泡底部显示「已调用 Skill: 维修工单处理」，SSE done 中 tool_calls 含 create_work_order"
+      },
+      {
+        "id": "S-03",
+        "title": "明确不命中",
+        "query": "今天天气怎么样",
+        "expected_skill": "",
+        "note": "未绑定天气 Skill 或未触发时，不应误触发维修工单 Skill",
+        "api": "POST /api/chat/stream",
+        "status": "not_run",
+        "evidence": "SSE done 中 activated_skills 为空"
+      },
+      {
+        "id": "S-04",
+        "title": "Prompt 注入预览",
+        "action": "编辑 Skill 时查看 Prompt 注入效果",
+        "expected": "保存后 SKILL.md 中 frontmatter + body 能被 Agent 正确加载",
+        "api": "GET /api/skills/{id}/files/SKILL.md",
+        "status": "not_run",
+        "evidence": "SKILL.md 内容包含触发条件与指令模板"
+      },
+      {
+        "id": "S-05",
+        "title": "model_id 覆盖",
+        "action": "为 Skill 设置 model_id=deepseek-v4-pro 并触发",
+        "expected": "该轮对话调用 Pro 模型而非默认 Flash",
+        "api": "PUT /api/skills/{id}; POST /api/chat/stream",
+        "status": "not_run",
+        "evidence": "token_detail 或响应质量体现 Pro 模型特征；日志中出现 pro 调用"
+      },
+      {
+        "id": "S-06",
+        "title": "SKILL.md version 元数据",
+        "action": "创建 Skill 时 frontmatter 写入 version: 1.0.0",
+        "expected": "SKILL.md 解析后 metadata.version = 1.0.0",
+        "api": "POST /api/skills; GET /api/skills/{id}/files/SKILL.md",
+        "status": "not_run",
+        "evidence": "SKILL.md 头部包含 version 字段",
+        "known_limitation": "当前无自动版本历史/回滚，修改即覆盖"
+      }
+    ],
+    "rag": [
+      {
+        "id": "R-01",
+        "title": "上传政策文档",
+        "action": "平台管理 → 知识库 → 上传《物业服务收费标准》",
+        "expected": "文档创建成功，状态为 indexed 或 chunks 生成完毕",
+        "api": "POST /api/knowledge/docs",
+        "status": "not_run",
+        "evidence": "文档列表出现新记录，chunk_count >= 15"
+      },
+      {
+        "id": "R-02",
+        "title": "查看 Chunk 切分",
+        "action": "点击文档行「重新索引」或「查看 Chunks」",
+        "expected": "按 chunk_size=512、overlap=64 切分后的片段列表",
+        "api": "GET /api/knowledge/docs/{id}/chunks",
+        "status": "not_run",
+        "evidence": "返回 chunks 数组，每个 chunk 含 content 与 chunk_index"
+      },
+      {
+        "id": "R-03",
+        "title": "Keyword 检索调试",
+        "action": "检索调试页选择 keyword 模式，输入「装修押金」",
+        "expected": "命中含「装修押金」关键词的片段",
+        "api": "POST /api/knowledge/search",
+        "status": "not_run",
+        "evidence": "keyword 结果列表含《装修管理规定》片段"
+      },
+      {
+        "id": "R-04",
+        "title": "Semantic 检索调试",
+        "action": "检索调试页选择 semantic 模式，输入「装修保证金怎么退」",
+        "expected": "通过向量语义命中「装修押金」相关片段",
+        "api": "POST /api/knowledge/search",
+        "status": "not_run",
+        "evidence": "semantic 结果列表含《装修管理规定》片段"
+      },
+      {
+        "id": "R-05",
+        "title": "Advanced 检索调试",
+        "action": "检索调试页选择 advanced 模式，输入「装修押金退还流程」",
+        "expected": "BM25 + 向量 + RRF 融合后的最终排序",
+        "api": "POST /api/knowledge/search",
+        "status": "not_run",
+        "evidence": "advanced 结果列表顶部为最相关片段，含 score 与来源"
+      },
+      {
+        "id": "R-06",
+        "title": "带引用回答",
+        "query": "物业费收费标准是什么",
+        "expected_doc_substring": "物业费",
+        "api": "POST /api/chat/stream",
+        "status": "not_run",
+        "evidence": "SSE done 中 citations 非空，UI 显示引用卡片《物业服务收费标准》"
+      }
+    ],
+    "hybrid_retrieval_and_rerank": [
+      {
+        "id": "H-01",
+        "title": "BM25 解决精确术语命中",
+        "query": "3-2-1201 物业费",
+        "mode": "keyword",
+        "expected": "精确命中含房间号与物业费术语的片段",
+        "api": "POST /api/knowledge/search",
+        "status": "not_run",
+        "evidence": "keyword 结果包含精确匹配房间号/物业费的 chunk"
+      },
+      {
+        "id": "H-02",
+        "title": "向量解决同义改写",
+        "query": "装修保证金怎么退",
+        "mode": "semantic",
+        "expected": "命中「装修押金」相关片段，即使 query 用的是「保证金」",
+        "api": "POST /api/knowledge/search",
+        "status": "not_run",
+        "evidence": "semantic 结果包含《装修管理规定》中押金相关 chunk"
+      },
+      {
+        "id": "H-03",
+        "title": "RRF + 阈值 + 重排解决最终排序",
+        "query": "停车管理规定有哪些",
+        "mode": "advanced",
+        "expected": "advanced 结果综合 BM25 与向量得分，经 RRF 融合；开启 rerank 后 Top-1 相关性最高；低于阈值的片段被过滤",
+        "api": "POST /api/knowledge/search",
+        "status": "not_run",
+        "evidence": "调试面板同时展示 keyword_score、semantic_score、rrf_score、rerank_score 与最终过滤结果"
+      }
+    ],
+    "model_config_and_ab": [
+      {
+        "id": "M-01",
+        "title": "模型配置脱敏",
+        "api": "GET /api/model-configs",
+        "check": "所有返回项的 api_key 为空或缺失",
+        "status": "not_run",
+        "evidence": "接口响应无 api_key 字段"
+      },
+      {
+        "id": "M-02",
+        "title": "默认模型为 Flash",
+        "api": "GET /api/model-configs/default",
+        "check": "model_id 包含 deepseek-v4-flash",
+        "status": "not_run",
+        "evidence": "接口响应显示 deepseek-v4-flash"
+      },
+      {
+        "id": "M-03",
+        "title": "Flash/Pro A/B 对比（人工记录延迟与成本）",
+        "api": "POST /api/model-configs/ab-test",
+        "payload": {
+          "prompt": "业主投诉楼上深夜噪音，请给出安抚与记录要点",
+          "model_a": "deepseek-v4-flash",
+          "model_b": "deepseek-v4-pro"
+        },
+        "expected": "接口并发返回 model_a 与 model_b 两条 response",
+        "manual_metrics": {
+          "latency_ms": "客户端从请求到收到首字节计时",
+          "cost_cny": "按 input/output token × 官方单价人工估算",
+          "quality_score": "人工 1-5 分评估回答质量"
+        },
+        "status": "not_run",
+        "evidence": "A/B 测试结果截图，含两条 response、人工评分、延迟与成本估算"
+      }
+    ],
+    "mcp_tool": [
+      {
+        "id": "T-01",
+        "title": "新增 MCP Server",
+        "action": "平台管理 → MCP Server 管理 → 新增「天气 Server」",
+        "expected": "Server 保存成功，可启用/禁用",
+        "api": "POST /api/mcp/servers",
+        "status": "not_run",
+        "evidence": "MCP Server 列表出现新 Server"
+      },
+      {
+        "id": "T-02",
+        "title": "Discover 工具并绑定 Agent",
+        "action": "点击 Discover，获取 get_weather；编辑维修 Agent 绑定该工具",
+        "expected": " discover 返回工具列表；Agent 详情 available_mcp_tools 含 get_weather",
+        "api": "POST /api/mcp/servers/{id}/discover; PUT /api/agents/{id}",
+        "status": "not_run",
+        "evidence": "MCP 工具列表与 Agent 详情均显示 get_weather"
+      },
+      {
+        "id": "T-03",
+        "title": "实际工具调用与结果回注",
+        "query": "今天适合晾衣服吗",
+        "expected_tool": "get_weather",
+        "api": "POST /api/chat/stream",
+        "status": "not_run",
+        "evidence": "SSE event: tool_calls 显示 get_weather 调用；最终回答中包含天气结果，而非模型猜测"
+      }
+    ],
+    "badcase_loop": [
+      {
+        "id": "B-01",
+        "title": "点踩生成 Badcase",
+        "action": "业主对 AI 回复点击 👎，选择「意图识别错误」",
+        "expected": "Badcase 创建，status=pending",
+        "api": "POST /api/chat/feedback",
+        "status": "not_run",
+        "evidence": "Badcase 库新增一条 pending 记录"
+      },
+      {
+        "id": "B-02",
+        "title": "Classify 自动分类",
+        "action": "在 Badcase 详情点击「自动分类」",
+        "expected": "status 从 pending 变为 classified，category 为 knowledge/skill/model/tool/other 之一",
+        "api": "POST /api/badcases/{id}/classify",
+        "status": "not_run",
+        "evidence": "Badcase 详情显示 classified 与分类理由"
+      },
+      {
+        "id": "B-03",
+        "title": "Darwin 深度分析",
+        "action": "点击「Darwin 优化」生成修复方案",
+        "expected": "调用 darwin-fix 接口，生成 root_cause 与 fix_plan",
+        "api": "POST /api/badcases/{id}/darwin-fix",
+        "status": "not_run",
+        "evidence": "Badcase 详情显示 Darwin 输出的根因与修复方案"
+      },
+      {
+        "id": "B-04",
+        "title": "Knowledge Draft 生成与发布",
+        "action": "点击「提取知识」生成草稿 → 点击「发布草稿」到知识库",
+        "expected": "status 从 classified → fixing → verifying；知识库新增文档",
+        "api": "POST /api/badcases/{id}/extract-knowledge; POST /api/badcases/{id}/publish-draft/{draft_id}",
+        "status": "not_run",
+        "evidence": "Badcase 状态流转；知识库出现新文档"
+      },
+      {
+        "id": "B-05",
+        "title": "Retest 复测",
+        "action": "点击「复测」，用当前默认模型重跑原 user query",
+        "expected": "返回 retest_response，status 保持 verifying 或回到 fixing",
+        "api": "POST /api/badcases/{id}/retest",
+        "status": "not_run",
+        "evidence": "Badcase actions 中新增 retest 记录，response 改善"
+      },
+      {
+        "id": "B-06",
+        "title": "Verify/Close 闭环",
+        "action": "人工确认修复有效后点击「通过并关闭」",
+        "expected": "status=closed",
+        "api": "POST /api/badcases/{id}/verify",
+        "status": "not_run",
+        "evidence": "Badcase 状态变为 closed，actions 中新增 verify 记录"
+      }
+    ],
+    "human_ai_collaboration": [
+      {
+        "id": "C-01",
+        "title": "人工接管",
+        "action": "业主输入「我要人工客服」",
+        "expected": "会话 handoff_status=requested 或 active；Agent 停止自动回复",
+        "api": "POST /api/chat/stream; POST /api/chat/handoff",
+        "status": "not_run",
+        "evidence": "GET /api/chat/handoffs 列表中出现该会话"
+      },
+      {
+        "id": "C-02",
+        "title": "员工回复",
+        "action": "员工在 handoff 会话中回复「您好，我是物业小王，已记录您的问题」",
+        "expected": "消息以 role=staff 写入，业主端可见",
+        "api": "POST /api/chat/handoff-reply",
+        "status": "not_run",
+        "evidence": "GET /api/chat/history?session_id=xxx 返回 staff 消息"
+      },
+      {
+        "id": "C-03",
+        "title": "结束接管与状态持久化",
+        "action": "点击「结束接管」并刷新页面",
+        "expected": "handoff_status 恢复；历史消息、引用、Skill 标签、工单状态均保留",
+        "api": "POST /api/chat/handoff-resolve; GET /api/chat/history; GET /api/work-orders",
+        "status": "not_run",
+        "evidence": "刷新后聊天记录、工单状态与之前一致"
+      }
+    ],
+    "multimodal_repair": [
+      {
+        "id": "V-01",
+        "title": "V1.3 图片上传与媒体网关",
+        "action": "业主在 AI 助手上传吊灯不亮照片",
+        "expected_v1_3": "前端完成压缩与 MIME 校验；媒体网关根据 has_image + image/* 分流到视觉链路",
+        "status": "not_run",
+        "evidence_v1_3": "网络请求显示图片单独上传，headers 含 image/jpeg"
+      },
+      {
+        "id": "V-02",
+        "title": "V1.3 kimi-k2.6 视觉理解",
+        "action": "视觉模型分析图片",
+        "expected_v1_3": "kimi-k2.6 输出 vision_result JSON：故障物、故障类型、位置、严重程度、置信度、route_intent、待补充字段",
+        "status": "not_run",
+        "evidence_v1_3": "后端日志或接口返回 vision_result 结构化字段"
+      },
+      {
+        "id": "V-03",
+        "title": "V1.3 工单字段预填",
+        "action": "维修 Agent 依据 vision_result 预填工单",
+        "expected_v1_3": "工单描述中体现「客厅主灯不亮/灯泡或线路故障」；用户确认后创建工单",
+        "status": "not_run",
+        "evidence_v1_3": "工单详情中的问题描述与图片识别结果一致"
+      }
+    ]
+  }
+}
