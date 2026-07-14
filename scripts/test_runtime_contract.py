@@ -402,8 +402,8 @@ def test_rag_citations():
         chunk_text = (charge_cit.get("content") or "").lower()
         ensure("严禁" in chunk_text, "RAG test A charging citation points to correct chunk", charge_cit)
 
-    # Test B: fee query.
-    res_b = chat_sse("1号集中充电区怎么收费？")
+    # Test B: fee query targeting the charging-management fee chunk.
+    res_b = chat_sse("电动车充电管理费多少钱一个月？")
     done_b = res_b["done"]
     citations_b = done_b.get("citations", [])
     fee_cit_b = next((c for c in citations_b if "物业费" in (c.get("doc_title") or "")), None)
