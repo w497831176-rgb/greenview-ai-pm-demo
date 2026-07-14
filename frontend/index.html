@@ -664,6 +664,7 @@
             .replace('sticky top-0 z-10', 'relative')
             .replace('max-w-6xl mx-auto', 'max-w-3xl mx-auto')
             .replace('</p>', '</p><button id="chat-refresh-btn" type="button" class="absolute right-6 top-1/2 -translate-y-1/2 text-xs text-slate-500 hover:text-brand-600 flex items-center gap-1"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>刷新</button>')}
+          <div id="chat-handoff-banner" class="hidden px-4 pt-3 pb-1 text-center"></div>
           <div class="flex-1 overflow-y-auto chat-scroll p-4 md:p-6" id="chat-messages">
             <div id="chat-message-list" class="w-full space-y-5">
               <div class="flex gap-3 welcome-message">
@@ -742,6 +743,7 @@
           });
           if (!res.ok) throw new Error('请求失败');
           STATE.chatHandoff = true;
+          updateHandoffBanner('requested');
           appendSystemMessage('您已发起转人工请求，物业工作人员会尽快回复。');
           showToast('已转人工，请等待工作人员回复', 'success');
         } catch (err) {
@@ -759,6 +761,26 @@
       });
 
       restoreChatMessages();
+    }
+
+    function updateHandoffBanner(status) {
+      const banner = $('#chat-handoff-banner');
+      if (!banner) return;
+      const labels = {
+        none: '',
+        requested: '待人工接管',
+        active: '人工接管中',
+        resolved: '人工接管已结束'
+      };
+      const text = labels[status] || '';
+      if (!text) {
+        banner.classList.add('hidden');
+        banner.innerHTML = '';
+        return;
+      }
+      const colorClass = status === 'active' ? 'bg-green-100 text-green-700' : (status === 'resolved' ? 'bg-slate-100 text-slate-600' : 'bg-amber-100 text-amber-700');
+      banner.classList.remove('hidden');
+      banner.innerHTML = `<span class="inline-block px-3 py-1 rounded-full text-xs font-medium ${colorClass}">${text}</span>`;
     }
 
     window.sendQuickQuestion = function(text) {
@@ -1075,6 +1097,7 @@
               );
               if (data.handoff) {
                 STATE.chatHandoff = true;
+                updateHandoffBanner(data.handoff_status || 'requested');
                 showToast('已转人工，请等待工作人员回复', 'success');
               }
             } else if (eventType === 'error') {
@@ -1112,17 +1135,30 @@
           if (msg.role === 'user') {
             appendUserMessage(msg.content || '', msg.created_at);
           } else if (msg.role === 'assistant') {
-            appendAiMessageFromHistory(msg.content || '', msg.created_at, msg.token_count, msg.id, msg.token_detail, msg.citations, msg.activated_skills, msg.tools, msg.agent);
+            appendAiMessageFromHistory(
+              msg.content || '',
+              msg.created_at,
+              msg.token_count,
+              msg.id,
+              msg.token_detail,
+              msg.citations,
+              msg.activated_skills,
+              msg.tool_calls,
+              msg.current_agent,
+              msg.route_reason,
+              msg.route_intent
+            );
           } else if (msg.role === 'staff') {
             appendStaffMessage(msg.content || '', msg.created_at);
           }
         });
+        updateHandoffBanner(session.handoff_status);
       } catch (err) {
         console.error('Restore chat history failed:', err);
       }
     }
 
-    function appendAiMessageFromHistory(content, createdAt, tokenCount, messageId, tokenDetail = null, citations = null, activatedSkills = null, tools = null, agent = null) {
+    function appendAiMessageFromHistory(content, createdAt, tokenCount, messageId, tokenDetail = null, citations = null, activatedSkills = null, tools = null, agent = null, routeReason = '', routeIntent = '') {
       const container = $('#chat-message-list');
       const div = document.createElement('div');
       div.className = 'flex gap-3 items-start fade-in';
@@ -1135,7 +1171,7 @@
         ? `<span class="cursor-help underline decoration-dotted" title="${escapeHtml(detailText)}">${tokenText}</span>`
         : tokenText;
       const footnotesHtml = renderCitations(citations);
-      const tagsHtml = renderAiMessageTags(activatedSkills, tools, agent);
+      const tagsHtml = renderAiMessageTags(activatedSkills, tools, agent, routeReason, routeIntent);
       div.innerHTML = `
         <div class="w-9 h-9 rounded-full bg-gradient-to-br from-brand-500 to-brand-700 flex items-center justify-center text-white shrink-0 shadow-md">
           <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z"></path></svg>
@@ -1213,10 +1249,10 @@
                   <th class="px-4 py-3 text-left font-semibold text-slate-600">工单号</th>
                   <th class="px-4 py-3 text-left font-semibold text-slate-600">房号</th>
                   ${!isOwner ? '<th class="px-4 py-3 text-left font-semibold text-slate-600">联系人</th>' : ''}
-                  <th class="px-4 py-3 text-left font-semibold text-slate-600">类型</th>
+                  <th class="px-4 py-3 text-left font-semibold text-slate-600 whitespace-nowrap min-w-[80px]">类型</th>
                   <th class="px-4 py-3 text-left font-semibold text-slate-600">问题描述</th>
-                  <th class="px-4 py-3 text-left font-semibold text-slate-600">紧急度</th>
-                  <th class="px-4 py-3 text-left font-semibold text-slate-600">状态</th>
+                  <th class="px-4 py-3 text-left font-semibold text-slate-600 whitespace-nowrap min-w-[80px]">紧急度</th>
+                  <th class="px-4 py-3 text-left font-semibold text-slate-600 whitespace-nowrap min-w-[80px]">状态</th>
                   <th class="px-4 py-3 text-left font-semibold text-slate-600">预约时间</th>
                   ${showAction ? '<th class="px-4 py-3 text-left font-semibold text-slate-600">操作</th>' : ''}
                 </tr>
@@ -1227,10 +1263,10 @@
                     <td class="px-4 py-3 font-medium text-slate-900">${order.id}</td>
                     <td class="px-4 py-3 text-slate-600">${order.room_id}</td>
                     ${!isOwner ? `<td class="px-4 py-3 text-slate-600">${order.contact_name || '-'}<br><span class="text-xs text-slate-400">${order.contact_phone || ''}</span></td>` : ''}
-                    <td class="px-4 py-3 text-slate-600">${order.issue_type}</td>
+                    <td class="px-4 py-3 text-slate-600 whitespace-nowrap min-w-[80px]">${order.issue_type}</td>
                     <td class="px-4 py-3 text-slate-600 max-w-xs truncate" title="${escapeHtml(order.issue_desc)}">${order.issue_desc}</td>
-                    <td class="px-4 py-3">${urgencyBadge(order.urgency)}</td>
-                    <td class="px-4 py-3">${statusBadge(order.status)}</td>
+                    <td class="px-4 py-3 whitespace-nowrap min-w-[80px]">${urgencyBadge(order.urgency)}</td>
+                    <td class="px-4 py-3 whitespace-nowrap min-w-[80px]">${statusBadge(order.status)}</td>
                     <td class="px-4 py-3 text-slate-500 text-xs">${formatDate(order.appointment_time)}</td>
                     ${showAction ? `<td class="px-4 py-3">${renderOrderAction(order, options.actionType)}</td>` : ''}
                   </tr>

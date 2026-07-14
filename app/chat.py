@@ -288,7 +288,7 @@ def _format_mcp_context() -> str:
 
 def _detect_handoff_intent(message: str) -> Optional[str]:
     """Detect whether the owner explicitly asks for human support."""
-    triggers = ["人工", "客服", "投诉", "找物业", "找管家", "不满意", "我要人"]
+    triggers = ["人工", "客服", "找物业", "找管家", "我要人"]
     lowered = message.lower()
     if any(t in lowered for t in triggers):
         return "业主主动要求人工服务"
@@ -455,7 +455,7 @@ async def _stream_agent_response(
         contextual_message = (
             f"[系统上下文：当前业主是 {DEFAULT_ROOM_ID} 的{DEFAULT_OWNER_NAME}，"
             f"如果用户没有提供房号，创建工单时默认使用 {DEFAULT_ROOM_ID}。"
-            f"当用户明确要求人工、提出投诉、表达强烈不满、或问题超出物业维修/收费/知识库范围时，"
+            f"当用户明确要求人工、表达强烈不满、或问题超出物业维修/收费/知识库范围时，"
             f"你必须主动提出转人工处理，不要强行回答。]"
             f"{knowledge_gap_note}"
             f"{rag_context}"
@@ -548,6 +548,10 @@ async def _stream_agent_response(
             token_detail=token_detail,
             citations=citations,
             activated_skills=activated_skills,
+            route_intent=intent,
+            route_reason=intent_result.get("reason", ""),
+            current_agent=current_agent,
+            tool_calls=tool_calls or None,
         )
 
         # Send completion event including token metrics, citations, activated skills and agent info.
@@ -560,6 +564,8 @@ async def _stream_agent_response(
             'citations': citations,
             'activated_skills': activated_skills,
             'current_agent': current_agent,
+            'route_intent': intent,
+            'route_reason': intent_result.get("reason", ""),
             'tool_calls': tool_calls,
             'auto_badcase_id': auto_badcase_id,
         }
