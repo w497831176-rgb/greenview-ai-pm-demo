@@ -33,41 +33,46 @@ def _tokenize(text: str) -> List[str]:
     return tokens
 
 
-_STOP_TOKENS = {
-    "什么", "的", "是", "我", "要", "在", "和", "与", "等", "或", "为", "了",
-    "可以", "请", "如何", "怎么", "吗", "呢", "吧", "啊", "什么", "是否",
-}
+_STOP_CHARS = set("什么的是我要在和与等或为了可以吗请怎么吗呢吧啊是否之及")
 
 
-def _simple_tokenize(text: str) -> List[str]:
-    """Tokenize into whole words/chars without n-grams for relevance scoring."""
+def _char_terms(text: str) -> List[str]:
+    """Extract meaningful Chinese characters and alphanumeric terms.
+
+    Treats each non-stop Chinese character and each alphanumeric word as a
+    term. This avoids the need for a Chinese word segmenter while still
+    capturing the key concepts in short queries.
+    """
     text = text.lower()
-    text = re.sub(r"[^\u4e00-\u9fa5a-z0-9]", " ", text)
-    tokens = []
-    for word in text.split():
-        if not word or word in _STOP_TOKENS:
+    terms = []
+    # Split out alphanumeric words.
+    parts = re.split(r"([^a-z0-9])", text)
+    for part in parts:
+        if not part:
             continue
-        # Keep whole Chinese words and alphanumeric terms.
-        if re.match(r"^[\u4e00-\u9fa5]+$", word):
-            if len(word) >= 2:
-                tokens.append(word)
+        if re.match(r"^[a-z0-9]+$", part):
+            terms.append(part)
         else:
-            tokens.append(word)
-    return tokens
+            for ch in part:
+                # Keep Chinese characters only, drop stop chars and punctuation.
+                if "\u4e00" <= ch <= "\u9fff" and ch not in _STOP_CHARS:
+                    terms.append(ch)
+    return terms
 
 
 def _context_relevance_score(query: str, content: str) -> float:
     """Compute a query-centric lexical overlap score in [0, 1].
 
-    Uses whole-word/char tokens (no n-grams) and ignores stop words so the
-    score reflects whether the content actually addresses the query concepts.
+    Uses character-level overlap on meaningful query characters so short
+    Chinese queries (e.g. "装修施工时间") can match relevant content without
+    requiring exact word segmentation or noisy n-grams.
     """
-    query_tokens = set(_simple_tokenize(query))
-    if not query_tokens:
+    query_terms = set(_char_terms(query))
+    if not query_terms:
         return 0.0
-    content_tokens = set(_simple_tokenize(content))
-    overlap = len(query_tokens & content_tokens)
-    return round(overlap / len(query_tokens), 4)
+    content_terms = set(_char_terms(content))
+    overlap = len(query_terms & content_terms)
+    return round(overlap / len(query_terms), 4)
 
 
 def _build_keyword_index() -> Dict[int, Dict[str, int]]:
