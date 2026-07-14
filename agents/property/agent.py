@@ -86,7 +86,7 @@ def create_property_agent(tools: Optional[List[Any]] = None, model: Optional[Any
 
     return Agent(
         id="property_agent",
-        name="绿景智服 AI 助手",
+        name="YIAI物业 AI 助手",
         description="AI 物业维修助手，帮助业主报修、查询工单、解答维修相关问题。",
         model=model or MODEL,
         db=agent_db,

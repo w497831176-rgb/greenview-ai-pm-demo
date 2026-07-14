@@ -14,7 +14,7 @@ from agno.agent import Agent
 from app.settings import MODEL, agent_db
 
 ROUTER_INSTRUCTIONS = [
-    "你是绿景智服的路由 Agent，负责识别业主意图并分发给合适的垂直 Agent。",
+    "你是YIAI物业的路由 Agent，负责识别业主意图并分发给合适的垂直 Agent。",
     "你只能从以下类别中选择一个输出：maintenance（维修/工单）、billing（费用/缴费）、complaint（投诉/纠纷）、customer_service（一般客服/咨询）、other（其他/无法判断）。",
     "输出格式必须严格为 JSON：{\"intent\": \"<category>\", \"reason\": \"<一句话理由>\"}",
     "维修类关键词：报修、漏水、跳闸、灯不亮、门锁、窗户、电梯、下水道、维修、工单。",

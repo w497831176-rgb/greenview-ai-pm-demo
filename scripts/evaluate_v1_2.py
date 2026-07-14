@@ -1,5 +1,5 @@
 """
-绿景智服 V1.2 能力评测脚本
+YIAI物业 V1.2 能力评测脚本
 ==========================
 
 固定测试集，评估：
@@ -247,7 +247,7 @@ def main():
     args = parser.parse_args()
     base = args.base
 
-    print("开始绿景智服 V1.2 能力评测...")
+    print("开始YIAI物业 V1.2 能力评测...")
     print(f"目标环境: {base}\n")
 
     intent = evaluate_intent(base)

@@ -437,7 +437,7 @@ async def switch_model_retry(case_id: int, request: SwitchModelRetryRequest = Sw
 
     alt_model = build_model(model_id)
     prompt = (
-        "你是绿景智服物业客服助手。请专业、简洁地回答业主问题。"
+        "你是YIAI物业物业客服助手。请专业、简洁地回答业主问题。"
         "当问题超出物业维修、收费或客服范围时，主动提出转人工。\n\n"
         f"业主问题：{user_message}"
     )
@@ -541,7 +541,7 @@ async def retest_badcase(case_id: int, request: SwitchModelRetryRequest = Switch
         raise HTTPException(status_code=400, detail="user_message or source_message_id required")
 
     prompt = (
-        "你是绿景智服物业客服助手。请专业、简洁地回答业主问题。"
+        "你是YIAI物业物业客服助手。请专业、简洁地回答业主问题。"
         "当问题超出物业维修、收费或客服范围时，主动提出转人工。\n\n"
         f"业主问题：{user_message}"
     )
