@@ -195,14 +195,14 @@ def init_db():
             enable_rerank INTEGER DEFAULT 0,
             rerank_model TEXT,
             score_threshold REAL DEFAULT 0.0,
-            context_threshold REAL DEFAULT 0.3,
+            context_threshold REAL DEFAULT 0.2,
             created_at TEXT,
             updated_at TEXT
         )
         """
     )
     try:
-        cursor.execute("ALTER TABLE retrieval_settings ADD COLUMN context_threshold REAL DEFAULT 0.3")
+        cursor.execute("ALTER TABLE retrieval_settings ADD COLUMN context_threshold REAL DEFAULT 0.2")
     except Exception:
         pass
 
@@ -1030,7 +1030,7 @@ def _seed_retrieval_settings(cursor):
         (name, top_k, keyword_weight, semantic_weight, rrf_k, enable_rerank, rerank_model, score_threshold, context_threshold, created_at, updated_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        ("default", 5, 0.3, 0.7, 60, 0, None, 0.0, 0.3, now, now),
+        ("default", 5, 0.3, 0.7, 60, 0, None, 0.0, 0.2, now, now),
     )
 
 
@@ -2242,7 +2242,7 @@ def update_retrieval_settings(
                 1 if enable_rerank else 0,
                 rerank_model,
                 score_threshold if score_threshold is not None else 0.0,
-                context_threshold if context_threshold is not None else 0.3,
+                context_threshold if context_threshold is not None else 0.2,
                 now,
                 now,
             ),

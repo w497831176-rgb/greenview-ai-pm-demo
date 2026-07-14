@@ -33,46 +33,20 @@ def _tokenize(text: str) -> List[str]:
     return tokens
 
 
-_STOP_CHARS = set("什么的是我要在和与等或为了可以吗请怎么吗呢吧啊是否之及")
-
-
-def _char_terms(text: str) -> List[str]:
-    """Extract meaningful Chinese characters and alphanumeric terms.
-
-    Treats each non-stop Chinese character and each alphanumeric word as a
-    term. This avoids the need for a Chinese word segmenter while still
-    capturing the key concepts in short queries.
-    """
-    text = text.lower()
-    terms = []
-    # Split out alphanumeric words.
-    parts = re.split(r"([^a-z0-9])", text)
-    for part in parts:
-        if not part:
-            continue
-        if re.match(r"^[a-z0-9]+$", part):
-            terms.append(part)
-        else:
-            for ch in part:
-                # Keep Chinese characters only, drop stop chars and punctuation.
-                if "\u4e00" <= ch <= "\u9fff" and ch not in _STOP_CHARS:
-                    terms.append(ch)
-    return terms
-
-
 def _context_relevance_score(query: str, content: str) -> float:
     """Compute a query-centric lexical overlap score in [0, 1].
 
-    Uses character-level overlap on meaningful query characters so short
-    Chinese queries (e.g. "装修施工时间") can match relevant content without
-    requiring exact word segmentation or noisy n-grams.
+    Uses the same n-gram tokenizer as the keyword/rerank pipeline so the score
+    reflects whether the content actually covers the query's phrases. A
+    threshold of 0.2 filters one-off keyword matches while preserving docs that
+    address the question.
     """
-    query_terms = set(_char_terms(query))
-    if not query_terms:
+    query_tokens = set(_tokenize(query))
+    if not query_tokens:
         return 0.0
-    content_terms = set(_char_terms(content))
-    overlap = len(query_terms & content_terms)
-    return round(overlap / len(query_terms), 4)
+    content_tokens = set(_tokenize(content))
+    overlap = len(query_tokens & content_tokens)
+    return round(overlap / len(query_tokens), 4)
 
 
 def _build_keyword_index() -> Dict[int, Dict[str, int]]:
@@ -239,7 +213,7 @@ def advanced_search(
     enable_rerank = settings.get("enable_rerank", False)
     rerank_model = settings.get("rerank_model")
     score_threshold = settings.get("score_threshold", 0.0)
-    context_threshold = settings.get("context_threshold", 0.3)
+    context_threshold = settings.get("context_threshold", 0.2)
 
     keyword_results = _keyword_search(query, top_k=top_k * 2)
     # Apply the configured similarity threshold to semantic matches before
@@ -301,7 +275,7 @@ def debug_search(
 ) -> Dict[str, Any]:
     """Debug endpoint exposing each retrieval stage."""
     score_threshold = score_threshold or 0.0
-    context_threshold = context_threshold if context_threshold is not None else 0.3
+    context_threshold = context_threshold if context_threshold is not None else 0.2
     settings = {
         "top_k": top_k,
         "keyword_weight": keyword_weight,

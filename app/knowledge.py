@@ -97,7 +97,7 @@ class RetrievalSettingsUpdate(BaseModel):
     enable_rerank: bool = False
     rerank_model: Optional[str] = None
     score_threshold: float = 0.0
-    context_threshold: float = 0.3
+    context_threshold: float = 0.2
 
 
 class RetrievalDebugRequest(BaseModel):
@@ -381,7 +381,7 @@ async def search_docs(
                 "enable_rerank": settings.get("enable_rerank", False),
                 "rerank_model": settings.get("rerank_model"),
                 "score_threshold": threshold if threshold is not None else settings.get("score_threshold", 0.0),
-                "context_threshold": settings.get("context_threshold", 0.3),
+                "context_threshold": settings.get("context_threshold", 0.2),
             },
         )
         return {"results": results["results"], "count": results["count"], "mode": mode, "details": results}
