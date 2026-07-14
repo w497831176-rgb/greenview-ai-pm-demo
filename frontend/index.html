@@ -2405,6 +2405,14 @@
               A/B 测试
             </button>
           </div>
+          <div class="bg-blue-50 rounded-2xl border border-blue-100 p-4 text-sm text-slate-700">
+            <h3 class="font-semibold text-slate-900 mb-2">模型分层说明</h3>
+            <ul class="list-disc list-inside space-y-1">
+              <li><b>deepseek-v4-flash</b>：默认文本 Router 与常规垂直 Agent 主力模型，低成本、低延迟。</li>
+              <li><b>deepseek-v4-pro</b>：复杂文本任务、Badcase / Darwin 深度分析、Flash/Pro A/B 对比。</li>
+              <li><b>kimi-k2.6</b>：V1.3 仅用于图片/视频理解，不作为默认聊天模型；当前版本未接入。</li>
+            </ul>
+          </div>
           <div id="models-content">${loadingState()}</div>
         </div>
       `;
