@@ -952,7 +952,7 @@ def _seed_mcp_servers(cursor):
         ),
     ]
     cursor.executemany(
-        "INSERT INTO mcp_servers (name, command, args, env, description, enabled, is_builtin, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT OR IGNORE INTO mcp_servers (name, command, args, env, description, enabled, is_builtin, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         servers,
     )
 
@@ -1343,6 +1343,12 @@ def _migrate_mcp_hygiene(cursor):
                 "DELETE FROM mcp_servers WHERE id IN (" + ",".join("?" * len(duplicate_ids)) + ")",
                 tuple(duplicate_ids),
             )
+
+    # Enforce unique server names to prevent duplicate canonical servers on
+    # repeated seed/migration runs.
+    cursor.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_mcp_servers_name ON mcp_servers(name)"
+    )
 
     # Canonical demo servers.  Use INSERT OR IGNORE for names, then UPDATE
     # command/args/description so re-running the migration stays idempotent.
