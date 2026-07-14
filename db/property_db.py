@@ -195,11 +195,16 @@ def init_db():
             enable_rerank INTEGER DEFAULT 0,
             rerank_model TEXT,
             score_threshold REAL DEFAULT 0.0,
+            context_threshold REAL DEFAULT 0.3,
             created_at TEXT,
             updated_at TEXT
         )
         """
     )
+    try:
+        cursor.execute("ALTER TABLE retrieval_settings ADD COLUMN context_threshold REAL DEFAULT 0.3")
+    except Exception:
+        pass
 
     cursor.execute(
         """
@@ -1022,10 +1027,10 @@ def _seed_retrieval_settings(cursor):
     cursor.execute(
         """
         INSERT INTO retrieval_settings
-        (name, top_k, keyword_weight, semantic_weight, rrf_k, enable_rerank, rerank_model, score_threshold, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (name, top_k, keyword_weight, semantic_weight, rrf_k, enable_rerank, rerank_model, score_threshold, context_threshold, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        ("default", 5, 0.3, 0.7, 60, 0, None, 0.0, now, now),
+        ("default", 5, 0.3, 0.7, 60, 0, None, 0.0, 0.3, now, now),
     )
 
 
@@ -2215,6 +2220,7 @@ def update_retrieval_settings(
     enable_rerank: Optional[bool] = None,
     rerank_model: Optional[str] = None,
     score_threshold: Optional[float] = None,
+    context_threshold: Optional[float] = None,
 ) -> Optional[Dict[str, Any]]:
     now = now_cn("%Y-%m-%d %H:%M")
     existing = get_retrieval_settings(name)
@@ -2224,8 +2230,8 @@ def update_retrieval_settings(
         cursor.execute(
             """
             INSERT INTO retrieval_settings
-            (name, top_k, keyword_weight, semantic_weight, rrf_k, enable_rerank, rerank_model, score_threshold, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (name, top_k, keyword_weight, semantic_weight, rrf_k, enable_rerank, rerank_model, score_threshold, context_threshold, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 name,
@@ -2236,6 +2242,7 @@ def update_retrieval_settings(
                 1 if enable_rerank else 0,
                 rerank_model,
                 score_threshold if score_threshold is not None else 0.0,
+                context_threshold if context_threshold is not None else 0.3,
                 now,
                 now,
             ),
@@ -2255,6 +2262,7 @@ def update_retrieval_settings(
         ("rrf_k", rrf_k),
         ("rerank_model", rerank_model),
         ("score_threshold", score_threshold),
+        ("context_threshold", context_threshold),
     ]:
         if val is not None:
             fields.append(f"{col} = ?")
