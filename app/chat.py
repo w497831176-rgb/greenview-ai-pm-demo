@@ -13,6 +13,7 @@ A full-power chat endpoint for web clients.
 - Supports human handoff for owner escalation.
 """
 
+import asyncio
 import json
 import os
 import re
@@ -68,6 +69,50 @@ def _estimate_tokens(text: str) -> int:
         return len(_tiktoken_encoding.encode(text))
     except Exception:
         return 0
+
+
+class ObservableMCPTools:
+    """Wrapper around Agno MCPTools that records every tool invocation.
+
+    Agno's streaming chunks do not surface MCP tool-call metadata, so we wrap
+    each registered function's entrypoint to capture the tool name and
+    arguments actually passed to the MCP server.  The recorded calls are then
+    included in the SSE `done` event and persisted with the chat message.
+    """
+
+    def __init__(self, tool: Any):
+        self._tool = tool
+        self.recorded_calls: List[Dict[str, Any]] = []
+        # Forward common attributes so callers can treat this as the toolkit.
+        self.name = getattr(tool, "name", "mcp-server")
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._tool, name)
+
+    async def build_tools(self) -> None:
+        # Let MCPTools discover and register functions against the MCP server.
+        await self._tool.build_tools()
+        # Wrap each registered function entrypoint so we can observe invocations.
+        for fn_name, fn in (getattr(self._tool, "functions", None) or {}).items():
+            original = getattr(fn, "entrypoint", None)
+            if original is None:
+                continue
+            wrapped = self._wrap(original, fn_name)
+            fn.entrypoint = wrapped
+
+    def _wrap(self, original: Any, fn_name: str):
+        if asyncio.iscoroutinefunction(original):
+            async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
+                args_dict = kwargs if kwargs else (args[0] if args else {})
+                self.recorded_calls.append({"tool_name": fn_name, "arguments": args_dict})
+                return await original(*args, **kwargs)
+            return async_wrapper
+
+        def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
+            args_dict = kwargs if kwargs else (args[0] if args else {})
+            self.recorded_calls.append({"tool_name": fn_name, "arguments": args_dict})
+            return original(*args, **kwargs)
+        return sync_wrapper
 
 
 # Default owner context used when the web page simulates owner "3-2-1201 王先生".
@@ -270,14 +315,14 @@ def _build_mcp_tools(agent_id: Optional[str] = None) -> List[Any]:
                 full_command = command
                 if args:
                     full_command = shlex.join([command] + list(args))
-                tool = MCPTools(
+                raw_tool = MCPTools(
                     command=full_command,
                     env=merged_env,
                     name=name,
                     transport="stdio",
                     timeout_seconds=15,
                 )
-                tools.append(tool)
+                tools.append(ObservableMCPTools(raw_tool))
             except Exception:
                 # If a single MCP server fails to initialize, log and continue.
                 import traceback
@@ -573,6 +618,16 @@ async def _stream_agent_response(
                         token_detail["cached_tokens"] = int(metrics.cached_tokens)
                 except Exception:
                     pass
+
+        # Streaming chunks do not expose MCP tool-call metadata.  Collect any
+        # invocations recorded by our ObservableMCPTools wrappers so the front
+        # end and acceptance tests can see real tool usage.
+        for toolkit in mcp_tools:
+            if hasattr(toolkit, "recorded_calls") and toolkit.recorded_calls:
+                for call in toolkit.recorded_calls:
+                    if call not in tool_calls:
+                        tool_calls.append(call)
+                        yield f"event: tool_calls\ndata: {json.dumps({'tool_calls': [call], 'current_agent': current_agent})}\n\n"
 
         # Derive token_count from total_tokens or input+output when possible.
         if token_detail["total_tokens"]:
