@@ -262,6 +262,10 @@ def init_db():
             token_detail TEXT,
             citations TEXT,
             activated_skills TEXT,
+            route_intent TEXT,
+            route_reason TEXT,
+            current_agent TEXT,
+            tool_calls TEXT,
             created_at TEXT
         )
         """
@@ -298,6 +302,16 @@ def init_db():
         cursor.execute("ALTER TABLE chat_messages ADD COLUMN activated_skills TEXT")
     except sqlite3.OperationalError:
         pass
+    for col, dtype in [
+        ("route_intent", "TEXT"),
+        ("route_reason", "TEXT"),
+        ("current_agent", "TEXT"),
+        ("tool_calls", "TEXT"),
+    ]:
+        try:
+            cursor.execute(f"ALTER TABLE chat_messages ADD COLUMN {col} {dtype}")
+        except sqlite3.OperationalError:
+            pass
 
     # Migration: add RAG columns to existing knowledge_docs table.
     for col, dtype in [
@@ -1813,12 +1827,16 @@ def save_chat_message(
     token_detail: Optional[Dict[str, Any]] = None,
     citations: Optional[List[Dict[str, Any]]] = None,
     activated_skills: Optional[List[str]] = None,
+    route_intent: Optional[str] = None,
+    route_reason: Optional[str] = None,
+    current_agent: Optional[str] = None,
+    tool_calls: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     now = now_cn()
     conn = _get_conn()
     cursor = conn.cursor()
     cursor.execute(
-        "INSERT INTO chat_messages (session_id, role, content, token_count, token_detail, citations, activated_skills, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO chat_messages (session_id, role, content, token_count, token_detail, citations, activated_skills, route_intent, route_reason, current_agent, tool_calls, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             session_id,
             role,
@@ -1827,6 +1845,10 @@ def save_chat_message(
             json.dumps(token_detail) if token_detail else None,
             json.dumps(citations) if citations else None,
             json.dumps(activated_skills) if activated_skills else None,
+            route_intent,
+            route_reason,
+            current_agent,
+            json.dumps(tool_calls) if tool_calls else None,
             now,
         ),
     )
@@ -1857,7 +1879,7 @@ def list_chat_messages(session_id: str) -> List[Dict[str, Any]]:
     messages = []
     for r in rows:
         msg = dict(r)
-        for json_col in ("token_detail", "citations", "activated_skills"):
+        for json_col in ("token_detail", "citations", "activated_skills", "tool_calls"):
             if msg.get(json_col):
                 try:
                     msg[json_col] = json.loads(msg[json_col])
