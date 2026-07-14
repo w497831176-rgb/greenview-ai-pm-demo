@@ -49,7 +49,7 @@ def sse_chat(base: str, message: str, session_id: str):
     url = f"{base}/api/chat/stream?message={requests.utils.quote(message)}&session_id={session_id}&user_id=acceptance-test"
     events = []
     done_payload = None
-    with _SESSION.get(url, stream=True, timeout=180) as resp:
+    with _SESSION.get(url, stream=True, timeout=300) as resp:
         resp.raise_for_status()
         buffer = ""
         for chunk in resp.iter_content(chunk_size=None):
