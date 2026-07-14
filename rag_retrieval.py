@@ -33,6 +33,16 @@ def _tokenize(text: str) -> List[str]:
     return tokens
 
 
+def _context_relevance_score(query: str, content: str) -> float:
+    """Compute a query-centric lexical overlap score in [0, 1]."""
+    query_tokens = set(_tokenize(query))
+    if not query_tokens:
+        return 0.0
+    content_tokens = set(_tokenize(content))
+    overlap = len(query_tokens & content_tokens)
+    return round(overlap / len(query_tokens), 4)
+
+
 def _build_keyword_index() -> Dict[int, Dict[str, int]]:
     """Build in-memory TF index for knowledge docs."""
     docs = db.list_knowledge_docs()
@@ -197,12 +207,15 @@ def advanced_search(
     enable_rerank = settings.get("enable_rerank", False)
     rerank_model = settings.get("rerank_model")
     score_threshold = settings.get("score_threshold", 0.0)
+    context_threshold = settings.get("context_threshold", 0.3)
 
     keyword_results = _keyword_search(query, top_k=top_k * 2)
     # Apply the configured similarity threshold to semantic matches before
     # fusing, so the threshold filters real semantic relevance rather than
     # the tiny RRF scores produced by rank fusion.
     semantic_results = _semantic_search(query, top_k=top_k * 2, threshold=score_threshold)
+    # Only business-indexed documents may be used as evidence.
+    semantic_results = [r for r in semantic_results if r.get("is_indexed")]
 
     fused = _rrf_fusion(
         keyword_results,
@@ -215,7 +228,20 @@ def advanced_search(
     if enable_rerank:
         fused = _rerank_results(query, fused, model_name=rerank_model)
 
-    results = fused[:top_k]
+    # Final grounded-evidence filter: only keep results that pass an
+    # independent query-content relevance threshold. This prevents weak keyword
+    # candidates (e.g. BM25 matches on generic terms) from becoming citations.
+    grounded = []
+    for r in fused:
+        if enable_rerank:
+            ctx_score = r.get("rerank_score", 0.0)
+        else:
+            ctx_score = _context_relevance_score(query, r.get("content", ""))
+        r["context_score"] = ctx_score
+        if ctx_score >= context_threshold:
+            grounded.append(r)
+
+    results = grounded[:top_k]
 
     return {
         "query": query,
@@ -237,9 +263,12 @@ def debug_search(
     enable_rerank: bool = False,
     rerank_model: Optional[str] = None,
     score_threshold: Optional[float] = None,
+    context_threshold: Optional[float] = None,
     expected_doc_title: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Debug endpoint exposing each retrieval stage."""
+    score_threshold = score_threshold or 0.0
+    context_threshold = context_threshold if context_threshold is not None else 0.3
     settings = {
         "top_k": top_k,
         "keyword_weight": keyword_weight,
@@ -247,13 +276,23 @@ def debug_search(
         "rrf_k": rrf_k,
         "enable_rerank": enable_rerank,
         "rerank_model": rerank_model,
-        "score_threshold": score_threshold or 0.0,
+        "score_threshold": score_threshold,
+        "context_threshold": context_threshold,
     }
     keyword_results = _keyword_search(query, top_k=top_k * 2)
     semantic_results = _semantic_search(query, top_k=top_k * 2, threshold=score_threshold)
+    # Expose unfiltered semantic candidates in debug, but flag those that would
+    # be removed by the business-index gate.
+    semantic_results_debug = []
+    for r in semantic_results:
+        r_debug = dict(r)
+        r_debug["_filtered_not_indexed"] = not r.get("is_indexed")
+        semantic_results_debug.append(r_debug)
+    semantic_results_indexed = [r for r in semantic_results if r.get("is_indexed")]
+
     fused = _rrf_fusion(
         keyword_results,
-        semantic_results,
+        semantic_results_indexed,
         k=rrf_k,
         keyword_weight=keyword_weight,
         semantic_weight=semantic_weight,
@@ -261,7 +300,18 @@ def debug_search(
     if enable_rerank:
         fused = _rerank_results(query, fused, model_name=rerank_model)
 
-    results = fused[:top_k]
+    # Apply the same grounded-evidence filter used in production.
+    grounded = []
+    for r in fused:
+        if enable_rerank:
+            ctx_score = r.get("rerank_score", 0.0)
+        else:
+            ctx_score = _context_relevance_score(query, r.get("content", ""))
+        r["context_score"] = ctx_score
+        if ctx_score >= context_threshold:
+            grounded.append(r)
+
+    results = grounded[:top_k]
 
     titles = [r.get("title") for r in results]
     top1_hit = bool(expected_doc_title and titles and titles[0] == expected_doc_title)
@@ -271,7 +321,7 @@ def debug_search(
         "query": query,
         "settings": settings,
         "keyword_results": keyword_results,
-        "semantic_results": semantic_results,
+        "semantic_results": semantic_results_debug,
         "fused_results": fused,
         "results": results,
         "count": len(results),

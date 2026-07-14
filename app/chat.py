@@ -190,6 +190,7 @@ def _build_rag_context(message: str, top_k: int = 3, threshold: Optional[float] 
             "enable_rerank": settings.get("enable_rerank", False),
             "rerank_model": settings.get("rerank_model"),
             "score_threshold": threshold if threshold is not None else settings.get("score_threshold", 0.0),
+            "context_threshold": settings.get("context_threshold", 0.3),
         }
         result = rag_retrieval.advanced_search(message, settings=settings_payload)
         results = result.get("results", [])
