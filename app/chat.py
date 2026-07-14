@@ -51,6 +51,55 @@ import rag_indexer
 import rag_retrieval
 import skill_storage
 
+# Optional MCP toolkit.  Import at module level so ObservableMCPTools can subclass it;
+# if extras are missing the fallback disables MCP loading gracefully.
+try:
+    from agno.tools.mcp import MCPTools
+except Exception:  # pragma: no cover
+    MCPTools = None  # type: ignore
+
+
+if MCPTools is not None:
+    class ObservableMCPTools(MCPTools):
+        """MCPTools subclass that records every tool invocation.
+
+        Agno's streaming chunks do not surface MCP tool-call metadata, so we
+        wrap each registered function's entrypoint to capture the tool name and
+        arguments actually passed to the MCP server.  The recorded calls are
+        then included in the SSE `done` event and persisted with the chat
+        message.
+        """
+
+        def __init__(self, *args: Any, **kwargs: Any):
+            super().__init__(*args, **kwargs)
+            self.recorded_calls: List[Dict[str, Any]] = []
+
+        async def build_tools(self) -> None:
+            await super().build_tools()
+            for fn_name, fn in (getattr(self, "functions", None) or {}).items():
+                original = getattr(fn, "entrypoint", None)
+                if original is None:
+                    continue
+                wrapped = self._wrap(original, fn_name)
+                fn.entrypoint = wrapped
+
+        def _wrap(self, original: Any, fn_name: str):
+            if asyncio.iscoroutinefunction(original):
+                async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
+                    args_dict = kwargs if kwargs else (args[0] if args else {})
+                    self.recorded_calls.append({"tool_name": fn_name, "arguments": args_dict})
+                    return await original(*args, **kwargs)
+                return async_wrapper
+
+            def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
+                args_dict = kwargs if kwargs else (args[0] if args else {})
+                self.recorded_calls.append({"tool_name": fn_name, "arguments": args_dict})
+                return original(*args, **kwargs)
+            return sync_wrapper
+else:
+    ObservableMCPTools = None  # type: ignore
+
+
 router = APIRouter(prefix="/api/chat", tags=["chat"])
 
 # Tokenizer fallback when the model does not report token metrics in streaming chunks.
@@ -71,51 +120,6 @@ def _estimate_tokens(text: str) -> int:
         return 0
 
 
-class ObservableMCPTools:
-    """Wrapper around Agno MCPTools that records every tool invocation.
-
-    Agno's streaming chunks do not surface MCP tool-call metadata, so we wrap
-    each registered function's entrypoint to capture the tool name and
-    arguments actually passed to the MCP server.  The recorded calls are then
-    included in the SSE `done` event and persisted with the chat message.
-    """
-
-    def __init__(self, tool: Any):
-        self._tool = tool
-        self.recorded_calls: List[Dict[str, Any]] = []
-        # Forward common attributes so callers can treat this as the toolkit.
-        self.name = getattr(tool, "name", "mcp-server")
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self._tool, name)
-
-    async def build_tools(self) -> None:
-        # Let MCPTools discover and register functions against the MCP server.
-        await self._tool.build_tools()
-        # Wrap each registered function entrypoint so we can observe invocations.
-        for fn_name, fn in (getattr(self._tool, "functions", None) or {}).items():
-            original = getattr(fn, "entrypoint", None)
-            if original is None:
-                continue
-            wrapped = self._wrap(original, fn_name)
-            fn.entrypoint = wrapped
-
-    def _wrap(self, original: Any, fn_name: str):
-        if asyncio.iscoroutinefunction(original):
-            async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
-                args_dict = kwargs if kwargs else (args[0] if args else {})
-                self.recorded_calls.append({"tool_name": fn_name, "arguments": args_dict})
-                return await original(*args, **kwargs)
-            return async_wrapper
-
-        def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
-            args_dict = kwargs if kwargs else (args[0] if args else {})
-            self.recorded_calls.append({"tool_name": fn_name, "arguments": args_dict})
-            return original(*args, **kwargs)
-        return sync_wrapper
-
-
-# Default owner context used when the web page simulates owner "3-2-1201 王先生".
 DEFAULT_ROOM_ID = "3-2-1201"
 DEFAULT_OWNER_NAME = "王先生"
 
@@ -294,8 +298,8 @@ def _build_mcp_tools(agent_id: Optional[str] = None) -> List[Any]:
             candidate_servers = [all_servers[name] for name in bound_names if name in all_servers]
         if not candidate_servers:
             return tools
-        # Delay import so the module can still load if mcp extras are missing.
-        from agno.tools.mcp import MCPTools
+        if ObservableMCPTools is None:
+            return tools
 
         for server in candidate_servers:
             command = server.get("command")
@@ -315,14 +319,13 @@ def _build_mcp_tools(agent_id: Optional[str] = None) -> List[Any]:
                 full_command = command
                 if args:
                     full_command = shlex.join([command] + list(args))
-                raw_tool = MCPTools(
+                tools.append(ObservableMCPTools(
                     command=full_command,
                     env=merged_env,
                     name=name,
                     transport="stdio",
                     timeout_seconds=15,
-                )
-                tools.append(ObservableMCPTools(raw_tool))
+                ))
             except Exception:
                 # If a single MCP server fails to initialize, log and continue.
                 import traceback
