@@ -8,7 +8,6 @@ YIAI物业 V1.2｜AI 智能客服与工单协同原型
 
 import asyncio
 from contextlib import asynccontextmanager
-from pathlib import Path
 
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -153,7 +152,6 @@ agent_os = AgentOS(
     lifespan=lifespan,
     db=agent_db,
     agents=[property_agent],
-    config=str(Path(__file__).parent / "config.yaml"),
 )
 
 app = agent_os.get_app()
