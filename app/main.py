@@ -1,11 +1,9 @@
 """
-Demo AgentOS
-============
+YIAI物业 V1.2｜AI 智能客服与工单协同原型
+============================================
 
-The main entry point for Demo AgentOS.
-
-Run:
-    python -m app.main
+物业场景下可运行的最小 AgentOS 入口。
+仅挂载 V1.2 需要的 Property Agent、业务 API 与 RAG 能力。
 """
 
 import asyncio
@@ -17,16 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from agno.os import AgentOS
 from agno.os.config import AuthorizationConfig
 
-from agents.builder import builder
-from agents.dash import dash, dash_knowledge, dash_learnings
-from agents.infra import infra
-from agents.mcp import mcp_agent
 from agents.property import property_agent
-from agents.reporter import reporter
-from agents.studio import studio
-from agents.taskboard import taskboard
-from agents.travel import travel
-from agents.wechatbot import wechatbot
 from app.agents import router as agents_router
 from app.badcases import router as badcases_router
 from app.chat import router as chat_router
@@ -34,41 +23,11 @@ from app.knowledge import retrieval_router, router as knowledge_router
 from app.mcp import discover_all_mcp_tools, router as mcp_router
 from app.model_configs import router as model_configs_router
 from app.models_compat import router as models_compat_router
-from app.registry import registry
 from app.skills import router as skills_router
-from app.settings import RUNTIME_ENV, SCHEDULER_BASE_URL, SLACK_SIGNING_SECRET, SLACK_TOKEN, agent_db
-from app.wechat_webhook import router as wechat_webhook_router
+from app.settings import RUNTIME_ENV, agent_db
 from app.work_orders import router as work_orders_router
 from db.property_db import init_db
 from rag_store import init_vector_store
-from frameworks.claude_repo import claude_repo
-from frameworks.dspy_math import dspy_math
-from frameworks.langgraph_debate import langgraph_debate
-from teams.clinic import clinic, clinic_knowledge
-from teams.coach import coach_learnings, coach_team
-from teams.research import research_coordinate
-from workflows.ai_research import ai_research
-from workflows.classifier import classifier
-from workflows.content_pipeline import content_pipeline
-from workflows.repo_walkthrough import repo_walkthrough
-from workflows.support_bot import support_bot
-
-# ---------------------------------------------------------------------------
-# Interfaces
-# ---------------------------------------------------------------------------
-interfaces: list = []
-if SLACK_TOKEN and SLACK_SIGNING_SECRET:
-    from agno.os.interfaces.slack import Slack
-
-    interfaces.append(
-        Slack(
-            agent=mcp_agent,
-            streaming=True,
-            token=SLACK_TOKEN,
-            signing_secret=SLACK_SIGNING_SECRET,
-            resolve_user_identity=True,
-        )
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -88,7 +47,6 @@ async def lifespan(app):  # type: ignore[no-untyped-def]
     except Exception:
         import traceback
         traceback.print_exc()
-    _register_schedules()
     yield
 
 
@@ -188,49 +146,13 @@ def _seed_default_agents() -> None:
 # Create AgentOS
 # ---------------------------------------------------------------------------
 agent_os = AgentOS(
-    name="Demo OS",
+    name="YIAI物业 V1.2",
     tracing=True,
-    scheduler=True,
-    scheduler_base_url=SCHEDULER_BASE_URL,
-    authorization=RUNTIME_ENV == "prd",
-    authorization_config=AuthorizationConfig(user_isolation=True),
+    scheduler=False,
+    authorization=False,
     lifespan=lifespan,
     db=agent_db,
-    agents=[
-        mcp_agent,
-        reporter,
-        builder,
-        infra,
-        studio,
-        taskboard,
-        travel,
-        wechatbot,
-        property_agent,
-        claude_repo,  # type: ignore[list-item]
-        langgraph_debate,  # type: ignore[list-item]
-        dspy_math,  # type: ignore[list-item]
-    ],
-    teams=[
-        dash,
-        coach_team,
-        clinic,
-        research_coordinate,
-    ],
-    workflows=[
-        classifier,
-        content_pipeline,
-        repo_walkthrough,
-        support_bot,
-        ai_research,
-    ],
-    knowledge=[
-        dash_knowledge,
-        dash_learnings,
-        clinic_knowledge,
-        coach_learnings,
-    ],
-    interfaces=interfaces,
-    registry=registry,
+    agents=[property_agent],
     config=str(Path(__file__).parent / "config.yaml"),
 )
 
@@ -250,7 +172,6 @@ app.add_middleware(
 # ---------------------------------------------------------------------------
 # Extra routes
 # ---------------------------------------------------------------------------
-app.include_router(wechat_webhook_router)
 app.include_router(chat_router)
 app.include_router(work_orders_router)
 app.include_router(knowledge_router)
@@ -265,25 +186,6 @@ app.include_router(badcases_router, prefix="/api/badcases")
 app.include_router(badcases_router, prefix="/api/knowledge/badcases")
 # Retrieval endpoints under /api/retrieval (test cases).
 app.include_router(retrieval_router, prefix="/api/retrieval")
-
-
-# ---------------------------------------------------------------------------
-# Schedules
-# ---------------------------------------------------------------------------
-def _register_schedules() -> None:
-    """Register all scheduled tasks (idempotent -- safe to run on every startup)."""
-    from agno.scheduler import ScheduleManager
-
-    mgr = ScheduleManager(agent_db)
-    mgr.create(
-        name="ai-digest",
-        cron="0 7 * * *",
-        endpoint="/workflows/ai-digest/runs",
-        payload={"message": "Run the daily AI research brief."},
-        timezone="UTC",
-        description="Daily parallel AI research",
-        if_exists="update",
-    )
 
 
 if __name__ == "__main__":
