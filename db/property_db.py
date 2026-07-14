@@ -312,6 +312,9 @@ def init_db():
         ("route_reason", "TEXT"),
         ("current_agent", "TEXT"),
         ("tool_calls", "TEXT"),
+        ("model_id", "TEXT"),
+        ("thinking_enabled", "INTEGER"),
+        ("model_selection_reason", "TEXT"),
     ]:
         try:
             cursor.execute(f"ALTER TABLE chat_messages ADD COLUMN {col} {dtype}")
@@ -419,6 +422,10 @@ def init_db():
     if cursor.fetchone()[0] == 0:
         _seed_model_configs(cursor)
         conn.commit()
+
+    # Always repair existing catalog so runtime policy stays in sync.
+    _migrate_model_configs(cursor)
+    conn.commit()
 
     conn.close()
 
@@ -1038,28 +1045,28 @@ def _seed_model_configs(cursor):
     now = now_cn("%Y-%m-%d %H:%M")
     configs = [
         (
-            "deepseek-v4-pro",
-            "DeepSeek V4 Pro",
+            "deepseek-v4-flash",
+            "DeepSeek V4 Flash",
             "deepseek",
             None,
             "https://api.deepseek.com",
             json.dumps({"use_thinking": True}),
             1,
             1,
-            "深度思考模型，适合复杂推理和维修决策。",
+            "常规文本 Router 与垂直 Agent 主力模型",
             now,
             now,
         ),
         (
-            "deepseek-v4-flash",
-            "DeepSeek V4 Flash",
+            "deepseek-v4-pro",
+            "DeepSeek V4 Pro",
             "deepseek",
             None,
             "https://api.deepseek.com",
-            json.dumps({"use_thinking": False}),
+            json.dumps({"use_thinking": True}),
             0,
             1,
-            "快速响应模型，适合简单问答和初筛。",
+            "后台 A/B 与 Darwin 深度复盘模型",
             now,
             now,
         ),
@@ -1071,6 +1078,51 @@ def _seed_model_configs(cursor):
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         configs,
+    )
+
+
+def _migrate_model_configs(cursor):
+    """Idempotently align SQLite model catalog with runtime policy.
+
+    Flash is the single default; Pro is enabled but not default; both use
+    thinking. This runs after seeding so existing deployments are repaired.
+    """
+    now = now_cn("%Y-%m-%d %H:%M")
+    updates = [
+        (
+            "deepseek-v4-flash",
+            "DeepSeek V4 Flash",
+            json.dumps({"use_thinking": True}),
+            1,
+            1,
+            "常规文本 Router 与垂直 Agent 主力模型",
+        ),
+        (
+            "deepseek-v4-pro",
+            "DeepSeek V4 Pro",
+            json.dumps({"use_thinking": True}),
+            0,
+            1,
+            "后台 A/B 与 Darwin 深度复盘模型",
+        ),
+    ]
+    for model_id, name, params, is_default, enabled, description in updates:
+        cursor.execute(
+            """
+            UPDATE model_configs
+            SET name = ?, model_params = ?, is_default = ?, enabled = ?, description = ?, updated_at = ?
+            WHERE model_id = ?
+            """,
+            (name, params, is_default, enabled, description, now, model_id),
+        )
+    # Ensure no other row accidentally remains default.
+    cursor.execute(
+        """
+        UPDATE model_configs
+        SET is_default = 0
+        WHERE model_id != ? AND is_default = 1
+        """,
+        ("deepseek-v4-flash",),
     )
 
 
@@ -1836,12 +1888,21 @@ def save_chat_message(
     route_reason: Optional[str] = None,
     current_agent: Optional[str] = None,
     tool_calls: Optional[List[Dict[str, Any]]] = None,
+    model_id: Optional[str] = None,
+    thinking_enabled: Optional[bool] = None,
+    model_selection_reason: Optional[str] = None,
 ) -> Dict[str, Any]:
     now = now_cn()
     conn = _get_conn()
     cursor = conn.cursor()
     cursor.execute(
-        "INSERT INTO chat_messages (session_id, role, content, token_count, token_detail, citations, activated_skills, route_intent, route_reason, current_agent, tool_calls, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        """
+        INSERT INTO chat_messages (
+            session_id, role, content, token_count, token_detail, citations, activated_skills,
+            route_intent, route_reason, current_agent, tool_calls, model_id, thinking_enabled,
+            model_selection_reason, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
         (
             session_id,
             role,
@@ -1854,6 +1915,9 @@ def save_chat_message(
             route_reason,
             current_agent,
             json.dumps(tool_calls) if tool_calls else None,
+            model_id,
+            1 if thinking_enabled else 0,
+            model_selection_reason,
             now,
         ),
     )
@@ -1863,13 +1927,24 @@ def save_chat_message(
     return get_chat_message(message_id)
 
 
+def _normalize_chat_message(msg: Dict[str, Any]) -> Dict[str, Any]:
+    for json_col in ("token_detail", "citations", "activated_skills", "tool_calls"):
+        if msg.get(json_col):
+            try:
+                msg[json_col] = json.loads(msg[json_col])
+            except Exception:
+                pass
+    msg["thinking_enabled"] = bool(msg.get("thinking_enabled"))
+    return msg
+
+
 def get_chat_message(message_id: int) -> Optional[Dict[str, Any]]:
     conn = _get_conn()
     cursor = conn.cursor()
     cursor.execute("SELECT * FROM chat_messages WHERE id = ?", (message_id,))
     row = cursor.fetchone()
     conn.close()
-    return dict(row) if row else None
+    return _normalize_chat_message(dict(row)) if row else None
 
 
 def list_chat_messages(session_id: str) -> List[Dict[str, Any]]:
@@ -1883,13 +1958,7 @@ def list_chat_messages(session_id: str) -> List[Dict[str, Any]]:
     conn.close()
     messages = []
     for r in rows:
-        msg = dict(r)
-        for json_col in ("token_detail", "citations", "activated_skills", "tool_calls"):
-            if msg.get(json_col):
-                try:
-                    msg[json_col] = json.loads(msg[json_col])
-                except Exception:
-                    pass
+        msg = _normalize_chat_message(dict(r))
         messages.append(msg)
     return messages
 

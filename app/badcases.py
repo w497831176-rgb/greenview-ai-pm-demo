@@ -378,7 +378,9 @@ async def darwin_fix(case_id: int, request: DarwinFixRequest = DarwinFixRequest(
     if request.prompt:
         prompt = f"{request.prompt}\n\n{prompt}"
 
-    fix_plan = await _llm_generate(prompt)
+    # Darwin deep-fix always runs on Pro; normal classify/retest stay on Flash.
+    darwin_model = build_model("deepseek-v4-pro")
+    fix_plan = await _llm_generate(prompt, model=darwin_model)
 
     # Move from classified -> fixing.
     before = case["status"]
@@ -389,8 +391,19 @@ async def darwin_fix(case_id: int, request: DarwinFixRequest = DarwinFixRequest(
         fix_plan=fix_plan,
         status=new_status,
     )
-    _record_action(case_id, "darwin-fix", {"fix_plan": fix_plan, "skill_used": bool(darwin)}, before, new_status)
-    return {"badcase": _enrich_badcase(updated), "fix_plan": fix_plan, "darwin_skill_found": bool(darwin)}
+    _record_action(
+        case_id,
+        "darwin-fix",
+        {"fix_plan": fix_plan, "skill_used": bool(darwin), "model_id": "deepseek-v4-pro"},
+        before,
+        new_status,
+    )
+    return {
+        "badcase": _enrich_badcase(updated),
+        "fix_plan": fix_plan,
+        "model_id": "deepseek-v4-pro",
+        "darwin_skill_found": bool(darwin),
+    }
 
 
 @router.post("/{case_id}/retry")
@@ -418,22 +431,8 @@ async def switch_model_retry(case_id: int, request: SwitchModelRetryRequest = Sw
     if not user_message:
         raise HTTPException(status_code=400, detail="user_message or source_message_id required")
 
-    # Prefer explicit model_id, otherwise switch from default pro to flash or vice versa.
-    model_id = request.model_id
-    if not model_id:
-        from db.property_db import get_default_model_config, list_model_configs
-        configs = list_model_configs()
-        default = get_default_model_config()
-        default_id = default.get("model_id") if default else None
-        for cfg in configs:
-            if cfg.get("enabled") and cfg.get("model_id") != default_id:
-                model_id = cfg["model_id"]
-                break
-        if not model_id and configs:
-            model_id = configs[0].get("model_id")
-
-    if not model_id:
-        raise HTTPException(status_code=400, detail="no alternative model available")
+    # Prefer explicit model_id; otherwise retry with the runtime default Flash.
+    model_id = request.model_id or "deepseek-v4-flash"
 
     alt_model = build_model(model_id)
     prompt = (
