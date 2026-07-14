@@ -9,7 +9,7 @@ Includes keyword search, semantic RAG search, chunk management and evaluation.
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Query
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from db.property_db import (
     create_badcase as db_create_badcase,
