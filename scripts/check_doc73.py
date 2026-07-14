@@ -15,6 +15,16 @@ import os
 import sys
 
 import requests
+import urllib3
+
+urllib3.disable_warnings()
+
+
+def _session():
+    s = requests.Session()
+    s.verify = False
+    s.proxies = {"http": None, "https": None}
+    return s
 
 
 def main():
@@ -24,8 +34,10 @@ def main():
     args = parser.parse_args()
     base = args.base_url.rstrip("/")
 
+    session = _session()
+
     # List docs and find the test badcase doc by title (we only read, not hardcode id).
-    resp = requests.get(f"{base}/api/knowledge/docs", timeout=30)
+    resp = session.get(f"{base}/api/knowledge/docs", timeout=30)
     resp.raise_for_status()
     docs = resp.json().get("knowledge_docs", [])
 
@@ -43,7 +55,7 @@ def main():
 
     if args.disable and target.get("is_indexed"):
         doc_id = target["id"]
-        patch_resp = requests.patch(
+        patch_resp = session.patch(
             f"{base}/api/knowledge/docs/{doc_id}/indexed",
             json={"is_indexed": False},
             timeout=30,
