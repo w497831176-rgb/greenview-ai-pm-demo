@@ -71,6 +71,7 @@ INSTRUCTIONS = [
     "工单创建成功后，必须告知工单号和预计处理时间。",
     "查询工单时调用 query_work_order 工具。",
     "当业主问题涉及天气、暴雨、台风、气温、湿度、天气预报等气象信息时，必须调用已绑定的 weather-server MCP 工具的 get_current_weather 函数获取实时天气，禁止基于自身知识或网络搜索猜测。",
+    "当业主查询工单数量、待办工单、工单统计或维修进度概览时，必须调用已绑定的 workorder-server MCP 工具的 count_work_orders 或 list_pending_work_orders 函数，禁止基于自身知识猜测。",
     "回复简洁专业，关键信息高亮，使用中文。",
 ]
 

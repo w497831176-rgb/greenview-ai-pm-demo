@@ -70,7 +70,7 @@ class IndexedFlagUpdate(BaseModel):
 
 class DebugSearchRequest(BaseModel):
     query: str
-    top_k: int = 3
+    top_k: int = Field(3, ge=1, le=10)
     threshold: Optional[float] = None
     expected_doc_title: Optional[str] = None
 
@@ -90,7 +90,7 @@ class BadcaseUpdate(BaseModel):
 
 
 class RetrievalSettingsUpdate(BaseModel):
-    top_k: int = 5
+    top_k: int = Field(5, ge=1, le=10)
     keyword_weight: float = 0.3
     semantic_weight: float = 0.7
     rrf_k: int = 60
@@ -102,7 +102,7 @@ class RetrievalSettingsUpdate(BaseModel):
 
 class RetrievalDebugRequest(BaseModel):
     query: str
-    top_k: int = 5
+    top_k: int = Field(5, ge=1, le=10)
     keyword_weight: float = 0.3
     semantic_weight: float = 0.7
     rrf_k: int = 60
@@ -362,7 +362,7 @@ async def toggle_doc_indexed(doc_id: int, request: IndexedFlagUpdate):
 @router.get("/search")
 async def search_docs(
     query: str = Query(...),
-    top_k: int = Query(3),
+    top_k: int = Query(3, ge=1, le=10),
     mode: str = Query("keyword"),
     threshold: Optional[float] = Query(None),
 ):
