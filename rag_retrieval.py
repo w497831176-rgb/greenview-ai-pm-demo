@@ -66,9 +66,12 @@ def _build_keyword_index() -> Dict[int, Dict[str, int]]:
 
 
 def _keyword_search(query: str, top_k: int = 10) -> List[Dict[str, Any]]:
-    """BM25-style keyword search over knowledge documents.
+    """BM25-style keyword search over knowledge chunks.
 
-    Uses a simple TF/IDF scoring so it works without external FTS engines.
+    Documents are first matched by their full title+content TF index, then
+    expanded into their indexed chunks so every result points to an exact
+    chunk.  This keeps citations chunk-accurate instead of falling back to
+    the document's first chunk.
     """
     query_tokens = _tokenize(query)
     if not query_tokens:
@@ -86,10 +89,10 @@ def _keyword_search(query: str, top_k: int = 10) -> List[Dict[str, Any]]:
                 df[t] = df.get(t, 0) + 1
 
     N = len(index) or 1
-    scored = []
+    scored_docs = []
     for doc_id, tf in index.items():
         doc = doc_map.get(doc_id)
-        if not doc:
+        if not doc or not doc.get("is_indexed"):
             continue
         doc_len = sum(tf.values()) or 1
         score = 0.0
@@ -105,11 +108,50 @@ def _keyword_search(query: str, top_k: int = 10) -> List[Dict[str, Any]]:
             denom = f + k1 * (1 - b + b * (doc_len / avg_len))
             score += idf * (f * (k1 + 1)) / denom
         if score > 0:
-            scored.append((score, doc))
+            scored_docs.append((score, doc))
 
-    scored.sort(key=lambda x: x[0], reverse=True)
+    scored_docs.sort(key=lambda x: x[0], reverse=True)
+
+    # Expand top matching documents into their indexed chunks and re-rank by chunk.
+    chunk_scores: List[tuple] = []
+    all_chunks: List[Dict[str, Any]] = []
+    for _, doc in scored_docs[:top_k]:
+        chunks = rag_store.list_chunks_for_doc(doc["id"])
+        if not chunks:
+            continue
+        title_tokens = _tokenize(doc.get("title") or "")
+        for chunk in chunks:
+            chunk_tokens = _tokenize(chunk.get("content", ""))
+            # Inject title terms into each chunk so the document title still contributes.
+            tokens = title_tokens + chunk_tokens
+            tf_chunk: Dict[str, int] = {}
+            for t in tokens:
+                tf_chunk[t] = tf_chunk.get(t, 0) + 1
+            all_chunks.append({"chunk": chunk, "doc": doc, "tf": tf_chunk, "len": len(tokens)})
+
+    if not all_chunks:
+        return []
+
+    avg_chunk_len = sum(c["len"] for c in all_chunks) / len(all_chunks) or 1
+    for item in all_chunks:
+        tf_chunk = item["tf"]
+        chunk_len = item["len"] or 1
+        score = 0.0
+        for t in query_tokens:
+            f = tf_chunk.get(t, 0)
+            if f == 0:
+                continue
+            idf = math.log((N - df.get(t, 0) + 0.5) / (df.get(t, 0) + 0.5) + 1.0)
+            denom = f + 1.5 * (1 - 0.75 + 0.75 * (chunk_len / avg_chunk_len))
+            score += idf * (f * 2.5) / denom
+        if score > 0:
+            chunk_scores.append((score, item))
+
+    chunk_scores.sort(key=lambda x: x[0], reverse=True)
     results = []
-    for score, doc in scored[:top_k]:
+    for score, item in chunk_scores[:top_k]:
+        doc = item["doc"]
+        chunk = item["chunk"]
         results.append({
             "id": doc["id"],
             "title": doc.get("title"),
@@ -117,8 +159,8 @@ def _keyword_search(query: str, top_k: int = 10) -> List[Dict[str, Any]]:
             "doc_id": doc["id"],
             "doc_title": doc.get("title"),
             "doc_category": doc.get("category"),
-            "chunk_index": None,
-            "content": (doc.get("content") or "")[:800],
+            "chunk_index": chunk.get("chunk_index"),
+            "content": chunk.get("content", ""),
             "score": round(score, 4),
             "source": "keyword",
         })
@@ -126,10 +168,33 @@ def _keyword_search(query: str, top_k: int = 10) -> List[Dict[str, Any]]:
 
 
 def _semantic_search(query: str, top_k: int = 10, threshold: Optional[float] = None) -> List[Dict[str, Any]]:
-    """Semantic search wrapper returning doc-level results."""
-    results = rag_indexer.semantic_search(query, top_k=top_k, threshold=threshold)
-    for r in results:
-        r["source"] = "semantic"
+    """Semantic search returning chunk-level results.
+
+    Unlike the indexer wrapper, this does not deduplicate by document so that
+    multiple relevant chunks from the same document can surface as independent
+    evidence.
+    """
+    effective_threshold = rag_indexer._effective_threshold(threshold)
+    query_embedding = rag_embeddings.embed_text(query)
+    chunks = rag_store.search_chunks(query_embedding, top_k=top_k, threshold=effective_threshold)
+    results = []
+    for chunk in chunks:
+        doc = db.get_knowledge_doc(chunk.get("doc_id"))
+        if not doc or not doc.get("is_indexed"):
+            continue
+        results.append({
+            "id": doc["id"],
+            "title": doc.get("title"),
+            "category": doc.get("category"),
+            "doc_id": doc["id"],
+            "doc_title": doc.get("title"),
+            "doc_category": doc.get("category"),
+            "chunk_index": chunk.get("chunk_index"),
+            "content": chunk.get("content", ""),
+            "score": chunk.get("score", 0),
+            "is_indexed": bool(doc.get("is_indexed")),
+            "source": "semantic",
+        })
     return results
 
 
@@ -140,24 +205,28 @@ def _rrf_fusion(
     keyword_weight: float = 0.3,
     semantic_weight: float = 0.7,
 ) -> List[Dict[str, Any]]:
-    """Reciprocal Rank Fusion between keyword and semantic rankings."""
-    scores: Dict[int, float] = {}
-    details: Dict[int, Dict[str, Any]] = {}
+    """Reciprocal Rank Fusion between keyword and semantic chunk rankings.
+
+    Fusion key is (doc_id, chunk_index) so each chunk is an independent
+    candidate and citations stay chunk-accurate.
+    """
+    scores: Dict[tuple, float] = {}
+    details: Dict[tuple, Dict[str, Any]] = {}
 
     for rank, r in enumerate(keyword_results, start=1):
-        doc_id = r["id"]
-        scores[doc_id] = scores.get(doc_id, 0.0) + keyword_weight * (1.0 / (k + rank))
-        details[doc_id] = r
+        key = (r.get("doc_id"), r.get("chunk_index"))
+        scores[key] = scores.get(key, 0.0) + keyword_weight * (1.0 / (k + rank))
+        details[key] = r
 
     for rank, r in enumerate(semantic_results, start=1):
-        doc_id = r["id"]
-        scores[doc_id] = scores.get(doc_id, 0.0) + semantic_weight * (1.0 / (k + rank))
-        details[doc_id] = r
+        key = (r.get("doc_id"), r.get("chunk_index"))
+        scores[key] = scores.get(key, 0.0) + semantic_weight * (1.0 / (k + rank))
+        details[key] = r
 
     ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
     results = []
-    for doc_id, score in ranked:
-        r = dict(details[doc_id])
+    for key, score in ranked:
+        r = dict(details[key])
         r["rrf_score"] = round(score, 4)
         r["source"] = "fusion"
         results.append(r)

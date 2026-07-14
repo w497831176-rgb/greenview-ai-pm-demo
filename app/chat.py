@@ -131,19 +131,33 @@ def _skill_matches_trigger(skill: Dict[str, Any], message: str) -> bool:
     return False
 
 
-def _build_skill_context(message: str) -> tuple:
-    """Load enabled skills from DB, filter by trigger, and format as system context.
+def _build_skill_context(message: str, agent_id: Optional[str] = None) -> tuple:
+    """Load enabled skills bound to the current agent, filter by trigger.
 
     Returns (skill_context_string, activated_skill_names, skill_model_id).
+
+    Only skills explicitly bound to the current agent are considered. The
+    router agent is treated specially: it sees all enabled skills so that it
+    can reason about available capabilities when classifying intent.
     """
     try:
-        enabled_skills = [s for s in list_skills() if s.get("enabled")]
-        if not enabled_skills:
+        is_router = agent_id == "router"
+        if is_router:
+            candidate_skills = [s for s in list_skills() if s.get("enabled")]
+        else:
+            from db.property_db import get_agent_skills, get_skill
+
+            bound_skill_ids = get_agent_skills(agent_id) if agent_id else []
+            candidate_skills = [
+                get_skill(int(skill_id)) for skill_id in bound_skill_ids
+            ]
+            candidate_skills = [s for s in candidate_skills if s and s.get("enabled")]
+        if not candidate_skills:
             return "", [], None
         parts = []
         activated = []
         skill_model_id = None
-        for skill in enabled_skills:
+        for skill in candidate_skills:
             name = skill.get("name", "")
             instructions = skill_storage.build_instructions(skill.get("id"), skill)
             trigger = skill.get("trigger_condition", "")
@@ -155,9 +169,9 @@ def _build_skill_context(message: str) -> tuple:
             # platform capabilities and stay in context but are not listed.
             if trigger and triggered:
                 activated.append(name)
-                # Honor the first activated skill that requests a specific model.
+                # Owner-facing chat ignores any Skill model_id override.
                 if skill_model_id is None and skill.get("model_id"):
-                    skill_model_id = skill["model_id"]
+                    skill_model_id = None
             if trigger and not triggered:
                 continue
             header = f"【Skill：{name}】"
@@ -197,18 +211,20 @@ def _build_rag_context(message: str, top_k: int = 3, threshold: Optional[float] 
         results = result.get("results", [])
         if not results:
             return "", []
-        parts = ["\n\n[相关知识库片段（回答时请引用出处）："]
+        parts = ["\n\n[相关知识库片段（回答时请引用出处，每条引用必须对应下方确切分片）："]
         citations = []
         for i, r in enumerate(results, 1):
             title = r.get("doc_title") or "未知文档"
             content = r.get("content", "")
             score = r.get("score", 0)
-            parts.append(f"[引用{i}]《{title}》：{content}")
+            chunk_index = r.get("chunk_index")
+            parts.append(f"[引用{i}]《{title}》（分片 {chunk_index}）：{content}")
             citations.append({
                 "index": i,
                 "doc_title": title,
                 "doc_id": r.get("doc_id"),
-                "chunk_index": r.get("chunk_index"),
+                "chunk_index": chunk_index,
+                "content": content,
                 "score": score,
             })
         parts.append("]")
@@ -217,17 +233,26 @@ def _build_rag_context(message: str, top_k: int = 3, threshold: Optional[float] 
         return "", []
 
 
-def _build_mcp_tools() -> List[Any]:
-    """Load enabled MCP servers from DB and return Agno MCPTools instances."""
+def _build_mcp_tools(agent_id: Optional[str] = None) -> List[Any]:
+    """Load MCP servers bound to the current agent and return MCPTools instances."""
     tools = []
     try:
-        enabled_servers = [s for s in list_mcp_servers() if s.get("enabled")]
-        if not enabled_servers:
+        is_router = agent_id == "router"
+        if is_router:
+            candidate_servers = [s for s in list_mcp_servers() if s.get("enabled")]
+        else:
+            from db.property_db import get_agent_tools, list_mcp_servers
+
+            bound_tools = get_agent_tools(agent_id) if agent_id else []
+            bound_names = {t.get("tool_name") for t in bound_tools if t.get("tool_name")}
+            all_servers = {s.get("name"): s for s in list_mcp_servers() if s.get("enabled")}
+            candidate_servers = [all_servers[name] for name in bound_names if name in all_servers]
+        if not candidate_servers:
             return tools
         # Delay import so the module can still load if mcp extras are missing.
         from agno.tools.mcp import MCPTools
 
-        for server in enabled_servers:
+        for server in candidate_servers:
             command = server.get("command")
             args = server.get("args") or []
             env = server.get("env") or {}
@@ -264,14 +289,22 @@ def _build_mcp_tools() -> List[Any]:
     return tools
 
 
-def _format_mcp_context() -> str:
-    """Format enabled MCP server descriptions for the agent prompt."""
+def _format_mcp_context(agent_id: Optional[str] = None) -> str:
+    """Format MCP servers bound to the current agent for the agent prompt."""
     try:
-        enabled_servers = [s for s in list_mcp_servers() if s.get("enabled")]
-        if not enabled_servers:
+        is_router = agent_id == "router"
+        if is_router:
+            servers = [s for s in list_mcp_servers() if s.get("enabled")]
+        else:
+            from db.property_db import get_agent_tools, list_mcp_servers
+
+            bound_tools = get_agent_tools(agent_id) if agent_id else []
+            bound_names = {t.get("tool_name") for t in bound_tools if t.get("tool_name")}
+            servers = [s for s in list_mcp_servers() if s.get("enabled") and s.get("name") in bound_names]
+        if not servers:
             return ""
         parts = []
-        for server in enabled_servers:
+        for server in servers:
             name = server.get("name", "")
             description = server.get("description", "")
             if name:
@@ -311,6 +344,17 @@ def _select_agent(intent: str, tools: Optional[List[Any]] = None):
     return create_property_agent, "物业 Agent"
 
 
+def _agent_id_for_intent(intent: str) -> str:
+    """Return the canonical agent_id used for Skill/MCP binding lookups."""
+    return {
+        "maintenance": "maintenance",
+        "billing": "billing",
+        "complaint": "complaint",
+        "customer_service": "customer_service",
+        "other": "customer_service",
+    }.get(intent, "customer_service")
+
+
 def _extract_tool_calls(chunk: Any) -> List[Dict[str, Any]]:
     """Extract tool call metadata from an Agno streaming chunk if available."""
     tool_calls: List[Dict[str, Any]] = []
@@ -322,24 +366,33 @@ def _extract_tool_calls(chunk: Any) -> List[Dict[str, Any]]:
         if hasattr(candidate, "tool_calls") and candidate.tool_calls:
             for tc in candidate.tool_calls:
                 if isinstance(tc, dict):
-                    tool_calls.append(tc)
+                    tool_calls.append(_normalize_tool_call(tc))
                 else:
                     tool_calls.append({
-                        "tool": getattr(tc, "tool", getattr(tc, "name", "")),
+                        "tool_name": getattr(tc, "tool", getattr(tc, "name", "")),
                         "arguments": getattr(tc, "arguments", getattr(tc, "args", {})),
                     })
         elif hasattr(candidate, "tools") and candidate.tools:
             for t in candidate.tools:
                 if isinstance(t, dict):
-                    tool_calls.append(t)
+                    tool_calls.append(_normalize_tool_call(t))
                 else:
                     tool_calls.append({
-                        "tool": getattr(t, "name", getattr(t, "tool", "")),
+                        "tool_name": getattr(t, "name", getattr(t, "tool", "")),
                         "arguments": getattr(t, "arguments", getattr(t, "args", {})),
                     })
     except Exception:
         pass
     return tool_calls
+
+
+def _normalize_tool_call(tc: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize a tool-call dict so the frontend can render a stable tool name."""
+    name = tc.get("tool_name") or tc.get("name") or tc.get("tool") or ""
+    return {
+        "tool_name": name,
+        "arguments": tc.get("arguments") or tc.get("args") or {},
+    }
 
 
 class ChatRequest(BaseModel):
@@ -411,18 +464,18 @@ async def _stream_agent_response(
         # Classify intent and dispatch to the appropriate vertical agent.
         intent_result = await classify_intent(message, user_id=user_id, session_id=session_id)
         intent = intent_result.get("intent", "other")
-        current_agent = intent_result.get("intent", "property_agent")
         create_agent_fn, agent_name = _select_agent(intent)
         current_agent = agent_name
+        current_agent_id = _agent_id_for_intent(intent)
 
         # Yield routing event so the UI can show which agent is handling the request.
         yield f"event: route\ndata: {json.dumps({'intent': intent, 'reason': intent_result.get('reason', ''), 'current_agent': current_agent})}\n\n"
 
-        # Build dynamic context and tools.
-        skill_context, activated_skills, skill_model_id = _build_skill_context(message)
+        # Build dynamic context and tools scoped to the current vertical agent.
+        skill_context, activated_skills, skill_model_id = _build_skill_context(message, agent_id=current_agent_id)
         rag_context, citations = _build_rag_context(message)
-        mcp_context = _format_mcp_context()
-        mcp_tools = _build_mcp_tools()
+        mcp_context = _format_mcp_context(agent_id=current_agent_id)
+        mcp_tools = _build_mcp_tools(agent_id=current_agent_id)
 
         # If no relevant knowledge was retrieved, record a badcase for the gap
         # and instruct the agent to admit the missing knowledge.
