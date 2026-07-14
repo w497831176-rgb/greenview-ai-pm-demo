@@ -33,12 +33,39 @@ def _tokenize(text: str) -> List[str]:
     return tokens
 
 
+_STOP_TOKENS = {
+    "什么", "的", "是", "我", "要", "在", "和", "与", "等", "或", "为", "了",
+    "可以", "请", "如何", "怎么", "吗", "呢", "吧", "啊", "什么", "是否",
+}
+
+
+def _simple_tokenize(text: str) -> List[str]:
+    """Tokenize into whole words/chars without n-grams for relevance scoring."""
+    text = text.lower()
+    text = re.sub(r"[^\u4e00-\u9fa5a-z0-9]", " ", text)
+    tokens = []
+    for word in text.split():
+        if not word or word in _STOP_TOKENS:
+            continue
+        # Keep whole Chinese words and alphanumeric terms.
+        if re.match(r"^[\u4e00-\u9fa5]+$", word):
+            if len(word) >= 2:
+                tokens.append(word)
+        else:
+            tokens.append(word)
+    return tokens
+
+
 def _context_relevance_score(query: str, content: str) -> float:
-    """Compute a query-centric lexical overlap score in [0, 1]."""
-    query_tokens = set(_tokenize(query))
+    """Compute a query-centric lexical overlap score in [0, 1].
+
+    Uses whole-word/char tokens (no n-grams) and ignores stop words so the
+    score reflects whether the content actually addresses the query concepts.
+    """
+    query_tokens = set(_simple_tokenize(query))
     if not query_tokens:
         return 0.0
-    content_tokens = set(_tokenize(content))
+    content_tokens = set(_simple_tokenize(content))
     overlap = len(query_tokens & content_tokens)
     return round(overlap / len(query_tokens), 4)
 
@@ -236,7 +263,8 @@ def advanced_search(
         if enable_rerank:
             ctx_score = r.get("rerank_score", 0.0)
         else:
-            ctx_score = _context_relevance_score(query, r.get("content", ""))
+            ctx_text = f"{r.get('title', '')} {r.get('content', '')}"
+            ctx_score = _context_relevance_score(query, ctx_text)
         r["context_score"] = ctx_score
         if ctx_score >= context_threshold:
             grounded.append(r)
@@ -306,7 +334,8 @@ def debug_search(
         if enable_rerank:
             ctx_score = r.get("rerank_score", 0.0)
         else:
-            ctx_score = _context_relevance_score(query, r.get("content", ""))
+            ctx_text = f"{r.get('title', '')} {r.get('content', '')}"
+            ctx_score = _context_relevance_score(query, ctx_text)
         r["context_score"] = ctx_score
         if ctx_score >= context_threshold:
             grounded.append(r)
