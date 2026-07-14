@@ -926,27 +926,42 @@
         const title = escapeHtml(c.doc_title || '未知文档');
         const docId = c.doc_id || '';
         const chunkIdx = typeof c.chunk_index === 'number' ? c.chunk_index : '';
+        const snippet = escapeHtml((c.content || '').slice(0, 120).replace(/[\n\r]+/g, ' '));
         const clickable = docId ? 'cursor-pointer hover:text-brand-600 hover:underline' : '';
-        const attrs = docId ? `data-doc-id="${docId}" data-chunk-index="${chunkIdx}" onclick="showCitationChunk(${docId}, '${chunkIdx}')"` : '';
-        return `<li class="mt-1 ${clickable}" ${attrs}>[${i + 1}] 《${title}》<span class="text-slate-400">（相关度 ${score}）</span></li>`;
+        const attrs = docId
+          ? `data-doc-id="${docId}" data-chunk-index="${chunkIdx}" data-snippet="${snippet}" onclick="showCitationChunk(${docId}, '${chunkIdx}', this.dataset.snippet)"`
+          : '';
+        const chunkLabel = chunkIdx !== '' ? ` · 分片 ${chunkIdx}` : '';
+        return `<li class="mt-1 ${clickable}" ${attrs}>[${i + 1}] 《${title}》${chunkLabel}<span class="text-slate-400">（相关度 ${score}）</span></li>`;
       }).join('');
       return `<div class="mt-2 pt-2 border-t border-slate-100"><p class="text-[10px] text-slate-400 mb-1">引用来源</p><ol class="text-[10px] text-slate-500 list-decimal list-inside">${items}</ol></div>`;
     }
 
-    async function showCitationChunk(docId, chunkIndex) {
+    async function showCitationChunk(docId, chunkIndex, snippet = '') {
       try {
         const data = await apiGet(`/api/knowledge/docs/${docId}/chunks`);
         const chunks = data.chunks || [];
         const title = data.knowledge_doc?.title || '知识文档';
-        let content = '';
-        if (chunkIndex !== '' && chunks[Number(chunkIndex)]) {
-          content = chunks[Number(chunkIndex)].content;
-        } else if (chunks.length > 0) {
-          content = chunks[0].content;
+        const chunk = chunkIndex !== '' ? chunks.find(c => String(c.chunk_index) === String(chunkIndex)) : null;
+        const content = chunk ? chunk.content : (chunks[0]?.content || '');
+        let html = '';
+        if (content) {
+          let display = escapeHtml(content);
+          // If the citation carried a snippet, try to bold the matching sentence.
+          if (snippet) {
+            const plainSnippet = snippet.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
+            if (plainSnippet.length > 6 && content.includes(plainSnippet)) {
+              display = display.replace(escapeHtml(plainSnippet), `<strong class="text-brand-700 bg-brand-50 px-1 rounded">${escapeHtml(plainSnippet)}</strong>`);
+            }
+          }
+          const chunkLabel = chunk && chunk.chunk_index !== undefined ? `分片 ${chunk.chunk_index}` : '原始分片';
+          html = `<div class="bg-slate-50 rounded-xl p-3 border border-slate-200">
+            <p class="text-xs text-slate-500 mb-2">${escapeHtml(chunkLabel)}</p>
+            <p class="text-sm text-slate-700 whitespace-pre-line">${display}</p>
+          </div>`;
+        } else {
+          html = '<p class="text-sm text-slate-500">未找到对应分片内容。</p>';
         }
-        const html = content
-          ? `<div class="bg-slate-50 rounded-xl p-3 border border-slate-200"><p class="text-sm text-slate-700 whitespace-pre-line">${escapeHtml(content)}</p></div>`
-          : '<p class="text-sm text-slate-500">未找到对应分片内容。</p>';
         openModal(`《${escapeHtml(title)}》引用分片`, html, null, '关闭');
       } catch (err) {
         showToast('加载引用分片失败', 'error');
@@ -2367,12 +2382,14 @@
         try {
           const [skillsData, mcpData] = await Promise.all([apiGet('/api/skills'), apiGet('/api/mcp-servers')]);
           skills = (skillsData.skills || []).map(s => ({ value: s.name, label: `${s.name} (${s.category || '未分类'})` }));
+          // Bindings are stored at MCP server level (tool_name = server name), so each
+          // checkbox value is the server name.  The label lists the discovered tools.
           const toolPromises = (mcpData.mcp_servers || []).map(async serv => {
             const tools = serv.tools || (await apiGet(`/api/mcp-servers/${serv.id}/tools`)).tools || [];
-            return tools.map(t => ({ value: `${serv.name}:${t.name}`, label: `${serv.name} · ${t.name}` }));
+            const toolNames = tools.map(t => t.name).join('、') || '无工具';
+            return { value: serv.name, label: `${serv.name} · ${toolNames}` };
           });
-          const toolGroups = await Promise.all(toolPromises);
-          mcpTools = toolGroups.flat();
+          mcpTools = await Promise.all(toolPromises);
         } catch (err) {
           console.error('加载 Agent 选项失败', err);
         }

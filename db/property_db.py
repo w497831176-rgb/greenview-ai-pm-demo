@@ -427,6 +427,10 @@ def init_db():
     _migrate_model_configs(cursor)
     conn.commit()
 
+    # Clean up agents, bindings, and rebrand runtime demo data.
+    _migrate_runtime_contract(cursor)
+    conn.commit()
+
     conn.close()
 
 
@@ -1124,6 +1128,139 @@ def _migrate_model_configs(cursor):
         """,
         ("deepseek-v4-flash",),
     )
+
+
+def _migrate_runtime_contract(cursor):
+    """Idempotently clean up agents, bindings, and rebrand runtime demo data.
+
+    - Adds is_router column to agents.
+    - Deduplicates agents by canonical agent_id, migrates bindings, removes temp/test agents.
+    - Ensures exactly the five canonical demo agents exist.
+    - Replaces "绿景" / "绿景智服" with "YIAI物业" in user-facing text fields.
+    """
+    now = now_cn("%Y-%m-%d %H:%M")
+
+    # 1. Add is_router column if missing.
+    cursor.execute("PRAGMA table_info(agents)")
+    columns = {row[1] for row in cursor.fetchall()}
+    if "is_router" not in columns:
+        cursor.execute("ALTER TABLE agents ADD COLUMN is_router INTEGER DEFAULT 0")
+        cursor.execute("UPDATE agents SET is_router = 1 WHERE category IN ('router', 'orchestration')")
+        cursor.execute("UPDATE agents SET is_router = 0 WHERE category NOT IN ('router', 'orchestration') OR category IS NULL")
+
+    # 2. Define canonical agents and ensure each exists with the lowest id possible.
+    canonical = [
+        ("router", "router", "路由 Agent", "负责识别业主意图并路由到对应垂直 Agent。", "你是物业智能客服路由助手，负责判断业主消息属于维修、费用、投诉还是一般客服咨询，并简洁输出意图分类。"),
+        ("maintenance", "vertical", "维修 Agent", "处理报修、维修进度、上门预约。", "你是物业维修助手，负责记录业主报修内容、判断紧急程度、创建维修工单。"),
+        ("billing", "vertical", "费用 Agent", "处理物业费、停车费、缴费查询。", "你是物业费用助手，负责解释收费标准、查询账单、引导缴费流程。"),
+        ("complaint", "vertical", "投诉 Agent", "处理业主投诉、邻里纠纷、责任争议。", "你是物业投诉处理助手，负责安抚业主情绪、记录投诉要点、协调人工跟进。不要自行判定责任。"),
+        ("customer_service", "vertical", "客服 Agent", "处理一般咨询、小区规定、服务承诺。", "你是物业客服助手，负责解答小区服务、联系方式、一般规定等咨询。"),
+    ]
+
+    canonical_agent_ids = {}
+    for agent_id, category, name, description, instructions in canonical:
+        cursor.execute("SELECT id FROM agents WHERE agent_id = ? ORDER BY id LIMIT 1", (agent_id,))
+        row = cursor.fetchone()
+        if row:
+            canonical_row_id = row[0]
+            cursor.execute(
+                """
+                UPDATE agents
+                SET agent_id = ?, name = ?, description = ?, instructions = ?, category = ?, is_router = ?, enabled = 1, updated_at = ?
+                WHERE id = ?
+                """,
+                (agent_id, name, description, instructions, category, 1 if category == "router" else 0, now, canonical_row_id),
+            )
+            # Remove duplicates for this agent_id, keeping canonical_row_id.
+            cursor.execute(
+                "DELETE FROM agents WHERE agent_id = ? AND id != ?",
+                (agent_id, canonical_row_id),
+            )
+        else:
+            cursor.execute(
+                """
+                INSERT INTO agents
+                (agent_id, name, description, instructions, category, is_router, enabled, model_id, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (agent_id, name, description, instructions, category, 1 if category == "router" else 0, 1, None, now, now),
+            )
+            canonical_row_id = cursor.lastrowid
+
+        canonical_agent_ids[name] = agent_id
+
+        # Migrate skill/tool bindings from rows that share this canonical name but have a different agent_id.
+        cursor.execute(
+            "SELECT agent_id FROM agents WHERE name = ? AND agent_id != ?",
+            (name, agent_id),
+        )
+        for dup_row in cursor.fetchall():
+            dup_agent_id = dup_row[0]
+            cursor.execute(
+                "INSERT OR IGNORE INTO agent_skills (agent_id, skill_id) SELECT ?, skill_id FROM agent_skills WHERE agent_id = ?",
+                (agent_id, dup_agent_id),
+            )
+            cursor.execute(
+                "INSERT OR IGNORE INTO agent_tools (agent_id, tool_name, config) SELECT ?, tool_name, config FROM agent_tools WHERE agent_id = ?",
+                (agent_id, dup_agent_id),
+            )
+            cursor.execute("DELETE FROM agent_skills WHERE agent_id = ?", (dup_agent_id,))
+            cursor.execute("DELETE FROM agent_tools WHERE agent_id = ?", (dup_agent_id,))
+            cursor.execute("DELETE FROM agents WHERE agent_id = ?", (dup_agent_id,))
+
+    # 3. Remove temp / test agents by name heuristic and migrate bindings first.
+    cursor.execute(
+        "SELECT agent_id FROM agents WHERE LOWER(name) LIKE '%test%' OR LOWER(name) LIKE '%temp%' OR LOWER(agent_id) LIKE '%test%' OR LOWER(agent_id) LIKE '%temp%'"
+    )
+    temp_agent_ids = [row[0] for row in cursor.fetchall()]
+    fallback_agent_id = canonical_agent_ids.get("维修 Agent") or next(iter(canonical_agent_ids.values()), None)
+    for temp_agent_id in temp_agent_ids:
+        if fallback_agent_id:
+            cursor.execute(
+                "INSERT OR IGNORE INTO agent_skills (agent_id, skill_id) SELECT ?, skill_id FROM agent_skills WHERE agent_id = ?",
+                (fallback_agent_id, temp_agent_id),
+            )
+            cursor.execute(
+                "INSERT OR IGNORE INTO agent_tools (agent_id, tool_name, config) SELECT ?, tool_name, config FROM agent_tools WHERE agent_id = ?",
+                (fallback_agent_id, temp_agent_id),
+            )
+        cursor.execute("DELETE FROM agent_skills WHERE agent_id = ?", (temp_agent_id,))
+        cursor.execute("DELETE FROM agent_tools WHERE agent_id = ?", (temp_agent_id,))
+        cursor.execute("DELETE FROM agents WHERE agent_id = ?", (temp_agent_id,))
+
+    # 4. Rebrand user-facing runtime text.
+    rebrand_fields = [
+        ("knowledge_docs", "title"),
+        ("knowledge_docs", "content"),
+        ("agents", "name"),
+        ("agents", "description"),
+        ("agents", "instructions"),
+        ("skills", "name"),
+        ("skills", "description"),
+        ("skills", "instructions"),
+        ("skills", "trigger_condition"),
+        ("mcp_servers", "name"),
+        ("mcp_servers", "description"),
+        ("chat_messages", "content"),
+    ]
+    for table, column in rebrand_fields:
+        try:
+            cursor.execute(
+                f"""
+                UPDATE {table}
+                SET {column} = REPLACE({column}, '绿景智服', 'YIAI物业')
+                WHERE {column} LIKE '%绿景智服%'
+                """
+            )
+            cursor.execute(
+                f"""
+                UPDATE {table}
+                SET {column} = REPLACE({column}, '绿景', 'YIAI物业')
+                WHERE {column} LIKE '%绿景%' AND {column} NOT LIKE '%YIAI物业%'
+                """
+            )
+        except Exception:
+            pass
 
 
 def create_work_order(
