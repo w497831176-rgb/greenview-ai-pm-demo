@@ -496,11 +496,13 @@
       }
     });
 
-    function formInput(label, id, value = '', placeholder = '', type = 'text') {
+    function formInput(label, id, value = '', placeholder = '', type = 'text', min = null, max = null) {
+      const minAttr = min !== null ? ` min="${min}"` : '';
+      const maxAttr = max !== null ? ` max="${max}"` : '';
       return `
         <div class="mb-4">
           <label class="block text-sm font-medium text-slate-700 mb-1">${label}</label>
-          <input id="${id}" type="${type}" value="${escapeHtml(value)}" placeholder="${escapeHtml(placeholder)}" class="w-full px-3 py-2 bg-white border border-slate-200 rounded-xl text-sm focus:outline-none focus:border-brand-400 focus:ring-2 focus:ring-brand-100">
+          <input id="${id}" type="${type}" value="${escapeHtml(value)}" placeholder="${escapeHtml(placeholder)}"${minAttr}${maxAttr} class="w-full px-3 py-2 bg-white border border-slate-200 rounded-xl text-sm focus:outline-none focus:border-brand-400 focus:ring-2 focus:ring-brand-100">
         </div>
       `;
     }
@@ -942,29 +944,49 @@
         const data = await apiGet(`/api/knowledge/docs/${docId}/chunks`);
         const chunks = data.chunks || [];
         const title = data.knowledge_doc?.title || '知识文档';
-        const chunk = chunkIndex !== '' ? chunks.find(c => String(c.chunk_index) === String(chunkIndex)) : null;
-        const content = chunk ? chunk.content : (chunks[0]?.content || '');
+        const hasIndex = chunkIndex !== '' && chunkIndex !== null && chunkIndex !== undefined;
+        const chunk = hasIndex ? chunks.find(c => String(c.chunk_index) === String(chunkIndex)) : null;
         let html = '';
-        if (content) {
+        if (!hasIndex) {
+          // Legacy citation without chunk_index: show the first chunk only as a reference, clearly labelled.
+          const first = chunks[0];
+          const content = first ? first.content : '';
           let display = escapeHtml(content);
-          // If the citation carried a snippet, try to bold the matching sentence.
+          if (snippet && content) {
+            const plainSnippet = snippet.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
+            if (plainSnippet.length > 6 && content.includes(plainSnippet)) {
+              display = display.replace(escapeHtml(plainSnippet), `<strong class="text-brand-700 bg-brand-50 px-1 rounded">${escapeHtml(plainSnippet)}</strong>`);
+            }
+          }
+          html = `<div class="bg-amber-50 rounded-xl p-3 border border-amber-200">
+            <p class="text-xs text-amber-700 mb-2">历史引用，分片编号缺失</p>
+            ${content ? `<p class="text-xs text-slate-500 mb-1">参考：文档首分片</p><p class="text-sm text-slate-700 whitespace-pre-line">${display}</p>` : '<p class="text-sm text-slate-500">未找到对应分片内容。</p>'}
+          </div>`;
+        } else if (chunk) {
+          const content = chunk.content;
+          let display = escapeHtml(content);
           if (snippet) {
             const plainSnippet = snippet.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
             if (plainSnippet.length > 6 && content.includes(plainSnippet)) {
               display = display.replace(escapeHtml(plainSnippet), `<strong class="text-brand-700 bg-brand-50 px-1 rounded">${escapeHtml(plainSnippet)}</strong>`);
             }
           }
-          const chunkLabel = chunk && chunk.chunk_index !== undefined ? `分片 ${chunk.chunk_index}` : '原始分片';
           html = `<div class="bg-slate-50 rounded-xl p-3 border border-slate-200">
-            <p class="text-xs text-slate-500 mb-2">${escapeHtml(chunkLabel)}</p>
+            <p class="text-xs text-slate-500 mb-2">分片 ${escapeHtml(chunk.chunk_index)}</p>
             <p class="text-sm text-slate-700 whitespace-pre-line">${display}</p>
           </div>`;
         } else {
-          html = '<p class="text-sm text-slate-500">未找到对应分片内容。</p>';
+          // Exact chunk not found: do not silently fall back to the first chunk.
+          const available = chunks.map(c => c.chunk_index).join(', ');
+          html = `<div class="bg-red-50 rounded-xl p-3 border border-red-200">
+            <p class="text-sm font-medium text-red-700 mb-1">该引用分片已不存在或无法定位</p>
+            <p class="text-xs text-slate-600">doc_id: ${escapeHtml(docId)}，chunk_index: ${escapeHtml(chunkIndex)}</p>
+            ${available ? `<p class="text-xs text-slate-500 mt-1">文档现有分片编号：${escapeHtml(available)}</p>` : '<p class="text-xs text-slate-500 mt-1">该文档暂无分片数据。</p>'}
+          </div>`;
         }
         openModal(`《${escapeHtml(title)}》引用分片`, html, null, '关闭');
       } catch (err) {
-        showToast('加载引用分片失败', 'error');
+        showToast('加载引用分片失败：' + (err && err.message ? err.message : err), 'error');
       }
     }
 
@@ -1762,20 +1784,41 @@
         try {
           const data = await apiGet('/api/knowledge/retrieval-settings');
           const s = data.retrieval_settings || {};
+          const currentTopK = s.top_k != null ? String(s.top_k) : '5';
           $('#knowledge-content').innerHTML = `
-            <div class="bg-white rounded-2xl shadow-soft border border-slate-200 p-5 max-w-2xl">
-              <form id="retrieval-settings-form" class="space-y-5">
-                ${formInput('Top-K', 'rs-topk', s.top_k != null ? String(s.top_k) : '5', '如：5', 'number')}
-                ${formInput('关键词权重（0-1）', 'rs-keyword-weight', s.keyword_weight != null ? String(s.keyword_weight) : '0.3', '如：0.3', 'number')}
-                ${formInput('语义权重（0-1）', 'rs-semantic-weight', s.semantic_weight != null ? String(s.semantic_weight) : '0.7', '如：0.7', 'number')}
-                ${formInput('RRF 融合参数 K', 'rs-rrf-k', s.rrf_k != null ? String(s.rrf_k) : '60', '如：60', 'number')}
-                ${formSwitch('启用重排序', 'rs-enable-rerank', !!s.enable_rerank)}
-                ${formInput('重排序模型', 'rs-rerank-model', s.rerank_model || '', '如：cross-encoder/ms-marco-MiniLM-L-6-v2')}
-                ${formInput('相似度阈值（可选）', 'rs-score-threshold', s.score_threshold != null ? String(s.score_threshold) : '', '如：0.5', 'number')}
-                <div class="pt-2">
-                  <button type="submit" class="px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white rounded-xl text-sm transition-colors">保存设置</button>
+            <div class="space-y-5 max-w-2xl">
+              <div class="bg-blue-50 rounded-2xl border border-blue-100 p-5">
+                <h3 class="text-sm font-semibold text-blue-900 mb-2">当前 RAG 技术方案</h3>
+                <div class="text-sm text-blue-800 space-y-1">
+                  <p><strong>数据接入：</strong>粘贴知识文本 → 自动切分 → 关键词索引 + 向量索引</p>
+                  <p><strong>检索：</strong>关键词检索（BM25）+ 语义检索（向量）→ 加权 RRF 融合 → 可选重排序 → 相关性过滤</p>
+                  <p><strong>生成：</strong>最终证据分片注入当前 Agent → 回答携带文档/分片引用 → 点击可查看原文证据</p>
                 </div>
-              </form>
+                <div class="mt-3 grid grid-cols-2 gap-2 text-xs text-slate-700">
+                  <div class="bg-white/70 rounded-lg p-2"><span class="text-slate-500">Top-K：</span>${currentTopK}</div>
+                  <div class="bg-white/70 rounded-lg p-2"><span class="text-slate-500">关键词权重：</span>${s.keyword_weight != null ? s.keyword_weight : '0.3'}</div>
+                  <div class="bg-white/70 rounded-lg p-2"><span class="text-slate-500">语义权重：</span>${s.semantic_weight != null ? s.semantic_weight : '0.7'}</div>
+                  <div class="bg-white/70 rounded-lg p-2"><span class="text-slate-500">RRF K：</span>${s.rrf_k != null ? s.rrf_k : '60'}</div>
+                  <div class="bg-white/70 rounded-lg p-2"><span class="text-slate-500">重排序：</span>${!!s.enable_rerank ? (s.rerank_model || '已启用') : '未启用'}</div>
+                  <div class="bg-white/70 rounded-lg p-2"><span class="text-slate-500">相似度阈值：</span>${s.score_threshold != null ? s.score_threshold : '无'}</div>
+                  <div class="bg-white/70 rounded-lg p-2"><span class="text-slate-500">context_threshold：</span>${s.context_threshold != null ? s.context_threshold : '0.2'}</div>
+                </div>
+              </div>
+              <div class="bg-white rounded-2xl shadow-soft border border-slate-200 p-5">
+                <form id="retrieval-settings-form" class="space-y-5">
+                  ${formInput('Top-K（1-10）', 'rs-topk', currentTopK, '如：5', 'number', '1', '10')}
+                  ${formInput('关键词权重（0-1）', 'rs-keyword-weight', s.keyword_weight != null ? String(s.keyword_weight) : '0.3', '如：0.3', 'number')}
+                  ${formInput('语义权重（0-1）', 'rs-semantic-weight', s.semantic_weight != null ? String(s.semantic_weight) : '0.7', '如：0.7', 'number')}
+                  ${formInput('RRF 融合参数 K', 'rs-rrf-k', s.rrf_k != null ? String(s.rrf_k) : '60', '如：60', 'number')}
+                  ${formSwitch('启用重排序', 'rs-enable-rerank', !!s.enable_rerank)}
+                  ${formInput('重排序模型', 'rs-rerank-model', s.rerank_model || '', '如：cross-encoder/ms-marco-MiniLM-L-6-v2')}
+                  ${formInput('相似度阈值（可选）', 'rs-score-threshold', s.score_threshold != null ? String(s.score_threshold) : '', '如：0.5', 'number')}
+                  ${formInput('context_threshold（0-1）', 'rs-context-threshold', s.context_threshold != null ? String(s.context_threshold) : '0.2', '如：0.2', 'number')}
+                  <div class="pt-2">
+                    <button type="submit" class="px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white rounded-xl text-sm transition-colors">保存设置</button>
+                  </div>
+                </form>
+              </div>
             </div>
           `;
           $('#retrieval-settings-form').addEventListener('submit', async (e) => {
@@ -1787,7 +1830,8 @@
               rrf_k: parseInt($('#rs-rrf-k').value || '60', 10),
               enable_rerank: $('#rs-enable-rerank').checked,
               rerank_model: $('#rs-rerank-model').value.trim() || null,
-              score_threshold: $('#rs-score-threshold').value.trim() ? parseFloat($('#rs-score-threshold').value) : null
+              score_threshold: $('#rs-score-threshold').value.trim() ? parseFloat($('#rs-score-threshold').value) : null,
+              context_threshold: $('#rs-context-threshold').value.trim() ? parseFloat($('#rs-context-threshold').value) : null
             };
             try {
               await apiPost('/api/knowledge/retrieval-settings', payload);
@@ -1895,7 +1939,9 @@
       function openKnowledgeModal(doc = null) {
         const isEdit = !!doc;
         const title = isEdit ? '编辑知识文档' : '新增知识文档';
+        const addNote = isEdit ? '' : `<div class="bg-blue-50 text-blue-800 text-xs rounded-lg p-2 mb-3 border border-blue-100">保存后系统将自动进行文本切分、关键词索引与向量索引；无需手动选择 RAG 方案。当前仅支持文本粘贴，不支持 PDF/Word 上传。</div>`;
         const body = `
+          ${addNote}
           ${formInput('标题', 'kd-title', doc ? doc.title : '', '请输入文档标题')}
           ${formInput('分类', 'kd-category', doc ? doc.category : '', '如：服务承诺、收费标准、FAQ')}
           ${formTextarea('内容', 'kd-content', doc ? doc.content : '', '请输入知识库内容，支持多行文本', 8)}
@@ -1963,9 +2009,9 @@
           const title = data.knowledge_doc?.title || '知识文档';
           const html = chunks.length === 0
             ? '<p class="text-sm text-slate-500">暂无分片，请先点击“重新索引”。</p>'
-            : `<div class="space-y-3">${chunks.map((c, i) => `
+            : `<div class="space-y-3">${chunks.map((c) => `
                 <div class="bg-slate-50 rounded-xl p-3 border border-slate-200">
-                  <p class="text-[10px] text-slate-400 mb-1">分片 #${i + 1}</p>
+                  <p class="text-[10px] text-slate-400 mb-1">分片 #${c.chunk_index != null ? c.chunk_index : '?'}</p>
                   <p class="text-sm text-slate-700 whitespace-pre-line">${escapeHtml(c.content)}</p>
                 </div>
               `).join('')}</div>`;
@@ -2382,14 +2428,18 @@
         try {
           const [skillsData, mcpData] = await Promise.all([apiGet('/api/skills'), apiGet('/api/mcp-servers')]);
           skills = (skillsData.skills || []).map(s => ({ value: s.name, label: `${s.name} (${s.category || '未分类'})` }));
-          // Bindings are stored at MCP server level (tool_name = server name), so each
-          // checkbox value is the server name.  The label lists the discovered tools.
-          const toolPromises = (mcpData.mcp_servers || []).map(async serv => {
-            const tools = serv.tools || (await apiGet(`/api/mcp-servers/${serv.id}/tools`)).tools || [];
-            const toolNames = tools.map(t => t.name).join('、') || '无工具';
-            return { value: serv.name, label: `${serv.name} · ${toolNames}` };
-          });
-          mcpTools = await Promise.all(toolPromises);
+          // Bindings are stored at MCP Server level (tool_name = server name).  Only
+          // enabled servers with at least one successfully discovered tool are shown
+          // as bindable; disabled / test / tool-less servers are hidden by default.
+          const toolPromises = (mcpData.mcp_servers || [])
+            .filter(serv => serv.enabled)
+            .map(async serv => {
+              const tools = serv.tools || (await apiGet(`/api/mcp-servers/${serv.id}/tools`)).tools || [];
+              if (!tools.length) return null;
+              const toolDescs = tools.map(t => `${t.name}${t.description ? '：' + t.description : ''}`).join('；');
+              return { value: serv.name, label: `${serv.name}（${toolDescs}）` };
+            });
+          mcpTools = (await Promise.all(toolPromises)).filter(Boolean);
         } catch (err) {
           console.error('加载 Agent 选项失败', err);
         }
@@ -2400,7 +2450,7 @@
           ${formTextarea('System Prompt', 'agent-system-prompt', agent ? agent.system_prompt : '', '定义该 Agent 的系统提示词', 5)}
           ${formSwitch('路由 Agent (is_router)', 'agent-is-router', agent ? agent.is_router : false)}
           ${formCheckboxGroup('可用 Skill', 'agent-skills', skills, agent ? agent.available_skills : [])}
-          ${formCheckboxGroup('可用 MCP 工具', 'agent-mcp-tools', mcpTools, agent ? agent.available_mcp_tools : [])}
+          ${formCheckboxGroup('可用 MCP Server（展开查看可调用工具）', 'agent-mcp-tools', mcpTools, agent ? agent.available_mcp_tools : [])}
         `;
         openModal(title, body, async () => {
           const payload = {

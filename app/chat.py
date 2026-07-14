@@ -238,16 +238,21 @@ def _build_skill_context(message: str, agent_id: Optional[str] = None) -> tuple:
         return "", [], None
 
 
-def _build_rag_context(message: str, top_k: int = 3, threshold: Optional[float] = None) -> tuple:
+def _build_rag_context(message: str, top_k: Optional[int] = None, threshold: Optional[float] = None) -> tuple:
     """Run advanced RAG and format retrieved chunks as context.
 
     Returns (rag_context_string, citations).
+
+    The number of retrieved chunks is read from retrieval_settings.top_k unless
+    explicitly overridden.  It is clamped to a sensible 1-10 range.
     """
     try:
         from db.property_db import get_retrieval_settings
         settings = get_retrieval_settings("default") or {}
+        effective_top_k = top_k if top_k is not None else settings.get("top_k", 3)
+        effective_top_k = max(1, min(10, int(effective_top_k)))
         settings_payload = {
-            "top_k": top_k,
+            "top_k": effective_top_k,
             "keyword_weight": settings.get("keyword_weight", 0.3),
             "semantic_weight": settings.get("semantic_weight", 0.7),
             "rrf_k": settings.get("rrf_k", 60),

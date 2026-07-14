@@ -431,6 +431,10 @@ def init_db():
     _migrate_runtime_contract(cursor)
     conn.commit()
 
+    # Clean up demo/test MCP servers and ensure canonical demo servers/bindings.
+    _migrate_mcp_hygiene(cursor)
+    conn.commit()
+
     conn.close()
 
 
@@ -918,7 +922,7 @@ def _seed_mcp_servers(cursor):
             "python",
             json.dumps(["/app/tools/weather_mcp_server.py"]),
             None,
-            "天气查询 MCP Server，用于查询实时天气辅助维修决策。",
+            "天气查询 MCP Server，提供实时天气与天气建议工具。",
             1,
             1,
             now,
@@ -929,29 +933,18 @@ def _seed_mcp_servers(cursor):
             "python",
             json.dumps(["/app/tools/calendar_mcp_server.py"]),
             None,
-            "日历查询 MCP Server，用于获取当前日期。",
+            "日历 MCP Server，提供当前日期与预约时间相关工具。",
             1,
             1,
             now,
             now,
         ),
         (
-            "calculator-server",
-            "python",
-            json.dumps(["/app/tools/calculator_mcp_server.py"]),
-            None,
-            "计算器 MCP Server，用于执行数学计算。",
-            1,
-            1,
-            now,
-            now,
-        ),
-        (
-            "db-query-server",
+            "workorder-server",
             "python",
             json.dumps(["/app/tools/db_query_mcp_server.py"]),
             None,
-            "数据库查询 MCP Server，用于只读查询工单数据。",
+            "工单查询 MCP Server，提供维修工单数量与待办列表只读查询。",
             1,
             1,
             now,
@@ -1280,6 +1273,112 @@ def _migrate_runtime_contract(cursor):
             )
         except Exception:
             pass
+
+
+def _migrate_mcp_hygiene(cursor):
+    """Clean up demo/test MCP servers and ensure canonical demo servers exist.
+
+    Demo rule: keep only real, discoverable MCP servers.  Test Server rows and
+    any server that fails discovery (currently time-server) are removed.
+    Canonical demo servers: weather-server, workorder-server, calendar-server.
+    """
+    import json
+
+    now = now_cn("%Y-%m-%d %H:%M")
+
+    # Names to purge.  "Test Server" covers frontend-created test duplicates;
+    # "time-server" has zero discoverable tools and should not be demoed.
+    purge_names = {"Test Server", "time-server", "calculator-server", "db-query-server"}
+
+    # Collect ids of servers to delete so we can clean dependent tables.
+    cursor.execute(
+        "SELECT id, name FROM mcp_servers WHERE name IN (" + ",".join("?" * len(purge_names)) + ")",
+        tuple(purge_names),
+    )
+    purge_rows = cursor.fetchall()
+    purge_ids = {row[0] for row in purge_rows}
+    purge_found_names = {row[1] for row in purge_rows}
+
+    # Also remove any server whose name starts with "Test" or contains "test"
+    # but was not matched exactly (defensive).
+    cursor.execute(
+        "SELECT id, name FROM mcp_servers WHERE LOWER(name) LIKE '%test%' OR LOWER(name) LIKE 'test %'"
+    )
+    for row in cursor.fetchall():
+        purge_ids.add(row[0])
+        purge_found_names.add(row[1])
+
+    if purge_ids:
+        # Cascade delete tool definitions and agent bindings for purged servers.
+        cursor.execute(
+            "DELETE FROM mcp_tools WHERE server_id IN (" + ",".join("?" * len(purge_ids)) + ")",
+            tuple(purge_ids),
+        )
+        cursor.execute(
+            "DELETE FROM agent_tools WHERE tool_name IN (" + ",".join("?" * len(purge_found_names)) + ")",
+            tuple(purge_found_names),
+        )
+        cursor.execute(
+            "DELETE FROM mcp_servers WHERE id IN (" + ",".join("?" * len(purge_ids)) + ")",
+            tuple(purge_ids),
+        )
+
+    # Canonical demo servers.  Use INSERT OR IGNORE for names, then UPDATE
+    # command/args/description so re-running the migration stays idempotent.
+    canonical_servers = [
+        {
+            "name": "weather-server",
+            "command": "python",
+            "args": ["/app/tools/weather_mcp_server.py"],
+            "description": "天气查询 MCP Server，提供实时天气与天气建议工具。",
+        },
+        {
+            "name": "workorder-server",
+            "command": "python",
+            "args": ["/app/tools/db_query_mcp_server.py"],
+            "description": "工单查询 MCP Server，提供维修工单数量与待办列表只读查询。",
+        },
+        {
+            "name": "calendar-server",
+            "command": "python",
+            "args": ["/app/tools/calendar_mcp_server.py"],
+            "description": "日历 MCP Server，提供当前日期与预约时间相关工具。",
+        },
+    ]
+
+    for server in canonical_servers:
+        cursor.execute(
+            """
+            INSERT OR IGNORE INTO mcp_servers (name, command, args, env, description, enabled, is_builtin, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, 1, 1, ?, ?)
+            """,
+            (server["name"], server["command"], json.dumps(server["args"]), "{}", server["description"], now, now),
+        )
+        cursor.execute(
+            """
+            UPDATE mcp_servers
+            SET command = ?, args = ?, description = ?, enabled = 1, is_builtin = 1, updated_at = ?
+            WHERE name = ?
+            """,
+            (server["command"], json.dumps(server["args"]), server["description"], now, server["name"]),
+        )
+
+    # Ensure formal demo bindings:
+    # - maintenance: weather-server + workorder-server
+    # - customer_service: calendar-server
+    cursor.execute("SELECT agent_id FROM agents WHERE agent_id = ?", ("maintenance",))
+    if cursor.fetchone():
+        for tool_name in ("weather-server", "workorder-server"):
+            cursor.execute(
+                "INSERT OR IGNORE INTO agent_tools (agent_id, tool_name, config) VALUES (?, ?, ?)",
+                ("maintenance", tool_name, "{}"),
+            )
+    cursor.execute("SELECT agent_id FROM agents WHERE agent_id = ?", ("customer_service",))
+    if cursor.fetchone():
+        cursor.execute(
+            "INSERT OR IGNORE INTO agent_tools (agent_id, tool_name, config) VALUES (?, ?, ?)",
+            ("customer_service", "calendar-server", "{}"),
+        )
 
 
 def create_work_order(
