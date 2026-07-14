@@ -1847,7 +1847,7 @@
           $('#debug-results').innerHTML = `<div class="col-span-full flex justify-center py-10 text-slate-400"><div class="w-8 h-8 border-2 border-slate-200 border-t-brand-500 rounded-full animate-spin mr-2"></div>检索中...</div>`;
           $('#debug-rerank-note').classList.add('hidden');
           try {
-            const data = await apiPost('/api/knowledge/retrieval-debug', { query });
+            const data = await apiPost('/api/retrieval/debug', { query });
             const settings = data.settings || {};
             const rerankEnabled = !!settings.enable_rerank;
             const rerankReturned = Array.isArray(data.reranked_results) && data.reranked_results.length > 0;

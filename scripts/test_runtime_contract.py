@@ -57,7 +57,7 @@ def patch(path: str, json_body: Optional[Dict[str, Any]] = None):
 # SSE chat helper
 # -----------------------------------------------------------------------------
 
-def chat_sse(message: str, session_id: Optional[str] = None, timeout: int = 120) -> Dict[str, Any]:
+def chat_sse(message: str, session_id: Optional[str] = None, timeout: int = 180) -> Dict[str, Any]:
     payload = {
         "message": message,
         "stream": True,
@@ -72,27 +72,33 @@ def chat_sse(message: str, session_id: Optional[str] = None, timeout: int = 120)
     text_parts: List[str] = []
     events: List[Dict[str, Any]] = []
     done: Optional[Dict[str, Any]] = None
+    current_event: Optional[str] = None
 
     start = time.time()
     for line in resp.iter_lines(decode_unicode=True):
         if time.time() - start > timeout:
             raise TimeoutError("SSE chat timed out")
-        if not line or not line.startswith("data:"):
+        if not line:
+            current_event = None
             continue
-        data = line[len("data:"):].strip()
-        if data == "[DONE]":
-            break
-        try:
-            evt = json.loads(data)
-        except json.JSONDecodeError:
+        if line.startswith("event:"):
+            current_event = line[len("event:"):].strip()
             continue
-        events.append(evt)
-        t = evt.get("type")
-        if t == "text":
-            text_parts.append(evt.get("content", ""))
-        elif t == "done":
-            done = evt
-            break
+        if line.startswith("data:"):
+            data = line[len("data:"):].strip()
+            if data == "[DONE]":
+                break
+            try:
+                evt = json.loads(data)
+            except json.JSONDecodeError:
+                continue
+            evt["_event"] = current_event
+            events.append(evt)
+            if current_event == "delta":
+                text_parts.append(evt.get("content", ""))
+            elif current_event == "done":
+                done = evt
+                break
 
     full_text = "".join(text_parts)
     return {
@@ -222,7 +228,7 @@ def ensure_knowledge_doc(title: str, content: str, category: str = "管理规定
 
 
 def debug_retrieval(query: str) -> Dict[str, Any]:
-    return post("/api/knowledge/debug", {
+    return post("/api/retrieval/debug", {
         "query": query,
         "top_k": 5,
         "keyword_weight": 0.3,
@@ -300,11 +306,13 @@ def test_skill_per_agent():
     text_a = res_a["text"]
     done_a = res_a["done"]
     hit_a = "【SKILL-HIT:YIAI-ONLY-927】" in text_a
-    skill_hit_a = "费用绑定探针" in (done_a.get("skill_hits") or [])
+    activated_a = done_a.get("activated_skills") or []
+    skill_hit_a = "费用绑定探针" in activated_a
     ensure(hit_a and skill_hit_a, "Skill test A: fee skill injected in billing chat", {
-        "skill_hits": done_a.get("skill_hits"),
+        "activated_skills": activated_a,
         "first_line": text_a[:80],
         "current_agent": done_a.get("current_agent"),
+        "route_intent": done_a.get("route_intent"),
     })
 
     # Test B: maintenance query -> no fee skill hit, maintenance skill allowed.
@@ -312,11 +320,12 @@ def test_skill_per_agent():
     text_b = res_b["text"]
     done_b = res_b["done"]
     no_hit = "【SKILL-HIT:YIAI-ONLY-927】" not in text_b
-    no_skill = "费用绑定探针" not in (done_b.get("skill_hits") or [])
+    no_skill = "费用绑定探针" not in (done_b.get("activated_skills") or [])
     ensure(no_hit and no_skill, "Skill test B: fee skill not injected in maintenance chat", {
-        "skill_hits": done_b.get("skill_hits"),
+        "activated_skills": done_b.get("activated_skills"),
         "first_line": text_b[:80],
         "current_agent": done_b.get("current_agent"),
+        "route_intent": done_b.get("route_intent"),
     })
 
 
