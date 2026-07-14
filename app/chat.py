@@ -75,12 +75,11 @@ if MCPTools is not None:
             self.recorded_calls: List[Dict[str, Any]] = []
 
         async def build_tools(self) -> None:
-            # Run the parent build_tools in a separate thread because its stdio
-            # MCP interactions are synchronous and would otherwise block the
-            # FastAPI event loop.
-            loop = asyncio.get_event_loop()
-            await loop.run_in_executor(None, lambda: asyncio.run(super(ObservableMCPTools, self).build_tools()))
-            for fn_name, fn in (getattr(self, "functions", None) or {}).items():
+            # Build tools in the current event loop. MCPTools uses asyncio stdio
+            # subprocess, so it is non-blocking and safe to await directly.
+            await super(ObservableMCPTools, self).build_tools()
+            functions = getattr(self, "functions", None) or {}
+            for fn_name, fn in functions.items():
                 original = getattr(fn, "entrypoint", None)
                 if original is None:
                     continue
@@ -447,10 +446,29 @@ def _extract_tool_calls(chunk: Any) -> List[Dict[str, Any]]:
 def _normalize_tool_call(tc: Dict[str, Any]) -> Dict[str, Any]:
     """Normalize a tool-call dict so the frontend can render a stable tool name."""
     name = tc.get("tool_name") or tc.get("name") or tc.get("tool") or ""
+    args = tc.get("arguments") or tc.get("args") or {}
+    # Ensure arguments are JSON-serializable (convert Pydantic models, etc.)
+    if hasattr(args, "model_dump"):
+        args = args.model_dump()
+    elif hasattr(args, "dict"):
+        args = args.dict()
+    elif not isinstance(args, dict):
+        args = {"value": str(args)}
     return {
         "tool_name": name,
-        "arguments": tc.get("arguments") or tc.get("args") or {},
+        "arguments": args,
     }
+
+
+def _safe_json_dumps(obj: Any) -> str:
+    """Serialize to JSON, converting non-serializable objects to strings."""
+    def _default(o: Any):
+        if hasattr(o, "model_dump"):
+            return o.model_dump()
+        if hasattr(o, "dict"):
+            return o.dict()
+        return str(o)
+    return json.dumps(obj, ensure_ascii=False, default=_default)
 
 
 class ChatRequest(BaseModel):
@@ -488,6 +506,9 @@ async def _stream_agent_response(
 ) -> AsyncIterator[str]:
     """Run the agent with streaming and yield SSE events."""
 
+    done_yielded = False
+    error_yielded = False
+
     try:
         # Ensure session exists and check handoff state.
         ensure_chat_session(session_id)
@@ -508,7 +529,8 @@ async def _stream_agent_response(
             )
             save_chat_message(session_id=session_id, role="assistant", content=reply)
             yield f"event: delta\ndata: {json.dumps({'content': reply})}\n\n"
-            yield f"event: done\ndata: {json.dumps({'status': 'complete', 'token_count': 0, 'message_id': None, 'handoff': True})}\n\n"
+            yield f"event: done\ndata: {_safe_json_dumps({'status': 'complete', 'token_count': 0, 'message_id': None, 'handoff': True})}\n\n"
+            done_yielded = True
             return
 
         # If handoff is active, do not run the agent; tell user to wait.
@@ -516,7 +538,8 @@ async def _stream_agent_response(
             reply = "当前会话已由人工接管，工作人员会尽快回复您，请稍候。"
             save_chat_message(session_id=session_id, role="assistant", content=reply)
             yield f"event: delta\ndata: {json.dumps({'content': reply})}\n\n"
-            yield f"event: done\ndata: {json.dumps({'status': 'complete', 'token_count': 0, 'message_id': None, 'handoff': True})}\n\n"
+            yield f"event: done\ndata: {_safe_json_dumps({'status': 'complete', 'token_count': 0, 'message_id': None, 'handoff': True})}\n\n"
+            done_yielded = True
             return
 
         # Classify intent and dispatch to the appropriate vertical agent.
@@ -592,44 +615,73 @@ async def _stream_agent_response(
         # Create a fresh agent instance with dynamic MCP tools.
         agent = create_agent_fn(tools=mcp_tools, model=turn_model)
 
-        # Run agent in streaming mode (returns an async generator)
-        async for chunk in agent.arun(
-            contextual_message,
-            user_id=user_id,
-            session_id=session_id,
-            stream=True,
-        ):
-            content = ""
-            if hasattr(chunk, "content") and chunk.content:
-                content = str(chunk.content)
-            elif hasattr(chunk, "delta") and chunk.delta:
-                content = str(chunk.delta)
+        # Run agent in streaming mode.  We decouple Agno's async generator from
+        # the HTTP SSE generator via an asyncio.Queue so that any quirks in the
+        # Agno generator lifecycle (especially after MCP tool-call turns) do not
+        # abort the SSE response before we can send the done event.
+        sse_queue: asyncio.Queue[Tuple[str, Any]] = asyncio.Queue()
 
-            if content:
-                full_content += content
-                yield f"event: delta\ndata: {json.dumps({'content': content, 'current_agent': current_agent})}\n\n"
+        async def _produce_chunks() -> None:
+            async for chunk in agent.arun(
+                contextual_message,
+                user_id=user_id,
+                session_id=session_id,
+                stream=True,
+            ):
+                content = ""
+                if hasattr(chunk, "content") and chunk.content:
+                    content = str(chunk.content)
+                elif hasattr(chunk, "delta") and chunk.delta:
+                    content = str(chunk.delta)
 
-            # Collect tool call metadata.
-            chunk_tools = _extract_tool_calls(chunk)
-            if chunk_tools:
-                tool_calls.extend(chunk_tools)
-                yield f"event: tool_calls\ndata: {json.dumps({'tool_calls': chunk_tools, 'current_agent': current_agent})}\n\n"
+                if content:
+                    sse_queue.put_nowait(("delta", content))
 
-            # Try to capture token usage if the chunk exposes it.
-            if hasattr(chunk, "metrics") and chunk.metrics:
+                chunk_tools = _extract_tool_calls(chunk)
+                if chunk_tools:
+                    sse_queue.put_nowait(("tool_calls", chunk_tools))
+
+                if hasattr(chunk, "metrics") and chunk.metrics:
+                    try:
+                        metrics = chunk.metrics
+                        if hasattr(metrics, "input_tokens") and metrics.input_tokens is not None:
+                            token_detail["input_tokens"] = int(metrics.input_tokens)
+                        if hasattr(metrics, "output_tokens") and metrics.output_tokens is not None:
+                            token_detail["output_tokens"] = int(metrics.output_tokens)
+                        if hasattr(metrics, "total_tokens") and metrics.total_tokens is not None:
+                            token_detail["total_tokens"] = int(metrics.total_tokens)
+                        if hasattr(metrics, "reasoning_tokens") and metrics.reasoning_tokens is not None:
+                            token_detail["reasoning_tokens"] = int(metrics.reasoning_tokens)
+                        if hasattr(metrics, "cached_tokens") and metrics.cached_tokens is not None:
+                            token_detail["cached_tokens"] = int(metrics.cached_tokens)
+                    except Exception:
+                        pass
+            sse_queue.put_nowait(("done", None))
+
+        producer_task = asyncio.create_task(_produce_chunks())
+
+        try:
+            while True:
                 try:
-                    metrics = chunk.metrics
-                    if hasattr(metrics, "input_tokens") and metrics.input_tokens is not None:
-                        token_detail["input_tokens"] = int(metrics.input_tokens)
-                    if hasattr(metrics, "output_tokens") and metrics.output_tokens is not None:
-                        token_detail["output_tokens"] = int(metrics.output_tokens)
-                    if hasattr(metrics, "total_tokens") and metrics.total_tokens is not None:
-                        token_detail["total_tokens"] = int(metrics.total_tokens)
-                    if hasattr(metrics, "reasoning_tokens") and metrics.reasoning_tokens is not None:
-                        token_detail["reasoning_tokens"] = int(metrics.reasoning_tokens)
-                    if hasattr(metrics, "cached_tokens") and metrics.cached_tokens is not None:
-                        token_detail["cached_tokens"] = int(metrics.cached_tokens)
-                except Exception:
+                    kind, payload = await asyncio.wait_for(sse_queue.get(), timeout=30.0)
+                except asyncio.TimeoutError:
+                    yield "event: keepalive\ndata: {}\n\n"
+                    continue
+
+                if kind == "done":
+                    break
+                if kind == "delta":
+                    full_content += payload
+                    yield f"event: delta\ndata: {json.dumps({'content': payload, 'current_agent': current_agent})}\n\n"
+                elif kind == "tool_calls":
+                    tool_calls.extend(payload)
+                    yield f"event: tool_calls\ndata: {_safe_json_dumps({'tool_calls': payload, 'current_agent': current_agent})}\n\n"
+        finally:
+            if not producer_task.done():
+                producer_task.cancel()
+                try:
+                    await producer_task
+                except asyncio.CancelledError:
                     pass
 
         # Streaming chunks do not expose MCP tool-call metadata.  Collect any
@@ -638,9 +690,10 @@ async def _stream_agent_response(
         for toolkit in mcp_tools:
             if hasattr(toolkit, "recorded_calls") and toolkit.recorded_calls:
                 for call in toolkit.recorded_calls:
-                    if call not in tool_calls:
-                        tool_calls.append(call)
-                        yield f"event: tool_calls\ndata: {json.dumps({'tool_calls': [call], 'current_agent': current_agent})}\n\n"
+                    normalized = _normalize_tool_call(call)
+                    if normalized not in tool_calls:
+                        tool_calls.append(normalized)
+                        yield f"event: tool_calls\ndata: {_safe_json_dumps({'tool_calls': [normalized], 'current_agent': current_agent})}\n\n"
 
         # Derive token_count from total_tokens or input+output when possible.
         if token_detail["total_tokens"]:
@@ -672,7 +725,10 @@ async def _stream_agent_response(
             else "owner-facing default"
         )
 
-        # Persist the assistant message.
+        # Persist the assistant message synchronously. SQLite writes against the
+        # local demo DB are fast enough that the brief event-loop block is
+        # acceptable for this demo; the previous thread-pool + keepalive path
+        # hung under the current Agno/FastAPI runtime, so we keep it simple.
         saved = save_chat_message(
             session_id=session_id,
             role="assistant",
@@ -708,12 +764,23 @@ async def _stream_agent_response(
             'thinking_enabled': USE_THINKING,
             'model_selection_reason': model_selection_reason,
         }
-        yield f"event: done\ndata: {json.dumps(done_payload)}\n\n"
+        yield f"event: done\ndata: {_safe_json_dumps(done_payload)}\n\n"
+        done_yielded = True
 
     except Exception as e:
         import traceback
         traceback.print_exc()
-        yield f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n"
+        yield f"event: error\ndata: {_safe_json_dumps({'error': str(e)})}\n\n"
+        error_yielded = True
+    finally:
+        # If the generator exits for any reason (including client disconnect)
+        # without having sent done or error, send a minimal done so the client
+        # can close gracefully rather than hang.
+        if not done_yielded and not error_yielded:
+            try:
+                yield "event: done\ndata: {\"status\":\"complete\"}\n\n"
+            except BaseException:
+                pass
 
 
 @router.post("/stream")
