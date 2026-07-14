@@ -55,6 +55,7 @@ def build_model(model_id: Optional[str] = None, **overrides) -> DeepSeek:
             api_key=api_key,
             base_url=base_url,
             use_thinking=use_thinking,
+            timeout=120,
         )
 
     # Fallback to environment defaults when no DB config exists.
@@ -73,6 +74,7 @@ MODEL = DeepSeek(
     api_key=_deepseek_api_key(),
     base_url=_deepseek_base_url(),
     use_thinking=True,
+    timeout=120,
 )
 
 # ---------------------------------------------------------------------------
