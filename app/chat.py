@@ -442,8 +442,12 @@ async def _stream_agent_response(
                 pass
 
         # Per-skill model routing: if an activated skill specifies a model_id,
-        # build that model for this turn.
+        # build that model for this turn. Pro is reserved for backend-only
+        # workflows (A/B tests and Darwin deep-fix) and must never be triggered
+        # automatically by an owner-facing skill.
         from app.settings import build_model
+        if skill_model_id == "deepseek-v4-pro":
+            skill_model_id = None
         turn_model = build_model(skill_model_id) if skill_model_id else None
 
         # Provide owner context so the agent defaults to the current room_id
