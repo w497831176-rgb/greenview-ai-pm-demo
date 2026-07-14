@@ -46,17 +46,17 @@ class AgentCreate(BaseModel):
 
 class AgentUpdate(BaseModel):
     name: Optional[str] = None
-    description: Optional[str] = ""
-    instructions: Optional[str] = ""
-    system_prompt: Optional[str] = ""  # frontend alias for instructions
-    category: Optional[str] = "vertical"
-    is_router: Optional[bool] = False
-    enabled: Optional[bool] = True
+    description: Optional[str] = None
+    instructions: Optional[str] = None
+    system_prompt: Optional[str] = None  # frontend alias for instructions
+    category: Optional[str] = None
+    is_router: Optional[bool] = None
+    enabled: Optional[bool] = None
     model_id: Optional[str] = None
-    skill_ids: Optional[List[int]] = []
-    available_skills: Optional[List[str]] = []
-    tool_names: Optional[List[str]] = []
-    available_mcp_tools: Optional[List[str]] = []
+    skill_ids: Optional[List[int]] = None
+    available_skills: Optional[List[str]] = None
+    tool_names: Optional[List[str]] = None
+    available_mcp_tools: Optional[List[str]] = None
 
 
 class AgentToggleRequest(BaseModel):
@@ -156,34 +156,69 @@ async def create_agent(request: AgentCreate):
 
 @router.put("/{agent_id}")
 async def update_agent(agent_id: str, request: AgentUpdate):
-    """Update an agent."""
+    """Update an agent with partial-update semantics.
+
+    Only fields explicitly present in the request body are changed.
+    Omitting skill/tool fields preserves existing bindings; passing an
+    empty array explicitly clears them.
+    """
     agent = _resolve_agent(agent_id)
 
-    instructions = request.system_prompt if request.system_prompt is not None else request.instructions
-    category = request.category
-    if request.is_router is not None:
+    # Pydantic V2 / V1 compatible way to know which fields were sent.
+    fields_set = getattr(request, "model_fields_set", getattr(request, "__fields_set__", set()))
+
+    # 1. Basic scalar fields: keep original if not sent.
+    name = request.name if "name" in fields_set else agent.get("name")
+    description = request.description if "description" in fields_set else agent.get("description")
+    enabled = request.enabled if "enabled" in fields_set else agent.get("enabled")
+    model_id = request.model_id if "model_id" in fields_set else agent.get("model_id")
+
+    # 2. Instructions / system_prompt alias: system_prompt wins if sent.
+    if "system_prompt" in fields_set:
+        instructions = request.system_prompt
+    elif "instructions" in fields_set:
+        instructions = request.instructions
+    else:
+        instructions = agent.get("instructions")
+
+    # 3. Category / is_router alias: is_router wins if sent.
+    if "is_router" in fields_set:
         category = "router" if request.is_router else "vertical"
-    category = "router" if category in ("router", "orchestration") else "vertical"
+    elif "category" in fields_set:
+        category = "router" if request.category in ("router", "orchestration") else "vertical"
+    else:
+        category = agent.get("category")
+        category = "router" if category in ("router", "orchestration") else "vertical"
+
     updated = db_update_agent(
         agent_row_id=agent["id"],
-        name=request.name,
-        description=request.description,
+        name=name,
+        description=description,
         instructions=instructions,
         category=category,
-        enabled=request.enabled,
-        model_id=request.model_id,
+        enabled=enabled,
+        model_id=model_id,
     )
-    skill_ids = request.skill_ids
-    if request.available_skills is not None:
-        skill_ids = _resolve_skill_ids(request.available_skills)
-    tool_names = request.tool_names
-    if request.available_mcp_tools is not None:
-        tool_names = request.available_mcp_tools
+
+    # 4. Skill bindings: update only when skill fields are explicitly sent.
+    skill_ids = None
+    if "available_skills" in fields_set:
+        skill_ids = _resolve_skill_ids(request.available_skills or [])
+    elif "skill_ids" in fields_set:
+        skill_ids = request.skill_ids or []
     if skill_ids is not None:
         set_agent_skills(agent["agent_id"], skill_ids)
+
+    # 5. MCP tool bindings: update only when tool fields are explicitly sent.
+    tool_names = None
+    if "available_mcp_tools" in fields_set:
+        tool_names = request.available_mcp_tools or []
+    elif "tool_names" in fields_set:
+        tool_names = request.tool_names or []
     if tool_names is not None:
         tools = [{"tool_name": name} for name in tool_names]
         set_agent_tools(agent["agent_id"], tools)
+
     return {"agent": _serialize_agent(updated)}
 
 
