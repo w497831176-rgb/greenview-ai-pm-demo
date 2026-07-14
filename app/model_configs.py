@@ -31,7 +31,6 @@ class ModelConfigCreate(BaseModel):
     model_id: str
     name: str
     provider: str = "deepseek"
-    api_key: Optional[str] = None
     base_url: Optional[str] = None
     model_params: Optional[Dict[str, Any]] = Field(default_factory=dict)
     is_default: bool = False
@@ -42,7 +41,6 @@ class ModelConfigCreate(BaseModel):
 class ModelConfigUpdate(BaseModel):
     name: str
     provider: str = "deepseek"
-    api_key: Optional[str] = None
     base_url: Optional[str] = None
     model_params: Optional[Dict[str, Any]] = Field(default_factory=dict)
     is_default: bool = False
@@ -52,8 +50,10 @@ class ModelConfigUpdate(BaseModel):
 
 class AbTestRequest(BaseModel):
     prompt: str
-    model_a: str = "deepseek-v4-flash"
-    model_b: str = "deepseek-v4-pro"
+    # model_a / model_b are intentionally ignored. A/B is fixed to Flash vs Pro
+    # so that callers cannot use this endpoint to route Pro into owner chat.
+    model_a: Optional[str] = None
+    model_b: Optional[str] = None
 
 
 # Sensitive fields that must never be returned by read endpoints.
@@ -104,12 +104,16 @@ async def get_model_config(config_id: int):
 
 @router.post("")
 async def create_model_config(request: ModelConfigCreate):
-    """Create a new model configuration."""
+    """Create a new model configuration.
+
+    Browser-submitted API keys are intentionally ignored; the runtime uses the
+    shared server-side credential configured in the deployment environment.
+    """
     config = db_create_model_config(
         model_id=request.model_id,
         name=request.name,
         provider=request.provider,
-        api_key=request.api_key,
+        api_key=None,
         base_url=request.base_url,
         model_params=request.model_params or {},
         is_default=request.is_default,
@@ -121,12 +125,16 @@ async def create_model_config(request: ModelConfigCreate):
 
 @router.put("/{config_id}")
 async def update_model_config(config_id: int, request: ModelConfigUpdate):
-    """Update a model configuration."""
+    """Update a model configuration.
+
+    Browser-submitted API keys are intentionally ignored; the runtime uses the
+    shared server-side credential configured in the deployment environment.
+    """
     config = db_update_model_config(
         config_id=config_id,
         name=request.name,
         provider=request.provider,
-        api_key=request.api_key,
+        api_key=None,
         base_url=request.base_url,
         model_params=request.model_params or {},
         is_default=request.is_default,
@@ -201,8 +209,11 @@ async def ab_test_models(request: AbTestRequest):
             traceback.print_exc()
             return {"model_id": model_id, "response": "", "error": str(e)}
 
-    a_task = asyncio.create_task(_run_model(request.model_a, request.prompt))
-    b_task = asyncio.create_task(_run_model(request.model_b, request.prompt))
+    # A/B is fixed to Flash vs Pro regardless of what the client sends.
+    FIXED_MODEL_A = "deepseek-v4-flash"
+    FIXED_MODEL_B = "deepseek-v4-pro"
+    a_task = asyncio.create_task(_run_model(FIXED_MODEL_A, request.prompt))
+    b_task = asyncio.create_task(_run_model(FIXED_MODEL_B, request.prompt))
     a_result, b_result = await asyncio.gather(a_task, b_task)
 
     return {

@@ -441,14 +441,12 @@ async def _stream_agent_response(
             except Exception:
                 pass
 
-        # Per-skill model routing: if an activated skill specifies a model_id,
-        # build that model for this turn. Pro is reserved for backend-only
-        # workflows (A/B tests and Darwin deep-fix) and must never be triggered
-        # automatically by an owner-facing skill.
-        from app.settings import build_model
-        if skill_model_id == "deepseek-v4-pro":
-            skill_model_id = None
-        turn_model = build_model(skill_model_id) if skill_model_id else None
+        # Owner-facing chat ignores any model_id declared by a Skill. Skills may
+        # inject prompt context, tools, and knowledge, but the runtime model is
+        # always the owner-facing default (deepseek-v4-flash). Pro and any other
+        # alternative model are reserved for backend-only workflows.
+        skill_model_id = None
+        turn_model = None
 
         # Provide owner context so the agent defaults to the current room_id
         # when the user does not explicitly mention one.

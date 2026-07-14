@@ -5,9 +5,12 @@ Model Config Compatibility Router
 Exposes the same model-config resources under the URL paths expected by the
 frontend (/api/models/*) and by test cases that use model_id identifiers
 (/api/model-configs/{model_id}/*).
+
+Legacy write endpoints for browser-submitted API keys are permanently removed
+(410 Gone). The runtime only uses the shared server-side credential configured
+in the deployment environment.
 """
 
-import asyncio
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, HTTPException
@@ -29,14 +32,9 @@ from db.property_db import (
 router = APIRouter(tags=["models-compat"])
 
 
-class ModelKeyUpdate(BaseModel):
-    api_key: str
-
-
 class ModelConfigPayload(BaseModel):
     name: str
     provider: str = "deepseek"
-    api_key: Optional[str] = None
     base_url: Optional[str] = None
     model_params: Optional[Dict[str, Any]] = {}
     enabled: bool = True
@@ -63,32 +61,23 @@ async def list_models_compat():
 
 
 @router.post("/api/models/{model_key}/key")
-async def update_model_key_compat(model_key: str, request: ModelKeyUpdate):
-    """Frontend alias for updating a model's API key by model_id.
+async def update_model_key_compat(model_key: str):
+    """Legacy endpoint for updating a model's API key from the browser.
 
-    The returned config never includes the api_key value.
+    Permanently disabled: API keys must not be submitted or persisted from the
+    browser. The runtime uses the shared server-side credential.
     """
-    cfg = _resolve_config(model_key)
-    updated = db_update_model_config(
-        config_id=cfg["id"],
-        name=cfg["name"],
-        provider=cfg.get("provider", "deepseek"),
-        api_key=request.api_key,
-        base_url=cfg.get("base_url"),
-        model_params=cfg.get("model_params") or {},
-        is_default=cfg.get("is_default", False),
-        enabled=cfg.get("enabled", True),
-        description=cfg.get("description", ""),
-    )
-    return {"model_config": _sanitize_config(updated)}
+    raise HTTPException(status_code=410, detail="api key update endpoint is retired")
 
 
 @router.post("/api/models/{model_key}/default")
 async def set_default_model_compat(model_key: str):
-    """Frontend alias for setting the default model by model_id."""
-    cfg = _resolve_config(model_key)
-    updated = db_set_default_model_config(cfg["id"])
-    return {"model_config": _sanitize_config(updated)}
+    """Legacy endpoint for setting the default model from the browser.
+
+    Permanently disabled: the runtime default is controlled by the deployment
+    configuration, not by browser requests.
+    """
+    raise HTTPException(status_code=410, detail="default model selection endpoint is retired")
 
 
 @router.post("/api/models/ab-test")
@@ -119,13 +108,16 @@ async def get_model_config_by_id_compat(model_id: str):
 
 @router.put("/api/model-configs/{model_id}")
 async def update_model_config_by_id_compat(model_id: str, request: ModelConfigPayload):
-    """Update model config by model_id."""
+    """Update model config by model_id.
+
+    Browser-submitted API keys are intentionally ignored.
+    """
     cfg = _resolve_config(model_id)
     updated = db_update_model_config(
         config_id=cfg["id"],
         name=request.name,
         provider=request.provider,
-        api_key=request.api_key,
+        api_key=None,
         base_url=request.base_url,
         model_params=request.model_params or {},
         is_default=cfg.get("is_default", False),
@@ -137,7 +129,9 @@ async def update_model_config_by_id_compat(model_id: str, request: ModelConfigPa
 
 @router.post("/api/model-configs/{model_id}/set-default")
 async def set_default_model_config_by_id_compat(model_id: str):
-    """Set default model config by model_id."""
-    cfg = _resolve_config(model_id)
-    updated = db_set_default_model_config(cfg["id"])
-    return {"model_config": _sanitize_config(updated)}
+    """Legacy endpoint for setting the default model.
+
+    Permanently disabled: the runtime default is controlled by the deployment
+    configuration, not by browser requests.
+    """
+    raise HTTPException(status_code=410, detail="default model selection endpoint is retired")
