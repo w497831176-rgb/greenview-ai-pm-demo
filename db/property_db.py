@@ -1323,6 +1323,27 @@ def _migrate_mcp_hygiene(cursor):
             tuple(purge_ids),
         )
 
+    # Deduplicate canonical server names: keep the lowest id for each name and
+    # remove duplicates that may have been created during earlier migrations/tests.
+    canonical_names = ("weather-server", "workorder-server", "calendar-server")
+    for name in canonical_names:
+        cursor.execute(
+            "SELECT id FROM mcp_servers WHERE name = ? ORDER BY id ASC",
+            (name,),
+        )
+        rows = [r[0] for r in cursor.fetchall()]
+        if len(rows) > 1:
+            keep_id = rows[0]
+            duplicate_ids = rows[1:]
+            cursor.execute(
+                "DELETE FROM mcp_tools WHERE server_id IN (" + ",".join("?" * len(duplicate_ids)) + ")",
+                tuple(duplicate_ids),
+            )
+            cursor.execute(
+                "DELETE FROM mcp_servers WHERE id IN (" + ",".join("?" * len(duplicate_ids)) + ")",
+                tuple(duplicate_ids),
+            )
+
     # Canonical demo servers.  Use INSERT OR IGNORE for names, then UPDATE
     # command/args/description so re-running the migration stays idempotent.
     canonical_servers = [
