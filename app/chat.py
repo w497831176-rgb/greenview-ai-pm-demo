@@ -146,6 +146,9 @@ if MCPTools is not None:
                     try:
                         result = await original(*args, **kwargs)
                         result_summary = _summarize_tool_result(result)
+                        if "Error from MCP tool" in result_summary:
+                            status = "failed"
+                            error_summary = result_summary[:300]
                         return result
                     except Exception as exc:
                         status = "failed"
@@ -166,6 +169,9 @@ if MCPTools is not None:
                     loop = asyncio.get_event_loop()
                     result = await loop.run_in_executor(None, lambda: original(*args, **kwargs))
                     result_summary = _summarize_tool_result(result)
+                    if "Error from MCP tool" in result_summary:
+                        status = "failed"
+                        error_summary = result_summary[:300]
                     return result
                 except Exception as exc:
                     status = "failed"
