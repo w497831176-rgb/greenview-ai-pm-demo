@@ -9,6 +9,7 @@ Database file lives on a mounted volume so it persists across container restarts
 import json
 import os
 import sqlite3
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional

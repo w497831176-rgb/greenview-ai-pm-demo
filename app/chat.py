@@ -17,6 +17,7 @@ import asyncio
 import json
 import os
 import re
+import time
 import uuid
 from typing import Any, AsyncIterator, Dict, List, Optional
 
@@ -939,6 +940,21 @@ async def _stream_agent_response(
         except Exception:
             pass
 
+        # Build MCP audit list for the done event and persistence.
+        mcp_calls_for_done: List[Dict[str, Any]] = []
+        for toolkit in mcp_tools:
+            if hasattr(toolkit, "recorded_calls") and toolkit.recorded_calls:
+                for call in toolkit.recorded_calls:
+                    mcp_calls_for_done.append({
+                        "server_name": getattr(toolkit, "server_name", "unknown"),
+                        "tool_name": call.get("tool_name", ""),
+                        "arguments": call.get("arguments", {}),
+                        "status": call.get("status", "success"),
+                        "result_summary": call.get("result_summary", ""),
+                        "error_summary": call.get("error_summary"),
+                        "latency_ms": call.get("latency_ms"),
+                    })
+
         # Persist the assistant message synchronously. SQLite writes against the
         # local demo DB are fast enough that the brief event-loop block is
         # acceptable for this demo; the previous thread-pool + keepalive path
@@ -965,21 +981,6 @@ async def _stream_agent_response(
             mcp_calls=mcp_calls_for_done or None,
             usage_source=usage_source,
         )
-
-        # Build MCP audit list for the done event.
-        mcp_calls_for_done: List[Dict[str, Any]] = []
-        for toolkit in mcp_tools:
-            if hasattr(toolkit, "recorded_calls") and toolkit.recorded_calls:
-                for call in toolkit.recorded_calls:
-                    mcp_calls_for_done.append({
-                        "server_name": getattr(toolkit, "server_name", "unknown"),
-                        "tool_name": call.get("tool_name", ""),
-                        "arguments": call.get("arguments", {}),
-                        "status": call.get("status", "success"),
-                        "result_summary": call.get("result_summary", ""),
-                        "error_summary": call.get("error_summary"),
-                        "latency_ms": call.get("latency_ms"),
-                    })
 
         # Send completion event including token metrics, citations, activated skills and agent info.
         done_payload = {
