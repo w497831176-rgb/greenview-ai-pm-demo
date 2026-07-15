@@ -286,11 +286,27 @@ def init_db():
             handoff_active_at TEXT,
             handoff_resolved_at TEXT,
             assigned_to TEXT,
+            title TEXT,
+            last_message_at TEXT,
+            last_message_preview TEXT,
+            last_agent TEXT,
             created_at TEXT,
             updated_at TEXT
         )
         """
     )
+
+    # Migration: add session metadata columns.
+    for col, dtype in [
+        ("title", "TEXT"),
+        ("last_message_at", "TEXT"),
+        ("last_message_preview", "TEXT"),
+        ("last_agent", "TEXT"),
+    ]:
+        try:
+            cursor.execute(f"ALTER TABLE chat_sessions ADD COLUMN {col} {dtype}")
+        except sqlite3.OperationalError:
+            pass
 
     # Migration: add token_detail column to existing chat_messages table.
     try:
@@ -315,6 +331,10 @@ def init_db():
         ("model_id", "TEXT"),
         ("thinking_enabled", "INTEGER"),
         ("model_selection_reason", "TEXT"),
+        ("trace_id", "TEXT"),
+        ("status", "TEXT"),
+        ("latency_ms", "INTEGER"),
+        ("error_summary", "TEXT"),
     ]:
         try:
             cursor.execute(f"ALTER TABLE chat_messages ADD COLUMN {col} {dtype}")
@@ -433,6 +453,10 @@ def init_db():
 
     # Clean up demo/test MCP servers and ensure canonical demo servers/bindings.
     _migrate_mcp_hygiene(cursor)
+    conn.commit()
+
+    # V1.3 observability & cost governance schema.
+    _migrate_v1_3_observability(cursor)
     conn.commit()
 
     conn.close()
@@ -1408,6 +1432,110 @@ def _migrate_mcp_hygiene(cursor):
         )
 
 
+def _migrate_v1_3_observability(cursor):
+    """Non-destructive migrations for V1.3 observability & cost governance."""
+    now = now_cn("%Y-%m-%d %H:%M")
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS chat_traces (
+            trace_id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            user_message TEXT,
+            intent TEXT,
+            agent_name TEXT,
+            status TEXT,
+            created_at TEXT,
+            updated_at TEXT
+        )
+        """
+    )
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS model_calls (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            trace_id TEXT NOT NULL,
+            stage TEXT,
+            model_id TEXT,
+            status TEXT,
+            latency_ms INTEGER,
+            input_tokens INTEGER,
+            output_tokens INTEGER,
+            reasoning_tokens INTEGER,
+            cached_tokens INTEGER,
+            total_tokens INTEGER,
+            usage_source TEXT,
+            model_selection_reason TEXT,
+            error_summary TEXT,
+            price_snapshot TEXT,
+            estimated_cost_cny REAL,
+            created_at TEXT
+        )
+        """
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_model_calls_trace_id ON model_calls(trace_id)"
+    )
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS mcp_call_audits (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            trace_id TEXT NOT NULL,
+            server_name TEXT,
+            tool_name TEXT,
+            arguments TEXT,
+            status TEXT,
+            result_summary TEXT,
+            error_summary TEXT,
+            latency_ms INTEGER,
+            created_at TEXT
+        )
+        """
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_mcp_call_audits_trace_id ON mcp_call_audits(trace_id)"
+    )
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS model_prices (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            model_id TEXT NOT NULL,
+            currency TEXT DEFAULT 'CNY',
+            effective_date TEXT,
+            input_price_per_1m REAL,
+            cached_input_price_per_1m REAL,
+            output_price_per_1m REAL,
+            reasoning_price_per_1m REAL,
+            source_note TEXT,
+            enabled INTEGER DEFAULT 1,
+            created_at TEXT,
+            updated_at TEXT
+        )
+        """
+    )
+    cursor.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_model_prices_model_effective ON model_prices(model_id, effective_date)"
+    )
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS budget_thresholds (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            per_call_threshold_cny REAL,
+            daily_threshold_cny REAL,
+            updated_at TEXT
+        )
+        """
+    )
+    cursor.execute(
+        "INSERT OR IGNORE INTO budget_thresholds (id, per_call_threshold_cny, daily_threshold_cny, updated_at) VALUES (1, NULL, NULL, ?)",
+        (now,),
+    )
+
+
 def create_work_order(
     work_order_id: str,
     room_id: str,
@@ -2173,6 +2301,10 @@ def save_chat_message(
     model_id: Optional[str] = None,
     thinking_enabled: Optional[bool] = None,
     model_selection_reason: Optional[str] = None,
+    trace_id: Optional[str] = None,
+    status: Optional[str] = None,
+    latency_ms: Optional[int] = None,
+    error_summary: Optional[str] = None,
 ) -> Dict[str, Any]:
     now = now_cn()
     conn = _get_conn()
@@ -2182,8 +2314,8 @@ def save_chat_message(
         INSERT INTO chat_messages (
             session_id, role, content, token_count, token_detail, citations, activated_skills,
             route_intent, route_reason, current_agent, tool_calls, model_id, thinking_enabled,
-            model_selection_reason, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            model_selection_reason, trace_id, status, latency_ms, error_summary, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             session_id,
@@ -2200,10 +2332,38 @@ def save_chat_message(
             model_id,
             1 if thinking_enabled else 0,
             model_selection_reason,
+            trace_id,
+            status,
+            latency_ms,
+            error_summary,
             now,
         ),
     )
     message_id = cursor.lastrowid
+
+    # Update session metadata for owner messages and assistant messages.
+    if role in ("user", "owner", "assistant", "staff"):
+        preview = (content or "")[:80]
+        title_update = ""
+        if role in ("user", "owner"):
+            cursor.execute("SELECT title FROM chat_sessions WHERE session_id = ?", (session_id,))
+            existing_title = cursor.fetchone()
+            if not existing_title or not existing_title[0]:
+                title = (content or "").strip().replace("\n", " ")[:30]
+                title_update = ", title = ?"
+                title_args = (title,)
+            else:
+                title_args = ()
+        else:
+            title_args = ()
+        cursor.execute(
+            f"""
+            UPDATE chat_sessions
+            SET updated_at = ?, last_message_at = ?, last_message_preview = ?, last_agent = ?{title_update}
+            WHERE session_id = ?
+            """,
+            (now, now, preview, current_agent or "") + title_args + (session_id,),
+        )
     conn.commit()
     conn.close()
     return get_chat_message(message_id)
@@ -2260,7 +2420,7 @@ def delete_chat_messages(session_id: str) -> bool:
 # -----------------------------------------------------------------------------
 
 
-def ensure_chat_session(session_id: str) -> Dict[str, Any]:
+def ensure_chat_session(session_id: str, title: Optional[str] = None) -> Dict[str, Any]:
     """Create a chat session row if it doesn't exist."""
     conn = _get_conn()
     cursor = conn.cursor()
@@ -2269,14 +2429,48 @@ def ensure_chat_session(session_id: str) -> Dict[str, Any]:
     if not row:
         now = now_cn()
         cursor.execute(
-            "INSERT INTO chat_sessions (session_id, handoff_status, created_at, updated_at) VALUES (?, ?, ?, ?)",
-            (session_id, "none", now, now),
+            "INSERT INTO chat_sessions (session_id, handoff_status, title, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+            (session_id, "none", title, now, now),
         )
         conn.commit()
         cursor.execute("SELECT * FROM chat_sessions WHERE session_id = ?", (session_id,))
         row = cursor.fetchone()
     conn.close()
     return dict(row) if row else {"session_id": session_id, "handoff_status": "none"}
+
+
+def create_chat_session(user_id: Optional[str] = None, title: Optional[str] = None) -> Dict[str, Any]:
+    """Create a new chat session with a fresh session_id."""
+    session_id = f"web-{uuid.uuid4().hex[:12]}"
+    now = now_cn()
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO chat_sessions (session_id, handoff_status, title, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+        (session_id, "none", title, now, now),
+    )
+    conn.commit()
+    conn.close()
+    return get_chat_session(session_id) or {"session_id": session_id, "handoff_status": "none"}
+
+
+def list_user_chat_sessions(user_id: Optional[str] = None, limit: int = 100) -> List[Dict[str, Any]]:
+    """Return recent chat sessions ordered by last activity."""
+    # user_id is accepted for future multi-tenant use; currently sessions are global per demo.
+    _ = user_id
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT * FROM chat_sessions
+        ORDER BY COALESCE(last_message_at, updated_at, created_at) DESC
+        LIMIT ?
+        """,
+        (limit,),
+    )
+    rows = cursor.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
 
 
 def request_handoff(session_id: str, reason: str) -> Dict[str, Any]:
@@ -2379,6 +2573,424 @@ def is_handoff_requested(session_id: str) -> bool:
     """Return True if the session has a pending handoff request."""
     session = get_chat_session(session_id)
     return session is not None and session.get("handoff_status") == "requested"
+
+
+# ---------------------------------------------------------------------------
+# V1.3 Observability & Cost Governance
+# ---------------------------------------------------------------------------
+
+
+def create_chat_trace(
+    trace_id: str,
+    session_id: str,
+    user_message: str,
+) -> Dict[str, Any]:
+    now = now_cn()
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        INSERT INTO chat_traces (trace_id, session_id, user_message, status, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (trace_id, session_id, user_message, "in_progress", now, now),
+    )
+    conn.commit()
+    conn.close()
+    return get_chat_trace(trace_id) or {"trace_id": trace_id, "session_id": session_id}
+
+
+def update_chat_trace(
+    trace_id: str,
+    intent: Optional[str] = None,
+    agent_name: Optional[str] = None,
+    status: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    now = now_cn()
+    conn = _get_conn()
+    cursor = conn.cursor()
+    fields = []
+    params = []
+    if intent is not None:
+        fields.append("intent = ?")
+        params.append(intent)
+    if agent_name is not None:
+        fields.append("agent_name = ?")
+        params.append(agent_name)
+    if status is not None:
+        fields.append("status = ?")
+        params.append(status)
+    if not fields:
+        conn.close()
+        return get_chat_trace(trace_id)
+    fields.append("updated_at = ?")
+    params.append(now)
+    params.append(trace_id)
+    cursor.execute(
+        f"UPDATE chat_traces SET {', '.join(fields)} WHERE trace_id = ?",
+        params,
+    )
+    conn.commit()
+    conn.close()
+    return get_chat_trace(trace_id)
+
+
+def get_chat_trace(trace_id: str) -> Optional[Dict[str, Any]]:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM chat_traces WHERE trace_id = ?", (trace_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def list_chat_traces(
+    session_id: Optional[str] = None,
+    limit: int = 100,
+    offset: int = 0,
+) -> List[Dict[str, Any]]:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    if session_id:
+        cursor.execute(
+            "SELECT * FROM chat_traces WHERE session_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?",
+            (session_id, limit, offset),
+        )
+    else:
+        cursor.execute(
+            "SELECT * FROM chat_traces ORDER BY created_at DESC LIMIT ? OFFSET ?",
+            (limit, offset),
+        )
+    rows = cursor.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def record_model_call(
+    trace_id: str,
+    stage: str,
+    model_id: str,
+    model_selection_reason: Optional[str] = None,
+    latency_ms: Optional[int] = None,
+    input_tokens: Optional[int] = None,
+    output_tokens: Optional[int] = None,
+    reasoning_tokens: Optional[int] = None,
+    cached_tokens: Optional[int] = None,
+    total_tokens: Optional[int] = None,
+    usage_source: str = "unavailable",
+    status: str = "success",
+    error_summary: Optional[str] = None,
+    price_snapshot: Optional[Dict[str, Any]] = None,
+    estimated_cost_cny: Optional[float] = None,
+) -> Dict[str, Any]:
+    now = now_cn()
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        INSERT INTO model_calls (
+            trace_id, stage, model_id, status, latency_ms, input_tokens, output_tokens,
+            reasoning_tokens, cached_tokens, total_tokens, usage_source, model_selection_reason,
+            error_summary, price_snapshot, estimated_cost_cny, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            trace_id,
+            stage,
+            model_id,
+            status,
+            latency_ms,
+            input_tokens,
+            output_tokens,
+            reasoning_tokens,
+            cached_tokens,
+            total_tokens,
+            usage_source,
+            model_selection_reason,
+            error_summary,
+            json.dumps(price_snapshot, ensure_ascii=False) if price_snapshot else None,
+            estimated_cost_cny,
+            now,
+        ),
+    )
+    call_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return get_model_call(call_id) or {"id": call_id}
+
+
+def get_model_call(call_id: int) -> Optional[Dict[str, Any]]:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM model_calls WHERE id = ?", (call_id,))
+    row = cursor.fetchone()
+    conn.close()
+    if not row:
+        return None
+    msg = dict(row)
+    if msg.get("price_snapshot"):
+        try:
+            msg["price_snapshot"] = json.loads(msg["price_snapshot"])
+        except Exception:
+            pass
+    return msg
+
+
+def get_model_calls_for_trace(trace_id: str) -> List[Dict[str, Any]]:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT * FROM model_calls WHERE trace_id = ? ORDER BY id ASC",
+        (trace_id,),
+    )
+    rows = cursor.fetchall()
+    conn.close()
+    calls = []
+    for r in rows:
+        msg = dict(r)
+        if msg.get("price_snapshot"):
+            try:
+                msg["price_snapshot"] = json.loads(msg["price_snapshot"])
+            except Exception:
+                pass
+        calls.append(msg)
+    return calls
+
+
+def record_mcp_call_audit(
+    trace_id: str,
+    server_name: str,
+    tool_name: str,
+    arguments: Optional[Dict[str, Any]] = None,
+    status: str = "success",
+    result_summary: Optional[str] = None,
+    error_summary: Optional[str] = None,
+    latency_ms: Optional[int] = None,
+) -> Dict[str, Any]:
+    now = now_cn()
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        INSERT INTO mcp_call_audits (
+            trace_id, server_name, tool_name, arguments, status, result_summary,
+            error_summary, latency_ms, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            trace_id,
+            server_name,
+            tool_name,
+            json.dumps(arguments, ensure_ascii=False) if arguments else None,
+            status,
+            result_summary,
+            error_summary,
+            latency_ms,
+            now,
+        ),
+    )
+    audit_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return get_mcp_call_audit(audit_id) or {"id": audit_id}
+
+
+def get_mcp_call_audit(audit_id: int) -> Optional[Dict[str, Any]]:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM mcp_call_audits WHERE id = ?", (audit_id,))
+    row = cursor.fetchone()
+    conn.close()
+    if not row:
+        return None
+    msg = dict(row)
+    if msg.get("arguments"):
+        try:
+            msg["arguments"] = json.loads(msg["arguments"])
+        except Exception:
+            pass
+    return msg
+
+
+def get_mcp_call_audits_for_trace(trace_id: str) -> List[Dict[str, Any]]:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT * FROM mcp_call_audits WHERE trace_id = ? ORDER BY id ASC",
+        (trace_id,),
+    )
+    rows = cursor.fetchall()
+    conn.close()
+    audits = []
+    for r in rows:
+        msg = dict(r)
+        if msg.get("arguments"):
+            try:
+                msg["arguments"] = json.loads(msg["arguments"])
+            except Exception:
+                pass
+        audits.append(msg)
+    return audits
+
+
+def _normalize_price(row: Dict[str, Any]) -> Dict[str, Any]:
+    row["enabled"] = bool(row.get("enabled"))
+    return row
+
+
+def create_model_price(
+    model_id: str,
+    effective_date: str,
+    input_price_per_1m: Optional[float] = None,
+    cached_input_price_per_1m: Optional[float] = None,
+    output_price_per_1m: Optional[float] = None,
+    reasoning_price_per_1m: Optional[float] = None,
+    source_note: Optional[str] = None,
+    enabled: bool = True,
+) -> Dict[str, Any]:
+    now = now_cn()
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        INSERT INTO model_prices (
+            model_id, currency, effective_date, input_price_per_1m, cached_input_price_per_1m,
+            output_price_per_1m, reasoning_price_per_1m, source_note, enabled, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            model_id,
+            "CNY",
+            effective_date,
+            input_price_per_1m,
+            cached_input_price_per_1m,
+            output_price_per_1m,
+            reasoning_price_per_1m,
+            source_note,
+            1 if enabled else 0,
+            now,
+            now,
+        ),
+    )
+    price_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return get_model_price(price_id) or {"id": price_id}
+
+
+def get_model_price(price_id: int) -> Optional[Dict[str, Any]]:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM model_prices WHERE id = ?", (price_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return _normalize_price(dict(row)) if row else None
+
+
+def list_model_prices(enabled_only: bool = False) -> List[Dict[str, Any]]:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    query = "SELECT * FROM model_prices WHERE 1=1"
+    params = []
+    if enabled_only:
+        query += " AND enabled = 1"
+    query += " ORDER BY model_id, effective_date DESC"
+    cursor.execute(query, params)
+    rows = cursor.fetchall()
+    conn.close()
+    return [_normalize_price(dict(r)) for r in rows]
+
+
+def get_enabled_price_for_model(model_id: str) -> Optional[Dict[str, Any]]:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT * FROM model_prices WHERE model_id = ? AND enabled = 1 ORDER BY effective_date DESC LIMIT 1",
+        (model_id,),
+    )
+    row = cursor.fetchone()
+    conn.close()
+    return _normalize_price(dict(row)) if row else None
+
+
+def update_model_price(
+    price_id: int,
+    **updates: Any,
+) -> Optional[Dict[str, Any]]:
+    allowed = {
+        "model_id",
+        "effective_date",
+        "input_price_per_1m",
+        "cached_input_price_per_1m",
+        "output_price_per_1m",
+        "reasoning_price_per_1m",
+        "source_note",
+        "enabled",
+    }
+    fields = []
+    params = []
+    for key, value in updates.items():
+        if key not in allowed:
+            continue
+        if key == "enabled":
+            value = 1 if value else 0
+        fields.append(f"{key} = ?")
+        params.append(value)
+    if not fields:
+        return get_model_price(price_id)
+    fields.append("updated_at = ?")
+    params.append(now_cn())
+    params.append(price_id)
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute(f"UPDATE model_prices SET {', '.join(fields)} WHERE id = ?", params)
+    conn.commit()
+    conn.close()
+    return get_model_price(price_id)
+
+
+def delete_model_price(price_id: int) -> bool:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM model_prices WHERE id = ?", (price_id,))
+    deleted = cursor.rowcount > 0
+    conn.commit()
+    conn.close()
+    return deleted
+
+
+def get_budget_thresholds() -> Dict[str, Any]:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM budget_thresholds WHERE id = 1")
+    row = cursor.fetchone()
+    conn.close()
+    return dict(row) if row else {"id": 1, "per_call_threshold_cny": None, "daily_threshold_cny": None}
+
+
+def update_budget_thresholds(
+    per_call_threshold_cny: Optional[float] = None,
+    daily_threshold_cny: Optional[float] = None,
+) -> Dict[str, Any]:
+    now = now_cn()
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        UPDATE budget_thresholds
+        SET per_call_threshold_cny = ?, daily_threshold_cny = ?, updated_at = ?
+        WHERE id = 1
+        """,
+        (per_call_threshold_cny, daily_threshold_cny, now),
+    )
+    if cursor.rowcount == 0:
+        cursor.execute(
+            "INSERT OR IGNORE INTO budget_thresholds (id, per_call_threshold_cny, daily_threshold_cny, updated_at) VALUES (1, ?, ?, ?)",
+            (per_call_threshold_cny, daily_threshold_cny, now),
+        )
+    conn.commit()
+    conn.close()
+    return get_budget_thresholds()
 
 
 # ---------------------------------------------------------------------------
