@@ -29,7 +29,9 @@ def get_current_weather(city: str) -> str:
     city = city.strip()
     data = CITY_WEATHER.get(city)
     if not data:
-        return f"暂不支持查询 {city} 的天气，请提供北京、上海、广州、深圳、杭州、成都、武汉、西安等城市。"
+        raise ValueError(
+            f"暂不支持查询 {city} 的天气，请提供北京、上海、广州、深圳、杭州、成都、武汉、西安等城市。"
+        )
     return (
         f"{city}当前天气：{data['condition']}，"
         f"气温 {data['temperature']}℃，"
@@ -44,7 +46,7 @@ def get_weather_advice(city: str) -> str:
     city = city.strip()
     data = CITY_WEATHER.get(city)
     if not data:
-        return f"暂不支持查询 {city} 的天气。"
+        raise ValueError(f"暂不支持查询 {city} 的天气。")
     if data["condition"] in ("雷阵雨", "阵雨", "大雨"):
         return f"{city}今天有雨，外出请带伞，不建议安排露天维修作业。"
     if data["temperature"] >= 35:

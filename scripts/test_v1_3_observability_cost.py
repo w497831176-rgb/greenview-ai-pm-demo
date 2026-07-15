@@ -452,9 +452,8 @@ def test_darwin_records_pro():
     try:
         badcase = post("/api/badcases", {
             "session_id": f"v13-darwin-{uuid.uuid4().hex[:8]}",
-            "message_id": 0,
-            "category": "routing_error",
-            "reason": "测试 Darwin 分析",
+            "source_message_id": 0,
+            "category": "model",
             "title": "V1.3 Darwin 测试",
             "description": "测试 Darwin 优化",
             "status": "pending",
@@ -486,7 +485,7 @@ def test_cost_02_rag_topk():
     query = "维修收费标准是什么"
 
     def run_search(k: int) -> Dict[str, Any]:
-        put("/api/knowledge/retrieval-settings", {**original, "top_k": k})
+        post("/api/knowledge/retrieval-settings", {**original, "top_k": k})
         return post("/api/retrieval/search", {"query": query, "top_k": k})
 
     r1 = run_search(1)
@@ -529,34 +528,39 @@ def test_security_no_secrets():
 
 
 def main():
-    test_health()
-    sids = test_session_create_and_isolation()
-    traces = test_trace_and_mcp_audit()
-    cost_trace = test_cost_governance_no_price()
-    ab_trace = test_price_table_and_cost_recalc()
-    test_budget_alert()
-    test_darwin_records_pro()
-    test_cost_02_rag_topk()
-    test_security_no_secrets()
-
-    passed = sum(1 for t in tests if t["passed"])
-    total = len(tests)
-    result = {
-        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "base_url": BASE_URL,
-        "tests": tests,
-        "summary": {"passed": passed, "total": total, "success": passed == total},
-        "trace_ids": {
-            "session_test": {"session_1": sids[0], "session_2": sids[1]} if sids else None,
-            "mcp": traces,
-            "cost_no_price": cost_trace.get("trace_id"),
-            "ab_test": ab_trace,
-        },
-    }
-    path = "/tmp/v1_3_observability_cost_evidence.json"
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(result, f, ensure_ascii=False, indent=2)
-    print(f"\n{passed}/{total} passed. Evidence written to {path}")
+    sids = None
+    traces = None
+    cost_trace = {}
+    ab_trace = None
+    try:
+        test_health()
+        sids = test_session_create_and_isolation()
+        traces = test_trace_and_mcp_audit()
+        cost_trace = test_cost_governance_no_price()
+        ab_trace = test_price_table_and_cost_recalc()
+        test_budget_alert()
+        test_darwin_records_pro()
+        test_cost_02_rag_topk()
+        test_security_no_secrets()
+    finally:
+        passed = sum(1 for t in tests if t["passed"])
+        total = len(tests)
+        result = {
+            "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "base_url": BASE_URL,
+            "tests": tests,
+            "summary": {"passed": passed, "total": total, "success": passed == total},
+            "trace_ids": {
+                "session_test": {"session_1": sids[0], "session_2": sids[1]} if sids else None,
+                "mcp": traces,
+                "cost_no_price": cost_trace.get("trace_id") if cost_trace else None,
+                "ab_test": ab_trace,
+            },
+        }
+        path = "/tmp/v1_3_observability_cost_evidence.json"
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(result, f, ensure_ascii=False, indent=2)
+        print(f"\n{passed}/{total} passed. Evidence written to {path}")
     if passed != total:
         raise SystemExit(1)
 

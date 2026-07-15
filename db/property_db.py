@@ -2860,7 +2860,7 @@ def create_model_price(
     cursor = conn.cursor()
     cursor.execute(
         """
-        INSERT INTO model_prices (
+        INSERT OR REPLACE INTO model_prices (
             model_id, currency, effective_date, input_price_per_1m, cached_input_price_per_1m,
             output_price_per_1m, reasoning_price_per_1m, source_note, enabled, created_at, updated_at
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
