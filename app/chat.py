@@ -34,17 +34,27 @@ from agents.router import classify_intent
 from db.property_db import (
     activate_handoff,
     create_badcase,
+    create_chat_session,
+    create_chat_trace,
     ensure_chat_session,
+    get_budget_thresholds,
     get_chat_session,
+    get_enabled_price_for_model,
+    get_model_calls_for_trace,
     is_handoff_active,
     is_handoff_requested,
     list_chat_messages,
     list_handoff_sessions,
     list_mcp_servers,
     list_skills,
+    list_user_chat_sessions,
+    record_mcp_call_audit,
+    record_model_call,
     request_handoff,
     resolve_handoff,
     save_chat_message,
+    update_budget_thresholds,
+    update_chat_trace,
     now_cn,
 )
 import rag_indexer
@@ -68,11 +78,16 @@ if MCPTools is not None:
         arguments actually passed to the MCP server.  The recorded calls are
         then included in the SSE `done` event and persisted with the chat
         message.
+
+        In V1.3 each call is also written to `mcp_call_audits` after the tool
+        actually executes, with status, result summary, and latency.
         """
 
         def __init__(self, *args: Any, **kwargs: Any):
             super().__init__(*args, **kwargs)
             self.recorded_calls: List[Dict[str, Any]] = []
+            self.trace_id: Optional[str] = None
+            self.server_name: str = "unknown"
 
         async def build_tools(self) -> None:
             # Build tools in the current event loop. MCPTools uses asyncio stdio
@@ -86,19 +101,78 @@ if MCPTools is not None:
                 wrapped = self._wrap(original, fn_name)
                 fn.entrypoint = wrapped
 
+        def _record_audit(
+            self,
+            fn_name: str,
+            args_dict: Any,
+            status: str,
+            result_summary: str,
+            error_summary: Optional[str],
+            latency_ms: int,
+        ) -> None:
+            call_record = {
+                "tool_name": fn_name,
+                "arguments": args_dict,
+                "status": status,
+                "result_summary": result_summary,
+                "error_summary": error_summary,
+                "latency_ms": latency_ms,
+            }
+            self.recorded_calls.append(call_record)
+            try:
+                record_mcp_call_audit(
+                    trace_id=self.trace_id or "unknown",
+                    server_name=self.server_name,
+                    tool_name=fn_name,
+                    arguments=args_dict if isinstance(args_dict, dict) else {"value": str(args_dict)},
+                    status=status,
+                    result_summary=result_summary,
+                    error_summary=error_summary,
+                    latency_ms=latency_ms,
+                )
+            except Exception:
+                # Audit failures must not break the chat flow.
+                pass
+
         def _wrap(self, original: Any, fn_name: str):
             if asyncio.iscoroutinefunction(original):
                 async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
                     args_dict = kwargs if kwargs else (args[0] if args else {})
-                    self.recorded_calls.append({"tool_name": fn_name, "arguments": args_dict})
-                    return await original(*args, **kwargs)
+                    start = __import__('time').time()
+                    status = "success"
+                    result_summary = ""
+                    error_summary = None
+                    try:
+                        result = await original(*args, **kwargs)
+                        result_summary = _summarize_tool_result(result)
+                        return result
+                    except Exception as exc:
+                        status = "failed"
+                        error_summary = str(exc)[:300]
+                        raise
+                    finally:
+                        latency_ms = int((__import__('time').time() - start) * 1000)
+                        self._record_audit(fn_name, args_dict, status, result_summary, error_summary, latency_ms)
                 return async_wrapper
 
             async def async_sync_wrapper(*args: Any, **kwargs: Any) -> Any:
                 args_dict = kwargs if kwargs else (args[0] if args else {})
-                self.recorded_calls.append({"tool_name": fn_name, "arguments": args_dict})
-                loop = asyncio.get_event_loop()
-                return await loop.run_in_executor(None, lambda: original(*args, **kwargs))
+                start = __import__('time').time()
+                status = "success"
+                result_summary = ""
+                error_summary = None
+                try:
+                    loop = asyncio.get_event_loop()
+                    result = await loop.run_in_executor(None, lambda: original(*args, **kwargs))
+                    result_summary = _summarize_tool_result(result)
+                    return result
+                except Exception as exc:
+                    status = "failed"
+                    error_summary = str(exc)[:300]
+                    raise
+                finally:
+                    latency_ms = int((__import__('time').time() - start) * 1000)
+                    self._record_audit(fn_name, args_dict, status, result_summary, error_summary, latency_ms)
             return async_sync_wrapper
 else:
     ObservableMCPTools = None  # type: ignore
@@ -126,6 +200,66 @@ def _estimate_tokens(text: str) -> int:
 
 DEFAULT_ROOM_ID = "3-2-1201"
 DEFAULT_OWNER_NAME = "王先生"
+
+
+def _build_price_snapshot(model_id: str) -> Optional[Dict[str, Any]]:
+    price = get_enabled_price_for_model(model_id)
+    if not price:
+        return None
+    return {
+        "model_id": price.get("model_id"),
+        "currency": price.get("currency"),
+        "effective_date": price.get("effective_date"),
+        "input_price_per_1m": price.get("input_price_per_1m"),
+        "cached_input_price_per_1m": price.get("cached_input_price_per_1m"),
+        "output_price_per_1m": price.get("output_price_per_1m"),
+        "reasoning_price_per_1m": price.get("reasoning_price_per_1m"),
+        "source_note": price.get("source_note"),
+    }
+
+
+def _calculate_cost(model_id: str, usage: Dict[str, Optional[int]]) -> tuple:
+    """Return (cost_cny, price_snapshot) for a model call.
+
+    Cost is always an estimate based on the configured price table at the time
+    of the call. If no price is configured, return (None, None).
+    """
+    snapshot = _build_price_snapshot(model_id)
+    if not snapshot:
+        return None, None
+
+    input_tk = usage.get("input_tokens") or 0
+    output_tk = usage.get("output_tokens") or 0
+    reasoning_tk = usage.get("reasoning_tokens") or 0
+    cached_tk = usage.get("cached_tokens") or 0
+
+    cost = 0.0
+    if snapshot.get("input_price_per_1m") is not None:
+        cost += (input_tk - cached_tk) * (snapshot["input_price_per_1m"] / 1_000_000)
+    if snapshot.get("cached_input_price_per_1m") is not None:
+        cost += cached_tk * (snapshot["cached_input_price_per_1m"] / 1_000_000)
+    if snapshot.get("output_price_per_1m") is not None:
+        cost += output_tk * (snapshot["output_price_per_1m"] / 1_000_000)
+    if snapshot.get("reasoning_price_per_1m") is not None:
+        cost += reasoning_tk * (snapshot["reasoning_price_per_1m"] / 1_000_000)
+
+    return round(cost, 8), snapshot
+
+
+def _summarize_tool_result(result: Any, max_len: int = 300) -> str:
+    """Build a short, safe summary of an MCP tool result."""
+    try:
+        if result is None:
+            return ""
+        if isinstance(result, (dict, list)):
+            text = json.dumps(result, ensure_ascii=False, default=str)
+        else:
+            text = str(result)
+        if len(text) > max_len:
+            text = text[:max_len] + "…"
+        return text
+    except Exception:
+        return ""
 
 
 def _skill_matches_trigger(skill: Dict[str, Any], message: str) -> bool:
@@ -291,7 +425,10 @@ def _build_rag_context(message: str, top_k: Optional[int] = None, threshold: Opt
         return "", []
 
 
-def _build_mcp_tools(agent_id: Optional[str] = None) -> List[Any]:
+def _build_mcp_tools(
+    agent_id: Optional[str] = None,
+    trace_id: Optional[str] = None,
+) -> List[Any]:
     """Load MCP servers bound to the current agent and return MCPTools instances."""
     tools = []
     try:
@@ -328,13 +465,16 @@ def _build_mcp_tools(agent_id: Optional[str] = None) -> List[Any]:
                 full_command = command
                 if args:
                     full_command = shlex.join([command] + list(args))
-                tools.append(ObservableMCPTools(
+                tool = ObservableMCPTools(
                     command=full_command,
                     env=merged_env,
                     name=name,
                     transport="stdio",
                     timeout_seconds=15,
-                ))
+                )
+                tool.trace_id = trace_id
+                tool.server_name = name
+                tools.append(tool)
             except Exception:
                 # If a single MCP server fails to initialize, log and continue.
                 import traceback
@@ -508,16 +648,25 @@ async def _stream_agent_response(
 
     done_yielded = False
     error_yielded = False
+    trace_id = uuid.uuid4().hex[:16]
+    trace_start = time.time()
+    turn_model_id = MODEL_ID
+    turn_selection_reason = "owner-facing default"
+    vertical_latency_ms: Optional[int] = None
+    router_latency_ms: Optional[int] = None
 
     try:
         # Ensure session exists and check handoff state.
         ensure_chat_session(session_id)
 
+        # Create the trace record for this turn.
+        create_chat_trace(trace_id=trace_id, session_id=session_id, user_message=message)
+
         # First send a "start" event
-        yield f"event: start\ndata: {json.dumps({'session_id': session_id})}\n\n"
+        yield f"event: start\ndata: {json.dumps({'session_id': session_id, 'trace_id': trace_id})}\n\n"
 
         # Persist the user message before invoking the agent.
-        save_chat_message(session_id=session_id, role="user", content=message)
+        save_chat_message(session_id=session_id, role="user", content=message, trace_id=trace_id)
 
         # Owner-initiated handoff detection.
         handoff_reason = _detect_handoff_intent(message)
@@ -527,36 +676,60 @@ async def _stream_agent_response(
                 "已收到您的请求，已为您转接人工服务。"
                 "物业工作人员会尽快在对话中回复您，请稍候。"
             )
-            save_chat_message(session_id=session_id, role="assistant", content=reply)
+            save_chat_message(session_id=session_id, role="assistant", content=reply, trace_id=trace_id)
+            update_chat_trace(trace_id=trace_id, intent="handoff", agent_name="人工", status="complete")
             yield f"event: delta\ndata: {json.dumps({'content': reply})}\n\n"
-            yield f"event: done\ndata: {_safe_json_dumps({'status': 'complete', 'token_count': 0, 'message_id': None, 'handoff': True})}\n\n"
+            yield f"event: done\ndata: {_safe_json_dumps({'status': 'complete', 'token_count': 0, 'message_id': None, 'handoff': True, 'trace_id': trace_id})}\n\n"
             done_yielded = True
             return
 
         # If handoff is active, do not run the agent; tell user to wait.
         if is_handoff_active(session_id):
             reply = "当前会话已由人工接管，工作人员会尽快回复您，请稍候。"
-            save_chat_message(session_id=session_id, role="assistant", content=reply)
+            save_chat_message(session_id=session_id, role="assistant", content=reply, trace_id=trace_id)
+            update_chat_trace(trace_id=trace_id, intent="handoff", agent_name="人工", status="complete")
             yield f"event: delta\ndata: {json.dumps({'content': reply})}\n\n"
-            yield f"event: done\ndata: {_safe_json_dumps({'status': 'complete', 'token_count': 0, 'message_id': None, 'handoff': True})}\n\n"
+            yield f"event: done\ndata: {_safe_json_dumps({'status': 'complete', 'token_count': 0, 'message_id': None, 'handoff': True, 'trace_id': trace_id})}\n\n"
             done_yielded = True
             return
 
         # Classify intent and dispatch to the appropriate vertical agent.
+        router_start = time.time()
         intent_result = await classify_intent(message, user_id=user_id, session_id=session_id)
+        router_latency_ms = int((time.time() - router_start) * 1000)
         intent = intent_result.get("intent", "other")
         create_agent_fn, agent_name = _select_agent(intent)
         current_agent = agent_name
         current_agent_id = _agent_id_for_intent(intent)
 
+        # Record the router model call (metrics are not returned by the non-streaming router).
+        try:
+            router_cost, router_price = _calculate_cost(
+                MODEL.model if hasattr(MODEL, "model") else MODEL_ID,
+                {"input_tokens": 0, "output_tokens": 0, "reasoning_tokens": 0, "cached_tokens": 0},
+            )
+            record_model_call(
+                trace_id=trace_id,
+                stage="router",
+                model_id=MODEL.model if hasattr(MODEL, "model") else MODEL_ID,
+                model_selection_reason="owner-facing default",
+                latency_ms=router_latency_ms,
+                usage_source="unavailable",
+                status="success",
+                estimated_cost_cny=router_cost,
+                price_snapshot=router_price,
+            )
+        except Exception:
+            pass
+
         # Yield routing event so the UI can show which agent is handling the request.
-        yield f"event: route\ndata: {json.dumps({'intent': intent, 'reason': intent_result.get('reason', ''), 'current_agent': current_agent})}\n\n"
+        yield f"event: route\ndata: {json.dumps({'intent': intent, 'reason': intent_result.get('reason', ''), 'current_agent': current_agent, 'trace_id': trace_id})}\n\n"
 
         # Build dynamic context and tools scoped to the current vertical agent.
         skill_context, activated_skills, skill_model_id = _build_skill_context(message, agent_id=current_agent_id)
         rag_context, citations = _build_rag_context(message)
         mcp_context = _format_mcp_context(agent_id=current_agent_id)
-        mcp_tools = _build_mcp_tools(agent_id=current_agent_id)
+        mcp_tools = _build_mcp_tools(agent_id=current_agent_id, trace_id=trace_id)
 
         # If no relevant knowledge was retrieved, record a badcase for the gap
         # and instruct the agent to admit the missing knowledge.
@@ -614,6 +787,7 @@ async def _stream_agent_response(
 
         # Create a fresh agent instance with dynamic MCP tools.
         agent = create_agent_fn(tools=mcp_tools, model=turn_model)
+        vertical_start = time.time()
 
         # Run agent in streaming mode.  We decouple Agno's async generator from
         # the HTTP SSE generator via an asyncio.Queue so that any quirks in the
@@ -724,6 +898,46 @@ async def _stream_agent_response(
             if skill_model_id
             else "owner-facing default"
         )
+        turn_model_id = runtime_model_id
+        turn_selection_reason = model_selection_reason
+
+        # Record the vertical agent model call.
+        try:
+            vertical_latency_ms = int((time.time() - vertical_start) * 1000) if 'vertical_start' in locals() else None
+        except Exception:
+            vertical_latency_ms = None
+        usage_source = "provider_reported" if token_detail.get("total_tokens") else "estimated_tokenization" if token_count else "unavailable"
+        try:
+            vertical_cost, vertical_price = _calculate_cost(runtime_model_id, token_detail)
+            record_model_call(
+                trace_id=trace_id,
+                stage="vertical_agent",
+                model_id=runtime_model_id,
+                model_selection_reason=model_selection_reason,
+                latency_ms=vertical_latency_ms,
+                input_tokens=token_detail.get("input_tokens"),
+                output_tokens=token_detail.get("output_tokens"),
+                reasoning_tokens=token_detail.get("reasoning_tokens"),
+                cached_tokens=token_detail.get("cached_tokens"),
+                total_tokens=token_detail.get("total_tokens") or token_count,
+                usage_source=usage_source,
+                status="success",
+                estimated_cost_cny=vertical_cost,
+                price_snapshot=vertical_price,
+            )
+        except Exception:
+            pass
+
+        # Update the trace record with final intent/agent/status.
+        try:
+            update_chat_trace(
+                trace_id=trace_id,
+                intent=intent,
+                agent_name=current_agent,
+                status="failed" if error_yielded else "complete",
+            )
+        except Exception:
+            pass
 
         # Persist the assistant message synchronously. SQLite writes against the
         # local demo DB are fast enough that the brief event-loop block is
@@ -744,7 +958,26 @@ async def _stream_agent_response(
             model_id=runtime_model_id,
             thinking_enabled=USE_THINKING,
             model_selection_reason=model_selection_reason,
+            trace_id=trace_id,
+            status="failed" if error_yielded else "success",
+            latency_ms=vertical_latency_ms,
+            error_summary=str(e) if error_yielded else None,
         )
+
+        # Build MCP audit list for the done event.
+        mcp_calls_for_done: List[Dict[str, Any]] = []
+        for toolkit in mcp_tools:
+            if hasattr(toolkit, "recorded_calls") and toolkit.recorded_calls:
+                for call in toolkit.recorded_calls:
+                    mcp_calls_for_done.append({
+                        "server_name": getattr(toolkit, "server_name", "unknown"),
+                        "tool_name": call.get("tool_name", ""),
+                        "arguments": call.get("arguments", {}),
+                        "status": call.get("status", "success"),
+                        "result_summary": call.get("result_summary", ""),
+                        "error_summary": call.get("error_summary"),
+                        "latency_ms": call.get("latency_ms"),
+                    })
 
         # Send completion event including token metrics, citations, activated skills and agent info.
         done_payload = {
@@ -759,10 +992,13 @@ async def _stream_agent_response(
             'route_intent': intent,
             'route_reason': intent_result.get("reason", ""),
             'tool_calls': tool_calls,
+            'mcp_calls': mcp_calls_for_done,
             'auto_badcase_id': auto_badcase_id,
             'model_id': runtime_model_id,
             'thinking_enabled': USE_THINKING,
             'model_selection_reason': model_selection_reason,
+            'trace_id': trace_id,
+            'usage_source': usage_source,
         }
         yield f"event: done\ndata: {_safe_json_dumps(done_payload)}\n\n"
         done_yielded = True
@@ -770,8 +1006,12 @@ async def _stream_agent_response(
     except Exception as e:
         import traceback
         traceback.print_exc()
-        yield f"event: error\ndata: {_safe_json_dumps({'error': str(e)})}\n\n"
+        yield f"event: error\ndata: {_safe_json_dumps({'error': str(e), 'trace_id': trace_id})}\n\n"
         error_yielded = True
+        try:
+            update_chat_trace(trace_id=trace_id, status="failed")
+        except Exception:
+            pass
     finally:
         # If the generator exits for any reason (including client disconnect)
         # without having sent done or error, send a minimal done so the client
@@ -833,6 +1073,25 @@ async def chat_history(
     messages = list_chat_messages(session_id)
     session = get_chat_session(session_id)
     return {"messages": messages, "session": session}
+
+
+@router.get("/sessions")
+async def chat_sessions(
+    user_id: Optional[str] = Query(None, description="Optional user id"),
+    limit: int = Query(100, ge=1, le=500),
+):
+    """Return recent chat sessions with last activity metadata."""
+    sessions = list_user_chat_sessions(user_id=user_id, limit=limit)
+    return {"sessions": sessions}
+
+
+@router.post("/sessions")
+async def create_new_session(
+    user_id: Optional[str] = Query(None, description="Optional user id"),
+):
+    """Create a new chat session and return its session_id."""
+    session = create_chat_session(user_id=user_id)
+    return {"session": session}
 
 
 @router.post("/feedback")
