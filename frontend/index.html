@@ -4,12 +4,18 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>YIAI物业 - 智慧物业 AI 平台</title>
-  <script src="https://cdn.tailwindcss.com"></script>
-  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <script src="./tailwindcss.js"></script>
+  <script src="./marked.min.js"></script>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@300;400;500;600;700&display=swap" rel="stylesheet">
   <script>
+    if (typeof tailwind === 'undefined') {
+      document.addEventListener('DOMContentLoaded', () => {
+        const main = document.getElementById('main-content');
+        if (main) main.innerHTML = '<div class="p-8 text-center text-red-600">样式资源加载失败，请刷新重试</div>';
+      });
+    }
     tailwind.config = {
       theme: {
         extend: {
@@ -281,6 +287,12 @@
     // ==========================================
     function $(selector) { return document.querySelector(selector); }
     function $$(selector) { return document.querySelectorAll(selector); }
+
+    function requireElement(selector, context = '') {
+      const el = $(selector);
+      if (!el) throw new Error(`渲染失败：缺少必要 DOM 元素 "${selector}"${context ? ' (' + context + ')' : ''}`);
+      return el;
+    }
 
     function showToast(message, type = 'success') {
       const toast = $('#toast');
@@ -595,13 +607,16 @@
 
     function renderSidebar() {
       const role = ROLES[STATE.topTab];
-      $('#role-title').textContent = role.title;
-      $('#role-subtitle').textContent = role.subtitle;
-      $('#role-avatar').textContent = role.avatar;
-      $('#role-avatar').className = `w-10 h-10 rounded-full bg-gradient-to-br ${role.color} flex items-center justify-center text-white font-semibold shadow-lg`;
+      if (!role) throw new Error(`renderSidebar: 未知角色 "${STATE.topTab}"`);
+      requireElement('#role-title', 'renderSidebar').textContent = role.title;
+      requireElement('#role-subtitle', 'renderSidebar').textContent = role.subtitle;
+      const avatar = requireElement('#role-avatar', 'renderSidebar');
+      avatar.textContent = role.avatar;
+      avatar.className = `w-10 h-10 rounded-full bg-gradient-to-br ${role.color} flex items-center justify-center text-white font-semibold shadow-lg`;
 
       const menu = MENU[STATE.topTab];
-      $('#sub-menu').innerHTML = menu.map(item => {
+      if (!menu) throw new Error(`renderSidebar: 无菜单配置 "${STATE.topTab}"`);
+      requireElement('#sub-menu', 'renderSidebar').innerHTML = menu.map(item => {
         const active = item.id === STATE.subTab;
         return `
           <button data-sub="${item.id}" class="w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-medium transition-all ${active ? 'bg-brand-600 text-white shadow-md' : 'text-slate-300 hover:bg-slate-800 hover:text-white'}">
@@ -622,7 +637,7 @@
     }
 
     function renderContent() {
-      const main = $('#main-content');
+      const main = requireElement('#main-content', 'renderContent');
       main.innerHTML = '';
       main.scrollTop = 0;
 
@@ -762,6 +777,7 @@
     }
 
     function renderChatPage(container) {
+      if (!container) throw new Error('renderChatPage: container 为 null');
       container.innerHTML = `
         <div class="h-full flex">
           ${renderChatSessionsSidebar()}
@@ -3888,6 +3904,7 @@
         if (savedSession) STATE.chatSessionId = savedSession;
       } catch (e) {}
 
+      ['#main-content', '#sub-menu', '#role-title'].forEach(sel => requireElement(sel, 'init'));
       renderTopTabs();
       renderSidebar();
       renderContent();
