@@ -184,7 +184,25 @@ async def traces(
 
     where = " AND ".join(conditions)
     cursor.execute(
-        f"SELECT * FROM chat_traces WHERE {where} ORDER BY created_at DESC LIMIT ? OFFSET ?",
+        f"""
+        SELECT * FROM chat_traces WHERE {where}
+        UNION
+        SELECT
+            m.trace_id,
+            NULL as session_id,
+            NULL as user_message,
+            MAX(m.status) as status,
+            MAX(m.created_at) as created_at,
+            MAX(m.created_at) as updated_at,
+            MAX(m.intent) as intent,
+            MAX(m.agent_name) as agent_name,
+            NULL as model_id,
+            NULL as model_selection_reason
+        FROM model_calls m
+        WHERE m.trace_id NOT IN (SELECT trace_id FROM chat_traces)
+        GROUP BY m.trace_id
+        ORDER BY created_at DESC LIMIT ? OFFSET ?
+        """,
         params + [limit, offset],
     )
     rows = cursor.fetchall()
@@ -197,7 +215,29 @@ async def trace_detail(trace_id: str):
     """Return a single trace with model calls, MCP audits, and messages."""
     trace = get_chat_trace(trace_id)
     if not trace:
-        raise HTTPException(status_code=404, detail="Trace not found")
+        conn = _get_conn()
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT * FROM model_calls WHERE trace_id = ? ORDER BY created_at DESC LIMIT 1",
+            (trace_id,),
+        )
+        row = cursor.fetchone()
+        conn.close()
+        if row:
+            trace = {
+                "trace_id": trace_id,
+                "session_id": None,
+                "user_message": None,
+                "status": row["status"],
+                "created_at": row["created_at"],
+                "updated_at": row["created_at"],
+                "intent": None,
+                "agent_name": None,
+                "model_id": row["model_id"],
+                "model_selection_reason": row["model_selection_reason"],
+            }
+        else:
+            raise HTTPException(status_code=404, detail="Trace not found")
 
     model_calls = get_model_calls_for_trace(trace_id)
     mcp_calls = get_mcp_call_audits_for_trace(trace_id)

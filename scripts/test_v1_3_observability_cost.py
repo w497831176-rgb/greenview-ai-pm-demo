@@ -28,8 +28,8 @@ def api(method: str, path: str, **kwargs) -> requests.Response:
     return requests.request(method, url, timeout=60, **kwargs)
 
 
-def get(path: str) -> Any:
-    r = api("GET", path)
+def get(path: str, params: Optional[Dict[str, Any]] = None) -> Any:
+    r = api("GET", path, params=params)
     r.raise_for_status()
     return r.json()
 
