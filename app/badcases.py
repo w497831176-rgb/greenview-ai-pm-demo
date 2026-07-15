@@ -11,7 +11,9 @@ optimization, model switch retry, and verification.
 
 import json
 import re
-from typing import Any, Dict, List, Optional
+import time
+import uuid
+from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
@@ -20,6 +22,8 @@ from app.settings import MODEL, build_model
 from db.property_db import (
     add_badcase_action,
     create_badcase as db_create_badcase,
+    get_enabled_price_for_model,
+    record_model_call,
     create_knowledge_doc as db_create_knowledge_doc,
     create_knowledge_draft as db_create_knowledge_draft,
     delete_badcase as db_delete_badcase,
@@ -125,12 +129,31 @@ def _record_action(badcase_id: int, action_type: str, detail: Any, before: str, 
     )
 
 
-async def _collect_response(generator) -> str:
-    """Collect text from an Agno async generator or a single response."""
+def _extract_usage(usage_obj: Any) -> Dict[str, Optional[int]]:
+    if isinstance(usage_obj, dict):
+        return {
+            "input_tokens": usage_obj.get("input_tokens") or usage_obj.get("prompt_tokens"),
+            "output_tokens": usage_obj.get("output_tokens") or usage_obj.get("completion_tokens"),
+            "reasoning_tokens": usage_obj.get("reasoning_tokens"),
+            "cached_tokens": usage_obj.get("cached_tokens") or usage_obj.get("prompt_cache_hit_tokens"),
+            "total_tokens": usage_obj.get("total_tokens"),
+        }
+    return {
+        "input_tokens": getattr(usage_obj, "input_tokens", None) or getattr(usage_obj, "prompt_tokens", None),
+        "output_tokens": getattr(usage_obj, "output_tokens", None) or getattr(usage_obj, "completion_tokens", None),
+        "reasoning_tokens": getattr(usage_obj, "reasoning_tokens", None),
+        "cached_tokens": getattr(usage_obj, "cached_tokens", None) or getattr(usage_obj, "prompt_cache_hit_tokens", None),
+        "total_tokens": getattr(usage_obj, "total_tokens", None),
+    }
+
+
+async def _collect_response(generator) -> Tuple[str, Dict[str, Optional[int]]]:
+    """Collect text and usage from an Agno async generator or a single response."""
     response = ""
+    usage = {}
     try:
         if isinstance(generator, str):
-            return generator
+            return generator, usage
         if hasattr(generator, "__aiter__"):
             async for chunk in generator:
                 if hasattr(chunk, "content") and chunk.content:
@@ -139,20 +162,24 @@ async def _collect_response(generator) -> str:
                     response += str(chunk.delta)
                 elif isinstance(chunk, str):
                     response += chunk
-            return response.strip()
+                if hasattr(chunk, "usage") and chunk.usage:
+                    usage = _extract_usage(chunk.usage)
+            return response.strip(), usage
         result = await generator
         if hasattr(result, "content"):
-            return str(result.content).strip()
+            if hasattr(result, "usage") and result.usage:
+                usage = _extract_usage(result.usage)
+            return str(result.content).strip(), usage
         if isinstance(result, str):
-            return result.strip()
-        return ""
+            return result.strip(), usage
+        return "", usage
     except Exception:
         import traceback
         traceback.print_exc()
-        return ""
+        return "", usage
 
 
-async def _llm_generate(prompt: str, model: Optional[Any] = None) -> str:
+async def _llm_generate(prompt: str, model: Optional[Any] = None) -> Tuple[str, Dict[str, Optional[int]]]:
     """Generate text using the default or a provided model."""
     from agno.agent import Agent
 
@@ -354,6 +381,42 @@ async def publish_knowledge_draft(case_id: int, draft_id: int):
     return {"badcase": _enrich_badcase(case), "knowledge_doc": doc}
 
 
+def _build_price_snapshot(model_id: str) -> Optional[Dict[str, Any]]:
+    price = get_enabled_price_for_model(model_id)
+    if not price:
+        return None
+    return {
+        "model_id": price.get("model_id"),
+        "currency": price.get("currency"),
+        "effective_date": price.get("effective_date"),
+        "input_price_per_1m": price.get("input_price_per_1m"),
+        "cached_input_price_per_1m": price.get("cached_input_price_per_1m"),
+        "output_price_per_1m": price.get("output_price_per_1m"),
+        "reasoning_price_per_1m": price.get("reasoning_price_per_1m"),
+        "source_note": price.get("source_note"),
+    }
+
+
+def _calculate_cost(model_id: str, usage: Dict[str, Optional[int]]) -> tuple:
+    snapshot = _build_price_snapshot(model_id)
+    if not snapshot:
+        return None, None
+    input_tk = usage.get("input_tokens") or 0
+    output_tk = usage.get("output_tokens") or 0
+    reasoning_tk = usage.get("reasoning_tokens") or 0
+    cached_tk = usage.get("cached_tokens") or 0
+    cost = 0.0
+    if snapshot.get("input_price_per_1m") is not None:
+        cost += (input_tk - cached_tk) * (snapshot["input_price_per_1m"] / 1_000_000)
+    if snapshot.get("cached_input_price_per_1m") is not None:
+        cost += cached_tk * (snapshot["cached_input_price_per_1m"] / 1_000_000)
+    if snapshot.get("output_price_per_1m") is not None:
+        cost += output_tk * (snapshot["output_price_per_1m"] / 1_000_000)
+    if snapshot.get("reasoning_price_per_1m") is not None:
+        cost += reasoning_tk * (snapshot["reasoning_price_per_1m"] / 1_000_000)
+    return round(cost, 8), snapshot
+
+
 @router.post("/{case_id}/darwin-fix")
 async def darwin_fix(case_id: int, request: DarwinFixRequest = DarwinFixRequest()):
     """Call the Darwin skill to optimize the badcase fix plan."""
@@ -378,9 +441,46 @@ async def darwin_fix(case_id: int, request: DarwinFixRequest = DarwinFixRequest(
     if request.prompt:
         prompt = f"{request.prompt}\n\n{prompt}"
 
-    # Darwin deep-fix always runs on Pro; normal classify/retest stay on Flash.
-    darwin_model = build_model("deepseek-v4-pro")
-    fix_plan = await _llm_generate(prompt, model=darwin_model)
+    trace_id = uuid.uuid4().hex[:16]
+    model_id = "deepseek-v4-pro"
+    start = time.time()
+    status = "success"
+    error_summary = None
+    usage = {}
+    try:
+        # Darwin deep-fix always runs on Pro; normal classify/retest stay on Flash.
+        darwin_model = build_model(model_id)
+        fix_plan, usage = await _llm_generate(prompt, model=darwin_model)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        fix_plan = ""
+        status = "failed"
+        error_summary = str(e)[:300]
+    latency_ms = int((time.time() - start) * 1000)
+    total_tokens = usage.get("total_tokens") or (usage.get("input_tokens") or 0) + (usage.get("output_tokens") or 0)
+    usage_source = "provider_reported" if usage.get("total_tokens") else "estimated_tokenization" if total_tokens else "unavailable"
+    cost_cny, snapshot = _calculate_cost(model_id, usage)
+    try:
+        record_model_call(
+            trace_id=trace_id,
+            stage="darwin",
+            model_id=model_id,
+            status=status,
+            latency_ms=latency_ms,
+            input_tokens=usage.get("input_tokens"),
+            output_tokens=usage.get("output_tokens"),
+            reasoning_tokens=usage.get("reasoning_tokens"),
+            cached_tokens=usage.get("cached_tokens"),
+            total_tokens=total_tokens,
+            usage_source=usage_source,
+            model_selection_reason="Darwin deep-fix uses Pro",
+            error_summary=error_summary,
+            price_snapshot=snapshot,
+            estimated_cost_cny=cost_cny,
+        )
+    except Exception:
+        pass
 
     # Move from classified -> fixing.
     before = case["status"]
@@ -394,15 +494,19 @@ async def darwin_fix(case_id: int, request: DarwinFixRequest = DarwinFixRequest(
     _record_action(
         case_id,
         "darwin-fix",
-        {"fix_plan": fix_plan, "skill_used": bool(darwin), "model_id": "deepseek-v4-pro"},
+        {"fix_plan": fix_plan, "skill_used": bool(darwin), "model_id": model_id, "trace_id": trace_id},
         before,
         new_status,
     )
     return {
         "badcase": _enrich_badcase(updated),
         "fix_plan": fix_plan,
-        "model_id": "deepseek-v4-pro",
+        "model_id": model_id,
         "darwin_skill_found": bool(darwin),
+        "trace_id": trace_id,
+        "usage_source": usage_source,
+        "total_tokens": total_tokens,
+        "estimated_cost_cny": cost_cny,
     }
 
 

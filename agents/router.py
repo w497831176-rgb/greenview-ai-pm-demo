@@ -21,6 +21,7 @@ ROUTER_INSTRUCTIONS = [
     "费用类关键词：收费、缴费、多少钱、费用、物业费、停车费、收费标准、账单。",
     "投诉类关键词：投诉、不满意、纠纷、邻居、噪音、责任、赔偿、物业不作为。",
     "客服类关键词：服务承诺、联系方式、咨询电话、小区规定、上班时间、托管、宠物。",
+    "天气查询（如'天气'、'气温'、'下雨'）属于维修/工单场景，因为涉及上门维修安排，应归类为 maintenance。",
     "如果用户问题同时涉及多个类别，选择最核心、最紧急的意图。",
 ]
 
@@ -113,7 +114,7 @@ async def classify_intent(message: str, user_id: str = "web-user", session_id: s
 def _keyword_intent(message: str) -> str:
     """Fallback keyword-based intent classification."""
     lowered = message.lower()
-    maintenance_keywords = ["报修", "漏水", "跳闸", "灯不亮", "门锁", "窗户", "电梯", "下水道", "维修", "工单", "师傅", "上门"]
+    maintenance_keywords = ["报修", "漏水", "跳闸", "灯不亮", "门锁", "窗户", "电梯", "下水道", "维修", "工单", "师傅", "上门", "天气", "气温", "下雨"]
     billing_keywords = ["收费", "缴费", "多少钱", "费用", "物业费", "停车费", "账单", "价格", "收费标准"]
     complaint_keywords = ["投诉", "不满意", "纠纷", "邻居", "噪音", "责任", "赔偿", "物业不作为", "举报"]
     if any(k in lowered for k in maintenance_keywords):

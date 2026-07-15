@@ -22,6 +22,7 @@ from app.knowledge import retrieval_router, router as knowledge_router
 from app.mcp import discover_all_mcp_tools, router as mcp_router
 from app.model_configs import router as model_configs_router
 from app.models_compat import router as models_compat_router
+from app.observability import router as observability_router
 from app.skills import router as skills_router
 from app.settings import RUNTIME_ENV, agent_db
 from app.work_orders import router as work_orders_router
@@ -88,6 +89,7 @@ app.include_router(mcp_router)
 app.include_router(models_compat_router)
 app.include_router(model_configs_router)
 app.include_router(agents_router)
+app.include_router(observability_router)
 # Badcase endpoints under both /api/badcases and /api/knowledge/badcases (frontend).
 app.include_router(badcases_router, prefix="/api/badcases")
 app.include_router(badcases_router, prefix="/api/knowledge/badcases")
