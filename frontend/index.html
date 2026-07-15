@@ -751,6 +751,15 @@
       `;
     }
 
+    function refreshSidebar() {
+      const sidebar = $('#chat-session-list');
+      if (!sidebar) return;
+      sidebar.innerHTML = renderSessionListItems();
+      sidebar.querySelectorAll('.session-item').forEach(btn => {
+        btn.addEventListener('click', () => switchChatSession(btn.dataset.sessionId));
+      });
+    }
+
     async function loadChatSessions() {
       try {
         const data = await apiGet('/api/chat/sessions?user_id=web-user');
@@ -846,14 +855,6 @@
         </div>
       `;
 
-      function refreshSidebar() {
-        const sidebar = $('#chat-session-list');
-        if (!sidebar) return;
-        sidebar.innerHTML = renderSessionListItems();
-        sidebar.querySelectorAll('.session-item').forEach(btn => {
-          btn.addEventListener('click', () => switchChatSession(btn.dataset.sessionId));
-        });
-      }
       refreshSidebar();
 
       const form = $('#chat-form');
@@ -1310,7 +1311,7 @@
                 updateHandoffBanner(data.handoff_status || 'requested');
                 showToast('已转人工，请等待工作人员回复', 'success');
               }
-              loadChatSessions().then(() => renderChatSessionsSidebar());
+              loadChatSessions().then(() => refreshSidebar());
               STATE.currentTraceId = null;
             } else if (eventType === 'error') {
               accumulated += `\n\n[错误: ${data.error}]`;

@@ -10,13 +10,17 @@ optimization, model switch retry, and verification.
 """
 
 import json
+import logging
 import re
 import time
 import uuid
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
+
+logger = logging.getLogger(__name__)
 
 from app.settings import MODEL, build_model
 from db.property_db import (
