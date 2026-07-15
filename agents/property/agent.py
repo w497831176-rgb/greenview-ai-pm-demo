@@ -13,9 +13,13 @@ from agno.agent import Agent
 
 from agents.property.instructions import PROPERTY_INSTRUCTIONS
 from app.settings import MODEL, agent_db
-from tools.bing_search import BingSearchTools
 from tools.knowledge import KnowledgeTools
 from tools.work_order import WorkOrderTools
+
+try:
+    from tools.bing_search import BingSearchTools
+except ImportError:
+    BingSearchTools = None
 
 # ---------------------------------------------------------------------------
 # Skills (lazy-loaded from local + enterprise directories)
@@ -49,7 +53,8 @@ def _base_tools() -> List[Any]:
         pass
 
     try:
-        base_tools.append(BingSearchTools())
+        if BingSearchTools is not None:
+            base_tools.append(BingSearchTools())
     except ImportError:
         pass
 
