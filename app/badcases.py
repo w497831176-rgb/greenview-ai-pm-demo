@@ -390,7 +390,7 @@ async def classify_badcase(case_id: int, request: ClassifyRequest = ClassifyRequ
             f"上下文：{json.dumps(context_obj, ensure_ascii=False)[:800]}\n\n"
             "请严格输出 JSON：{\"category\": \"<类别>\", \"reason\": \"<一句话理由>\", \"priority\": \"<high|medium|low>\"}"
         )
-        raw = await _llm_generate(prompt)
+        raw, _ = await _llm_generate(prompt)
         parsed = _extract_json(raw) or {}
         category = parsed.get("category", "other")
         reason = parsed.get("reason", "自动分类失败，归入 other")
@@ -441,7 +441,7 @@ async def extract_knowledge(case_id: int, request: ExtractKnowledgeRequest = Ext
             f"证据：{case.get('evidence', '')}\n\n"
             "直接输出知识条目内容，不要添加解释。"
         )
-        content = await _llm_generate(prompt)
+        content, _ = await _llm_generate(prompt)
     else:
         content = request.content
 
@@ -830,7 +830,7 @@ async def switch_model_retry(case_id: int, request: SwitchModelRetryRequest = Sw
         "当问题超出物业维修、收费或客服范围时，主动提出转人工。\n\n"
         f"业主问题：{user_message}"
     )
-    retry_response = await _llm_generate(prompt, model=alt_model)
+    retry_text, _ = await _llm_generate(prompt, model=alt_model)
 
     before = case["status"]
     new_status = "fixing" if before in ("pending", "classified") else before
@@ -839,8 +839,8 @@ async def switch_model_retry(case_id: int, request: SwitchModelRetryRequest = Sw
         status=new_status,
         fix_plan=f"model retry with {model_id}",
     )
-    _record_action(case_id, "switch-model-retry", {"model_id": model_id, "response": retry_response}, before, new_status)
-    return {"badcase": _enrich_badcase(updated), "model_id": model_id, "retry_response": retry_response}
+    _record_action(case_id, "switch-model-retry", {"model_id": model_id, "response": retry_text}, before, new_status)
+    return {"badcase": _enrich_badcase(updated), "model_id": model_id, "retry_response": retry_text}
 
 
 @router.post("/{case_id}/verify")
@@ -1050,7 +1050,7 @@ async def check_tools_badcase(case_id: int):
         f"当前已启用 MCP 工具：\n{chr(10).join(tool_descriptions)}\n\n"
         "请直接输出分析结论与建议，不要添加解释。"
     )
-    analysis = await _llm_generate(prompt)
+    analysis, _ = await _llm_generate(prompt)
 
     before = case["status"]
     new_status = "fixing" if before in ("pending", "classified") else before

@@ -1115,6 +1115,15 @@ async def create_new_session(
     return {"session": session}
 
 
+@router.get("/sessions/{session_id}")
+async def chat_session_detail(session_id: str):
+    """Return a single chat session by id."""
+    session = get_chat_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return {"session": session}
+
+
 @router.post("/feedback")
 async def chat_feedback(request: FeedbackRequest):
     """Create a badcase from user feedback on an AI response."""

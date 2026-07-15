@@ -209,8 +209,14 @@ def run_case_2_knowledge_gap_closed_loop() -> Dict[str, Any]:
         "feedback_reason": "知识库缺少新能源车充电桩申请指南",
         "priority": "high",
     })
-    badcase_id = bc["id"]
+    badcase_id = bc["badcase"]["id"]
     print(f"  Created badcase id={badcase_id}")
+
+    # 2) Badcase detail
+    bc = get(f"/api/badcases/{badcase_id}")["badcase"]
+    assert_cond(bc.get("source") == "manual" and bc.get("category") == "knowledge_gap", "badcase source/category mismatch")
+    trace_id = bc.get("trace_id")
+    assert_cond(trace_id, "badcase missing trace_id")
 
     # Classify.
     cls = post(f"/api/badcases/{badcase_id}/classify", {"auto": False, "category": "knowledge_gap", "reason": "缺少充电桩申请材料文档"})
@@ -307,10 +313,9 @@ def run_case_3_composite_rag_mcp() -> Dict[str, Any]:
 def run_session_management_check() -> None:
     print("\n[Session management] first render / new session / refresh")
     # Basic API checks; Playwright covers UI.
-    sessions_before = get(f"/api/chat/sessions?user_id={USER_ID}").get("sessions", [])
     sid = create_session()
-    sessions_after = get(f"/api/chat/sessions?user_id={USER_ID}").get("sessions", [])
-    assert_cond(len(sessions_after) == len(sessions_before) + 1, "new session not created")
+    session = get(f"/api/chat/sessions/{sid}")
+    assert_cond(session.get("session", {}).get("session_id") == sid, "new session not created or not retrievable")
     msgs = get(f"/api/chat/sessions/{sid}/messages").get("messages", [])
     assert_cond(isinstance(msgs, list), "messages not list")
     print("  Session management API PASS")
