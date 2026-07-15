@@ -269,12 +269,52 @@ def _rerank_results(query: str, results: List[Dict[str, Any]], model_name: Optio
     return results
 
 
-def advanced_search(
+def _extract_quoted_titles(query: str) -> List[str]:
+    """Extract document titles wrapped in 《》 from the user query."""
+    return re.findall(r'《([^《》]+)》', query)
+
+
+def _extract_sub_queries(query: str) -> List[str]:
+    """Split a long composite query into candidate sub-questions.
+
+    Keeps whole lines and sentence-level segments ending with ？ or ? so that
+    focused sub-questions (e.g. "家里漏水了怎么办？") can be retrieved
+    independently.  Short fragments are ignored.
+    """
+    segments = []
+    for line in query.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        # Split on Chinese or ASCII question marks while keeping the marker.
+        parts = re.split(r'(?<=[？?])', line)
+        for part in parts:
+            part = part.strip()
+            if len(part) >= 5:
+                segments.append(part)
+        # If the line had no question mark, keep it as a standalone sub-query.
+        if not re.search(r'[？?]', line) and len(line) >= 5:
+            segments.append(line)
+    # Deduplicate while preserving order.
+    seen = set()
+    unique = []
+    for s in segments:
+        if s not in seen:
+            seen.add(s)
+            unique.append(s)
+    return unique
+
+
+def _single_query_search(
     query: str,
-    settings: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    """Run the full advanced RAG pipeline."""
-    settings = settings or {}
+    settings: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """Run keyword + semantic + RRF + rerank + context filter for one query.
+
+    The context filter is applied against this specific query so that a short
+    sub-question ("家里漏水了怎么办？") is not penalised by tokens from the
+    broader composite prompt.
+    """
     top_k = settings.get("top_k", 5)
     keyword_weight = settings.get("keyword_weight", 0.3)
     semantic_weight = settings.get("semantic_weight", 0.7)
@@ -285,11 +325,7 @@ def advanced_search(
     context_threshold = settings.get("context_threshold", 0.2)
 
     keyword_results = _keyword_search(query, top_k=top_k * 2)
-    # Apply the configured similarity threshold to semantic matches before
-    # fusing, so the threshold filters real semantic relevance rather than
-    # the tiny RRF scores produced by rank fusion.
     semantic_results = _semantic_search(query, top_k=top_k * 2, threshold=score_threshold)
-    # Only business-indexed documents may be used as evidence.
     semantic_results = [r for r in semantic_results if r.get("is_indexed")]
 
     fused = _rrf_fusion(
@@ -303,21 +339,119 @@ def advanced_search(
     if enable_rerank:
         fused = _rerank_results(query, fused, model_name=rerank_model)
 
-    # Final grounded-evidence filter: only keep results that pass an
-    # independent query-content relevance threshold. This prevents weak keyword
-    # candidates (e.g. BM25 matches on generic terms) from becoming citations.
     grounded = []
     for r in fused:
         if enable_rerank:
             ctx_score = r.get("rerank_score", 0.0)
+            r["score"] = round(ctx_score, 4)
         else:
             ctx_text = f"{r.get('title', '')} {r.get('content', '')}"
             ctx_score = _context_relevance_score(query, ctx_text)
-        r["context_score"] = ctx_score
+            r["score"] = round(ctx_score, 4)
+        r["context_score"] = round(ctx_score, 4)
         if ctx_score >= context_threshold:
             grounded.append(r)
 
-    results = grounded[:top_k]
+    return grounded[:top_k]
+
+
+def _title_boosted_results(
+    query: str,
+    title: str,
+    settings: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """Retrieve chunks from documents whose titles are explicitly cited.
+
+    Uses keyword search to locate the cited document(s), then scores every
+    chunk of those documents against the full user query with the context
+    relevance metric.  This prevents title-only chunks from drowning out
+    content chunks (e.g. FAQ Q1) when the user asks a composite question.
+    """
+    top_k = settings.get("top_k", 5)
+    context_threshold = settings.get("context_threshold", 0.2)
+
+    # Find candidate docs by matching the cited title.
+    title_hits = _keyword_search(title, top_k=top_k * 2)
+    doc_ids = {r.get("doc_id") for r in title_hits if r.get("doc_id")}
+
+    candidates = []
+    for doc_id in doc_ids:
+        doc = db.get_knowledge_doc(doc_id)
+        if not doc:
+            continue
+        doc_title = doc.get("title") or ""
+        chunks = rag_store.list_chunks_for_doc(doc_id)
+        for c in chunks:
+            content = c.get("content", "")
+            ctx_text = f"{doc_title} {content}"
+            ctx_score = _context_relevance_score(query, ctx_text)
+            if ctx_score < context_threshold:
+                continue
+            candidates.append({
+                "id": doc_id,
+                "title": doc_title,
+                "category": doc.get("category"),
+                "doc_id": doc_id,
+                "doc_title": doc_title,
+                "doc_category": doc.get("category"),
+                "chunk_index": c.get("chunk_index"),
+                "content": content,
+                "score": round(ctx_score, 4),
+                "context_score": round(ctx_score, 4),
+                "source": "title_boost",
+            })
+
+    candidates.sort(key=lambda x: x.get("score", 0), reverse=True)
+    # Keep a small number of high-confidence chunks per cited title.
+    return candidates[:3]
+
+
+def advanced_search(
+    query: str,
+    settings: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Run composite-aware advanced RAG.
+
+    In addition to the full user query, the pipeline:
+      1. Searches for any document titles explicitly cited in 《》.
+      2. Searches focused sub-questions (sentences ending with ？/?).
+      3. Merges and deduplicates candidates by exact chunk.
+
+    Only when none of the retrieval paths produce evidence does the caller see
+    an empty result set (and may create an auto knowledge badcase).
+    """
+    settings = settings or {}
+    top_k = settings.get("top_k", 5)
+
+    merged: Dict[tuple, Dict[str, Any]] = {}
+
+    def _add_results(results: List[Dict[str, Any]]) -> None:
+        for r in results:
+            key = (r.get("doc_id"), r.get("chunk_index"))
+            existing = merged.get(key)
+            if existing is None or r.get("score", 0) > existing.get("score", 0):
+                merged[key] = r
+
+    # Primary retrieval path: the full user query.
+    original_results = _single_query_search(query, settings)
+    _add_results(original_results)
+
+    # Secondary path: exact titles cited in 《》 (e.g. 《常见维修问题 FAQ》).
+    for title in _extract_quoted_titles(query):
+        _add_results(_title_boosted_results(query, title, settings))
+
+    # Tertiary path: focused sub-questions inside the composite prompt.
+    for sub_query in _extract_sub_queries(query):
+        if sub_query == query:
+            continue
+        _add_results(_single_query_search(sub_query, settings))
+
+    results = sorted(merged.values(), key=lambda x: x.get("score", 0), reverse=True)[:top_k]
+
+    # Keep simple diagnostics based on the original query so callers can still
+    # compare the raw full-query pipeline against the composite result set.
+    keyword_results = _keyword_search(query, top_k=top_k * 2)
+    semantic_results = [r for r in _semantic_search(query, top_k=top_k * 2, threshold=settings.get("score_threshold", 0.0)) if r.get("is_indexed")]
 
     return {
         "query": query,
@@ -388,7 +522,11 @@ def debug_search(
         if ctx_score >= context_threshold:
             grounded.append(r)
 
-    results = grounded[:top_k]
+    # The original-query stages are exposed for diagnostics, but the final
+    # production result set comes from the composite-aware advanced_search so
+    # that title/sub-question evidence is preserved.
+    composite = advanced_search(query, settings=settings)
+    results = composite.get("results", [])
 
     titles = [r.get("title") for r in results]
     top1_hit = bool(expected_doc_title and titles and titles[0] == expected_doc_title)
@@ -405,4 +543,9 @@ def debug_search(
         "expected_doc_title": expected_doc_title,
         "top1_hit": top1_hit,
         "top3_hit": top3_hit,
+        "composite_debug": {
+            "quoted_titles": _extract_quoted_titles(query),
+            "sub_queries": _extract_sub_queries(query),
+            "merged_count": composite.get("count", 0),
+        },
     }

@@ -163,7 +163,7 @@
         <div class="p-4 border-t border-slate-800/60">
           <div class="rounded-xl bg-gradient-to-br from-slate-800 to-slate-850 p-3 border border-slate-700/50">
             <p class="text-xs text-slate-400 mb-1">当前版本</p>
-            <p class="text-sm font-medium text-gold-400">v1.2</p>
+            <p id="app-version" class="text-sm font-medium text-gold-400">V1.3</p>
           </div>
         </div>
       </aside>
@@ -218,6 +218,7 @@
     // ==========================================
     const API_BASE = '';
     const DEFAULT_ROOM_ID = '3-2-1201';
+    const APP_VERSION = 'V1.3';
 
     const STATE = {
       topTab: 'owner',
@@ -770,10 +771,16 @@
         const session = data.session || {};
         STATE.chatSessionId = session.session_id || null;
         try { if (STATE.chatSessionId) localStorage.setItem('chatSessionId', STATE.chatSessionId); } catch (e) {}
+        STATE.chatMessages = [];
+        STATE.currentAiMessage = null;
+        STATE.currentRoute = null;
         await loadChatSessions();
-        renderContent();
+        await renderContent();
+        const input = $('#chat-input');
+        if (input) input.focus();
         showToast('已创建新会话', 'success');
       } catch (err) {
+        console.error('createNewSession failed:', err);
         showToast('新建会话失败', 'error');
       }
     }
@@ -841,7 +848,8 @@
 
       function refreshSidebar() {
         const sidebar = $('#chat-session-list');
-        if (sidebar) sidebar.innerHTML = renderSessionListItems();
+        if (!sidebar) return;
+        sidebar.innerHTML = renderSessionListItems();
         sidebar.querySelectorAll('.session-item').forEach(btn => {
           btn.addEventListener('click', () => switchChatSession(btn.dataset.sessionId));
         });
@@ -913,7 +921,11 @@
       });
 
       await loadChatSessions();
-      renderChatSessionsSidebar();
+      refreshSidebar();
+      const newSessionBtn = $('#chat-new-session');
+      if (newSessionBtn) {
+        newSessionBtn.addEventListener('click', createNewSession);
+      }
       restoreChatMessages();
     }
 
@@ -3924,6 +3936,8 @@
         } catch (e) {}
 
         ['#main-content', '#sub-menu', '#role-title'].forEach(sel => requireElement(sel, 'init'));
+        const versionEl = $('#app-version');
+        if (versionEl) versionEl.textContent = APP_VERSION;
         renderTopTabs();
         renderSidebar();
         await renderContent();
