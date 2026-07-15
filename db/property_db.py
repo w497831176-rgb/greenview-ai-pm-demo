@@ -335,6 +335,8 @@ def init_db():
         ("status", "TEXT"),
         ("latency_ms", "INTEGER"),
         ("error_summary", "TEXT"),
+        ("mcp_calls", "TEXT"),
+        ("usage_source", "TEXT"),
     ]:
         try:
             cursor.execute(f"ALTER TABLE chat_messages ADD COLUMN {col} {dtype}")
@@ -2305,6 +2307,8 @@ def save_chat_message(
     status: Optional[str] = None,
     latency_ms: Optional[int] = None,
     error_summary: Optional[str] = None,
+    mcp_calls: Optional[List[Dict[str, Any]]] = None,
+    usage_source: Optional[str] = None,
 ) -> Dict[str, Any]:
     now = now_cn()
     conn = _get_conn()
@@ -2314,8 +2318,8 @@ def save_chat_message(
         INSERT INTO chat_messages (
             session_id, role, content, token_count, token_detail, citations, activated_skills,
             route_intent, route_reason, current_agent, tool_calls, model_id, thinking_enabled,
-            model_selection_reason, trace_id, status, latency_ms, error_summary, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            model_selection_reason, trace_id, status, latency_ms, error_summary, mcp_calls, usage_source, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             session_id,
@@ -2336,6 +2340,8 @@ def save_chat_message(
             status,
             latency_ms,
             error_summary,
+            json.dumps(mcp_calls) if mcp_calls else None,
+            usage_source,
             now,
         ),
     )
@@ -2370,7 +2376,7 @@ def save_chat_message(
 
 
 def _normalize_chat_message(msg: Dict[str, Any]) -> Dict[str, Any]:
-    for json_col in ("token_detail", "citations", "activated_skills", "tool_calls"):
+    for json_col in ("token_detail", "citations", "activated_skills", "tool_calls", "mcp_calls"):
         if msg.get(json_col):
             try:
                 msg[json_col] = json.loads(msg[json_col])

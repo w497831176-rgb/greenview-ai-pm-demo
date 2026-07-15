@@ -220,6 +220,7 @@
       subTab: 'chat',
       sidebarOpen: false,
       chatSessionId: null,
+      chatSessions: [],
       chatMessages: [],
       chatStreaming: false,
       chatHandoff: false,
@@ -254,7 +255,8 @@
         { id: 'skills', label: 'Skill 管理', icon: 'skill' },
         { id: 'mcp', label: 'MCP Server 管理', icon: 'mcp' },
         { id: 'knowledge', label: '知识库管理', icon: 'knowledge' },
-        { id: 'badcases', label: 'Badcase 库', icon: 'badcase' }
+        { id: 'badcases', label: 'Badcase 库', icon: 'badcase' },
+        { id: 'cost-governance', label: '调用与成本治理', icon: 'cost' }
       ]
     };
 
@@ -270,7 +272,8 @@
       knowledge: `<svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6.253v13m0-13C10.832 5.477 9.246 5 7.5 5S4.168 5.477 3 6.253v13C4.168 18.477 5.754 18 7.5 18s3.332.477 4.5 1.253m0-13C13.168 5.477 14.754 5 16.5 5c1.747 0 3.332.477 4.5 1.253v13C19.832 18.477 18.247 18 16.5 18c-1.746 0-3.332.477-4.5 1.253"></path></svg>`,
       badcase: `<svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path></svg>`,
       agent: `<svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z"></path></svg>`,
-      model: `<svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"></path></svg>`
+      model: `<svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"></path></svg>`,
+      cost: `<svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>`
     };
 
     // ==========================================
@@ -464,7 +467,7 @@
       }, '提交');
     }
 
-    function renderAiMessageTags(skills, tools, agent, routeReason = '', routeIntent = '', modelId = '', thinkingEnabled = null, modelSelectionReason = '') {
+    function renderAiMessageTags(skills, tools, agent, routeReason = '', routeIntent = '', modelId = '', thinkingEnabled = null, modelSelectionReason = '', traceId = '', mcpCalls = null, usageSource = '') {
       const tags = [];
       if (modelId) {
         const modelLabel = modelId === 'deepseek-v4-pro' ? 'Pro' : (modelId === 'deepseek-v4-flash' ? 'Flash' : modelId);
@@ -475,6 +478,17 @@
       if (agent) tags.push(`<span class="px-1.5 py-0.5 bg-indigo-50 text-indigo-600 rounded text-[10px]">当前处理 Agent：${escapeHtml(agent)}</span>`);
       if (skills && skills.length) tags.push(`<span class="px-1.5 py-0.5 bg-brand-50 text-brand-600 rounded text-[10px]">已命中 Skill：${escapeHtml(skills.join('、'))}</span>`);
       if (tools && tools.length) tags.push(`<span class="px-1.5 py-0.5 bg-gold-50 text-gold-600 rounded text-[10px]">已调用工具：${escapeHtml(tools.map(t => typeof t === 'string' ? t : (t.name || t.tool_name || JSON.stringify(t))).join('、'))}</span>`);
+      if (mcpCalls && mcpCalls.length) {
+        const okCount = mcpCalls.filter(c => c.status === 'success').length;
+        const failCount = mcpCalls.length - okCount;
+        const statusText = failCount > 0 ? `${okCount}成功/${failCount}失败` : `${okCount}次成功`;
+        const summary = mcpCalls.map(c => `[${escapeHtml(c.server_name || 'unknown')}] ${escapeHtml(c.tool_name || '')} ${c.status === 'success' ? '✓' : '✗'} ${c.latency_ms || 0}ms`).join('\n');
+        tags.push(`<span class="px-1.5 py-0.5 bg-cyan-50 text-cyan-600 rounded text-[10px] cursor-help" title="${escapeHtml(summary)}">MCP 调用：${statusText}</span>`);
+      }
+      if (traceId) {
+        const sourceLabel = usageSource === 'provider_reported' ? 'Provider账单' : (usageSource === 'estimated_tokenization' ? '本地估算' : '未知');
+        tags.push(`<span class="px-1.5 py-0.5 bg-slate-50 text-slate-500 rounded text-[10px]" title="trace_id: ${escapeHtml(traceId)} · usage_source: ${escapeHtml(usageSource || 'unknown')}">Trace · ${escapeHtml(sourceLabel)}</span>`);
+      }
       return tags.length ? `<div class="flex flex-wrap items-center gap-1 mt-2">${tags.join('')}</div>` : '';
     }
 
@@ -627,6 +641,7 @@
         case 'knowledge': renderKnowledgePage(main); break;
         case 'badcases': renderBadcasesPage(main); break;
         case 'badcase-detail': renderBadcaseDetailPage(main); break;
+        case 'cost-governance': renderCostGovernancePage(main); break;
       }
     }
 
@@ -664,47 +679,141 @@
     // ==========================================
     // Chat Page
     // ==========================================
+    function renderSessionListItems() {
+      const sessions = STATE.chatSessions || [];
+      const currentId = STATE.chatSessionId;
+      const items = sessions.map(s => {
+        const isActive = s.session_id === currentId;
+        const title = escapeHtml(s.title || s.last_message_preview || '新会话');
+        const time = formatTimeLabel(s.last_message_at || s.updated_at || s.created_at);
+        const handoffText = s.handoff_status === 'active' ? '人工中' : (s.handoff_status === 'requested' ? '待人工' : '');
+        const handoffClass = s.handoff_status === 'active' ? 'bg-green-100 text-green-700' : 'bg-amber-100 text-amber-700';
+        const agentText = s.last_agent ? ` · ${escapeHtml(s.last_agent)}` : '';
+        return `
+          <button type="button" data-session-id="${escapeHtml(s.session_id)}" class="session-item w-full text-left px-3 py-2.5 rounded-xl transition-colors ${isActive ? 'bg-brand-50 border border-brand-200' : 'hover:bg-slate-100 border border-transparent'}">
+            <div class="flex items-center justify-between gap-2">
+              <span class="text-sm font-medium text-slate-800 truncate flex-1">${title}</span>
+              ${handoffText ? `<span class="text-[10px] px-1.5 py-0.5 rounded-full shrink-0 ${handoffClass}">${handoffText}</span>` : ''}
+            </div>
+            <div class="text-[11px] text-slate-400 mt-0.5 truncate">${time}${agentText}</div>
+          </button>
+        `;
+      }).join('');
+      return items || emptyState('暂无历史会话');
+    }
+
+    function renderChatSessionsSidebar() {
+      return `
+        <div class="h-full flex flex-col w-64 border-r border-slate-200 bg-slate-50/80">
+          <div class="p-3 border-b border-slate-200">
+            <button type="button" id="chat-new-session" class="w-full flex items-center justify-center gap-2 px-3 py-2 bg-brand-600 hover:bg-brand-700 text-white text-sm font-medium rounded-xl transition-colors">
+              <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"></path></svg>
+              新建会话
+            </button>
+          </div>
+          <div class="flex-1 overflow-y-auto p-2 space-y-1" id="chat-session-list">
+            ${renderSessionListItems()}
+          </div>
+        </div>
+      `;
+    }
+
+    async function loadChatSessions() {
+      try {
+        const data = await apiGet('/api/chat/sessions?user_id=web-user');
+        STATE.chatSessions = data.sessions || [];
+      } catch (err) {
+        console.error('Load sessions failed:', err);
+        STATE.chatSessions = [];
+      }
+    }
+
+    async function createNewSession() {
+      if (STATE.chatStreaming) {
+        showToast('流式回复中，请稍后再新建会话', 'error');
+        return;
+      }
+      try {
+        const data = await apiPost('/api/chat/sessions?user_id=web-user', {});
+        const session = data.session || {};
+        STATE.chatSessionId = session.session_id || null;
+        try { if (STATE.chatSessionId) localStorage.setItem('chatSessionId', STATE.chatSessionId); } catch (e) {}
+        await loadChatSessions();
+        renderContent();
+        showToast('已创建新会话', 'success');
+      } catch (err) {
+        showToast('新建会话失败', 'error');
+      }
+    }
+
+    async function switchChatSession(sessionId) {
+      if (STATE.chatStreaming) {
+        showToast('流式回复中，请稍后再切换', 'error');
+        return;
+      }
+      if (!sessionId || sessionId === STATE.chatSessionId) return;
+      STATE.chatSessionId = sessionId;
+      try { localStorage.setItem('chatSessionId', sessionId); } catch (e) {}
+      STATE.chatMessages = [];
+      STATE.currentAiMessage = null;
+      STATE.currentRoute = null;
+      await loadChatSessions();
+      renderContent();
+    }
+
     function renderChatPage(container) {
       container.innerHTML = `
-        <div class="h-full flex flex-col max-w-3xl mx-auto w-full">
-          ${pageHeader('AI 物业维修助手', '24 小时在线，帮您解答维修、报修、收费等问题')
-            .replace('sticky top-0 z-10', 'relative')
-            .replace('max-w-6xl mx-auto', 'max-w-3xl mx-auto')
-            .replace('</p>', '</p><button id="chat-refresh-btn" type="button" class="absolute right-6 top-1/2 -translate-y-1/2 text-xs text-slate-500 hover:text-brand-600 flex items-center gap-1"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>刷新</button>')}
-          <div id="chat-handoff-banner" class="hidden px-4 pt-3 pb-1 text-center"></div>
-          <div class="flex-1 overflow-y-auto chat-scroll p-4 md:p-6" id="chat-messages">
-            <div id="chat-message-list" class="w-full space-y-5">
-              <div class="flex gap-3 welcome-message">
-                <div class="w-9 h-9 rounded-full bg-gradient-to-br from-brand-500 to-brand-700 flex items-center justify-center text-white shrink-0 shadow-md">
-                  <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z"></path></svg>
-                </div>
-                <div class="bg-white rounded-2xl rounded-tl-sm shadow-soft px-4 py-3 max-w-[85%] border border-slate-100">
-                  <p class="text-sm text-slate-700">您好，我是YIAI物业的物业维修助手。您可以问我关于维修报修、收费标准、责任划分、紧急情况处理等问题。</p>
-                  <div class="flex flex-wrap gap-2 mt-3">
-                    <button onclick="sendQuickQuestion('我家卫生间漏水怎么办？')" class="text-xs px-3 py-1.5 bg-slate-100 hover:bg-brand-50 hover:text-brand-700 text-slate-600 rounded-full transition-colors">我家卫生间漏水怎么办？</button>
-                    <button onclick="sendQuickQuestion('维修收费标准是什么？')" class="text-xs px-3 py-1.5 bg-slate-100 hover:bg-brand-50 hover:text-brand-700 text-slate-600 rounded-full transition-colors">维修收费标准是什么？</button>
-                    <button onclick="sendQuickQuestion('帮我报修客厅吊灯不亮')" class="text-xs px-3 py-1.5 bg-slate-100 hover:bg-brand-50 hover:text-brand-700 text-slate-600 rounded-full transition-colors">帮我报修客厅吊灯不亮</button>
+        <div class="h-full flex">
+          ${renderChatSessionsSidebar()}
+          <div class="flex-1 flex flex-col min-w-0 max-w-4xl mx-auto w-full">
+            ${pageHeader('AI 物业维修助手', '24 小时在线，帮您解答维修、报修、收费等问题')
+              .replace('sticky top-0 z-10', 'relative')
+              .replace('max-w-6xl mx-auto', 'max-w-4xl mx-auto')
+              .replace('</p>', '</p><button id="chat-refresh-btn" type="button" class="absolute right-6 top-1/2 -translate-y-1/2 text-xs text-slate-500 hover:text-brand-600 flex items-center gap-1"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>刷新</button>')}
+            <div id="chat-handoff-banner" class="hidden px-4 pt-3 pb-1 text-center"></div>
+            <div class="flex-1 overflow-y-auto chat-scroll p-4 md:p-6" id="chat-messages">
+              <div id="chat-message-list" class="w-full space-y-5">
+                <div class="flex gap-3 welcome-message">
+                  <div class="w-9 h-9 rounded-full bg-gradient-to-br from-brand-500 to-brand-700 flex items-center justify-center text-white shrink-0 shadow-md">
+                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z"></path></svg>
+                  </div>
+                  <div class="bg-white rounded-2xl rounded-tl-sm shadow-soft px-4 py-3 max-w-[85%] border border-slate-100">
+                    <p class="text-sm text-slate-700">您好，我是YIAI物业的物业维修助手。您可以问我关于维修报修、收费标准、责任划分、紧急情况处理等问题。</p>
+                    <div class="flex flex-wrap gap-2 mt-3">
+                      <button onclick="sendQuickQuestion('我家卫生间漏水怎么办？')" class="text-xs px-3 py-1.5 bg-slate-100 hover:bg-brand-50 hover:text-brand-700 text-slate-600 rounded-full transition-colors">我家卫生间漏水怎么办？</button>
+                      <button onclick="sendQuickQuestion('维修收费标准是什么？')" class="text-xs px-3 py-1.5 bg-slate-100 hover:bg-brand-50 hover:text-brand-700 text-slate-600 rounded-full transition-colors">维修收费标准是什么？</button>
+                      <button onclick="sendQuickQuestion('帮我报修客厅吊灯不亮')" class="text-xs px-3 py-1.5 bg-slate-100 hover:bg-brand-50 hover:text-brand-700 text-slate-600 rounded-full transition-colors">帮我报修客厅吊灯不亮</button>
+                    </div>
                   </div>
                 </div>
               </div>
             </div>
-          </div>
-          <div class="border-t border-slate-200 bg-white p-4">
-            <div class="w-full">
-              <form id="chat-form" class="relative flex items-end gap-2 bg-slate-50 border border-slate-200 rounded-2xl p-2 focus-within:border-brand-400 focus-within:ring-2 focus-within:ring-brand-100 transition-all">
-                <button type="button" id="chat-handoff" title="转人工" class="mb-0.5 p-2.5 text-slate-500 hover:text-brand-600 hover:bg-brand-50 rounded-xl transition-colors shrink-0">
-                  <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z"></path></svg>
-                </button>
-                <textarea id="chat-input" rows="1" placeholder="请输入您的问题..." class="flex-1 bg-transparent px-3 py-2.5 text-sm text-slate-700 placeholder-slate-400 resize-none outline-none max-h-32" style="min-height: 44px;"></textarea>
-                <button type="submit" id="chat-send" class="mb-0.5 p-2.5 bg-brand-600 hover:bg-brand-700 text-white rounded-xl transition-colors disabled:opacity-50 disabled:cursor-not-allowed">
-                  <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8"></path></svg>
-                </button>
-              </form>
-              <p class="text-[11px] text-slate-400 text-center mt-2">AI 助手回答仅供参考，紧急情况请拨打物业 24 小时值班电话</p>
+            <div class="border-t border-slate-200 bg-white p-4">
+              <div class="w-full">
+                <form id="chat-form" class="relative flex items-end gap-2 bg-slate-50 border border-slate-200 rounded-2xl p-2 focus-within:border-brand-400 focus-within:ring-2 focus-within:ring-brand-100 transition-all">
+                  <button type="button" id="chat-handoff" title="转人工" class="mb-0.5 p-2.5 text-slate-500 hover:text-brand-600 hover:bg-brand-50 rounded-xl transition-colors shrink-0">
+                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z"></path></svg>
+                  </button>
+                  <textarea id="chat-input" rows="1" placeholder="请输入您的问题..." class="flex-1 bg-transparent px-3 py-2.5 text-sm text-slate-700 placeholder-slate-400 resize-none outline-none max-h-32" style="min-height: 44px;"></textarea>
+                  <button type="submit" id="chat-send" class="mb-0.5 p-2.5 bg-brand-600 hover:bg-brand-700 text-white rounded-xl transition-colors disabled:opacity-50 disabled:cursor-not-allowed">
+                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8"></path></svg>
+                  </button>
+                </form>
+                <p class="text-[11px] text-slate-400 text-center mt-2">AI 助手回答仅供参考，紧急情况请拨打物业 24 小时值班电话</p>
+              </div>
             </div>
           </div>
         </div>
       `;
+
+      function refreshSidebar() {
+        const sidebar = $('#chat-session-list');
+        if (sidebar) sidebar.innerHTML = renderSessionListItems();
+        sidebar.querySelectorAll('.session-item').forEach(btn => {
+          btn.addEventListener('click', () => switchChatSession(btn.dataset.sessionId));
+        });
+      }
+      refreshSidebar();
 
       const form = $('#chat-form');
       const input = $('#chat-input');
@@ -730,7 +839,6 @@
           return;
         }
         if (STATE.chatStreaming) return;
-        // Clear input immediately so the user sees the message has been sent.
         input.value = '';
         input.style.height = 'auto';
         await sendChatMessage(text);
@@ -753,6 +861,8 @@
           updateHandoffBanner('requested');
           appendSystemMessage('您已发起转人工请求，物业工作人员会尽快回复。');
           showToast('已转人工，请等待工作人员回复', 'success');
+          await loadChatSessions();
+          renderChatSessionsSidebar();
         } catch (err) {
           showToast('转人工失败，请重试', 'error');
         }
@@ -763,10 +873,14 @@
           showToast('流式回复中，请稍后再刷新', 'error');
           return;
         }
+        await loadChatSessions();
         await restoreChatMessages();
+        renderChatSessionsSidebar();
         showToast('会话已刷新', 'success');
       });
 
+      await loadChatSessions();
+      renderChatSessionsSidebar();
       restoreChatMessages();
     }
 
@@ -996,7 +1110,7 @@
       return `<div class="flex flex-wrap items-center gap-1 mt-2"><span class="text-[10px] text-slate-400">已调用skill:</span>${tags}</div>`;
     }
 
-    function updateAiMessage(content, done = false, tokenCount = 0, messageId = null, tokenDetail = null, citations = null, activatedSkills = null, tools = null, agent = null, modelId = '', thinkingEnabled = null, modelSelectionReason = '') {
+    function updateAiMessage(content, done = false, tokenCount = 0, messageId = null, tokenDetail = null, citations = null, activatedSkills = null, tools = null, agent = null, modelId = '', thinkingEnabled = null, modelSelectionReason = '', traceId = '', mcpCalls = null, usageSource = '') {
       const current = STATE.currentAiMessage;
       if (!current) return;
       const contentDiv = current.querySelector('.ai-message-content');
@@ -1026,7 +1140,7 @@
           const tagsEl = footer.querySelector('.ai-message-tags');
           if (tagsEl) {
             const route = STATE.currentRoute || {};
-            tagsEl.innerHTML = renderAiMessageTags(activatedSkills, tools, agent, route.reason || '', route.intent || '', modelId, thinkingEnabled, modelSelectionReason);
+            tagsEl.innerHTML = renderAiMessageTags(activatedSkills, tools, agent, route.reason || '', route.intent || '', modelId, thinkingEnabled, modelSelectionReason, traceId, mcpCalls, usageSource);
           }
           // Append citation footnotes below the footer row.
           const existingFootnotes = footer.parentElement.querySelector('.ai-message-footnotes');
@@ -1108,6 +1222,7 @@
             if (eventType === 'start') {
               STATE.chatSessionId = data.session_id;
               try { localStorage.setItem('chatSessionId', data.session_id); } catch (e) {}
+              if (data.trace_id) STATE.currentTraceId = data.trace_id;
             } else if (eventType === 'route') {
               STATE.currentRoute = {
                 intent: data.intent || '',
@@ -1138,13 +1253,18 @@
                 data.current_agent || (STATE.currentRoute && STATE.currentRoute.current_agent) || null,
                 data.model_id || '',
                 data.thinking_enabled || false,
-                data.model_selection_reason || ''
+                data.model_selection_reason || '',
+                data.trace_id || STATE.currentTraceId || '',
+                data.mcp_calls || null,
+                data.usage_source || ''
               );
               if (data.handoff) {
                 STATE.chatHandoff = true;
                 updateHandoffBanner(data.handoff_status || 'requested');
                 showToast('已转人工，请等待工作人员回复', 'success');
               }
+              loadChatSessions().then(() => renderChatSessionsSidebar());
+              STATE.currentTraceId = null;
             } else if (eventType === 'error') {
               accumulated += `\n\n[错误: ${data.error}]`;
               updateAiMessage(accumulated, true);
@@ -1194,7 +1314,10 @@
               msg.route_intent,
               msg.model_id,
               msg.thinking_enabled,
-              msg.model_selection_reason
+              msg.model_selection_reason,
+              msg.trace_id,
+              msg.mcp_calls,
+              msg.usage_source
             );
           } else if (msg.role === 'staff') {
             appendStaffMessage(msg.content || '', msg.created_at);
@@ -1206,7 +1329,7 @@
       }
     }
 
-    function appendAiMessageFromHistory(content, createdAt, tokenCount, messageId, tokenDetail = null, citations = null, activatedSkills = null, tools = null, agent = null, routeReason = '', routeIntent = '', modelId = '', thinkingEnabled = null, modelSelectionReason = '') {
+    function appendAiMessageFromHistory(content, createdAt, tokenCount, messageId, tokenDetail = null, citations = null, activatedSkills = null, tools = null, agent = null, routeReason = '', routeIntent = '', modelId = '', thinkingEnabled = null, modelSelectionReason = '', traceId = '', mcpCalls = null, usageSource = '') {
       const container = $('#chat-message-list');
       const div = document.createElement('div');
       div.className = 'flex gap-3 items-start fade-in';
@@ -1219,7 +1342,7 @@
         ? `<span class="cursor-help underline decoration-dotted" title="${escapeHtml(detailText)}">${tokenText}</span>`
         : tokenText;
       const footnotesHtml = renderCitations(citations);
-      const tagsHtml = renderAiMessageTags(activatedSkills, tools, agent, routeReason, routeIntent, modelId, thinkingEnabled, modelSelectionReason);
+      const tagsHtml = renderAiMessageTags(activatedSkills, tools, agent, routeReason, routeIntent, modelId, thinkingEnabled, modelSelectionReason, traceId, mcpCalls, usageSource);
       div.innerHTML = `
         <div class="w-9 h-9 rounded-full bg-gradient-to-br from-brand-500 to-brand-700 flex items-center justify-center text-white shrink-0 shadow-md">
           <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z"></path></svg>
@@ -2325,6 +2448,546 @@
       }
 
       await loadDetail();
+    }
+
+    async function renderCostGovernancePage(container) {
+      container.innerHTML = loadingState();
+
+      const state = {
+        filters: { start: '', end: '', model: '', agent: '', intent: '', stage: '', search: '', groupBy: 'model' },
+        overview: null,
+        traces: [],
+        trends: [],
+        distribution: [],
+        prices: [],
+        budget: {},
+        costCases: [],
+      };
+
+      function fmtDate(d) {
+        if (!d) return '';
+        const date = new Date(d);
+        if (isNaN(date.getTime())) return d;
+        return date.toISOString().slice(0, 10);
+      }
+      function fmtTime(d) {
+        if (!d) return '';
+        return formatTimeLabel(d);
+      }
+      function fmtCost(v) {
+        if (v === null || v === undefined) return '-- / 未配置价格';
+        return '¥' + Number(v).toFixed(6);
+      }
+      function fmtTokens(v) {
+        if (v === null || v === undefined) return '-';
+        return Number(v).toLocaleString();
+      }
+      function sourceBadge(src) {
+        if (src === 'provider_reported') return '<span class="px-1.5 py-0.5 bg-green-50 text-green-600 rounded text-[10px]">Provider账单</span>';
+        if (src === 'estimated_tokenization') return '<span class="px-1.5 py-0.5 bg-amber-50 text-amber-600 rounded text-[10px]">本地估算</span>';
+        return '<span class="px-1.5 py-0.5 bg-slate-100 text-slate-500 rounded text-[10px]">未知</span>';
+      }
+      function statusBadgeSmall(s) {
+        if (s === 'success') return '<span class="text-green-600">成功</span>';
+        if (s === 'failed') return '<span class="text-red-600">失败</span>';
+        return '<span class="text-slate-500">' + escapeHtml(s || '-') + '</span>';
+      }
+
+      async function loadAll() {
+        const params = new URLSearchParams();
+        if (state.filters.start) params.append('start', state.filters.start);
+        if (state.filters.end) params.append('end', state.filters.end);
+        const qs = params.toString() ? '?' + params.toString() : '';
+        const [overview, traces, trends, distribution, prices, budget] = await Promise.all([
+          apiGet(`/api/observability/overview${qs}`).catch(() => ({})),
+          apiGet(`/api/observability/traces${qs}`).catch(() => ({ traces: [] })),
+          apiGet(`/api/observability/trends${qs}`).catch(() => ({ items: [] })),
+          apiGet(`/api/observability/distribution?group_by=${state.filters.groupBy}${state.filters.start ? '&start=' + state.filters.start : ''}${state.filters.end ? '&end=' + state.filters.end : ''}`).catch(() => ({ items: [] })),
+          apiGet('/api/observability/prices').catch(() => ({ prices: [] })),
+          apiGet('/api/observability/budget').catch(() => ({ budget: {} })),
+        ]);
+        state.overview = overview;
+        state.traces = traces.traces || [];
+        state.trends = trends.items || [];
+        state.distribution = distribution.items || [];
+        state.prices = prices.prices || [];
+        state.budget = budget.budget || {};
+      }
+
+      function renderOverview() {
+        const o = state.overview || {};
+        const alerts = (o.alerts || []).map(a => `<span class="px-2 py-1 rounded-lg text-xs ${a.type === 'daily' ? 'bg-red-100 text-red-700' : 'bg-amber-100 text-amber-700'}">${a.type === 'daily' ? '每日' : '单次'}预警：阈值 ¥${a.threshold}，实际 ¥${a.actual}</span>`).join('');
+        return `
+          <div class="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-7 gap-3">
+            <div class="bg-white rounded-2xl shadow-soft border border-slate-200 p-4">
+              <div class="text-[11px] text-slate-500">今日调用次数</div>
+              <div class="text-xl font-semibold text-slate-900 mt-1">${Number(o.calls || 0).toLocaleString()}</div>
+            </div>
+            <div class="bg-white rounded-2xl shadow-soft border border-slate-200 p-4">
+              <div class="text-[11px] text-slate-500">今日总 Token</div>
+              <div class="text-xl font-semibold text-slate-900 mt-1">${fmtTokens(o.total_tokens)}</div>
+            </div>
+            <div class="bg-white rounded-2xl shadow-soft border border-slate-200 p-4">
+              <div class="text-[11px] text-slate-500">今日估算成本</div>
+              <div class="text-xl font-semibold text-slate-900 mt-1">${fmtCost(o.total_cost)}</div>
+            </div>
+            <div class="bg-white rounded-2xl shadow-soft border border-slate-200 p-4">
+              <div class="text-[11px] text-slate-500">平均单轮 Token</div>
+              <div class="text-xl font-semibold text-slate-900 mt-1">${fmtTokens(o.avg_tokens)}</div>
+            </div>
+            <div class="bg-white rounded-2xl shadow-soft border border-slate-200 p-4">
+              <div class="text-[11px] text-slate-500">平均单轮估算成本</div>
+              <div class="text-xl font-semibold text-slate-900 mt-1">${fmtCost(o.avg_cost)}</div>
+            </div>
+            <div class="bg-white rounded-2xl shadow-soft border border-slate-200 p-4">
+              <div class="text-[11px] text-slate-500">成本未知调用数</div>
+              <div class="text-xl font-semibold text-slate-900 mt-1">${Number(o.unknown_cost_calls || 0).toLocaleString()}</div>
+            </div>
+            <div class="bg-white rounded-2xl shadow-soft border border-slate-200 p-4">
+              <div class="text-[11px] text-slate-500">失败调用数</div>
+              <div class="text-xl font-semibold text-slate-900 mt-1">${Number(o.failed_calls || 0).toLocaleString()}</div>
+            </div>
+          </div>
+          ${alerts ? `<div class="flex flex-wrap gap-2 mt-3">${alerts}</div>` : ''}
+          <p class="text-[11px] text-slate-400 mt-2">${escapeHtml(o.cost_note || '按配置价格估算成本，非供应商实际结算金额')} · 货币 ${escapeHtml(o.currency || 'CNY')}</p>
+        `;
+      }
+
+      function renderFilters() {
+        return `
+          <div class="bg-white rounded-2xl shadow-soft border border-slate-200 p-4">
+            <div class="flex flex-wrap gap-3">
+              <input id="cg-start" type="date" value="${state.filters.start ? fmtDate(state.filters.start) : ''}" class="px-3 py-2 border border-slate-200 rounded-xl text-sm">
+              <input id="cg-end" type="date" value="${state.filters.end ? fmtDate(state.filters.end) : ''}" class="px-3 py-2 border border-slate-200 rounded-xl text-sm">
+              <input id="cg-search" type="text" placeholder="session_id / trace_id" value="${escapeHtml(state.filters.search)}" class="px-3 py-2 border border-slate-200 rounded-xl text-sm w-48">
+              <select id="cg-model" class="px-3 py-2 border border-slate-200 rounded-xl text-sm">
+                <option value="">全部模型</option>
+                <option value="deepseek-v4-flash" ${state.filters.model === 'deepseek-v4-flash' ? 'selected' : ''}>deepseek-v4-flash</option>
+                <option value="deepseek-v4-pro" ${state.filters.model === 'deepseek-v4-pro' ? 'selected' : ''}>deepseek-v4-pro</option>
+              </select>
+              <select id="cg-stage" class="px-3 py-2 border border-slate-200 rounded-xl text-sm">
+                <option value="">全部阶段</option>
+                <option value="router" ${state.filters.stage === 'router' ? 'selected' : ''}>router</option>
+                <option value="vertical_agent" ${state.filters.stage === 'vertical_agent' ? 'selected' : ''}>vertical_agent</option>
+                <option value="ab_test_a" ${state.filters.stage === 'ab_test_a' ? 'selected' : ''}>ab_test_a</option>
+                <option value="ab_test_b" ${state.filters.stage === 'ab_test_b' ? 'selected' : ''}>ab_test_b</option>
+                <option value="darwin" ${state.filters.stage === 'darwin' ? 'selected' : ''}>darwin</option>
+              </select>
+              <select id="cg-group" class="px-3 py-2 border border-slate-200 rounded-xl text-sm">
+                <option value="model" ${state.filters.groupBy === 'model' ? 'selected' : ''}>按模型分布</option>
+                <option value="agent" ${state.filters.groupBy === 'agent' ? 'selected' : ''}>按 Agent 分布</option>
+                <option value="intent" ${state.filters.groupBy === 'intent' ? 'selected' : ''}>按意图分布</option>
+                <option value="stage" ${state.filters.groupBy === 'stage' ? 'selected' : ''}>按阶段分布</option>
+              </select>
+              <button id="cg-apply" type="button" class="px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white rounded-xl text-sm">应用筛选</button>
+            </div>
+          </div>
+        `;
+      }
+
+      function renderTrends() {
+        const items = state.trends || [];
+        if (!items.length) return `<div class="bg-white rounded-2xl shadow-soft border border-slate-200 p-4"><p class="text-sm text-slate-400">暂无趋势数据</p></div>`;
+        const maxCalls = Math.max(...items.map(i => i.calls || 0), 1);
+        return `
+          <div class="bg-white rounded-2xl shadow-soft border border-slate-200 p-4">
+            <h3 class="font-semibold text-slate-900 mb-3">调用趋势</h3>
+            <div class="space-y-2 max-h-64 overflow-y-auto">
+              ${items.map(i => `
+                <div class="flex items-center gap-3 text-sm">
+                  <div class="w-24 text-slate-500 shrink-0">${escapeHtml(i.period)}</div>
+                  <div class="flex-1 h-4 bg-slate-100 rounded-full overflow-hidden">
+                    <div class="h-full bg-brand-500 rounded-full" style="width: ${Math.min(100, ((i.calls || 0) / maxCalls) * 100)}%"></div>
+                  </div>
+                  <div class="w-16 text-right text-slate-700">${Number(i.calls || 0).toLocaleString()}</div>
+                  <div class="w-20 text-right text-slate-500">${fmtTokens(i.tokens)}</div>
+                  <div class="w-24 text-right text-slate-700">${fmtCost(i.cost)}</div>
+                </div>
+              `).join('')}
+            </div>
+          </div>
+        `;
+      }
+
+      function renderDistribution() {
+        const items = state.distribution || [];
+        if (!items.length) return `<div class="bg-white rounded-2xl shadow-soft border border-slate-200 p-4"><p class="text-sm text-slate-400">暂无分布数据</p></div>`;
+        return `
+          <div class="bg-white rounded-2xl shadow-soft border border-slate-200 p-4">
+            <h3 class="font-semibold text-slate-900 mb-3">${{ model: '模型', agent: 'Agent', intent: '意图', stage: '阶段' }[state.filters.groupBy] || '分布'}</h3>
+            <div class="overflow-x-auto">
+              <table class="w-full text-sm">
+                <thead><tr class="text-left text-slate-500 text-xs border-b border-slate-100"><th class="pb-2">分组</th><th class="pb-2">调用数</th><th class="pb-2">Token</th><th class="pb-2">估算成本</th></tr></thead>
+                <tbody>
+                  ${items.map(i => `
+                    <tr class="border-b border-slate-50 last:border-0">
+                      <td class="py-2">${escapeHtml(i[state.filters.groupBy === 'stage' ? 'stage' : (state.filters.groupBy === 'model' ? 'model_id' : state.filters.groupBy)] || '-')}</td>
+                      <td class="py-2">${Number(i.calls || 0).toLocaleString()}</td>
+                      <td class="py-2">${fmtTokens(i.tokens)}</td>
+                      <td class="py-2">${fmtCost(i.cost)}</td>
+                    </tr>
+                  `).join('')}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        `;
+      }
+
+      function renderTraces() {
+        let items = state.traces || [];
+        if (state.filters.search) {
+          const s = state.filters.search.toLowerCase();
+          items = items.filter(t => (t.trace_id || '').toLowerCase().includes(s) || (t.session_id || '').toLowerCase().includes(s));
+        }
+        if (!items.length) return `<div class="bg-white rounded-2xl shadow-soft border border-slate-200 p-4"><p class="text-sm text-slate-400">暂无 Trace 数据</p></div>`;
+        return `
+          <div class="bg-white rounded-2xl shadow-soft border border-slate-200 p-4">
+            <h3 class="font-semibold text-slate-900 mb-3">调用 Trace 列表</h3>
+            <div class="overflow-x-auto">
+              <table class="w-full text-sm">
+                <thead><tr class="text-left text-slate-500 text-xs border-b border-slate-100"><th class="pb-2">trace_id</th><th class="pb-2">时间</th><th class="pb-2">意图</th><th class="pb-2">Agent</th><th class="pb-2">状态</th><th class="pb-2">操作</th></tr></thead>
+                <tbody>
+                  ${items.map(t => `
+                    <tr class="border-b border-slate-50 last:border-0 hover:bg-slate-50">
+                      <td class="py-2 font-mono text-xs text-slate-600">${escapeHtml(t.trace_id)}</td>
+                      <td class="py-2 text-slate-500">${fmtTime(t.created_at)}</td>
+                      <td class="py-2">${escapeHtml(t.intent || '-')}</td>
+                      <td class="py-2">${escapeHtml(t.agent_name || '-')}</td>
+                      <td class="py-2">${statusBadgeSmall(t.status)}</td>
+                      <td class="py-2"><button type="button" data-trace="${escapeHtml(t.trace_id)}" class="cg-trace-detail px-2 py-1 bg-brand-50 text-brand-600 rounded-lg text-xs hover:bg-brand-100">查看账单</button></td>
+                    </tr>
+                  `).join('')}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        `;
+      }
+
+      async function showTraceDetail(traceId) {
+        try {
+          const data = await apiGet(`/api/observability/traces/${traceId}`);
+          const trace = data.trace || {};
+          const modelCalls = data.model_calls || [];
+          const mcpCalls = data.mcp_calls || [];
+          const breakdown = data.context_breakdown || {};
+          const totalCost = modelCalls.reduce((sum, c) => sum + (c.estimated_cost_cny || 0), 0);
+          const totalTokens = modelCalls.reduce((sum, c) => sum + (c.total_tokens || 0), 0);
+          const callsHtml = modelCalls.map(c => `
+            <div class="border border-slate-200 rounded-xl p-3 mb-2 text-sm">
+              <div class="flex items-center justify-between mb-1">
+                <span class="font-medium text-slate-900">${escapeHtml(c.stage)} · ${escapeHtml(c.model_id)}</span>
+                <span class="text-xs">${statusBadgeSmall(c.status)} · ${sourceBadge(c.usage_source)}</span>
+              </div>
+              <div class="text-xs text-slate-500">耗时 ${c.latency_ms || 0}ms · 模型选择原因：${escapeHtml(c.model_selection_reason || '-')}</div>
+              <div class="text-xs text-slate-500 mt-1">Token: 输入 ${fmtTokens(c.input_tokens)} / 输出 ${fmtTokens(c.output_tokens)} / 推理 ${fmtTokens(c.reasoning_tokens)} / 缓存 ${fmtTokens(c.cached_tokens)} / 总计 ${fmtTokens(c.total_tokens)}</div>
+              <div class="text-xs text-slate-700 mt-1">估算成本：${fmtCost(c.estimated_cost_cny)}</div>
+              ${c.error_summary ? `<div class="text-xs text-red-600 mt-1">错误：${escapeHtml(c.error_summary)}</div>` : ''}
+            </div>
+          `).join('');
+          const mcpHtml = mcpCalls.length ? mcpCalls.map(c => `
+            <div class="border border-slate-200 rounded-xl p-3 mb-2 text-sm">
+              <div class="flex items-center justify-between mb-1">
+                <span class="font-medium text-slate-900">[${escapeHtml(c.server_name)}] ${escapeHtml(c.tool_name)}</span>
+                <span class="text-xs">${statusBadgeSmall(c.status)} · ${c.latency_ms || 0}ms</span>
+              </div>
+              <div class="text-xs text-slate-500">参数：${escapeHtml(JSON.stringify(c.arguments || {}))}</div>
+              ${c.result_summary ? `<div class="text-xs text-slate-600 mt-1 bg-slate-50 rounded p-1.5">结果摘要：${escapeHtml(c.result_summary)}</div>` : ''}
+              ${c.error_summary ? `<div class="text-xs text-red-600 mt-1">错误：${escapeHtml(c.error_summary)}</div>` : ''}
+            </div>
+          `).join('') : '<p class="text-sm text-slate-400">无 MCP 调用</p>';
+          const breakdownHtml = `
+            <div class="text-sm text-slate-600 space-y-1">
+              <div class="flex justify-between"><span>system prompt</span><span>${fmtTokens(breakdown.system_prompt_tokens)}</span></div>
+              <div class="flex justify-between"><span>历史消息</span><span>${fmtTokens(breakdown.history_tokens)}</span></div>
+              <div class="flex justify-between"><span>Skill</span><span>${fmtTokens(breakdown.skill_tokens)}</span></div>
+              <div class="flex justify-between"><span>RAG</span><span>${fmtTokens(breakdown.rag_tokens)}</span></div>
+              <div class="flex justify-between"><span>工具结果</span><span>${fmtTokens(breakdown.tool_result_tokens)}</span></div>
+              <div class="flex justify-between"><span>用户消息</span><span>${fmtTokens(breakdown.user_message_tokens)}</span></div>
+              <p class="text-[11px] text-amber-600 mt-2">${escapeHtml(breakdown.note || '本地估算构成，非 Provider 原始账单')}</p>
+            </div>
+          `;
+          const html = `
+            <div class="space-y-4">
+              <div class="bg-slate-50 rounded-xl p-3 border border-slate-200 text-sm">
+                <div><span class="text-slate-500">trace_id:</span> <span class="font-mono">${escapeHtml(traceId)}</span></div>
+                <div><span class="text-slate-500">session_id:</span> <span class="font-mono">${escapeHtml(trace.session_id || '-')}</span></div>
+                <div><span class="text-slate-500">用户问题：</span>${escapeHtml(trace.user_message || '-')}</div>
+              </div>
+              <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
+                <div class="bg-white rounded-xl border border-slate-200 p-3"><div class="text-[11px] text-slate-500">当前轮总 Token</div><div class="text-lg font-semibold">${fmtTokens(totalTokens)}</div></div>
+                <div class="bg-white rounded-xl border border-slate-200 p-3"><div class="text-[11px] text-slate-500">当前轮估算成本</div><div class="text-lg font-semibold">${fmtCost(totalCost)}</div></div>
+                <div class="bg-white rounded-xl border border-slate-200 p-3"><div class="text-[11px] text-slate-500">RAG 命中分片数</div><div class="text-lg font-semibold">${(data.messages || []).filter(m => m.role === 'assistant' && m.citations).reduce((s, m) => s + (m.citations || []).length, 0)}</div></div>
+              </div>
+              <div><h4 class="font-medium text-slate-900 mb-2">模型调用</h4>${callsHtml || '<p class="text-sm text-slate-400">无模型调用记录</p>'}</div>
+              <div><h4 class="font-medium text-slate-900 mb-2">MCP 工具审计</h4>${mcpHtml}</div>
+              <div><h4 class="font-medium text-slate-900 mb-2">输入上下文构成估算</h4>${breakdownHtml}</div>
+            </div>
+          `;
+          openModal('单次调用账单', html, null, '关闭');
+        } catch (err) {
+          showToast('加载 Trace 详情失败', 'error');
+        }
+      }
+
+      function renderPrices() {
+        const rows = state.prices.map(p => `
+          <tr class="border-b border-slate-50 last:border-0">
+            <td class="py-2">${escapeHtml(p.model_id)}</td>
+            <td class="py-2">${escapeHtml(p.currency || 'CNY')}</td>
+            <td class="py-2">${escapeHtml(p.effective_date)}</td>
+            <td class="py-2">${p.input_price_per_1m ?? '-'}</td>
+            <td class="py-2">${p.cached_input_price_per_1m ?? '-'}</td>
+            <td class="py-2">${p.output_price_per_1m ?? '-'}</td>
+            <td class="py-2">${p.reasoning_price_per_1m ?? '-'}</td>
+            <td class="py-2">${escapeHtml(p.source_note || '-')}</td>
+            <td class="py-2">${p.enabled ? '<span class="text-green-600">启用</span>' : '<span class="text-slate-400">禁用</span>'}</td>
+            <td class="py-2"><button type="button" data-price-id="${p.id}" class="cg-edit-price px-2 py-1 bg-slate-100 text-slate-600 rounded-lg text-xs hover:bg-slate-200">编辑</button></td>
+          </tr>
+        `).join('');
+        return `
+          <div class="bg-white rounded-2xl shadow-soft border border-slate-200 p-4">
+            <div class="flex items-center justify-between mb-3">
+              <h3 class="font-semibold text-slate-900">模型价格表</h3>
+              <button id="cg-add-price" type="button" class="px-3 py-1.5 bg-brand-600 hover:bg-brand-700 text-white rounded-lg text-xs">新增价格</button>
+            </div>
+            <div class="overflow-x-auto">
+              <table class="w-full text-sm">
+                <thead><tr class="text-left text-slate-500 text-xs border-b border-slate-100"><th class="pb-2">模型</th><th class="pb-2">货币</th><th class="pb-2">生效日期</th><th class="pb-2">输入/百万</th><th class="pb-2">缓存输入/百万</th><th class="pb-2">输出/百万</th><th class="pb-2">推理/百万</th><th class="pb-2">来源备注</th><th class="pb-2">启用</th><th class="pb-2">操作</th></tr></thead>
+                <tbody>${rows || '<tr><td colspan="10" class="py-4 text-center text-sm text-slate-400">暂无价格配置</td></tr>'}</tbody>
+              </table>
+            </div>
+          </div>
+        `;
+      }
+
+      function openPriceModal(price = null) {
+        const body = `
+          <div class="space-y-3">
+            ${formInput('模型', 'price-model', price ? price.model_id : '', '例如 deepseek-v4-flash')}
+            ${formInput('生效日期', 'price-effective', price ? price.effective_date : '', 'YYYY-MM-DD')}
+            ${formInput('输入 Token 单价（每百万 CNY）', 'price-input', price ? (price.input_price_per_1m ?? '') : '', '', 'number')}
+            ${formInput('缓存输入 Token 单价', 'price-cached', price ? (price.cached_input_price_per_1m ?? '') : '', '', 'number')}
+            ${formInput('输出 Token 单价', 'price-output', price ? (price.output_price_per_1m ?? '') : '', '', 'number')}
+            ${formInput('推理 Token 单价', 'price-reasoning', price ? (price.reasoning_price_per_1m ?? '') : '', '', 'number')}
+            ${formInput('价格来源备注', 'price-note', price ? (price.source_note || '') : '', '例如 自购 Gateway 账单')}
+            ${formSwitch('启用', 'price-enabled', price ? price.enabled : true)}
+          </div>
+        `;
+        openModal(price ? '编辑价格' : '新增价格', body, async () => {
+          const payload = {
+            model_id: $('#price-model').value.trim(),
+            effective_date: $('#price-effective').value.trim(),
+            input_price_per_1m: parseFloat($('#price-input').value) || null,
+            cached_input_price_per_1m: parseFloat($('#price-cached').value) || null,
+            output_price_per_1m: parseFloat($('#price-output').value) || null,
+            reasoning_price_per_1m: parseFloat($('#price-reasoning').value) || null,
+            source_note: $('#price-note').value.trim() || null,
+            enabled: $('#price-enabled').checked,
+          };
+          if (!payload.model_id || !payload.effective_date) {
+            showToast('模型与生效日期必填', 'error');
+            return false;
+          }
+          try {
+            if (price) await apiPut(`/api/observability/prices/${price.id}`, payload);
+            else await apiPost('/api/observability/prices', payload);
+            showToast('保存成功', 'success');
+            closeModal();
+            await loadAll();
+            renderPage();
+            return true;
+          } catch (err) {
+            showToast('保存失败', 'error');
+            return false;
+          }
+        });
+      }
+
+      function renderBudget() {
+        const b = state.budget || {};
+        return `
+          <div class="bg-white rounded-2xl shadow-soft border border-slate-200 p-4">
+            <div class="flex items-center justify-between mb-3">
+              <h3 class="font-semibold text-slate-900">预算预警阈值</h3>
+              <button id="cg-edit-budget" type="button" class="px-3 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg text-xs">编辑阈值</button>
+            </div>
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+              <div class="bg-slate-50 rounded-xl p-3 border border-slate-200">
+                <div class="text-[11px] text-slate-500">单次调用成本预警</div>
+                <div class="text-lg font-semibold text-slate-900">${b.per_call_threshold_cny ? '¥' + Number(b.per_call_threshold_cny).toFixed(6) : '未设置'}</div>
+              </div>
+              <div class="bg-slate-50 rounded-xl p-3 border border-slate-200">
+                <div class="text-[11px] text-slate-500">每日估算成本预警</div>
+                <div class="text-lg font-semibold text-slate-900">${b.daily_threshold_cny ? '¥' + Number(b.daily_threshold_cny).toFixed(6) : '未设置'}</div>
+              </div>
+            </div>
+            <p class="text-[11px] text-slate-400 mt-2">仅预警，不阻断业主聊天</p>
+          </div>
+        `;
+      }
+
+      function openBudgetModal() {
+        const b = state.budget || {};
+        const body = `
+          <div class="space-y-3">
+            ${formInput('单次调用成本预警（CNY）', 'budget-per-call', b.per_call_threshold_cny ?? '', '例如 0.5', 'number')}
+            ${formInput('每日估算成本预警（CNY）', 'budget-daily', b.daily_threshold_cny ?? '', '例如 10', 'number')}
+            <p class="text-xs text-slate-400">留空表示不启用。触发后仅在后台显示预警，不阻断业主聊天。</p>
+          </div>
+        `;
+        openModal('编辑预算阈值', body, async () => {
+          const payload = {
+            per_call_threshold_cny: parseFloat($('#budget-per-call').value) || null,
+            daily_threshold_cny: parseFloat($('#budget-daily').value) || null,
+          };
+          try {
+            await apiPut('/api/observability/budget', payload);
+            showToast('保存成功', 'success');
+            closeModal();
+            await loadAll();
+            renderPage();
+            return true;
+          } catch (err) {
+            showToast('保存失败', 'error');
+            return false;
+          }
+        });
+      }
+
+      function renderStrategy() {
+        return `
+          <div class="bg-white rounded-2xl shadow-soft border border-slate-200 p-4">
+            <h3 class="font-semibold text-slate-900 mb-3">当前 Token 优化策略</h3>
+            <ul class="text-sm text-slate-700 space-y-2 list-disc list-inside">
+              <li>Flash 是业主常规链路默认模型，成本低、响应快。</li>
+              <li>Pro 仅用于 A/B 测试与 Darwin 深度分析，避免常规链路成本失控。</li>
+              <li>Skill 仅按当前 Agent 与触发条件注入，未命中则不进入上下文。</li>
+              <li>RAG 通过 Top-K、相关性阈值、context_threshold 控制上下文长度，无关知识不会进入最终证据。</li>
+              <li>MCP 工具结果需要摘要化后再进入后续上下文，避免长原始响应膨胀。</li>
+              <li>历史会话按实际需要截断或摘要，不能无限拼接。</li>
+            </ul>
+          </div>
+        `;
+      }
+
+      function renderCostCases() {
+        return `
+          <div class="bg-white rounded-2xl shadow-soft border border-slate-200 p-4">
+            <h3 class="font-semibold text-slate-900 mb-3">真实对比案例</h3>
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <div class="border border-slate-200 rounded-xl p-3">
+                <div class="text-sm font-medium text-slate-900 mb-2">COST-01：模型分层（Flash vs Pro）</div>
+                <p class="text-xs text-slate-500 mb-2">对同一固定投诉问题执行 Flash / Pro A/B，记录 Token、耗时、估算成本。质量判断为人工记录项。</p>
+                <button id="cg-run-cost01" type="button" class="px-3 py-1.5 bg-brand-600 hover:bg-brand-700 text-white rounded-lg text-xs">执行对比</button>
+                <div id="cost01-result" class="mt-2 text-xs text-slate-600"></div>
+              </div>
+              <div class="border border-slate-200 rounded-xl p-3">
+                <div class="text-sm font-medium text-slate-900 mb-2">COST-02：RAG Top-K（1 vs 5）</div>
+                <p class="text-xs text-slate-500 mb-2">对固定知识库问题分别以 Top-K=1 与 Top-K=5 执行，记录引用数量、Token、估算成本。测试后恢复原配置。</p>
+                <button id="cg-run-cost02" type="button" class="px-3 py-1.5 bg-brand-600 hover:bg-brand-700 text-white rounded-lg text-xs">执行对比</button>
+                <div id="cost02-result" class="mt-2 text-xs text-slate-600"></div>
+              </div>
+            </div>
+          </div>
+        `;
+      }
+
+      async function runCost01() {
+        const resultEl = $('#cost01-result');
+        resultEl.innerHTML = '<span class="text-slate-400">执行中...</span>';
+        try {
+          const query = '我要投诉楼下噪音太大，物业不作为';
+          const r = await apiPost('/api/model-configs/ab-test', { prompt: query });
+          const fmt = (d, name) => {
+            if (d.error) return `<div class="text-red-600">${name} 失败：${escapeHtml(d.error)}</div>`;
+            return `<div><span class="font-medium">${name}</span> · Token ${fmtTokens(d.total_tokens)} · 耗时 ${d.latency_ms || 0}ms · 估算 ${fmtCost(d.estimated_cost_cny)} · usage ${escapeHtml(d.usage_source || '-')}</div>`;
+          };
+          resultEl.innerHTML = `
+            <div>trace: ${escapeHtml(r.trace_id || '-')}</div>
+            ${fmt(r.model_a_result, 'Flash')}
+            ${fmt(r.model_b_result, 'Pro')}
+          `;
+          state.costCases.push({ id: 'COST-01', result: r });
+        } catch (err) {
+          resultEl.innerHTML = '<span class="text-red-600">执行失败：' + escapeHtml(err.message || err) + '</span>';
+        }
+      }
+
+      async function runCost02() {
+        const resultEl = $('#cost02-result');
+        resultEl.innerHTML = '<span class="text-slate-400">执行中...</span>';
+        try {
+          const original = await apiGet('/api/knowledge/retrieval-settings');
+          const origTopK = original.top_k;
+          const query = '维修收费标准是什么';
+          const run = async (k) => {
+            await apiPut('/api/knowledge/retrieval-settings', { ...original, top_k: k });
+            const res = await apiPost('/api/retrieval/search', { query, top_k: k });
+            return { k, citations: res.citations || [], tokenCount: (res.citations || []).reduce((s, c) => s + (c.content || '').length, 0) };
+          };
+          const r1 = await run(1);
+          const r5 = await run(5);
+          await apiPut('/api/knowledge/retrieval-settings', { ...original, top_k: origTopK });
+          resultEl.innerHTML = `
+            <div>Top-K=1：引用 ${r1.citations.length} 条 · 文本长度 ${r1.tokenCount} 字</div>
+            <div>Top-K=5：引用 ${r5.citations.length} 条 · 文本长度 ${r5.tokenCount} 字</div>
+            <div class="text-slate-400">测试后已恢复 top_k=${origTopK}</div>
+          `;
+          state.costCases.push({ id: 'COST-02', r1, r5 });
+        } catch (err) {
+          resultEl.innerHTML = '<span class="text-red-600">执行失败</span>';
+        }
+      }
+
+      function renderPage() {
+        container.innerHTML = `
+          <div class="max-w-6xl mx-auto p-4 md:p-6 space-y-5">
+            ${pageHeader('调用与成本治理', 'Trace 可观测性、Token 成本估算、模型价格表与预算预警').replace('sticky top-0 z-10', 'relative')}
+            ${renderOverview()}
+            ${renderFilters()}
+            <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              ${renderTrends()}
+              ${renderDistribution()}
+            </div>
+            ${renderTraces()}
+            ${renderPrices()}
+            ${renderBudget()}
+            ${renderStrategy()}
+            ${renderCostCases()}
+          </div>
+        `;
+        bindEvents();
+      }
+
+      function bindEvents() {
+        $('#cg-apply').addEventListener('click', async () => {
+          const startVal = $('#cg-start').value;
+          const endVal = $('#cg-end').value;
+          state.filters.start = startVal ? startVal + ' 00:00:00' : '';
+          state.filters.end = endVal ? endVal + ' 23:59:59' : '';
+          state.filters.search = $('#cg-search').value.trim();
+          state.filters.model = $('#cg-model').value;
+          state.filters.stage = $('#cg-stage').value;
+          state.filters.groupBy = $('#cg-group').value;
+          container.innerHTML = loadingState();
+          await loadAll();
+          renderPage();
+        });
+        $$('.cg-trace-detail').forEach(btn => btn.addEventListener('click', () => showTraceDetail(btn.dataset.trace)));
+        $('#cg-add-price').addEventListener('click', () => openPriceModal());
+        $$('.cg-edit-price').forEach(btn => {
+          const price = state.prices.find(p => String(p.id) === btn.dataset.priceId);
+          btn.addEventListener('click', () => openPriceModal(price));
+        });
+        $('#cg-edit-budget').addEventListener('click', openBudgetModal);
+        $('#cg-run-cost01').addEventListener('click', runCost01);
+        $('#cg-run-cost02').addEventListener('click', runCost02);
+      }
+
+      await loadAll();
+      renderPage();
     }
 
     async function renderAgentsPage(container) {

@@ -9,6 +9,8 @@ that calls flash and pro models concurrently.
 import asyncio
 import json
 import os
+import time
+import uuid
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, HTTPException
@@ -18,8 +20,10 @@ from app.settings import build_model
 from db.property_db import (
     create_model_config as db_create_model_config,
     delete_model_config as db_delete_model_config,
+    get_enabled_price_for_model,
     get_model_config as db_get_model_config,
     list_model_configs as db_list_model_configs,
+    record_model_call,
     set_default_model_config as db_set_default_model_config,
     update_model_config as db_update_model_config,
 )
@@ -171,11 +175,48 @@ async def ab_test_models(request: AbTestRequest):
     Useful for evaluating which model works better for a specific prompt.
     """
 
-    async def _collect_response(generator) -> str:
+    trace_id = uuid.uuid4().hex[:16]
+
+    def _build_price_snapshot(model_id: str) -> Optional[Dict[str, Any]]:
+        price = get_enabled_price_for_model(model_id)
+        if not price:
+            return None
+        return {
+            "model_id": price.get("model_id"),
+            "currency": price.get("currency"),
+            "effective_date": price.get("effective_date"),
+            "input_price_per_1m": price.get("input_price_per_1m"),
+            "cached_input_price_per_1m": price.get("cached_input_price_per_1m"),
+            "output_price_per_1m": price.get("output_price_per_1m"),
+            "reasoning_price_per_1m": price.get("reasoning_price_per_1m"),
+            "source_note": price.get("source_note"),
+        }
+
+    def _calculate_cost(model_id: str, usage: Dict[str, Optional[int]]) -> tuple:
+        snapshot = _build_price_snapshot(model_id)
+        if not snapshot:
+            return None, None
+        input_tk = usage.get("input_tokens") or 0
+        output_tk = usage.get("output_tokens") or 0
+        reasoning_tk = usage.get("reasoning_tokens") or 0
+        cached_tk = usage.get("cached_tokens") or 0
+        cost = 0.0
+        if snapshot.get("input_price_per_1m") is not None:
+            cost += (input_tk - cached_tk) * (snapshot["input_price_per_1m"] / 1_000_000)
+        if snapshot.get("cached_input_price_per_1m") is not None:
+            cost += cached_tk * (snapshot["cached_input_price_per_1m"] / 1_000_000)
+        if snapshot.get("output_price_per_1m") is not None:
+            cost += output_tk * (snapshot["output_price_per_1m"] / 1_000_000)
+        if snapshot.get("reasoning_price_per_1m") is not None:
+            cost += reasoning_tk * (snapshot["reasoning_price_per_1m"] / 1_000_000)
+        return round(cost, 8), snapshot
+
+    async def _collect_response(generator) -> tuple:
         response = ""
+        usage = {}
         try:
             if isinstance(generator, str):
-                return generator
+                return generator, usage
             if hasattr(generator, "__aiter__"):
                 async for chunk in generator:
                     if hasattr(chunk, "content") and chunk.content:
@@ -184,40 +225,102 @@ async def ab_test_models(request: AbTestRequest):
                         response += str(chunk.delta)
                     elif isinstance(chunk, str):
                         response += chunk
-                return response.strip()
+                    if hasattr(chunk, "usage") and chunk.usage:
+                        usage = _extract_usage(chunk.usage)
+                return response.strip(), usage
             result = await generator
             if hasattr(result, "content"):
-                return str(result.content).strip()
+                if hasattr(result, "usage") and result.usage:
+                    usage = _extract_usage(result.usage)
+                return str(result.content).strip(), usage
             if isinstance(result, str):
-                return result.strip()
-            return ""
+                return result.strip(), usage
+            return "", usage
         except Exception:
             import traceback
             traceback.print_exc()
-            return ""
+            return "", usage
 
-    async def _run_model(model_id: str, prompt: str) -> Dict[str, Any]:
+    def _extract_usage(usage_obj: Any) -> Dict[str, Optional[int]]:
+        if isinstance(usage_obj, dict):
+            return {
+                "input_tokens": usage_obj.get("input_tokens") or usage_obj.get("prompt_tokens"),
+                "output_tokens": usage_obj.get("output_tokens") or usage_obj.get("completion_tokens"),
+                "reasoning_tokens": usage_obj.get("reasoning_tokens"),
+                "cached_tokens": usage_obj.get("cached_tokens") or usage_obj.get("prompt_cache_hit_tokens"),
+                "total_tokens": usage_obj.get("total_tokens"),
+            }
+        return {
+            "input_tokens": getattr(usage_obj, "input_tokens", None) or getattr(usage_obj, "prompt_tokens", None),
+            "output_tokens": getattr(usage_obj, "output_tokens", None) or getattr(usage_obj, "completion_tokens", None),
+            "reasoning_tokens": getattr(usage_obj, "reasoning_tokens", None),
+            "cached_tokens": getattr(usage_obj, "cached_tokens", None) or getattr(usage_obj, "prompt_cache_hit_tokens", None),
+            "total_tokens": getattr(usage_obj, "total_tokens", None),
+        }
+
+    async def _run_model(stage: str, model_id: str, prompt: str) -> Dict[str, Any]:
+        start = time.time()
+        status = "success"
+        error_summary = None
+        response_text = ""
+        usage = {}
         try:
             model = build_model(model_id)
             from agno.agent import Agent
 
             agent = Agent(model=model, markdown=False)
-            response = await _collect_response(agent.arun(prompt, stream=False))
-            return {"model_id": model_id, "response": response, "error": None}
+            response_text, usage = await _collect_response(agent.arun(prompt, stream=False))
         except Exception as e:
             import traceback
             traceback.print_exc()
-            return {"model_id": model_id, "response": "", "error": str(e)}
+            status = "failed"
+            error_summary = str(e)[:300]
+        latency_ms = int((time.time() - start) * 1000)
+        total_tokens = usage.get("total_tokens") or (usage.get("input_tokens") or 0) + (usage.get("output_tokens") or 0)
+        usage_source = "provider_reported" if usage.get("total_tokens") else "estimated_tokenization" if total_tokens else "unavailable"
+        cost_cny, snapshot = _calculate_cost(model_id, usage)
+        try:
+            record_model_call(
+                trace_id=trace_id,
+                stage=stage,
+                model_id=model_id,
+                status=status,
+                latency_ms=latency_ms,
+                input_tokens=usage.get("input_tokens"),
+                output_tokens=usage.get("output_tokens"),
+                reasoning_tokens=usage.get("reasoning_tokens"),
+                cached_tokens=usage.get("cached_tokens"),
+                total_tokens=total_tokens,
+                usage_source=usage_source,
+                model_selection_reason="A/B test fixed model",
+                error_summary=error_summary,
+                price_snapshot=snapshot,
+                estimated_cost_cny=cost_cny,
+            )
+        except Exception:
+            pass
+        return {
+            "model_id": model_id,
+            "response": response_text,
+            "error": error_summary,
+            "latency_ms": latency_ms,
+            "total_tokens": total_tokens,
+            "usage_source": usage_source,
+            "estimated_cost_cny": cost_cny,
+        }
 
     # A/B is fixed to Flash vs Pro regardless of what the client sends.
     FIXED_MODEL_A = "deepseek-v4-flash"
     FIXED_MODEL_B = "deepseek-v4-pro"
-    a_task = asyncio.create_task(_run_model(FIXED_MODEL_A, request.prompt))
-    b_task = asyncio.create_task(_run_model(FIXED_MODEL_B, request.prompt))
+    a_task = asyncio.create_task(_run_model("ab_test_a", FIXED_MODEL_A, request.prompt))
+    b_task = asyncio.create_task(_run_model("ab_test_b", FIXED_MODEL_B, request.prompt))
     a_result, b_result = await asyncio.gather(a_task, b_task)
 
     return {
+        "trace_id": trace_id,
         "prompt": request.prompt,
-        "model_a": a_result,
-        "model_b": b_result,
+        "model_a": FIXED_MODEL_A,
+        "model_b": FIXED_MODEL_B,
+        "model_a_result": a_result,
+        "model_b_result": b_result,
     }

@@ -962,6 +962,8 @@ async def _stream_agent_response(
             status="failed" if error_yielded else "success",
             latency_ms=vertical_latency_ms,
             error_summary=str(e) if error_yielded else None,
+            mcp_calls=mcp_calls_for_done or None,
+            usage_source=usage_source,
         )
 
         # Build MCP audit list for the done event.
