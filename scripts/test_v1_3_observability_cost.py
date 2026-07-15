@@ -306,7 +306,7 @@ def test_trace_and_mcp_audit():
 
     # Safe failed tool test: ask for weather of a deliberately invalid location that the tool rejects.
     fail_sid = f"v13-fail-{uuid.uuid4().hex[:8]}"
-    res_fail = chat_sse("查一下火星的天气怎么样", session_id=fail_sid)
+    res_fail = chat_sse("请使用天气工具查询火星的天气", session_id=fail_sid)
     done_fail = res_fail.get("done") or {}
     trace_id_fail = done_fail.get("trace_id")
     mcp_fail = done_fail.get("mcp_calls", [])
@@ -450,7 +450,7 @@ def test_budget_alert():
 def test_darwin_records_pro():
     print("\n=== Darwin records Pro ===")
     try:
-        badcase = post("/api/badcases", {
+        badcase_resp = post("/api/badcases", {
             "session_id": f"v13-darwin-{uuid.uuid4().hex[:8]}",
             "source_message_id": 0,
             "category": "model",
@@ -458,7 +458,7 @@ def test_darwin_records_pro():
             "description": "测试 Darwin 优化",
             "status": "pending",
         })
-        case_id = badcase.get("id")
+        case_id = badcase_resp.get("badcase", {}).get("id")
         fix = post(f"/api/badcases/{case_id}/darwin-fix")
         darwin_trace_id = fix.get("trace_id") or fix.get("darwin_trace_id")
         record("Darwin endpoint reachable", bool(darwin_trace_id), {"badcase_id": case_id, "trace_id": darwin_trace_id})
@@ -486,14 +486,14 @@ def test_cost_02_rag_topk():
 
     def run_search(k: int) -> Dict[str, Any]:
         post("/api/knowledge/retrieval-settings", {**original, "top_k": k})
-        return post("/api/retrieval/search", {"query": query, "top_k": k})
+        return get("/api/knowledge/search", params={"query": query, "top_k": k, "mode": "advanced"})
 
     r1 = run_search(1)
     r5 = run_search(5)
-    put("/api/knowledge/retrieval-settings", {**original, "top_k": orig_topk})
+    post("/api/knowledge/retrieval-settings", {**original, "top_k": orig_topk})
 
-    c1 = len(r1.get("citations", []))
-    c5 = len(r5.get("citations", []))
+    c1 = len(r1.get("results", []))
+    c5 = len(r5.get("results", []))
     passed = c1 <= c5 and orig_topk == get("/api/knowledge/retrieval-settings").get("retrieval_settings", {}).get("top_k")
     record(
         "COST-02 Top-K comparison",
