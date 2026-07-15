@@ -6,17 +6,14 @@
   <title>YIAI物业 - 智慧物业 AI 平台</title>
   <script src="./tailwindcss.js"></script>
   <script src="./marked.min.js"></script>
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@300;400;500;600;700&display=swap" rel="stylesheet">
   <script>
     if (typeof tailwind === 'undefined') {
       document.addEventListener('DOMContentLoaded', () => {
         const main = document.getElementById('main-content');
         if (main) main.innerHTML = '<div class="p-8 text-center text-red-600">样式资源加载失败，请刷新重试</div>';
       });
-    }
-    tailwind.config = {
+    } else {
+      tailwind.config = {
       theme: {
         extend: {
           fontFamily: {
@@ -60,6 +57,7 @@
         }
       }
     }
+  }
   </script>
   <style>
     * { scrollbar-width: thin; scrollbar-color: #cbd5e1 #f1f5f9; }
@@ -214,7 +212,7 @@
     <div id="drawer-body" class="p-6 overflow-y-auto flex-1 min-h-0"></div>
   </div>
 
-  <script>
+  <script type="module">
     // ==========================================
     // App Configuration & State
     // ==========================================
@@ -292,6 +290,25 @@
       const el = $(selector);
       if (!el) throw new Error(`渲染失败：缺少必要 DOM 元素 "${selector}"${context ? ' (' + context + ')' : ''}`);
       return el;
+    }
+
+    function displayRenderError(err, context = '') {
+      console.error(`[${context || 'frontend'}] 渲染失败:`, err);
+      const main = document.getElementById('main-content');
+      if (!main) return;
+      const msg = err && err.message ? err.message : String(err);
+      main.innerHTML = `
+        <div class="min-h-screen flex items-center justify-center p-6 fade-in">
+          <div class="max-w-md w-full bg-white rounded-2xl shadow-soft border border-slate-200 p-8 text-center">
+            <div class="w-14 h-14 mx-auto mb-4 rounded-full bg-red-50 flex items-center justify-center">
+              <svg class="w-7 h-7 text-red-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path></svg>
+            </div>
+            <h2 class="text-lg font-semibold text-slate-800 mb-2">页面加载失败</h2>
+            ${context ? `<p class="text-sm text-slate-500 mb-2">${escapeHtml(context)}</p>` : ''}
+            <pre class="text-xs text-left bg-slate-50 p-3 rounded-lg text-red-600 overflow-auto max-h-32 mb-6">${escapeHtml(msg)}</pre>
+            <button onclick="location.reload()" class="px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white rounded-lg transition-colors">刷新重试</button>
+          </div>
+        </div>`;
     }
 
     function showToast(message, type = 'success') {
@@ -636,13 +653,13 @@
       });
     }
 
-    function renderContent() {
+    async function renderContent() {
       const main = requireElement('#main-content', 'renderContent');
       main.innerHTML = '';
       main.scrollTop = 0;
 
       switch (STATE.subTab) {
-        case 'chat': renderChatPage(main); break;
+        case 'chat': await renderChatPage(main); break;
         case 'my-orders': renderMyOrdersPage(main); break;
         case 'pending-orders': renderStaffOrdersPage(main, '待派单', 'pending'); break;
         case 'processing-orders': renderProcessingOrdersPage(main); break;
@@ -776,7 +793,7 @@
       renderContent();
     }
 
-    function renderChatPage(container) {
+    async function renderChatPage(container) {
       if (!container) throw new Error('renderChatPage: container 为 null');
       container.innerHTML = `
         <div class="h-full flex">
@@ -1119,6 +1136,7 @@
         showToast('加载引用分片失败：' + (err && err.message ? err.message : err), 'error');
       }
     }
+    window.showCitationChunk = showCitationChunk;
 
     function renderActivatedSkills(skills) {
       if (!skills || skills.length === 0) return '';
@@ -3897,43 +3915,52 @@
     // ==========================================
     // Initialization
     // ==========================================
-    function init() {
-      // Restore persisted chat session so history survives reloads/tab switches.
+    async function init() {
       try {
-        const savedSession = localStorage.getItem('chatSessionId');
-        if (savedSession) STATE.chatSessionId = savedSession;
-      } catch (e) {}
+        // Restore persisted chat session so history survives reloads/tab switches.
+        try {
+          const savedSession = localStorage.getItem('chatSessionId');
+          if (savedSession) STATE.chatSessionId = savedSession;
+        } catch (e) {}
 
-      ['#main-content', '#sub-menu', '#role-title'].forEach(sel => requireElement(sel, 'init'));
-      renderTopTabs();
-      renderSidebar();
-      renderContent();
+        ['#main-content', '#sub-menu', '#role-title'].forEach(sel => requireElement(sel, 'init'));
+        renderTopTabs();
+        renderSidebar();
+        await renderContent();
 
-      $$('.top-tab, .top-tab-mobile').forEach(btn => {
-        btn.addEventListener('click', () => {
-          STATE.topTab = btn.dataset.top;
-          const firstSub = MENU[STATE.topTab][0].id;
-          STATE.subTab = firstSub;
-          renderTopTabs();
-          renderSidebar();
-          renderContent();
-          if (window.innerWidth < 768) openSidebar();
+        $$('.top-tab, .top-tab-mobile').forEach(btn => {
+          btn.addEventListener('click', async () => {
+            try {
+              STATE.topTab = btn.dataset.top;
+              const firstSub = MENU[STATE.topTab][0].id;
+              STATE.subTab = firstSub;
+              renderTopTabs();
+              renderSidebar();
+              await renderContent();
+              if (window.innerWidth < 768) openSidebar();
+            } catch (err) {
+              displayRenderError(err, `切换 ${btn.dataset.top} 标签`);
+            }
+          });
         });
-      });
 
-      $('#mobile-menu-btn').addEventListener('click', () => {
-        if (STATE.sidebarOpen) closeSidebar();
-        else openSidebar();
-      });
+        $('#mobile-menu-btn').addEventListener('click', () => {
+          if (STATE.sidebarOpen) closeSidebar();
+          else openSidebar();
+        });
 
-      $('#sidebar-overlay').addEventListener('click', closeSidebar);
+        $('#sidebar-overlay').addEventListener('click', closeSidebar);
 
-      window.addEventListener('resize', () => {
-        if (window.innerWidth >= 768) closeSidebar();
-      });
+        window.addEventListener('resize', () => {
+          if (window.innerWidth >= 768) closeSidebar();
+        });
+      } catch (err) {
+        displayRenderError(err, '初始化');
+        throw err;
+      }
     }
 
-    document.addEventListener('DOMContentLoaded', init);
+    document.addEventListener('DOMContentLoaded', () => init().catch(err => displayRenderError(err, '启动')));
   </script>
 </body>
 </html>
