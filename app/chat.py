@@ -705,6 +705,14 @@ async def _stream_agent_response(
         intent_result = await classify_intent(message, user_id=user_id, session_id=session_id)
         router_latency_ms = int((time.time() - router_start) * 1000)
         intent = intent_result.get("intent", "other")
+
+        # Weather queries (even for unsupported cities) must be dispatched to the
+        # maintenance agent, which owns the weather MCP tools.
+        if intent in {"other", "customer_service"} and any(k in message for k in ("天气", "气温", "下雨")):
+            intent = "maintenance"
+            intent_result["intent"] = intent
+            intent_result["reason"] = "天气查询属于维修/工单场景（含工具支持）"
+
         create_agent_fn, agent_name = _select_agent(intent)
         current_agent = agent_name
         current_agent_id = _agent_id_for_intent(intent)
