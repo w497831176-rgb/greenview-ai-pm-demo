@@ -191,13 +191,11 @@ async def traces(
             m.trace_id,
             NULL as session_id,
             NULL as user_message,
+            NULL as intent,
+            NULL as agent_name,
             MAX(m.status) as status,
             MAX(m.created_at) as created_at,
-            MAX(m.created_at) as updated_at,
-            MAX(m.intent) as intent,
-            MAX(m.agent_name) as agent_name,
-            NULL as model_id,
-            NULL as model_selection_reason
+            MAX(m.created_at) as updated_at
         FROM model_calls m
         WHERE m.trace_id NOT IN (SELECT trace_id FROM chat_traces)
         GROUP BY m.trace_id
