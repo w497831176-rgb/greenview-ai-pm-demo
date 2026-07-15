@@ -35,6 +35,8 @@ def req(method: str, path: str, **kwargs) -> Any:
     url = f"{BASE_URL}{path}"
     kwargs.setdefault("proxies", PROXIES)
     kwargs.setdefault("timeout", 120)
+    kwargs.setdefault("headers", {})
+    kwargs["headers"].setdefault("Connection", "close")
     resp = requests.request(method, url, **kwargs)
     try:
         resp.raise_for_status()
@@ -174,7 +176,8 @@ def run_case_1_mcp_capability_gap() -> Dict[str, Any]:
     assert_cond(darwin_calls[0].get("model_id") == "deepseek-v4-pro", "Darwin should use Pro")
 
     # Capability gap draft must exist; accept it; ensure no real tool is created.
-    gap_drafts = darwin["badcase"].get("capability_gap_drafts", [])
+    bc_after_darwin = get_badcase(badcase_id)
+    gap_drafts = bc_after_darwin.get("capability_gap_drafts", [])
     assert_cond(gap_drafts, "capability_gap_draft missing")
     gap_id = gap_drafts[0]["id"]
     accepted = post(f"/api/badcases/{badcase_id}/accept-capability-gap/{gap_id}", {"note": "产品待办"})
@@ -225,7 +228,8 @@ def run_case_2_knowledge_gap_closed_loop() -> Dict[str, Any]:
     # Darwin.
     darwin = post(f"/api/badcases/{badcase_id}/darwin-fix", {})
     assert_cond(darwin["badcase"]["status"] == "fixing", "status should be fixing after Darwin")
-    knowledge_drafts = darwin["badcase"].get("knowledge_drafts", [])
+    bc_after_darwin = get_badcase(badcase_id)
+    knowledge_drafts = bc_after_darwin.get("knowledge_drafts", [])
     assert_cond(knowledge_drafts, "knowledge draft missing from Darwin")
     draft_id = knowledge_drafts[0]["id"]
 
@@ -316,7 +320,7 @@ def run_session_management_check() -> None:
     sid = create_session()
     session = get(f"/api/chat/sessions/{sid}")
     assert_cond(session.get("session", {}).get("session_id") == sid, "new session not created or not retrievable")
-    msgs = get(f"/api/chat/messages?session_id={sid}").get("messages", [])
+    msgs = get(f"/api/chat/history?session_id={sid}").get("messages", [])
     assert_cond(isinstance(msgs, list), "messages not list")
     print("  Session management API PASS")
 

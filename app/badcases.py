@@ -591,6 +591,10 @@ async def accept_capability_gap_endpoint(
         case["status"],
         case["status"],
     )
+    case["actions"] = list_badcase_actions(case_id)
+    case["knowledge_drafts"] = [d for d in db_list_knowledge_drafts() if d.get("badcase_id") == case_id]
+    case["skill_prompt_drafts"] = db_list_skill_prompt_drafts(badcase_id=case_id)
+    case["capability_gap_drafts"] = db_list_capability_gap_drafts(badcase_id=case_id)
     return {"badcase": _enrich_badcase(case), "note": "能力缺口已记录为产品待办，未自动创建工具"}
 
 
