@@ -316,7 +316,7 @@ def run_session_management_check() -> None:
     sid = create_session()
     session = get(f"/api/chat/sessions/{sid}")
     assert_cond(session.get("session", {}).get("session_id") == sid, "new session not created or not retrievable")
-    msgs = get(f"/api/chat/sessions/{sid}/messages").get("messages", [])
+    msgs = get(f"/api/chat/messages?session_id={sid}").get("messages", [])
     assert_cond(isinstance(msgs, list), "messages not list")
     print("  Session management API PASS")
 

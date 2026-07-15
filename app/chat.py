@@ -724,13 +724,13 @@ async def _stream_agent_response(
         # Record the router model call (metrics are not returned by the non-streaming router).
         try:
             router_cost, router_price = _calculate_cost(
-                MODEL.model if hasattr(MODEL, "model") else MODEL_ID,
+                MODEL_ID,
                 {"input_tokens": 0, "output_tokens": 0, "reasoning_tokens": 0, "cached_tokens": 0},
             )
             record_model_call(
                 trace_id=trace_id,
                 stage="router",
-                model_id=MODEL.model if hasattr(MODEL, "model") else MODEL_ID,
+                model_id=MODEL_ID,
                 model_selection_reason="owner-facing default",
                 latency_ms=router_latency_ms,
                 usage_source="unavailable",
@@ -758,7 +758,7 @@ async def _stream_agent_response(
                 bc = create_badcase(
                     title=(message[:60] + "...") if len(message) > 60 else message,
                     description="检索阶段未命中知识库，可能缺少相关文档。",
-                    category="knowledge",
+                    category="knowledge_gap",
                     evidence=f"user: {message}",
                     source_message_id=None,
                     session_id=session_id,

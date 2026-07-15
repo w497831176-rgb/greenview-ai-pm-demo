@@ -127,6 +127,11 @@ class BadcaseCreate(BaseModel):
     evidence: str = ""
     source_message_id: Optional[int] = None
     session_id: Optional[str] = None
+    source: str = "manual"
+    original_query: Optional[str] = None
+    ai_response: Optional[str] = None
+    feedback_reason: Optional[str] = None
+    priority: str = "medium"
 
 
 class BadcaseUpdate(BaseModel):
@@ -317,6 +322,11 @@ async def create_badcase(request: BadcaseCreate):
         evidence=request.evidence,
         source_message_id=request.source_message_id,
         session_id=request.session_id,
+        source=request.source,
+        original_query=request.original_query,
+        ai_response=request.ai_response,
+        feedback_reason=request.feedback_reason,
+        priority=request.priority,
     )
     return {"badcase": _enrich_badcase(case)}
 
@@ -337,6 +347,7 @@ async def update_badcase(case_id: int, request: BadcaseUpdate):
         root_cause=request.root_cause,
         fix_plan=request.fix_plan,
         rejected_reason=request.rejected_reason,
+        priority=request.priority,
     )
     if updated:
         _record_action(
@@ -760,6 +771,34 @@ async def darwin_fix(case_id: int, request: DarwinFixRequest = DarwinFixRequest(
         except Exception as exc:
             logger.exception("failed to create draft from Darwin output")
             created_drafts.append({"type": draft_type, "error": str(exc)})
+
+    # Fallback: ensure the classified category is represented as a draft so
+    # the operations loop can proceed without faking a successful model output.
+    has_knowledge = any(d.get("type") == "knowledge" for d in created_drafts)
+    has_capability = any(d.get("type") == "capability_gap" for d in created_drafts)
+    if case.get("category") == "knowledge_gap" and not has_knowledge:
+        try:
+            created = db_create_knowledge_draft(
+                badcase_id=case_id,
+                title=f"补充：{case.get('title', '知识库缺口')[:40]}",
+                content=case.get("description", ""),
+                category="未分类",
+            )
+            created_drafts.append({"type": "knowledge", "draft": created})
+        except Exception:
+            logger.exception("failed to create fallback knowledge draft")
+    if case.get("category") == "mcp_capability" and not has_capability:
+        try:
+            created = db_create_capability_gap_draft(
+                badcase_id=case_id,
+                title="MCP/能力缺口草稿",
+                description=analysis_obj.get("root_cause") or case.get("description", ""),
+                gap_type="mcp_write",
+                suggested_action="待产品评估后补充对应 MCP 写操作或系统集成能力，当前不可自动完成业务操作。",
+            )
+            created_drafts.append({"type": "capability_gap", "draft": created})
+        except Exception:
+            logger.exception("failed to create fallback capability gap draft")
 
     before = case["status"]
     new_status = "fixing"
