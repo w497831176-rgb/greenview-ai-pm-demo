@@ -2565,15 +2565,45 @@
         const content = draftField(type, d);
         const snippet = (content || '').slice(0, 120);
         const status = d.status || 'draft';
-        const terminalDraft = type === 'capability_gap' ? ['accepted', 'rejected'].includes(status) : ['published', 'rejected'].includes(status);
-        const canEdit = !isTerminal && allowed.has('edit-draft') && !terminalDraft;
-        const canReview = !isTerminal && allowed.has('review-draft') && !terminalDraft;
-        const canApplyKnowledge = !isTerminal && status === 'approved' && allowed.has('apply-draft') && type === 'knowledge';
-        const canApplyGap = !isTerminal && status === 'approved' && allowed.has('apply-draft') && type === 'capability_gap';
+        const terminalDraft = type === 'capability_gap'
+          ? ['accepted', 'rejected'].includes(status)
+          : ['published', 'rejected'].includes(status);
+        const canEdit = !isTerminal && allowed.has('edit-draft') && status !== 'published' && status !== 'accepted' && status !== 'rejected';
         const applyConfirm = {
           knowledge: '应用后系统将：\n1. 写入正式知识库文档；\n2. 重建向量索引；\n3. 将 Badcase 推进到“验证中”。\n\n请确认索引服务可用。',
           capability_gap: '应用后系统将：\n1. 把能力缺口记录为产品待办；\n2. 不会创建任何 MCP 工具或真实能力；\n3. Badcase 仍保持“修复中”。\n\n请确认。'
         };
+
+        // Build status-specific action buttons so users never see a button that
+        // would trigger a backend 400.
+        let actionButtons = '<button data-draft-id="' + d.id + '" data-draft-type="' + type + '" class="badcase-draft-view px-2 py-1 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg text-xs transition-colors">查看全文</button>';
+
+        if (isTerminal || terminalDraft) {
+          actionButtons += `<span class="px-2 py-1 bg-slate-100 text-slate-400 rounded-lg text-xs">${terminalDraft ? '草稿已终态' : 'Badcase 已终态'}</span>`;
+        } else {
+          // Edit is available in draft, under_review and approved (editing approved auto-resets to draft).
+          if (canEdit) {
+            actionButtons += `<button data-draft-id="${d.id}" data-draft-type="${type}" class="badcase-draft-edit px-2 py-1 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg text-xs transition-colors">编辑</button>`;
+          }
+
+          if (status === 'draft') {
+            actionButtons += `<button data-draft-id="${d.id}" data-draft-type="${type}" data-review="under_review" class="badcase-draft-review px-2 py-1 bg-blue-50 hover:bg-blue-100 text-blue-700 rounded-lg text-xs transition-colors" ${allowed.has('review-draft') ? '' : 'disabled title="当前状态不可审核"'}>提交审核</button>`;
+            actionButtons += `<button data-draft-id="${d.id}" data-draft-type="${type}" data-review="rejected" class="badcase-draft-review px-2 py-1 bg-red-50 hover:bg-red-100 text-red-700 rounded-lg text-xs transition-colors" ${allowed.has('review-draft') ? '' : 'disabled title="当前状态不可审核"'}>驳回</button>`;
+          } else if (status === 'under_review') {
+            actionButtons += `<button data-draft-id="${d.id}" data-draft-type="${type}" data-review="approved" class="badcase-draft-review px-2 py-1 bg-green-50 hover:bg-green-100 text-green-700 rounded-lg text-xs transition-colors" ${allowed.has('review-draft') ? '' : 'disabled title="当前状态不可审核"'}>通过审核</button>`;
+            actionButtons += `<button data-draft-id="${d.id}" data-draft-type="${type}" data-review="draft" class="badcase-draft-review px-2 py-1 bg-amber-50 hover:bg-amber-100 text-amber-700 rounded-lg text-xs transition-colors" ${allowed.has('review-draft') ? '' : 'disabled title="当前状态不可审核"'}>退回草稿</button>`;
+            actionButtons += `<button data-draft-id="${d.id}" data-draft-type="${type}" data-review="rejected" class="badcase-draft-review px-2 py-1 bg-red-50 hover:bg-red-100 text-red-700 rounded-lg text-xs transition-colors" ${allowed.has('review-draft') ? '' : 'disabled title="当前状态不可审核"'}>驳回</button>`;
+          } else if (status === 'approved') {
+            if (type === 'knowledge' && allowed.has('apply-draft')) {
+              actionButtons += `<button data-draft-id="${d.id}" data-draft-type="${type}" data-confirm="${escapeHtml(applyConfirm.knowledge)}" class="badcase-draft-apply px-2 py-1 bg-brand-600 hover:bg-brand-700 text-white rounded-lg text-xs transition-colors">应用到正式知识库</button>`;
+            } else if (type === 'skill_prompt') {
+              actionButtons += `<span class="px-2 py-1 bg-slate-100 text-slate-500 rounded-lg text-xs">待第二批：选择目标 Agent 并建立 agent_skills 绑定后才能应用</span>`;
+            } else if (type === 'capability_gap' && allowed.has('apply-draft')) {
+              actionButtons += `<button data-draft-id="${d.id}" data-draft-type="${type}" data-confirm="${escapeHtml(applyConfirm.capability_gap)}" class="badcase-draft-apply px-2 py-1 bg-brand-600 hover:bg-brand-700 text-white rounded-lg text-xs transition-colors">采纳为产品待办</button>`;
+            }
+          }
+        }
+
         return `
           <div class="bg-slate-50 rounded-xl p-3 border border-slate-200 text-sm">
             <div class="flex items-center justify-between mb-1 gap-2">
@@ -2582,14 +2612,7 @@
             </div>
             <div class="text-xs text-slate-500 mb-2 min-h-[2.5em]">${escapeHtml(snippet)}${(content || '').length > 120 ? '...' : ''}</div>
             <div class="flex flex-wrap gap-2">
-              <button data-draft-id="${d.id}" data-draft-type="${type}" class="badcase-draft-view px-2 py-1 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg text-xs transition-colors">查看全文</button>
-              <button data-draft-id="${d.id}" data-draft-type="${type}" class="badcase-draft-edit px-2 py-1 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg text-xs transition-colors" ${canEdit ? '' : 'disabled title="当前状态不可编辑或草稿已终态"'}>编辑</button>
-              <button data-draft-id="${d.id}" data-draft-type="${type}" data-review="approved" class="badcase-draft-review px-2 py-1 bg-green-50 hover:bg-green-100 text-green-700 rounded-lg text-xs transition-colors" ${canReview ? '' : 'disabled title="当前状态不可审核"'}>通过审核</button>
-              <button data-draft-id="${d.id}" data-draft-type="${type}" data-review="under_review" class="badcase-draft-review px-2 py-1 bg-amber-50 hover:bg-amber-100 text-amber-700 rounded-lg text-xs transition-colors" ${canReview ? '' : 'disabled title="当前状态不可审核"'}>退回草稿</button>
-              <button data-draft-id="${d.id}" data-draft-type="${type}" data-review="rejected" class="badcase-draft-review px-2 py-1 bg-red-50 hover:bg-red-100 text-red-700 rounded-lg text-xs transition-colors" ${canReview ? '' : 'disabled title="当前状态不可审核"'}>驳回</button>
-              ${canApplyKnowledge ? `<button data-draft-id="${d.id}" data-draft-type="${type}" data-confirm="${escapeHtml(applyConfirm.knowledge)}" class="badcase-draft-apply px-2 py-1 bg-brand-600 hover:bg-brand-700 text-white rounded-lg text-xs transition-colors">应用已审核草稿</button>` : ''}
-              ${type === 'skill_prompt' && status === 'approved' ? `<span class="px-2 py-1 bg-slate-100 text-slate-500 rounded-lg text-xs">待第二批：选择目标 Agent 并建立 agent_skills 绑定后才能应用到运行时</span>` : ''}
-              ${canApplyGap ? `<button data-draft-id="${d.id}" data-draft-type="${type}" data-confirm="${escapeHtml(applyConfirm.capability_gap)}" class="badcase-draft-apply px-2 py-1 bg-brand-600 hover:bg-brand-700 text-white rounded-lg text-xs transition-colors">记录产品待办</button>` : ''}
+              ${actionButtons}
             </div>
           </div>
         `;

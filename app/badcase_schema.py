@@ -77,21 +77,21 @@ ACTION_STATUS_REQUIREMENTS: Dict[str, Set[str]] = {
 DRAFT_STATUS_TRANSITIONS: Dict[str, Dict[str, Set[str]]] = {
     "knowledge": {
         "draft": {"under_review", "rejected"},
-        "under_review": {"approved", "rejected"},
+        "under_review": {"draft", "approved", "rejected"},
         "approved": {"published"},
         "published": set(),
         "rejected": set(),
     },
     "skill_prompt": {
         "draft": {"under_review", "rejected"},
-        "under_review": {"approved", "rejected"},
+        "under_review": {"draft", "approved", "rejected"},
         "approved": {"published"},
         "published": set(),
         "rejected": set(),
     },
     "capability_gap": {
         "draft": {"under_review", "rejected"},
-        "under_review": {"approved", "rejected"},
+        "under_review": {"draft", "approved", "rejected"},
         "approved": {"accepted"},
         "accepted": set(),
         "rejected": set(),
