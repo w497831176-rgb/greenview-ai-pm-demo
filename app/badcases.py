@@ -1568,6 +1568,22 @@ async def retest_badcase(case_id: int, request: SwitchModelRetryRequest = Switch
     token_detail = done.get("token_detail") or {}
     retest_trace_id = done.get("trace_id") or f"retest-{uuid.uuid4().hex[:16]}"
     model_id = done.get("model_id") or MODEL_ID
+    total_tokens = token_detail.get("total_tokens") or done.get("token_count")
+
+    # Compute retest cost and price snapshot before building the context.
+    usage = {
+        "input_tokens": token_detail.get("input_tokens") if token_detail else None,
+        "output_tokens": token_detail.get("output_tokens") if token_detail else None,
+        "reasoning_tokens": token_detail.get("reasoning_tokens") if token_detail else None,
+        "cached_tokens": token_detail.get("cached_tokens") if token_detail else None,
+        "total_tokens": total_tokens,
+    }
+    retest_cost: Optional[float] = None
+    retest_price: Optional[Dict[str, Any]] = None
+    try:
+        retest_cost, retest_price = _calculate_cost(model_id, usage)
+    except Exception:
+        pass
 
     retest_context = {
         "session_id": retest_session_id,
@@ -1580,21 +1596,16 @@ async def retest_badcase(case_id: int, request: SwitchModelRetryRequest = Switch
         "model_id": model_id,
         "trace_id": retest_trace_id,
         "token_count": done.get("token_count"),
+        "total_tokens": total_tokens,
         "token_detail": token_detail,
         "usage_source": done.get("usage_source"),
+        "estimated_cost_cny": retest_cost,
+        "price_snapshot": retest_price,
         "auto_badcase_id": done.get("auto_badcase_id"),
     }
 
     # Record a retest-stage model call for cost observability.
     try:
-        usage = {
-            "input_tokens": token_detail.get("input_tokens") if token_detail else None,
-            "output_tokens": token_detail.get("output_tokens") if token_detail else None,
-            "reasoning_tokens": token_detail.get("reasoning_tokens") if token_detail else None,
-            "cached_tokens": token_detail.get("cached_tokens") if token_detail else None,
-            "total_tokens": token_detail.get("total_tokens") or done.get("token_count"),
-        }
-        retest_cost, retest_price = _calculate_cost(model_id, usage)
         record_model_call(
             trace_id=retest_trace_id,
             stage="retest",

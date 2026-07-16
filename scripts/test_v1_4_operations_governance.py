@@ -230,9 +230,23 @@ def run(base_url: str) -> int:
         if not detail.get("retest_response"):
             raise AssertionError("retest_response missing")
         ctx = detail.get("retest_context") or {}
-        missing = [k for k in ("model", "trace_id", "total_tokens", "estimated_cost_cny") if not ctx.get(k)]
+        required = ("model_id", "trace_id", "token_count", "token_detail", "total_tokens", "usage_source", "estimated_cost_cny", "price_snapshot")
+        missing = [k for k in required if k not in ctx]
         if missing:
             raise AssertionError(f"retest_context missing fields: {missing}; got {ctx}")
+        if not ctx.get("model_id"):
+            raise AssertionError("retest_context.model_id is empty")
+        if not ctx.get("trace_id"):
+            raise AssertionError("retest_context.trace_id is empty")
+        if not (ctx.get("token_count") or ctx.get("total_tokens")):
+            raise AssertionError("retest_context has no token_count or total_tokens")
+
+    def assert_retest_trace_has_retest_model_call(trace_id: str):
+        trace_detail = c.get(f"/api/observability/traces/{trace_id}")
+        model_calls = trace_detail.get("model_calls", [])
+        retest_calls = [mc for mc in model_calls if mc.get("stage") == "retest"]
+        if not retest_calls:
+            raise AssertionError(f"no stage=retest model_call found in trace {trace_id}; got {model_calls}")
 
     def ensure_knowledge_draft(case_id: int) -> Tuple[Dict[str, Any], int]:
         detail = c.get(f"/api/badcases/{case_id}")["badcase"]
@@ -310,6 +324,7 @@ def run(base_url: str) -> int:
         check("A stays verifying after post-apply retest", lambda: detail["status"] == "verifying")
         check("A post-apply retest has runtime fields", lambda: assert_retest_has_runtime_fields(detail))
         check("A post-apply retest is newer than apply", lambda: detail.get("last_retest_at", "") >= detail.get("last_applied_at", ""))
+        check("A retest trace has stage=retest model_call", lambda: assert_retest_trace_has_retest_model_call(detail.get("retest_trace_id")))
 
         # Verify-pass -> closed
         c.post(f"/api/badcases/{case_a_id}/verify", {"passed": True, "note": "验收通过"})
@@ -377,6 +392,7 @@ def run(base_url: str) -> int:
             detail = c.get(f"/api/badcases/{case_b_id}")["badcase"]
             check("B stays verifying after post-apply retest", lambda: detail["status"] == "verifying")
             check("B post-apply retest has runtime fields", lambda: assert_retest_has_runtime_fields(detail))
+            check("B retest trace has stage=retest model_call", lambda: assert_retest_trace_has_retest_model_call(detail.get("retest_trace_id")))
 
             # Verify skill created and bound
             agent_detail = c.get(f"/api/agents/{target_agent_id}")["agent"]
