@@ -25,6 +25,7 @@ from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
+from app.observability import _check_budget
 from app.settings import MODEL_ID, USE_THINKING
 from agents.billing import create_billing_agent
 from agents.complaint import create_complaint_agent
@@ -138,6 +139,43 @@ if MCPTools is not None:
                 # Audit failures must not break the chat flow.
                 pass
 
+            # Auto-capture MCP tool failures as badcases for ops governance.
+            if status == "failed":
+                try:
+                    sanitized_args = {
+                        k: f"<{type(v).__name__}>" if not isinstance(v, (str, int, float, bool, type(None))) else v
+                        for k, v in (args_dict.items() if isinstance(args_dict, dict) else {}.items())
+                    }
+                    # Remove any potential secret values from the summary.
+                    sanitized_summary = {k: v for k, v in sanitized_args.items() if isinstance(v, (str, int, float, bool))}
+                    create_badcase(
+                        title=f"MCP 工具失败：{fn_name}",
+                        description=error_summary or result_summary or "MCP 工具调用失败，待排查能力缺口或配置问题。",
+                        category="mcp_capability" if "mcp" in self.server_name.lower() or "mcp" in fn_name.lower() else "tool_failure",
+                        evidence=f"server={self.server_name}, tool={fn_name}",
+                        source_message_id=None,
+                        session_id=None,
+                        source="auto",
+                        original_query=fn_name,
+                        ai_response=error_summary or result_summary,
+                        context_json=json.dumps(
+                            {
+                                "server_name": self.server_name,
+                                "tool_name": fn_name,
+                                "sanitized_params_summary": sanitized_summary,
+                                "error_message": error_summary,
+                                "result_summary": result_summary,
+                                "trace_id": self.trace_id,
+                            },
+                            ensure_ascii=False,
+                            default=str,
+                        ),
+                        trace_id=self.trace_id or "unknown",
+                    )
+                except Exception:
+                    # Badcase auto-capture failures must not break the chat flow.
+                    pass
+
         def _wrap(self, original: Any, fn_name: str):
             if asyncio.iscoroutinefunction(original):
                 async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
@@ -206,6 +244,11 @@ def _estimate_tokens(text: str) -> int:
         return len(_tiktoken_encoding.encode(text))
     except Exception:
         return 0
+
+
+def _is_pro_model(model_id: Optional[str]) -> bool:
+    """Return True for models classified as Pro (higher-cost) models."""
+    return (model_id or "").lower() in {"deepseek-v4-pro"}
 
 
 DEFAULT_ROOM_ID = "3-2-1201"
@@ -753,6 +796,12 @@ async def _stream_agent_response(
         # If no relevant knowledge was retrieved, record a badcase for the gap
         # and instruct the agent to admit the missing knowledge.
         auto_badcase_id: Optional[int] = None
+        rag_retrieval_summary = {
+            "query": message,
+            "top_k": effective_top_k if 'effective_top_k' in locals() else None,
+            "results_count": len(citations),
+            "citation_titles": [c.get("doc_title") for c in citations],
+        }
         if not citations:
             try:
                 bc = create_badcase(
@@ -762,6 +811,20 @@ async def _stream_agent_response(
                     evidence=f"user: {message}",
                     source_message_id=None,
                     session_id=session_id,
+                    source="auto",
+                    original_query=message,
+                    ai_response="",
+                    context_json=json.dumps(
+                        {
+                            "retrieval_summary": rag_retrieval_summary,
+                            "route_intent": intent if 'intent' in locals() else None,
+                            "current_agent": current_agent if 'current_agent' in locals() else None,
+                            "trace_id": trace_id,
+                        },
+                        ensure_ascii=False,
+                        default=str,
+                    ),
+                    trace_id=trace_id,
                 )
                 auto_badcase_id = bc.get("id") if bc else None
             except Exception:
@@ -803,6 +866,38 @@ async def _stream_agent_response(
             "cached_tokens": 0,
             "total_tokens": 0,
         }
+
+        # Owner-facing chat must never silently downgrade or fake execution when
+        # a Pro model is requested. If the budget is exhausted, block the Pro
+        # call and record it as blocked.
+        runtime_model_id = skill_model_id if skill_model_id else MODEL_ID
+        pro_selection_reason = (
+            f"skill_model_override:{skill_model_id}"
+            if skill_model_id
+            else "owner-facing default"
+        )
+        if _is_pro_model(runtime_model_id):
+            budget = _check_budget("pro_call")
+            if budget.get("alert_level") == "blocked":
+                try:
+                    record_model_call(
+                        trace_id=trace_id,
+                        stage="vertical_agent",
+                        model_id=runtime_model_id,
+                        status="blocked",
+                        latency_ms=0,
+                        usage_source="unavailable",
+                        model_selection_reason=pro_selection_reason,
+                        error_summary="预算已达上限，Pro 调用被阻止",
+                        estimated_cost_cny=None,
+                        price_snapshot=None,
+                    )
+                    update_chat_trace(trace_id=trace_id, status="failed")
+                except Exception:
+                    pass
+                yield f"event: error\ndata: {_safe_json_dumps({'error': '预算已达上限，Pro 调用被阻止', 'trace_id': trace_id})}\n\n"
+                error_yielded = True
+                return
 
         # Create a fresh agent instance with dynamic MCP tools.
         agent = create_agent_fn(tools=mcp_tools, model=turn_model)
@@ -1000,6 +1095,29 @@ async def _stream_agent_response(
             usage_source=usage_source,
         )
 
+        # Back-fill the auto-captured knowledge-gap badcase with the actual AI response.
+        if auto_badcase_id:
+            try:
+                from db.property_db import update_badcase
+                update_badcase(
+                    auto_badcase_id,
+                    ai_response=full_content,
+                    context_json=json.dumps(
+                        {
+                            "retrieval_summary": rag_retrieval_summary,
+                            "route_intent": intent,
+                            "current_agent": current_agent,
+                            "activated_skills": activated_skills,
+                            "trace_id": trace_id,
+                            "model_id": runtime_model_id,
+                        },
+                        ensure_ascii=False,
+                        default=str,
+                    ),
+                )
+            except Exception:
+                pass
+
         # Send completion event including token metrics, citations, activated skills and agent info.
         done_payload = {
             'status': 'complete',
@@ -1170,6 +1288,8 @@ async def chat_feedback(request: FeedbackRequest):
         original_query = user_msg.get("content") or ""
         context_json["user_message_id"] = user_msg.get("id")
 
+    source = "user_feedback" if request.type == "thumb_down" else "manual"
+    action_type = "user_feedback" if request.type == "thumb_down" else "manual_feedback"
     badcase = create_badcase(
         title=f"人工反馈：{reason[:40]}",
         description=reason,
@@ -1179,7 +1299,7 @@ async def chat_feedback(request: FeedbackRequest):
         evidence=reason,
         source_message_id=request.message_id,
         session_id=request.session_id,
-        source="manual",
+        source=source,
         original_query=original_query,
         ai_response=ai_response,
         feedback_reason=reason,
@@ -1190,13 +1310,22 @@ async def chat_feedback(request: FeedbackRequest):
     )
     add_badcase_action(
         badcase_id=badcase["id"],
-        action_type="manual_feedback",
-        action_detail=json.dumps({"reason": reason, "type": request.type}, ensure_ascii=False),
+        action_type=action_type,
+        action_detail=json.dumps(
+            {
+                "reason": reason,
+                "type": request.type,
+                "query": original_query,
+                "response": ai_response,
+            },
+            ensure_ascii=False,
+            default=str,
+        ),
         status_before="pending",
         status_after="pending",
         created_by="owner",
     )
-    return {"status": "ok", "badcase": badcase, "source": "manual"}
+    return {"status": "ok", "badcase": badcase, "source": source}
 
 
 @router.post("/handoff")

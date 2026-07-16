@@ -16,6 +16,7 @@ from typing import Any, Dict, Optional
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
+from app.observability import _check_budget
 from app.settings import build_model
 from db.property_db import (
     create_model_config as db_create_model_config,
@@ -27,6 +28,8 @@ from db.property_db import (
     set_default_model_config as db_set_default_model_config,
     update_model_config as db_update_model_config,
 )
+
+_BUDGET_BLOCKED_DETAIL = "预算已达上限，Darwin/AI 分类等 Pro/额外评估操作被阻止，请联系管理员调整预算或等待次日刷新"
 
 router = APIRouter(prefix="/api/model-configs", tags=["model-configs"])
 
@@ -176,6 +179,26 @@ async def ab_test_models(request: AbTestRequest):
     """
 
     trace_id = uuid.uuid4().hex[:16]
+
+    # A/B test uses Pro; enforce the daily budget before spending budget.
+    budget = _check_budget("ab_test")
+    if budget.get("alert_level") == "blocked":
+        try:
+            record_model_call(
+                trace_id=trace_id,
+                stage="ab_test",
+                model_id="deepseek-v4-pro",
+                status="blocked",
+                latency_ms=0,
+                usage_source="unavailable",
+                model_selection_reason="A/B test blocked by daily budget",
+                error_summary=budget.get("reason") or _BUDGET_BLOCKED_DETAIL,
+                estimated_cost_cny=None,
+                price_snapshot=None,
+            )
+        except Exception:
+            pass
+        raise HTTPException(status_code=403, detail=_BUDGET_BLOCKED_DETAIL)
 
     def _build_price_snapshot(model_id: str) -> Optional[Dict[str, Any]]:
         price = get_enabled_price_for_model(model_id)
