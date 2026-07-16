@@ -229,6 +229,33 @@ def test_draft_terminal_and_editable():
     assert not is_draft_editable("knowledge", "rejected")
 
 
+def test_draft_under_review_can_return_to_draft():
+    """All three draft types allow under_review -> draft rollback."""
+    for draft_type in ("knowledge", "skill_prompt", "capability_gap"):
+        validate_draft_status_transition(draft_type, "under_review", "draft")
+
+
+def test_draft_terminal_cannot_escape_to_non_terminal():
+    """Terminal draft statuses must not transition back to editable states."""
+    terminal_cases = [
+        ("knowledge", "published", ["draft", "under_review", "approved"]),
+        ("knowledge", "rejected", ["draft", "under_review", "approved", "published"]),
+        ("skill_prompt", "published", ["draft", "under_review", "approved"]),
+        ("skill_prompt", "rejected", ["draft", "under_review", "approved", "published"]),
+        ("capability_gap", "accepted", ["draft", "under_review", "approved"]),
+        ("capability_gap", "rejected", ["draft", "under_review", "approved", "accepted"]),
+    ]
+    for draft_type, terminal_status, illegal_targets in terminal_cases:
+        for target in illegal_targets:
+            try:
+                validate_draft_status_transition(draft_type, terminal_status, target)
+                raise AssertionError(
+                    f"expected ValueError for {draft_type} {terminal_status} -> {target}"
+                )
+            except ValueError:
+                pass
+
+
 if __name__ == "__main__":
     test_enrich_badcase_exposes_stable_schema()
     test_enrich_badcase_action_parsing_fallback()
@@ -245,4 +272,6 @@ if __name__ == "__main__":
     test_draft_status_transitions_knowledge_and_skill()
     test_draft_status_transitions_capability_gap()
     test_draft_terminal_and_editable()
+    test_draft_under_review_can_return_to_draft()
+    test_draft_terminal_cannot_escape_to_non_terminal()
     print("All badcase_schema tests passed.")

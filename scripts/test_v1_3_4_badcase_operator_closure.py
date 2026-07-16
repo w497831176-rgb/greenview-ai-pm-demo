@@ -14,13 +14,15 @@ The script avoids LLM calls where possible. It uses manual classification and
 the extract-knowledge endpoint to move cases through the lifecycle.
 
 All created test data is prefixed with DEMO_TEST_V134_ and the script attempts
-to clean it up in the finally block. Any residuals are printed explicitly.
+to clean it up in the finally block. Any residual test data causes the script
+to exit with a non-zero code so that "test items passed" cannot mask leftover
+DEMO_TEST artifacts.
 """
 
 import argparse
 import json
 import sys
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 from urllib.parse import urljoin
 
 import requests
@@ -88,6 +90,15 @@ def run(base_url: str) -> int:
     failed = 0
     created_case_ids: List[int] = []
     created_doc_ids: List[int] = []
+    residuals: List[Dict[str, Any]] = []
+
+    def record_residual(resource_type: str, resource_id: int, status_code: Optional[int] = None, error: Optional[str] = None):
+        residual: Dict[str, Any] = {"type": resource_type, "id": resource_id}
+        if status_code is not None:
+            residual["status_code"] = status_code
+        if error is not None:
+            residual["error"] = error
+        residuals.append(residual)
 
     def check(name: str, fn):
         nonlocal passed, failed
@@ -238,9 +249,13 @@ def run(base_url: str) -> int:
 
         # Apply approved draft on primary case.
         apply_resp = c.post(f"/api/badcases/{case_id}/knowledge-drafts/{draft_id}/apply")
-        created_doc_id = apply_resp.get("knowledge_doc", {}).get("id")
-        if created_doc_id:
+        knowledge_doc = apply_resp.get("knowledge_doc") or {}
+        created_doc_id = knowledge_doc.get("id")
+        created_doc_title = knowledge_doc.get("title") or ""
+        if created_doc_id and TEST_PREFIX in created_doc_title:
             created_doc_ids.append(created_doc_id)
+        elif created_doc_id:
+            print(f"  WARNING applied knowledge doc {created_doc_id} title does not contain {TEST_PREFIX}; not scheduling cleanup")
         detail = c.get(f"/api/badcases/{case_id}")["badcase"]
         check("status moved to verifying after apply", lambda: detail["status"] == "verifying")
         check("draft status is published", lambda: next(d for d in detail["knowledge_drafts"] if d["id"] == draft_id).get("status") == "published")
@@ -399,24 +414,39 @@ def run(base_url: str) -> int:
         print("\n[cleanup] attempting to remove test data")
         for doc_id in created_doc_ids:
             try:
-                code, _ = c.delete(f"/api/knowledge/{doc_id}")
-                print(f"  deleted knowledge doc {doc_id}: HTTP {code}")
+                code, _ = c.delete(f"/api/knowledge/docs/{doc_id}")
+                if 200 <= code < 300:
+                    print(f"  deleted knowledge doc {doc_id}: HTTP {code}")
+                else:
+                    print(f"  failed to delete knowledge doc {doc_id}: HTTP {code}")
+                    record_residual("knowledge_doc", doc_id, status_code=code)
             except Exception as exc:
                 print(f"  failed to delete knowledge doc {doc_id}: {exc}")
+                record_residual("knowledge_doc", doc_id, error=str(exc))
         for cid in created_case_ids:
             try:
                 code, _ = c.delete(f"/api/badcases/{cid}")
-                print(f"  deleted badcase {cid}: HTTP {code}")
+                if 200 <= code < 300:
+                    print(f"  deleted badcase {cid}: HTTP {code}")
+                else:
+                    print(f"  failed to delete badcase {cid}: HTTP {code}")
+                    record_residual("badcase", cid, status_code=code)
             except Exception as exc:
                 print(f"  failed to delete badcase {cid}: {exc}")
+                record_residual("badcase", cid, error=str(exc))
 
     print(f"\n{'=' * 60}")
     print(f"Results: {passed} passed, {failed} failed")
-    if created_case_ids:
-        print(f"Created Badcase IDs: {created_case_ids}")
-    if created_doc_ids:
-        print(f"Created Knowledge Doc IDs: {created_doc_ids}")
-    return 0 if failed == 0 else 1
+    print(f"Created Badcase IDs: {created_case_ids}")
+    print(f"Created Knowledge Doc IDs: {created_doc_ids}")
+    print(f"Residuals: {residuals}")
+
+    if failed:
+        return 1
+    if residuals:
+        print("\nFAILURE: test data residuals remain; see Residuals list above.")
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
