@@ -261,7 +261,8 @@
         { id: 'mcp', label: 'MCP Server 管理', icon: 'mcp' },
         { id: 'knowledge', label: '知识库管理', icon: 'knowledge' },
         { id: 'badcases', label: 'Badcase 库', icon: 'badcase' },
-        { id: 'cost-governance', label: '调用与成本治理', icon: 'cost' }
+        { id: 'cost-governance', label: '调用与成本治理', icon: 'cost' },
+        { id: 'cost-strategy', label: '成本优化策略', icon: 'cost' }
       ]
     };
 
@@ -365,10 +366,25 @@
       return dateStr;
     }
 
+    async function parseApiError(res) {
+      let detail = null;
+      try {
+        const data = await res.json();
+        detail = data.detail || data.message || data.error || (typeof data === 'string' ? data : null);
+      } catch (e) {
+        try {
+          detail = await res.text();
+        } catch (e2) {
+          detail = null;
+        }
+      }
+      return detail || `HTTP ${res.status}`;
+    }
+
     async function apiGet(url) {
       try {
         const res = await fetch(`${API_BASE}${url}`);
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        if (!res.ok) throw new Error(await parseApiError(res));
         return await res.json();
       } catch (err) {
         console.error('API GET error:', err);
@@ -383,7 +399,7 @@
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(body)
         });
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        if (!res.ok) throw new Error(await parseApiError(res));
         return await res.json();
       } catch (err) {
         console.error('API PATCH error:', err);
@@ -398,7 +414,7 @@
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(body)
         });
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        if (!res.ok) throw new Error(await parseApiError(res));
         return await res.json();
       } catch (err) {
         console.error('API POST error:', err);
@@ -413,7 +429,7 @@
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(body)
         });
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        if (!res.ok) throw new Error(await parseApiError(res));
         return await res.json();
       } catch (err) {
         console.error('API PUT error:', err);
@@ -424,7 +440,7 @@
     async function apiDelete(url) {
       try {
         const res = await fetch(`${API_BASE}${url}`, { method: 'DELETE' });
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        if (!res.ok) throw new Error(await parseApiError(res));
         return await res.json();
       } catch (err) {
         console.error('API DELETE error:', err);
@@ -675,6 +691,7 @@
         case 'badcases': renderBadcasesPage(main); break;
         case 'badcase-detail': renderBadcaseDetailPage(main); break;
         case 'cost-governance': renderCostGovernancePage(main); break;
+        case 'cost-strategy': renderCostStrategyPage(main); break;
       }
     }
 
@@ -2218,33 +2235,68 @@
               <p class="text-sm text-slate-500 mt-1">AI 对话错误案例，用于持续优化模型表现</p>
             </div>
           </div>
-          <div class="bg-white rounded-2xl shadow-soft border border-slate-200 p-4 flex flex-wrap gap-3 items-end">
-            <div class="flex-1 min-w-[180px]">
-              <label class="block text-xs text-slate-500 mb-1">状态</label>
-              <select id="badcase-filter-status" class="w-full px-3 py-2 bg-white border border-slate-200 rounded-xl text-sm focus:outline-none focus:border-brand-400">
-                <option value="">全部状态</option>
-                <option value="pending">待处理</option>
-                <option value="classified">已分类</option>
-                <option value="fixing">修复中</option>
-                <option value="verifying">验证中</option>
-                <option value="closed">已关闭</option>
-                <option value="rejected">已驳回</option>
-              </select>
+          <div class="bg-white rounded-2xl shadow-soft border border-slate-200 p-4">
+            <div class="flex flex-wrap gap-3 items-end">
+              <div class="min-w-[150px]">
+                <label class="block text-xs text-slate-500 mb-1">来源</label>
+                <select id="badcase-filter-source" class="w-full px-3 py-2 bg-white border border-slate-200 rounded-xl text-sm focus:outline-none focus:border-brand-400">
+                  <option value="">全部来源</option>
+                  <option value="manual">人工反馈</option>
+                  <option value="auto">自动发现</option>
+                  <option value="user_feedback">用户反馈</option>
+                </select>
+              </div>
+              <div class="min-w-[150px]">
+                <label class="block text-xs text-slate-500 mb-1">分类</label>
+                <select id="badcase-filter-category" class="w-full px-3 py-2 bg-white border border-slate-200 rounded-xl text-sm focus:outline-none focus:border-brand-400">
+                  <option value="">全部分类</option>
+                  <option value="knowledge_gap">知识库缺口</option>
+                  <option value="skill_prompt">Skill/Prompt 问题</option>
+                  <option value="mcp_capability">MCP/能力缺口</option>
+                  <option value="routing">路由问题</option>
+                  <option value="response_quality">模型回答质量</option>
+                  <option value="other">其他</option>
+                  <option value="pending">待分类</option>
+                </select>
+              </div>
+              <div class="min-w-[150px]">
+                <label class="block text-xs text-slate-500 mb-1">状态</label>
+                <select id="badcase-filter-status" class="w-full px-3 py-2 bg-white border border-slate-200 rounded-xl text-sm focus:outline-none focus:border-brand-400">
+                  <option value="">全部状态</option>
+                  <option value="pending">待处理</option>
+                  <option value="classified">已分类</option>
+                  <option value="fixing">修复中</option>
+                  <option value="verifying">验证中</option>
+                  <option value="closed">已关闭</option>
+                  <option value="rejected">已驳回</option>
+                </select>
+              </div>
+              <div class="min-w-[120px]">
+                <label class="block text-xs text-slate-500 mb-1">是否有 Trace</label>
+                <select id="badcase-filter-has-trace" class="w-full px-3 py-2 bg-white border border-slate-200 rounded-xl text-sm focus:outline-none focus:border-brand-400">
+                  <option value="">全部</option>
+                  <option value="true">有 Trace</option>
+                  <option value="false">无 Trace</option>
+                </select>
+              </div>
+              <div class="min-w-[120px]">
+                <label class="block text-xs text-slate-500 mb-1">是否有复测</label>
+                <select id="badcase-filter-has-retest" class="w-full px-3 py-2 bg-white border border-slate-200 rounded-xl text-sm focus:outline-none focus:border-brand-400">
+                  <option value="">全部</option>
+                  <option value="true">有复测</option>
+                  <option value="false">无复测</option>
+                </select>
+              </div>
+              <div class="min-w-[140px]">
+                <label class="block text-xs text-slate-500 mb-1">开始时间</label>
+                <input id="badcase-filter-start" type="date" class="w-full px-3 py-2 bg-white border border-slate-200 rounded-xl text-sm focus:outline-none focus:border-brand-400">
+              </div>
+              <div class="min-w-[140px]">
+                <label class="block text-xs text-slate-500 mb-1">结束时间</label>
+                <input id="badcase-filter-end" type="date" class="w-full px-3 py-2 bg-white border border-slate-200 rounded-xl text-sm focus:outline-none focus:border-brand-400">
+              </div>
+              <button id="badcase-filter-btn" class="px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white rounded-xl text-sm transition-colors">筛选</button>
             </div>
-            <div class="flex-1 min-w-[180px]">
-              <label class="block text-xs text-slate-500 mb-1">分类</label>
-              <select id="badcase-filter-category" class="w-full px-3 py-2 bg-white border border-slate-200 rounded-xl text-sm focus:outline-none focus:border-brand-400">
-                <option value="">全部分类</option>
-                <option value="knowledge_gap">知识库缺口</option>
-                <option value="skill_prompt">Skill/Prompt 问题</option>
-                <option value="mcp_capability">MCP/能力缺口</option>
-                <option value="routing">路由问题</option>
-                <option value="response_quality">模型回答质量</option>
-                <option value="other">其他</option>
-                <option value="pending">待分类</option>
-              </select>
-            </div>
-            <button id="badcase-filter-btn" class="px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white rounded-xl text-sm transition-colors">筛选</button>
           </div>
           <div id="badcases-content">${loadingState()}</div>
         </div>
@@ -2268,12 +2320,22 @@
       async function loadBadcases() {
         const status = $('#badcase-filter-status').value;
         const category = $('#badcase-filter-category').value;
+        const source = $('#badcase-filter-source').value;
+        const hasTrace = $('#badcase-filter-has-trace').value;
+        const hasRetest = $('#badcase-filter-has-retest').value;
+        const start = $('#badcase-filter-start').value;
+        const end = $('#badcase-filter-end').value;
         $('#badcases-content').innerHTML = loadingState();
         try {
           let path = '/api/badcases';
           const params = [];
           if (status) params.push(`status=${encodeURIComponent(status)}`);
           if (category) params.push(`category=${encodeURIComponent(category)}`);
+          if (source) params.push(`source=${encodeURIComponent(source)}`);
+          if (hasTrace) params.push(`has_trace=${encodeURIComponent(hasTrace)}`);
+          if (hasRetest) params.push(`has_retest=${encodeURIComponent(hasRetest)}`);
+          if (start) params.push(`created_after=${encodeURIComponent(start + ' 00:00:00')}`);
+          if (end) params.push(`created_before=${encodeURIComponent(end + ' 23:59:59')}`);
           if (params.length) path += '?' + params.join('&');
           const data = await apiGet(path);
           const cases = data.badcases || [];
@@ -2347,6 +2409,9 @@
         renderContent();
         return;
       }
+      let allowed = new Set();
+      let isTerminal = false;
+      let category = 'pending';
       const categoryLabels = {
         knowledge_gap: '知识库缺口',
         skill_prompt: 'Skill/Prompt 问题',
@@ -2358,9 +2423,9 @@
       };
       const actionTypeLabels = {
         classify: '分类',
-        'darwin-fix': 'Darwin 优化修复',
+        'darwin-fix': 'Darwin 深度分析',
         'extract-knowledge': '提取知识草稿',
-        retest: '复测',
+        retest: '真实复测',
         verify: '验证',
         'verify-pass': '验证通过',
         'verify-fail': '验证不通过',
@@ -2376,6 +2441,7 @@
         'apply-knowledge-draft': '应用知识草稿',
         'apply-skill-prompt-draft': '应用 Skill/Prompt 草稿',
         'apply-capability-gap-draft': '记录能力缺口待办',
+        'publish-skill-draft': '发布 Skill 到 Agent',
         'publish-knowledge': '发布知识',
         'publish-skill-prompt': '发布 Skill/Prompt',
         'accept-capability-gap': '记录能力缺口',
@@ -2391,13 +2457,25 @@
         accepted: '已采纳'
       };
 
-      async function runAction(path, body, successText) {
+      async function runAction(path, body, successText, opts = {}) {
+        const { loadingEl, loadingText = '处理中...' } = opts;
+        const prevText = loadingEl ? loadingEl.textContent : '';
+        if (loadingEl) {
+          loadingEl.disabled = true;
+          loadingEl.dataset.originalText = prevText;
+          loadingEl.textContent = loadingText;
+        }
         try {
           await apiPost(path, body || {});
           showToast(successText, 'success');
           await loadDetail();
         } catch (err) {
           showToast('操作失败：' + err.message, 'error');
+        } finally {
+          if (loadingEl) {
+            loadingEl.disabled = false;
+            loadingEl.textContent = loadingEl.dataset.originalText || prevText;
+          }
         }
       }
 
@@ -2425,6 +2503,24 @@
       function sourceBadgeDetail(srcLabel) {
         if (srcLabel === '人工反馈') return '<span class="text-xs px-2 py-1 rounded-full bg-indigo-50 text-indigo-600 border border-indigo-100">人工反馈</span>';
         return '<span class="text-xs px-2 py-1 rounded-full bg-slate-100 text-slate-500 border border-slate-200">自动发现</span>';
+      }
+
+      function sourceBadge(src) {
+        const map = {
+          realtime: '实时账单',
+          estimated: '本地估算',
+          fallback: '回退估算',
+          unknown: '未知'
+        };
+        const label = map[src] || src || '未知';
+        const color = src === 'realtime' ? 'bg-indigo-50 text-indigo-600' : src === 'estimated' ? 'bg-brand-50 text-brand-600' : 'bg-slate-100 text-slate-500';
+        return `<span class="text-[10px] px-1.5 py-0.5 rounded-full ${color}">${escapeHtml(label)}</span>`;
+      }
+
+      function statusBadgeSmall(s) {
+        const map = { success: ['bg-green-50 text-green-600', '成功'], error: ['bg-red-50 text-red-600', '失败'], warning: ['bg-amber-50 text-amber-600', '警告'] };
+        const [cls, label] = map[s] || ['bg-slate-100 text-slate-500', s || '未知'];
+        return `<span class="text-[10px] px-1.5 py-0.5 rounded-full ${cls}">${escapeHtml(label)}</span>`;
       }
 
       function parseDarwin(da) {
@@ -2561,6 +2657,46 @@
         });
       }
 
+      let agentsList = [];
+      async function loadAgentsList() {
+        try {
+          const data = await apiGet('/api/agents');
+          agentsList = data.agents || [];
+        } catch (err) {
+          agentsList = [];
+        }
+      }
+
+      function openSkillApplyModal(d) {
+        const options = agentsList.length
+          ? agentsList.map(a => `<option value="${a.id}">${escapeHtml(a.name)}${a.is_router ? '（路由）' : ''}</option>`).join('')
+          : '<option value="">暂无可用 Agent</option>';
+        const body = `
+          <div class="space-y-3">
+            <p class="text-sm text-slate-600">选择要绑定该 Skill 的目标 Agent：</p>
+            ${formSelect('目标 Agent', 'skill-target-agent', agentsList.map(a => ({ value: String(a.id), label: a.name + (a.is_router ? '（路由）' : '') })), '')}
+            <p class="text-xs text-slate-400">应用后系统将创建/更新 Skill 并把该 Skill 绑定到所选 Agent。</p>
+          </div>
+        `;
+        openModal('应用 Skill/Prompt 草稿', body, async () => {
+          const targetId = $('#skill-target-agent').value;
+          if (!targetId) {
+            showToast('请选择目标 Agent', 'error');
+            return false;
+          }
+          try {
+            await apiPost(`/api/badcases/${id}/skill-prompt-drafts/${d.id}/publish-skill-draft`, { target_agent_id: Number(targetId) });
+            showToast('Skill 已发布并绑定到 Agent', 'success');
+            closeModal();
+            await loadDetail();
+            return true;
+          } catch (err) {
+            showToast('发布失败：' + err.message, 'error');
+            return false;
+          }
+        }, '发布并绑定');
+      }
+
       function renderDraftCard(d, type, idx) {
         const content = draftField(type, d);
         const snippet = (content || '').slice(0, 120);
@@ -2574,14 +2710,11 @@
           capability_gap: '应用后系统将：\n1. 把能力缺口记录为产品待办；\n2. 不会创建任何 MCP 工具或真实能力；\n3. Badcase 仍保持“修复中”。\n\n请确认。'
         };
 
-        // Build status-specific action buttons so users never see a button that
-        // would trigger a backend 400.
-        let actionButtons = '<button data-draft-id="' + d.id + '" data-draft-type="' + type + '" class="badcase-draft-view px-2 py-1 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg text-xs transition-colors">查看全文</button>';
+        let actionButtons = `<button data-draft-id="${d.id}" data-draft-type="${type}" class="badcase-draft-view px-2 py-1 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg text-xs transition-colors">查看全文</button>`;
 
         if (isTerminal || terminalDraft) {
           actionButtons += `<span class="px-2 py-1 bg-slate-100 text-slate-400 rounded-lg text-xs">${terminalDraft ? '草稿已终态' : 'Badcase 已终态'}</span>`;
         } else {
-          // Edit is available in draft, under_review and approved (editing approved auto-resets to draft).
           if (canEdit) {
             actionButtons += `<button data-draft-id="${d.id}" data-draft-type="${type}" class="badcase-draft-edit px-2 py-1 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg text-xs transition-colors">编辑</button>`;
           }
@@ -2596,8 +2729,8 @@
           } else if (status === 'approved') {
             if (type === 'knowledge' && allowed.has('apply-draft')) {
               actionButtons += `<button data-draft-id="${d.id}" data-draft-type="${type}" data-confirm="${escapeHtml(applyConfirm.knowledge)}" class="badcase-draft-apply px-2 py-1 bg-brand-600 hover:bg-brand-700 text-white rounded-lg text-xs transition-colors">应用到正式知识库</button>`;
-            } else if (type === 'skill_prompt') {
-              actionButtons += `<span class="px-2 py-1 bg-slate-100 text-slate-500 rounded-lg text-xs">待第二批：选择目标 Agent 并建立 agent_skills 绑定后才能应用</span>`;
+            } else if (type === 'skill_prompt' && allowed.has('apply-draft')) {
+              actionButtons += `<button data-draft-id="${d.id}" data-draft-type="${type}" class="badcase-draft-skill-apply px-2 py-1 bg-brand-600 hover:bg-brand-700 text-white rounded-lg text-xs transition-colors">选择 Agent 并应用</button>`;
             } else if (type === 'capability_gap' && allowed.has('apply-draft')) {
               actionButtons += `<button data-draft-id="${d.id}" data-draft-type="${type}" data-confirm="${escapeHtml(applyConfirm.capability_gap)}" class="badcase-draft-apply px-2 py-1 bg-brand-600 hover:bg-brand-700 text-white rounded-lg text-xs transition-colors">采纳为产品待办</button>`;
             }
@@ -2630,12 +2763,76 @@
         `;
       }
 
-      let allowed = new Set();
-      let isTerminal = false;
-      let category = 'pending';
+      function renderDarwinStructured(parsed) {
+        if (!parsed || typeof parsed !== 'object') return '';
+        const repairPathLabels = {
+          knowledge: '补充知识库',
+          skill_prompt: '新增/优化 Skill 或 Prompt',
+          mcp_capability: '开发 MCP 能力',
+          ops_only: '仅运营处理'
+        };
+        const fields = [
+          { key: 'phenomenon_impact', label: '现象与影响范围' },
+          { key: 'root_cause_hypothesis', label: '根因假设' },
+          { key: 'evidence_uncertainties', label: '证据与不确定项' },
+          { key: 'repair_path_suggestion', label: '修复路径建议' },
+          { key: 'recommended_category', label: '推荐分类' },
+          { key: 'repair_path', label: '推荐修复路径', format: v => repairPathLabels[v] || v }
+        ];
+        const cards = fields.map(f => {
+          const raw = parsed[f.key];
+          if (raw === null || raw === undefined || raw === '') return '';
+          const value = f.format ? f.format(raw) : raw;
+          return `
+            <div class="bg-slate-50 rounded-lg p-3 border border-slate-200">
+              <div class="text-xs text-slate-500 mb-1">${f.label}</div>
+              <div class="text-sm text-slate-700 whitespace-pre-wrap">${escapeHtml(value)}</div>
+            </div>
+          `;
+        }).filter(Boolean).join('');
+        const meta = [];
+        if (parsed.model) meta.push(`模型：${escapeHtml(parsed.model)}`);
+        if (parsed.trace_id) meta.push(`Trace ID：${escapeHtml(parsed.trace_id)}`);
+        if (parsed.token_cost_estimate) meta.push(`Token/成本估算：${escapeHtml(parsed.token_cost_estimate)}`);
+        const metaHtml = meta.length ? `<div class="mt-3 text-xs text-slate-500 flex flex-wrap gap-3">${meta.map(m => `<span>${m}</span>`).join('')}</div>` : '';
+        return `
+          <div class="space-y-3 text-sm text-slate-700">
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+              ${cards}
+            </div>
+            ${metaHtml}
+          </div>
+        `;
+      }
+
+      function renderRetestResult(bc) {
+        const retestContext = bc.retest_context || {};
+        return `
+          <div class="bg-white rounded-2xl shadow-soft border border-slate-200 p-5">
+            <h3 class="font-semibold text-slate-900 mb-3">真实复测结果</h3>
+            <div class="space-y-3 text-sm text-slate-700">
+              <div>
+                <div class="text-xs text-slate-500 mb-1">复测回答</div>
+                <div class="whitespace-pre-wrap bg-slate-50 rounded-lg p-3 border border-slate-200">${escapeHtml(bc.retest_response || '（无）')}</div>
+              </div>
+              <details class="group">
+                <summary class="text-xs text-slate-500 cursor-pointer hover:text-slate-700">复测上下文（点击展开）</summary>
+                <div class="mt-2">${renderKeyValue(retestContext)}</div>
+              </details>
+              ${bc.retest_trace_id ? `
+                <div>
+                  <div class="text-xs text-slate-500 mb-1">复测 Trace ID</div>
+                  <a href="#observability?trace_id=${encodeURIComponent(bc.retest_trace_id)}" class="font-mono text-xs text-brand-600 bg-slate-50 px-2 py-1 rounded border border-slate-200 inline-block hover:text-brand-700">${escapeHtml(bc.retest_trace_id)}</a>
+                </div>
+              ` : ''}
+            </div>
+          </div>
+        `;
+      }
 
       async function loadDetail() {
         try {
+          await loadAgentsList();
           const data = await apiGet(`/api/badcases/${id}`);
           const bc = data.badcase || data;
           allowed = new Set(bc.allowed_actions || []);
@@ -2648,8 +2845,7 @@
           const kDrafts = bc.knowledge_drafts || [];
           const sDrafts = bc.skill_prompt_drafts || [];
           const cDrafts = bc.capability_gap_drafts || [];
-          const darwin = parseDarwin(bc.darwin_analysis);
-          const retestContext = bc.retest_context || {};
+          const darwinParsed = bc.darwin_analysis_parsed || parseDarwin(bc.darwin_analysis);
 
           const categoryDraftMap = {
             knowledge_gap: { label: '提取知识草稿', action: 'extract-knowledge', path: `/api/badcases/${id}/extract-knowledge` },
@@ -2659,38 +2855,44 @@
             response_quality: { label: '生成修复计划草稿', action: 'darwin-fix', path: `/api/badcases/${id}/darwin-fix` }
           };
           const catDraft = categoryDraftMap[category];
-          const catDraftBtn = catDraft ? `<button id="badcase-category-draft" type="button" class="w-full px-4 py-2 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 rounded-xl text-sm transition-colors" ${allowed.has(catDraft.action) ? '' : 'disabled title="当前状态不可执行该操作"'}>${escapeHtml(catDraft.label)}</button>` : '';
+
+          function actionBtn(label, actionId, opts = {}) {
+            const { cls = 'w-full px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white rounded-xl text-sm transition-colors', id = null, disabledTitle = '当前状态不可执行该操作' } = opts;
+            const hasAction = allowed.has(actionId);
+            const btnId = id ? ` id="${id}"` : '';
+            return `<button type="button"${btnId} class="${cls}" ${hasAction ? '' : `disabled title="${disabledTitle}"`}>${escapeHtml(label)}</button>`;
+          }
 
           let actionButtonsHtml = '';
           if (isTerminal) {
             actionButtonsHtml = `<p class="text-xs text-slate-500 mt-3">该 Badcase 已${bc.status === 'rejected' ? '驳回' : '关闭'}，不可继续操作。</p>`;
           } else if (bc.status === 'pending') {
             actionButtonsHtml = `
-              <button id="badcase-classify" type="button" class="w-full px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white rounded-xl text-sm transition-colors" ${allowed.has('classify') ? '' : 'disabled title="当前状态不可分类"'}>保存分类</button>
-              <button id="badcase-reject" type="button" class="w-full text-xs text-slate-500 hover:text-red-600 underline mt-2" ${allowed.has('reject') ? '' : 'disabled title="当前状态不可驳回"'}>驳回 / 拒绝处理</button>
+              ${actionBtn('分类', 'classify', { id: 'badcase-classify' })}
+              ${actionBtn('AI 自动分类', 'classify', { id: 'badcase-auto-classify', cls: 'w-full px-4 py-2 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 rounded-xl text-sm transition-colors' })}
+              ${actionBtn('驳回 / 拒绝处理', 'reject', { id: 'badcase-reject', cls: 'w-full text-xs text-slate-500 hover:text-red-600 underline mt-2' })}
             `;
           } else if (bc.status === 'classified') {
             actionButtonsHtml = `
-              <button id="badcase-darwin" type="button" class="w-full px-4 py-2 bg-gold-500 hover:bg-gold-600 text-white rounded-xl text-sm transition-colors" ${allowed.has('darwin-fix') ? '' : 'disabled title="当前状态不可执行 Darwin 优化"'}>Darwin 优化修复方案</button>
-              ${catDraftBtn}
-              <button id="badcase-reject" type="button" class="w-full text-xs text-slate-500 hover:text-red-600 underline mt-2" ${allowed.has('reject') ? '' : 'disabled title="当前状态不可驳回"'}>驳回 / 拒绝处理</button>
+              ${actionBtn('Darwin 深度分析', 'darwin-fix', { id: 'badcase-darwin', cls: 'w-full px-4 py-2 bg-gold-500 hover:bg-gold-600 text-white rounded-xl text-sm transition-colors' })}
+              ${catDraft ? actionBtn(catDraft.label, catDraft.action, { id: 'badcase-category-draft', cls: 'w-full px-4 py-2 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 rounded-xl text-sm transition-colors' }) : ''}
+              ${actionBtn('驳回 / 拒绝处理', 'reject', { id: 'badcase-reject', cls: 'w-full text-xs text-slate-500 hover:text-red-600 underline mt-2' })}
             `;
           } else if (bc.status === 'fixing') {
             actionButtonsHtml = `
+              ${actionBtn('真实复测', 'retest', { id: 'badcase-retest', cls: 'w-full px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl text-sm transition-colors' })}
               <p class="text-xs text-slate-500">请在下方草稿卡片中查看、编辑、审核并应用。</p>
-              <button id="badcase-reject" type="button" class="w-full text-xs text-slate-500 hover:text-red-600 underline mt-2" ${allowed.has('reject') ? '' : 'disabled title="当前状态不可驳回"'}>驳回 / 拒绝处理</button>
+              ${actionBtn('驳回 / 拒绝处理', 'reject', { id: 'badcase-reject', cls: 'w-full text-xs text-slate-500 hover:text-red-600 underline mt-2' })}
             `;
           } else if (bc.status === 'verifying') {
             const noRetest = !bc.retest_response;
-            const verifyPassTitle = noRetest ? '请先完成真实复测' : '当前状态不可验证';
             actionButtonsHtml = `
-              <button id="badcase-retest" type="button" class="w-full px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl text-sm transition-colors" ${allowed.has('retest') ? '' : 'disabled title="当前状态不可复测"'}>复测</button>
-              ${noRetest ? `<p class="text-xs text-amber-600 bg-amber-50 rounded-lg px-3 py-2 border border-amber-100">当前尚未进行真实复测，验证通过不可用。请先点击“复测”。</p>` : ''}
+              ${noRetest ? `<p class="text-xs text-amber-600 bg-amber-50 rounded-lg px-3 py-2 border border-amber-100">请先完成真实复测，验证通过不可用。</p>` : ''}
               <div class="flex gap-2">
-                <button id="badcase-verify-pass" type="button" class="flex-1 px-4 py-2 bg-green-600 hover:bg-green-700 text-white rounded-xl text-sm transition-colors" ${allowed.has('verify-pass') ? '' : 'disabled title="${verifyPassTitle}"'}>验证通过</button>
-                <button id="badcase-verify-fail" type="button" class="flex-1 px-4 py-2 bg-red-50 hover:bg-red-100 text-red-700 rounded-xl text-sm transition-colors" ${allowed.has('verify-fail') ? '' : 'disabled title="当前状态不可验证"'}>验证不通过</button>
+                ${actionBtn('验证通过', 'verify-pass', { id: 'badcase-verify-pass', cls: 'flex-1 px-4 py-2 bg-green-600 hover:bg-green-700 text-white rounded-xl text-sm transition-colors', disabledTitle: noRetest ? '请先完成真实复测' : '当前状态不可验证' })}
+                ${actionBtn('验证不通过', 'verify-fail', { id: 'badcase-verify-fail', cls: 'flex-1 px-4 py-2 bg-red-50 hover:bg-red-100 text-red-700 rounded-xl text-sm transition-colors' })}
               </div>
-              <button id="badcase-reject" type="button" class="w-full text-xs text-slate-500 hover:text-red-600 underline mt-2" ${allowed.has('reject') ? '' : 'disabled title="当前状态不可驳回"'}>驳回 / 拒绝处理</button>
+              ${actionBtn('驳回 / 拒绝处理', 'reject', { id: 'badcase-reject', cls: 'w-full text-xs text-slate-500 hover:text-red-600 underline mt-2' })}
             `;
           }
 
@@ -2701,6 +2903,7 @@
                   <span class="text-sm text-slate-500">当前状态：${statusBadge(bc.status)} <span class="text-slate-700 font-medium">${escapeHtml(bc.status_label || '')}</span></span>
                   <span class="text-sm text-slate-500">分类：<span class="font-medium text-slate-800">${escapeHtml(bc.category_label || categoryLabels[category] || category)}</span></span>
                   <span class="text-sm text-slate-500">来源：${sourceBadgeDetail(bc.source_label)}</span>
+                  ${bc.created_by ? `<span class="text-sm text-slate-500">创建人：<span class="font-medium text-slate-800">${escapeHtml(bc.created_by)}</span></span>` : ''}
                 </div>
                 <div class="text-xs text-slate-400">状态流转：pending → classified → fixing → verifying → closed / rejected</div>
               </div>
@@ -2752,26 +2955,9 @@
                 </div>
 
                 <div class="bg-white rounded-2xl shadow-soft border border-slate-200 p-5">
-                  ${darwin ? `
+                  ${darwinParsed ? `
                     <h3 class="font-semibold text-slate-900 mb-3">Darwin 分析</h3>
-                    <div class="space-y-3 text-sm text-slate-700">
-                      <div>
-                        <div class="text-xs text-slate-500 mb-1">根因</div>
-                        <div class="whitespace-pre-wrap bg-slate-50 rounded-lg p-3 border border-slate-200">${escapeHtml(darwin.root_cause || '（无）')}</div>
-                      </div>
-                      <div>
-                        <div class="text-xs text-slate-500 mb-1">建议动作</div>
-                        <div class="whitespace-pre-wrap bg-slate-50 rounded-lg p-3 border border-slate-200">${escapeHtml(Array.isArray(darwin.suggested_actions) ? darwin.suggested_actions.join('\n') : (darwin.suggested_actions || '（无）'))}</div>
-                      </div>
-                      <div>
-                        <div class="text-xs text-slate-500 mb-1">预期收益</div>
-                        <div class="whitespace-pre-wrap bg-slate-50 rounded-lg p-3 border border-slate-200">${escapeHtml(darwin.expected_impact || '（无）')}</div>
-                      </div>
-                      <div>
-                        <div class="text-xs text-slate-500 mb-1">风险</div>
-                        <div class="whitespace-pre-wrap bg-slate-50 rounded-lg p-3 border border-slate-200">${escapeHtml(darwin.risks || '（无）')}</div>
-                      </div>
-                    </div>
+                    ${renderDarwinStructured(darwinParsed)}
                   ` : `
                     <h3 class="font-semibold text-slate-900 mb-3">修复计划</h3>
                     <div class="text-sm text-slate-700 whitespace-pre-wrap bg-slate-50 rounded-lg p-3 border border-slate-200 min-h-[100px]">${escapeHtml(bc.fix_plan || '（待生成）')}</div>
@@ -2782,88 +2968,130 @@
               ${renderDraftSection('knowledge', kDrafts, '知识库草稿')}
               ${renderDraftSection('skill_prompt', sDrafts, 'Skill/Prompt 草稿')}
               ${renderDraftSection('capability_gap', cDrafts, '能力缺口建议')}
-
-              ${bc.retest_response ? `
-                <div class="bg-white rounded-2xl shadow-soft border border-slate-200 p-5">
-                  <h3 class="font-semibold text-slate-900 mb-3">复测结果</h3>
-                  <div class="space-y-3 text-sm text-slate-700">
-                    <div>
-                      <div class="text-xs text-slate-500 mb-1">复测回答</div>
-                      <div class="whitespace-pre-wrap bg-slate-50 rounded-lg p-3 border border-slate-200">${escapeHtml(bc.retest_response)}</div>
-                    </div>
-                    <div>
-                      <div class="text-xs text-slate-500 mb-1">复测上下文</div>
-                      ${renderKeyValue(retestContext)}
-                    </div>
-                    ${bc.retest_trace_id ? `
-                      <div>
-                        <div class="text-xs text-slate-500 mb-1">复测 Trace ID</div>
-                        <div class="font-mono text-xs text-brand-600 bg-slate-50 px-2 py-1 rounded border border-slate-200 inline-block">${escapeHtml(bc.retest_trace_id)}</div>
-                      </div>
-                    ` : ''}
-                  </div>
+              ${cDrafts.some(d => d.status === 'accepted') ? `
+                <div class="bg-amber-50 border border-amber-200 rounded-xl p-3 text-sm text-amber-700 flex items-start gap-2">
+                  <svg class="w-5 h-5 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path></svg>
+                  <div>已记录能力缺口产品待办，当前状态保持“修复中”。后续请等待能力开发/接入，接入后可重新复测并验证。</div>
                 </div>
               ` : ''}
+
+              ${bc.retest_response ? renderRetestResult(bc) : ''}
 
               ${(bc.actions || []).length ? `
                 <div class="bg-white rounded-2xl shadow-soft border border-slate-200 p-5">
                   <h3 class="font-semibold text-slate-900 mb-3">操作历史</h3>
-                  <ul class="space-y-3 text-sm text-slate-700">
+                  <div class="relative border-l border-slate-200 ml-2 space-y-4">
                     ${bc.actions.map(a => `
-                      <li class="border-l-2 border-slate-200 pl-3">
+                      <div class="pl-5 relative">
+                        <span class="absolute -left-[5px] top-1.5 w-2.5 h-2.5 rounded-full bg-brand-400 border-2 border-white"></span>
                         <div class="flex flex-wrap items-center gap-2 text-xs text-slate-500">
+                          <span class="font-medium text-slate-700">${escapeHtml(a.created_by || '系统')}</span>
+                          <span>·</span>
                           <span>${formatTimeLabel(a.created_at)}</span>
-                          ${a.status_before !== null && a.status_before !== undefined ? transitionBadge(a.status_before, a.status_before_label, a.status_after, a.status_after_label) : ''}
+                          ${a.status_before !== null && a.status_before !== undefined ? `<span>·</span>${transitionBadge(a.status_before, a.status_before_label, a.status_after, a.status_after_label)}` : ''}
                         </div>
-                        <div class="mt-1">
+                        <div class="mt-1 text-sm text-slate-700">
                           <b class="font-medium text-slate-900">${escapeHtml(actionTypeLabels[a.action_type] || a.action_type)}</b>
                           ${renderDetail(a.action_detail_parsed)}
                         </div>
-                      </li>
+                      </div>
                     `).join('')}
-                  </ul>
+                  </div>
                 </div>
               ` : ''}
             </div>
           `;
 
           if (bc.status === 'pending') {
-            $('#badcase-classify').addEventListener('click', () => {
-              const selected = $('#badcase-category').value;
-              runAction(`/api/badcases/${id}/classify`, { auto: false, category: selected, reason: `手动分类为 ${selected}` }, '已保存分类');
-            });
+            const classifyBtn = $('#badcase-classify');
+            if (classifyBtn && !classifyBtn.disabled) {
+              classifyBtn.addEventListener('click', () => {
+                const selected = $('#badcase-category').value;
+                runAction(`/api/badcases/${id}/classify`, { auto: false, category: selected, reason: `手动分类为 ${selected}` }, '已保存分类', { loadingEl: classifyBtn });
+              });
+            }
+            const autoBtn = $('#badcase-auto-classify');
+            if (autoBtn && !autoBtn.disabled) {
+              autoBtn.addEventListener('click', () => {
+                runAction(`/api/badcases/${id}/classify`, { auto: true }, 'AI 分类完成', { loadingEl: autoBtn });
+              });
+            }
           }
 
           if (bc.status === 'classified') {
-            $('#badcase-darwin').addEventListener('click', () => {
-              runAction(`/api/badcases/${id}/darwin-fix`, {}, 'Darwin 优化完成');
-            });
+            const darwinBtn = $('#badcase-darwin');
+            if (darwinBtn && !darwinBtn.disabled) {
+              darwinBtn.addEventListener('click', () => {
+                runAction(`/api/badcases/${id}/darwin-fix`, {}, 'Darwin 分析完成', { loadingEl: darwinBtn });
+              });
+            }
             if (catDraft) {
               const btn = $('#badcase-category-draft');
               if (btn && !btn.disabled) {
                 btn.addEventListener('click', () => {
-                  runAction(catDraft.path, {}, catDraft.label + '完成');
+                  runAction(catDraft.path, {}, catDraft.label + '完成', { loadingEl: btn });
                 });
               }
             }
           }
 
+          if (bc.status === 'fixing') {
+            const retestBtn = $('#badcase-retest');
+            if (retestBtn && !retestBtn.disabled) {
+              retestBtn.addEventListener('click', async () => {
+                retestBtn.disabled = true;
+                retestBtn.dataset.originalText = retestBtn.textContent;
+                retestBtn.textContent = '复测中...';
+                try {
+                  await apiPost(`/api/badcases/${id}/retest`, {});
+                  showToast('真实复测完成', 'success');
+                  await loadDetail();
+                } catch (err) {
+                  showToast('复测失败：' + err.message, 'error');
+                } finally {
+                  retestBtn.disabled = false;
+                  retestBtn.textContent = retestBtn.dataset.originalText || '真实复测';
+                }
+              });
+            }
+          }
+
           if (bc.status === 'verifying') {
-            $('#badcase-retest').addEventListener('click', () => {
-              runAction(`/api/badcases/${id}/retest`, {}, '已发起复测');
-            });
-            $('#badcase-verify-pass').addEventListener('click', () => {
-              runAction(`/api/badcases/${id}/verify`, { passed: true }, '已验证关闭');
-            });
-            $('#badcase-verify-fail').addEventListener('click', () => {
-              const note = window.prompt('验证不通过原因（将回到修复阶段）：');
-              if (note === null) return;
-              if (!note.trim()) {
-                showToast('验证不通过原因不能为空', 'error');
-                return;
+            const verifyPassBtn = $('#badcase-verify-pass');
+            const verifyFailBtn = $('#badcase-verify-fail');
+            if (verifyPassBtn && !verifyPassBtn.disabled) {
+              verifyPassBtn.addEventListener('click', () => openVerifyModal(true));
+            }
+            if (verifyFailBtn && !verifyFailBtn.disabled) {
+              verifyFailBtn.addEventListener('click', () => openVerifyModal(false));
+            }
+          }
+
+          function openVerifyModal(passed) {
+            const title = passed ? '验证通过' : '验证不通过';
+            const body = `
+              <div class="space-y-3">
+                ${formTextarea('验证备注', 'verify-note', '', '请输入验证意见或观察到的现象', 4)}
+                <p class="text-xs text-slate-400">${passed ? '通过后将关闭 Badcase。' : '不通过后将回到修复阶段。'}</p>
+              </div>
+            `;
+            openModal(title, body, async () => {
+              const note = $('#verify-note').value.trim();
+              if (!note) {
+                showToast('请输入验证备注', 'error');
+                return false;
               }
-              runAction(`/api/badcases/${id}/verify`, { passed: false, note: note.trim() }, '已退回修复');
-            });
+              try {
+                await apiPost(`/api/badcases/${id}/verify`, { passed, note });
+                showToast(passed ? '已验证关闭' : '已退回修复', 'success');
+                closeModal();
+                await loadDetail();
+                return true;
+              } catch (err) {
+                showToast('验证失败：' + err.message, 'error');
+                return false;
+              }
+            }, passed ? '确认通过' : '确认退回');
           }
 
           const rejectBtn = $('#badcase-reject');
@@ -2875,7 +3103,7 @@
                 showToast('驳回原因不能为空', 'error');
                 return;
               }
-              runAction(`/api/badcases/${id}/reject`, { rejected_reason: reason.trim() }, '已驳回');
+              runAction(`/api/badcases/${id}/reject`, { rejected_reason: reason.trim() }, '已驳回', { loadingEl: rejectBtn });
             });
           }
 
@@ -2910,18 +3138,28 @@
               const type = btn.dataset.draftType;
               const draftId = Number(btn.dataset.draftId);
               const status = btn.dataset.review;
-              runAction(`/api/badcases/${id}/${draftEndpoint(type)}/${draftId}/review`, { status }, '审核完成');
+              runAction(`/api/badcases/${id}/${draftEndpoint(type)}/${draftId}/review`, { status }, '审核完成', { loadingEl: btn });
             });
           });
 
           $$('.badcase-draft-apply').forEach(btn => {
+            if (btn.disabled) return;
             btn.addEventListener('click', () => {
               const type = btn.dataset.draftType;
               const draftId = Number(btn.dataset.draftId);
               const confirmMsg = btn.dataset.confirm || '确认应用该草稿？';
               if (!window.confirm(confirmMsg)) return;
               const body = {};
-              runAction(`/api/badcases/${id}/${draftEndpoint(type)}/${draftId}/apply`, body, type === 'capability_gap' ? '已记录能力缺口待办' : '草稿已应用');
+              runAction(`/api/badcases/${id}/${draftEndpoint(type)}/${draftId}/apply`, body, type === 'capability_gap' ? '已记录能力缺口待办' : '草稿已应用', { loadingEl: btn });
+            });
+          });
+
+          $$('.badcase-draft-skill-apply').forEach(btn => {
+            if (btn.disabled) return;
+            btn.addEventListener('click', () => {
+              const draftId = Number(btn.dataset.draftId);
+              const d = sDrafts.find(x => x.id === draftId);
+              if (d) openSkillApplyModal(d);
             });
           });
         } catch (err) {
@@ -3000,6 +3238,30 @@
       function renderOverview() {
         const o = state.overview || {};
         const alerts = (o.alerts || []).map(a => `<span class="px-2 py-1 rounded-lg text-xs ${a.type === 'daily' ? 'bg-red-100 text-red-700' : 'bg-amber-100 text-amber-700'}">${a.type === 'daily' ? '每日' : '单次'}预警：阈值 ¥${a.threshold}，实际 ¥${a.actual}</span>`).join('');
+        const priceMissingWarning = o.price_missing ? `<div class="mt-3 p-3 bg-amber-50 border border-amber-200 rounded-xl text-xs text-amber-700 flex items-center gap-2"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path></svg>部分模型调用缺少价格配置，成本显示为“未配置价格”。请先到下方“模型价格表”补全价格。</div>` : '';
+
+        function periodCard(label, p) {
+          const usage = p && typeof p.budget_usage_percent === 'number' ? `${p.budget_usage_percent.toFixed(2)}%` : '-';
+          const usageBar = p && typeof p.budget_usage_percent === 'number' ? `
+            <div class="w-full h-1.5 bg-slate-100 rounded-full mt-2 overflow-hidden">
+              <div class="h-full ${p.budget_usage_percent >= 80 ? 'bg-red-500' : 'bg-brand-500'}" style="width: ${Math.min(100, p.budget_usage_percent)}%"></div>
+            </div>
+          ` : '';
+          return `
+            <div class="bg-white rounded-2xl shadow-soft border border-slate-200 p-4">
+              <div class="text-[11px] text-slate-500 mb-1">${label}</div>
+              <div class="text-lg font-semibold text-slate-900">${fmtTokens(p ? p.total_tokens : null)}</div>
+              <div class="text-[11px] text-slate-500 mt-1">估算成本 ${fmtCost(p ? p.estimated_cost_cny : null)}</div>
+              <div class="mt-2 text-[10px] text-slate-400 flex flex-col gap-0.5">
+                <span>Provider 账单 Token：${fmtTokens(p ? p.provider_reported_tokens : null)}</span>
+                <span>本地估算 Token：${fmtTokens(p ? p.local_estimated_tokens : null)}</span>
+                <span>预算使用：${usage}</span>
+              </div>
+              ${usageBar}
+            </div>
+          `;
+        }
+
         return `
           <div class="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-7 gap-3">
             <div class="bg-white rounded-2xl shadow-soft border border-slate-200 p-4">
@@ -3031,7 +3293,13 @@
               <div class="text-xl font-semibold text-slate-900 mt-1">${Number(o.failed_calls || 0).toLocaleString()}</div>
             </div>
           </div>
+          <div class="grid grid-cols-1 md:grid-cols-3 gap-3 mt-3">
+            ${periodCard('今日', o.today)}
+            ${periodCard('近7天', o.last_7_days)}
+            ${periodCard('本月', o.this_month)}
+          </div>
           ${alerts ? `<div class="flex flex-wrap gap-2 mt-3">${alerts}</div>` : ''}
+          ${priceMissingWarning}
           <p class="text-[11px] text-slate-400 mt-2">${escapeHtml(o.cost_note || '按配置价格估算成本，非供应商实际结算金额')} · 货币 ${escapeHtml(o.currency || 'CNY')}</p>
         `;
       }
@@ -3117,19 +3385,69 @@
         `;
       }
 
+      function renderBarChart(items, labelKey, title) {
+        if (!items || !items.length) return `<div class="bg-white rounded-2xl shadow-soft border border-slate-200 p-4"><p class="text-sm text-slate-400">暂无${title}数据</p></div>`;
+        const maxTokens = Math.max(...items.map(i => i.total_tokens || 0), 1);
+        return `
+          <div class="bg-white rounded-2xl shadow-soft border border-slate-200 p-4">
+            <h3 class="font-semibold text-slate-900 mb-3">${title}</h3>
+            <div class="space-y-2 max-h-64 overflow-y-auto">
+              ${items.map(i => `
+                <div class="flex items-center gap-3 text-sm">
+                  <div class="w-28 text-slate-500 shrink-0 truncate" title="${escapeHtml(i[labelKey] || '-')}">${escapeHtml(i[labelKey] || '-')}</div>
+                  <div class="flex-1 h-4 bg-slate-100 rounded-full overflow-hidden">
+                    <div class="h-full bg-brand-500 rounded-full" style="width: ${Math.min(100, ((i.total_tokens || 0) / maxTokens) * 100)}%"></div>
+                  </div>
+                  <div class="w-16 text-right text-slate-700">${Number(i.calls || 0).toLocaleString()}</div>
+                  <div class="w-20 text-right text-slate-500">${fmtTokens(i.total_tokens)}</div>
+                  <div class="w-24 text-right text-slate-700">${fmtCost(i.estimated_cost_cny)}</div>
+                </div>
+              `).join('')}
+            </div>
+          </div>
+        `;
+      }
+
+      function renderModelChart() {
+        const o = state.overview || {};
+        const byModel = o.by_model || {};
+        const items = Object.entries(byModel).map(([k, v]) => ({ ...v, model_id: v.model_name || k }));
+        return renderBarChart(items, 'model_id', '按模型（Flash / Pro）');
+      }
+
+      function renderStageChart() {
+        const o = state.overview || {};
+        const byStage = o.by_stage || {};
+        const stageLabels = {
+          router: '路由',
+          vertical_agent: '垂直 Agent',
+          darwin: 'Darwin 分析',
+          ab_test: 'A/B 测试',
+          badcase_classify: 'Badcase 分类'
+        };
+        const items = Object.entries(byStage).map(([k, v]) => ({ ...v, stage: stageLabels[k] || k, stage_key: k }));
+        return renderBarChart(items, 'stage', '按阶段');
+      }
+
       function renderTraces() {
         let items = state.traces || [];
         if (state.filters.search) {
           const s = state.filters.search.toLowerCase();
           items = items.filter(t => (t.trace_id || '').toLowerCase().includes(s) || (t.session_id || '').toLowerCase().includes(s));
         }
+        if (state.filters.model) {
+          items = items.filter(t => (t.model_id || '') === state.filters.model);
+        }
+        if (state.filters.stage) {
+          items = items.filter(t => (t.stage || '') === state.filters.stage || (state.filters.stage.startsWith('ab_test') && (t.stage || '').startsWith('ab_test')));
+        }
         if (!items.length) return `<div class="bg-white rounded-2xl shadow-soft border border-slate-200 p-4"><p class="text-sm text-slate-400">暂无 Trace 数据</p></div>`;
         return `
           <div class="bg-white rounded-2xl shadow-soft border border-slate-200 p-4">
-            <h3 class="font-semibold text-slate-900 mb-3">调用 Trace 列表</h3>
+            <h3 class="font-semibold text-slate-900 mb-3">调用 Trace 列表（含成本可解释性）</h3>
             <div class="overflow-x-auto">
               <table class="w-full text-sm">
-                <thead><tr class="text-left text-slate-500 text-xs border-b border-slate-100"><th class="pb-2">trace_id</th><th class="pb-2">时间</th><th class="pb-2">意图</th><th class="pb-2">Agent</th><th class="pb-2">状态</th><th class="pb-2">操作</th></tr></thead>
+                <thead><tr class="text-left text-slate-500 text-xs border-b border-slate-100"><th class="pb-2">trace_id</th><th class="pb-2">时间</th><th class="pb-2">意图</th><th class="pb-2">Agent</th><th class="pb-2">模型</th><th class="pb-2">Token</th><th class="pb-2">估算成本</th><th class="pb-2">状态</th><th class="pb-2">操作</th></tr></thead>
                 <tbody>
                   ${items.map(t => `
                     <tr class="border-b border-slate-50 last:border-0 hover:bg-slate-50">
@@ -3137,6 +3455,9 @@
                       <td class="py-2 text-slate-500">${fmtTime(t.created_at)}</td>
                       <td class="py-2">${escapeHtml(t.intent || '-')}</td>
                       <td class="py-2">${escapeHtml(t.agent_name || '-')}</td>
+                      <td class="py-2">${escapeHtml(t.model_id || '-')}</td>
+                      <td class="py-2">${fmtTokens(t.total_tokens)}</td>
+                      <td class="py-2">${fmtCost(t.estimated_cost_cny)}</td>
                       <td class="py-2">${statusBadgeSmall(t.status)}</td>
                       <td class="py-2"><button type="button" data-trace="${escapeHtml(t.trace_id)}" class="cg-trace-detail px-2 py-1 bg-brand-50 text-brand-600 rounded-lg text-xs hover:bg-brand-100">查看账单</button></td>
                     </tr>
@@ -3157,7 +3478,17 @@
           const breakdown = data.context_breakdown || {};
           const totalCost = modelCalls.reduce((sum, c) => sum + (c.estimated_cost_cny || 0), 0);
           const totalTokens = modelCalls.reduce((sum, c) => sum + (c.total_tokens || 0), 0);
-          const callsHtml = modelCalls.map(c => `
+          const callsHtml = modelCalls.map(c => {
+            const formula = c.formula || (
+              `cost = input_tokens * input_price + output_tokens * output_price + reasoning_tokens * reasoning_price - cached_tokens * cached_discount`
+            );
+            const formulaDetail = [
+              c.input_price_per_1m ? `输入价 ¥${c.input_price_per_1m}/M` : null,
+              c.output_price_per_1m ? `输出价 ¥${c.output_price_per_1m}/M` : null,
+              c.reasoning_price_per_1m ? `推理价 ¥${c.reasoning_price_per_1m}/M` : null,
+              c.cached_input_price_per_1m ? `缓存价 ¥${c.cached_input_price_per_1m}/M` : null
+            ].filter(Boolean).join(' · ') || '价格未配置';
+            return `
             <div class="border border-slate-200 rounded-xl p-3 mb-2 text-sm">
               <div class="flex items-center justify-between mb-1">
                 <span class="font-medium text-slate-900">${escapeHtml(c.stage)} · ${escapeHtml(c.model_id)}</span>
@@ -3166,9 +3497,16 @@
               <div class="text-xs text-slate-500">耗时 ${c.latency_ms || 0}ms · 模型选择原因：${escapeHtml(c.model_selection_reason || '-')}</div>
               <div class="text-xs text-slate-500 mt-1">Token: 输入 ${fmtTokens(c.input_tokens)} / 输出 ${fmtTokens(c.output_tokens)} / 推理 ${fmtTokens(c.reasoning_tokens)} / 缓存 ${fmtTokens(c.cached_tokens)} / 总计 ${fmtTokens(c.total_tokens)}</div>
               <div class="text-xs text-slate-700 mt-1">估算成本：${fmtCost(c.estimated_cost_cny)}</div>
+              <details class="mt-2">
+                <summary class="text-xs text-brand-600 cursor-pointer hover:text-brand-700">成本计算公式</summary>
+                <div class="mt-1 p-2 bg-slate-50 rounded-lg border border-slate-200">
+                  <div class="text-xs text-slate-700 font-mono">${escapeHtml(formula)}</div>
+                  <div class="text-[10px] text-slate-500 mt-1">${escapeHtml(formulaDetail)}</div>
+                </div>
+              </details>
               ${c.error_summary ? `<div class="text-xs text-red-600 mt-1">错误：${escapeHtml(c.error_summary)}</div>` : ''}
             </div>
-          `).join('');
+          `;}).join('');
           const mcpHtml = mcpCalls.length ? mcpCalls.map(c => `
             <div class="border border-slate-200 rounded-xl p-3 mb-2 text-sm">
               <div class="flex items-center justify-between mb-1">
@@ -3434,11 +3772,20 @@
               ${renderTrends()}
               ${renderDistribution()}
             </div>
+            <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              ${renderModelChart()}
+              ${renderStageChart()}
+            </div>
             ${renderTraces()}
             ${renderPrices()}
             ${renderBudget()}
             ${renderStrategy()}
             ${renderCostCases()}
+            <div class="bg-white rounded-2xl shadow-soft border border-slate-200 p-4">
+              <h3 class="font-semibold text-slate-900 mb-2">成本治理策略详情</h3>
+              <p class="text-sm text-slate-600 mb-3">查看 COST-01 ~ COST-04 四则成本优化策略的说明、收益估算与执行入口。</p>
+              <button id="cg-open-strategy-page" type="button" class="px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white rounded-lg text-sm transition-colors">查看策略页</button>
+            </div>
           </div>
         `;
         bindEvents();
@@ -3467,11 +3814,189 @@
         $('#cg-edit-budget').addEventListener('click', openBudgetModal);
         $('#cg-run-cost01').addEventListener('click', runCost01);
         $('#cg-run-cost02').addEventListener('click', runCost02);
+        const strategyBtn = $('#cg-open-strategy-page');
+        if (strategyBtn) strategyBtn.addEventListener('click', () => {
+          STATE.subTab = 'cost-strategy';
+          renderSidebar();
+          renderContent();
+        });
       }
 
       await loadAll();
       renderPage();
     }
+
+    async function renderCostStrategyPage(container) {
+      async function runCost01() {
+        const resultEl = $('#strategy-cost01-result');
+        resultEl.innerHTML = '<span class="text-slate-400">执行中...</span>';
+        try {
+          const query = '我要投诉楼下噪音太大，物业不作为';
+          const r = await apiPost('/api/model-configs/ab-test', { prompt: query });
+          const fmt = (d, name) => {
+            if (d.error) return `<div class="text-red-600">${name} 失败：${escapeHtml(d.error)}</div>`;
+            return `<div><span class="font-medium">${name}</span> · Token ${fmtTokens(d.total_tokens)} · 耗时 ${d.latency_ms || 0}ms · 估算 ${fmtCost(d.estimated_cost_cny)} · usage ${escapeHtml(d.usage_source || '-')}</div>`;
+          };
+          resultEl.innerHTML = `
+            <div>trace: ${escapeHtml(r.trace_id || '-')}</div>
+            ${fmt(r.model_a_result, 'Flash')}
+            ${fmt(r.model_b_result, 'Pro')}
+          `;
+        } catch (err) {
+          resultEl.innerHTML = '<span class="text-red-600">执行失败：' + escapeHtml(err.message || err) + '</span>';
+        }
+      }
+
+      async function runCost02() {
+        const resultEl = $('#strategy-cost02-result');
+        resultEl.innerHTML = '<span class="text-slate-400">执行中...</span>';
+        try {
+          const original = await apiGet('/api/knowledge/retrieval-settings');
+          const origTopK = original.top_k;
+          const query = '维修收费标准是什么';
+          const run = async (k) => {
+            await apiPut('/api/knowledge/retrieval-settings', { ...original, top_k: k });
+            const res = await apiPost('/api/retrieval/search', { query, top_k: k });
+            return { k, citations: res.citations || [], tokenCount: (res.citations || []).reduce((s, c) => s + (c.content || '').length, 0) };
+          };
+          const r1 = await run(1);
+          const r5 = await run(5);
+          await apiPut('/api/knowledge/retrieval-settings', { ...original, top_k: origTopK });
+          resultEl.innerHTML = `
+            <div>Top-K=1：引用 ${r1.citations.length} 条 · 文本长度 ${r1.tokenCount} 字</div>
+            <div>Top-K=5：引用 ${r5.citations.length} 条 · 文本长度 ${r5.tokenCount} 字</div>
+            <div class="text-slate-400">测试后已恢复 top_k=${origTopK}</div>
+          `;
+        } catch (err) {
+          resultEl.innerHTML = '<span class="text-red-600">执行失败</span>';
+        }
+      }
+
+      function showExample(title, body) {
+        openModal(title, body, null, '关闭');
+      }
+
+      const page = `
+        <div class="max-w-6xl mx-auto p-4 md:p-6 space-y-5">
+          ${pageHeader('成本优化策略（COST-01 ~ COST-04）', '四则 Token 与成本治理策略：模型分层、RAG 精度、Skill 命中、MCP 摘要').replace('sticky top-0 z-10', 'relative')}
+
+          <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div class="bg-white rounded-2xl shadow-soft border border-slate-200 p-5">
+              <div class="flex items-center gap-2 mb-3">
+                <span class="px-2 py-1 bg-brand-50 text-brand-700 rounded-lg text-xs font-medium">COST-01</span>
+                <h3 class="font-semibold text-slate-900">模型分层：Flash 与 Pro 分流</h3>
+              </div>
+              <p class="text-sm text-slate-600 mb-3">对同一固定投诉问题分别调用轻量模型（Flash）与重模型（Pro），比较 Token、耗时与估算成本。质量判断由人工记录，用于确定不同链路的默认模型。</p>
+              <ul class="text-xs text-slate-500 list-disc list-inside mb-3 space-y-1">
+                <li>业主常规问答默认 Flash，降低 80% 以上单轮成本。</li>
+                <li>Darwin 深度分析、A/B 测试使用 Pro。</li>
+                <li>不推荐在常规链路默认使用 Pro。</li>
+              </ul>
+              <button id="strategy-cost01-run" type="button" class="px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white rounded-lg text-sm transition-colors">执行对比</button>
+              <div id="strategy-cost01-result" class="mt-3 text-xs text-slate-600 space-y-1"></div>
+            </div>
+
+            <div class="bg-white rounded-2xl shadow-soft border border-slate-200 p-5">
+              <div class="flex items-center gap-2 mb-3">
+                <span class="px-2 py-1 bg-brand-50 text-brand-700 rounded-lg text-xs font-medium">COST-02</span>
+                <h3 class="font-semibold text-slate-900">RAG Top-K：精度与成本平衡</h3>
+              </div>
+              <p class="text-sm text-slate-600 mb-3">对固定知识库问题分别以 Top-K=1 与 Top-K=5 检索，比较引用数量、上下文文本长度与 Token 成本。测试后自动恢复原配置。</p>
+              <ul class="text-xs text-slate-500 list-disc list-inside mb-3 space-y-1">
+                <li>Top-K 越大，RAG 上下文越长，模型成本越高。</li>
+                <li>建议结合相关性阈值动态截断，而非固定高 K。</li>
+                <li>对于 FAQ 类问题，Top-K=1 通常足够。</li>
+              </ul>
+              <button id="strategy-cost02-run" type="button" class="px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white rounded-lg text-sm transition-colors">执行对比</button>
+              <div id="strategy-cost02-result" class="mt-3 text-xs text-slate-600 space-y-1"></div>
+            </div>
+
+            <div class="bg-white rounded-2xl shadow-soft border border-slate-200 p-5">
+              <div class="flex items-center gap-2 mb-3">
+                <span class="px-2 py-1 bg-brand-50 text-brand-700 rounded-lg text-xs font-medium">COST-03</span>
+                <h3 class="font-semibold text-slate-900">Skill 触发命中：避免无效注入</h3>
+              </div>
+              <p class="text-sm text-slate-600 mb-3">Skill/Prompt 仅应在命中触发条件时注入上下文；未命中时 Skill 内容不应进入模型输入。通过触发关键词或意图匹配减少无效 Token。</p>
+              <ul class="text-xs text-slate-500 list-disc list-inside mb-3 space-y-1">
+                <li>每条 Skill 配置明确的 trigger_keywords 与适用 Agent。</li>
+                <li>命中时：注入 Skill Prompt，可能提升准确率。</li>
+                <li>未命中时：完全不注入，避免每次请求都增加上下文。</li>
+              </ul>
+              <button id="strategy-cost03-example" type="button" class="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg text-sm transition-colors">查看示例</button>
+            </div>
+
+            <div class="bg-white rounded-2xl shadow-soft border border-slate-200 p-5">
+              <div class="flex items-center gap-2 mb-3">
+                <span class="px-2 py-1 bg-brand-50 text-brand-700 rounded-lg text-xs font-medium">COST-04</span>
+                <h3 class="font-semibold text-slate-900">MCP 结果摘要：控制工具响应长度</h3>
+              </div>
+              <p class="text-sm text-slate-600 mb-3">MCP 工具原始结果通常包含大量字段，直接带入后续上下文会显著增加 Token。应在工具节点后增加摘要步骤，仅保留必要信息。</p>
+              <ul class="text-xs text-slate-500 list-disc list-inside mb-3 space-y-1">
+                <li>原始结果：全量 JSON，可能数千 Token。</li>
+                <li>摘要后结果：保留关键字段，通常只有数百 Token。</li>
+                <li>在成本敏感链路中，优先使用摘要后结果。</li>
+              </ul>
+              <button id="strategy-cost04-example" type="button" class="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg text-sm transition-colors">查看示例</button>
+            </div>
+          </div>
+
+          <div class="bg-white rounded-2xl shadow-soft border border-slate-200 p-5">
+            <h3 class="font-semibold text-slate-900 mb-3">策略收益估算公式</h3>
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-4 text-sm text-slate-600">
+              <div class="bg-slate-50 rounded-xl p-3 border border-slate-200">
+                <div class="font-medium text-slate-900 mb-1">Flash 替代 Pro 收益</div>
+                <div class="font-mono text-xs">saved = calls × (cost_pro - cost_flash)</div>
+              </div>
+              <div class="bg-slate-50 rounded-xl p-3 border border-slate-200">
+                <div class="font-medium text-slate-900 mb-1">RAG Top-K 降低收益</div>
+                <div class="font-mono text-xs">saved = calls × (tokens_k5 - tokens_k1) × input_price</div>
+              </div>
+              <div class="bg-slate-50 rounded-xl p-3 border border-slate-200">
+                <div class="font-medium text-slate-900 mb-1">Skill 未命中收益</div>
+                <div class="font-mono text-xs">saved = miss_calls × skill_prompt_tokens × input_price</div>
+              </div>
+              <div class="bg-slate-50 rounded-xl p-3 border border-slate-200">
+                <div class="font-medium text-slate-900 mb-1">MCP 摘要收益</div>
+                <div class="font-mono text-xs">saved = calls × (raw_tokens - summary_tokens) × input_price</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      `;
+      container.innerHTML = page;
+      $('#strategy-cost01-run').addEventListener('click', runCost01);
+      $('#strategy-cost02-run').addEventListener('click', runCost02);
+      $('#strategy-cost03-example').addEventListener('click', () => showExample('COST-03 示例：Skill 命中与不命中', `
+        <div class="space-y-3 text-sm text-slate-700">
+          <div class="bg-slate-50 rounded-lg p-3 border border-slate-200">
+            <div class="font-medium text-slate-900 mb-1">场景</div>
+            <div>业主问："物业费怎么交？"</div>
+            <div>Skill「投诉处理」触发关键词：投诉 / 噪音 / 漏水 / 态度差</div>
+          </div>
+          <div class="bg-green-50 rounded-lg p-3 border border-green-100">
+            <div class="font-medium text-green-800 mb-1">未命中：不注入投诉处理 Skill</div>
+            <div>输入上下文仅保留 FAQ 回答，节省约 800 Token。</div>
+          </div>
+          <div class="bg-amber-50 rounded-lg p-3 border border-amber-100">
+            <div class="font-medium text-amber-800 mb-1">命中：注入投诉处理 Skill</div>
+            <div>业主问："我要投诉保安态度差" → 注入 Skill Prompt，提升处理准确率。</div>
+          </div>
+        </div>
+      `));
+      $('#strategy-cost04-example').addEventListener('click', () => showExample('COST-04 示例：MCP 结果摘要', `
+        <div class="space-y-3 text-sm text-slate-700">
+          <div class="bg-slate-50 rounded-lg p-3 border border-slate-200">
+            <div class="font-medium text-slate-900 mb-1">原始工具结果（约 2500 Token）</div>
+            <pre class="text-xs bg-white p-2 rounded border border-slate-200 overflow-x-auto">{ "orders": [ { "id": "O1001", "status": "pending", "items": [...], "logs": [...] }, ... ] }</pre>
+          </div>
+          <div class="bg-green-50 rounded-lg p-3 border border-green-100">
+            <div class="font-medium text-green-800 mb-1">摘要后进入上下文（约 200 Token）</div>
+            <div>查得 3 条未完成工单：O1001 维修待派单、O1002 保洁已分配、O1003 投诉处理中。</div>
+          </div>
+        </div>
+      `));
+    }
+
 
     async function renderAgentsPage(container) {
       container.innerHTML = `
