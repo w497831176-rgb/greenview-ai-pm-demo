@@ -522,7 +522,7 @@ async def publish_skill_prompt_draft_endpoint(
         raise HTTPException(status_code=404, detail="draft not found")
 
     target_skill_id = request.target_skill_id or draft.get("skill_id")
-    now = datetime.now(UTC).isoformat()
+    now = datetime.now(timezone.utc).isoformat()
     if target_skill_id:
         existing = get_skill(target_skill_id)
         # Use imported alias db_update_skill.
@@ -577,7 +577,7 @@ async def accept_capability_gap_endpoint(
     if not draft or draft.get("badcase_id") != case_id:
         raise HTTPException(status_code=404, detail="draft not found")
 
-    now = datetime.now(UTC).isoformat()
+    now = datetime.now(timezone.utc).isoformat()
     db_update_capability_gap_draft(
         draft_id,
         status="accepted",
