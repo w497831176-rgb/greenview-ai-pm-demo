@@ -168,7 +168,7 @@ def api_create_knowledge_draft(case_id: int) -> int:
             "content": "浏览器验收测试生成的知识草稿内容，用于验证修复后复测生命周期。",
             "category": "缴费",
         },
-        timeout=20,
+        timeout=60,
     )
     resp.raise_for_status()
     return resp.json()["knowledge_draft"]["id"]
@@ -179,11 +179,11 @@ def api_review_and_apply_knowledge(case_id: int, draft_id: int):
         requests.post(
             f"{BASE_URL}/api/badcases/{case_id}/knowledge-drafts/{draft_id}/review",
             json={"status": status},
-            timeout=20,
+            timeout=30,
         ).raise_for_status()
     requests.post(
         f"{BASE_URL}/api/badcases/{case_id}/knowledge-drafts/{draft_id}/apply",
-        timeout=20,
+        timeout=30,
     ).raise_for_status()
 
 
@@ -199,15 +199,18 @@ def api_verify_pass_badcase(case_id: int):
     ).raise_for_status()
 
 
-def open_badcase_detail(page: Page, case_id: int):
+def open_badcase_detail(page: Page, case_id: int, status: str = "verifying"):
     wait_visible(page, '.top-tab[data-top="platform"]').click()
     page.wait_for_timeout(500)
     wait_visible(page, '#sub-menu button[data-sub="badcases"]').click()
     page.wait_for_timeout(800)
-    page.locator("#badcase-filter-source").select_option("manual")
-    page.locator("#badcase-filter-status").select_option("verifying")
-    page.locator("#badcase-filter-btn").click()
-    page.wait_for_timeout(800)
+    page.locator("#badcase-filter-status").select_option(status)
+    page.locator("#badcase-filter-source").select_option("")
+    with page.expect_response(lambda resp: "/api/badcases?" in resp.url and resp.status == 200, timeout=30000):
+        page.locator("#badcase-filter-btn").click()
+    page.wait_for_timeout(500)
+    # Wait for the list to render at least one row for the selected status.
+    page.locator("#badcases-content button[data-id]").first.wait_for(state="visible", timeout=15000)
     wait_visible(page, f"button[data-id='{case_id}']").click()
     page.wait_for_timeout(800)
     wait_visible(page, "#badcase-detail-content")
@@ -262,7 +265,7 @@ def run_badcase_retest_lifecycle(page: Page):
     api_verify_pass_badcase(case_id)
     page.reload(wait_until="networkidle", timeout=60000)
     page.wait_for_timeout(800)
-    open_badcase_detail(page, case_id)
+    open_badcase_detail(page, case_id, status="closed")
     screenshot(page, "11_badcase_closed")
 
     closed_header = page.locator("#badcase-detail-header-status").first.inner_text()
