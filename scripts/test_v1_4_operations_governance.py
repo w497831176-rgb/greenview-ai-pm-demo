@@ -246,6 +246,12 @@ def run(base_url: str) -> int:
         draft_a = next(d for d in detail["knowledge_drafts"] if d["id"] == draft_a_id)
         check("A draft approved", lambda: draft_a.get("status") == "approved")
 
+        # Retest while still in fixing
+        retest_resp = c.post(f"/api/badcases/{case_a_id}/retest")
+        detail = c.get(f"/api/badcases/{case_a_id}")["badcase"]
+        check("A still fixing after retest", lambda: detail["status"] == "fixing")
+        check("A retest_response present", lambda: bool(detail.get("retest_response")))
+
         # Apply knowledge draft
         apply_resp = c.post(f"/api/badcases/{case_a_id}/knowledge-drafts/{draft_a_id}/apply")
         doc = apply_resp.get("knowledge_doc") or {}
@@ -261,12 +267,6 @@ def run(base_url: str) -> int:
         found = any(TEST_PREFIX in (r.get("title") or r.get("content") or "") for r in search_results.get("results", []))
         check("A knowledge doc searchable", lambda: found)
 
-        # Retest
-        retest_resp = c.post(f"/api/badcases/{case_a_id}/retest")
-        detail = c.get(f"/api/badcases/{case_a_id}")["badcase"]
-        check("A status moved to verifying after retest", lambda: detail["status"] == "verifying")
-        check("A retest_response present", lambda: bool(detail.get("retest_response")))
-
         # Verify-pass -> closed
         c.post(f"/api/badcases/{case_a_id}/verify", {"passed": True, "note": "验收通过"})
         detail = c.get(f"/api/badcases/{case_a_id}")["badcase"]
@@ -274,7 +274,7 @@ def run(base_url: str) -> int:
         check("A terminal has no actions", lambda: detail["allowed_actions"] == [])
 
         # ------------------------------------------------------------------
-        # B. Skill prompt path: classify -> Darwin -> draft -> publish -> chat verify
+        # B. Skill prompt path: classify -> Darwin -> draft -> retest -> publish -> chat verify
         # ------------------------------------------------------------------
         print("\n[B] Skill prompt path")
         case_b = new_case("Skill Prompt 绑定", category="skill_prompt")
@@ -291,71 +291,74 @@ def run(base_url: str) -> int:
         detail = c.get(f"/api/badcases/{case_b_id}")["badcase"]
 
         if not detail.get("skill_prompt_drafts"):
-            # Seed a skill prompt draft manually
-            c.post(f"/api/badcases/{case_b_id}/extract-knowledge", {"title": "tmp", "content": "tmp"})
-            # The extract-knowledge endpoint only creates knowledge drafts; we need a skill draft.
-            # Use the legacy/manual path: create a skill_prompt_draft via a direct review trigger is not possible.
-            # Instead, create the skill draft by directly invoking darwin if it failed, or skip this section.
-            raise AssertionError("no skill_prompt draft available and Darwin failed; cannot proceed with skill prompt test")
+            # Seed a skill prompt draft manually via a lightweight endpoint is not available.
+            # Mark section as failed gracefully so cleanup still runs.
+            check("B skill_prompt draft exists", lambda: False)
 
-        skill_draft = detail["skill_prompt_drafts"][0]
-        skill_draft_id = skill_draft["id"]
+        if detail.get("skill_prompt_drafts"):
+            skill_draft = detail["skill_prompt_drafts"][0]
+            skill_draft_id = skill_draft["id"]
 
-        # Edit skill draft with a unique trigger keyword
-        trigger_kw = "V140_SKILL_TRIGGER"
-        original_query = f"请使用测试技能 {trigger_kw}"
-        c.put(f"/api/badcases/{case_b_id}/skill-prompt-drafts/{skill_draft_id}", {
-            "title": f"{TEST_PREFIX}Skill草稿",
-            "skill_name": f"{TEST_PREFIX}测试Skill",
-            "prompt_content": f"当用户消息包含 '{trigger_kw}' 时，请在回答中明确提到 '{TEST_PREFIX}测试Skill已激活' 并给出简短确认。",
-            "trigger_keywords": trigger_kw,
-        })
-
-        # Review to approved
-        c.post(f"/api/badcases/{case_b_id}/skill-prompt-drafts/{skill_draft_id}/review", {"status": "under_review"})
-        c.post(f"/api/badcases/{case_b_id}/skill-prompt-drafts/{skill_draft_id}/review", {"status": "approved"})
-        detail = c.get(f"/api/badcases/{case_b_id}")["badcase"]
-        skill_draft = next(d for d in detail["skill_prompt_drafts"] if d["id"] == skill_draft_id)
-        check("B skill draft approved", lambda: skill_draft.get("status") == "approved")
-
-        # Record original agent skills before binding
-        original_agent_skills = c.get(f"/api/agents/{target_agent_id}")["agent"].get("skill_ids", [])
-
-        # Publish skill draft to target agent
-        publish_resp = c.post(
-            f"/api/badcases/{case_b_id}/skill-prompt-drafts/{skill_draft_id}/apply",
-            {"target_agent_id": target_agent_id},
-        )
-        detail = c.get(f"/api/badcases/{case_b_id}")["badcase"]
-        check("B case moved to verifying", lambda: detail["status"] == "verifying")
-
-        # Verify skill created and agent binding exists
-        agent_detail = c.get(f"/api/agents/{target_agent_id}")["agent"]
-        created_skill_id = None
-        for sid in agent_detail.get("skill_ids", []):
-            skill = c.get(f"/api/skills/{sid}").get("skill", {})
-            if TEST_PREFIX in (skill.get("name") or ""):
-                created_skill_id = sid
-                break
-        check("B skill created and bound to agent", lambda: created_skill_id is not None)
-        if created_skill_id:
-            created_skill_ids.append(created_skill_id)
-            created_agent_skill_bindings.append({
-                "agent_id": target_agent_id,
-                "skill_id": created_skill_id,
-                "original_skill_ids": original_agent_skills,
+            # Edit skill draft with a unique trigger keyword
+            trigger_kw = "V140_SKILL_TRIGGER"
+            original_query = f"请使用测试技能 {trigger_kw}"
+            c.put(f"/api/badcases/{case_b_id}/skill-prompt-drafts/{skill_draft_id}", {
+                "title": f"{TEST_PREFIX}Skill草稿",
+                "skill_name": f"{TEST_PREFIX}测试Skill",
+                "prompt_content": f"当用户消息包含 '{trigger_kw}' 时，请在回答中明确提到 '{TEST_PREFIX}测试Skill已激活' 并给出简短确认。",
+                "trigger_keywords": trigger_kw,
             })
 
-        # Send original_query via chat and verify skill mention or activation
-        chat_resp = chat_sse(c, original_query)
-        activated = chat_resp.get("done", {}).get("activated_skills", []) or []
-        text = chat_resp.get("text", "")
-        skill_mentioned = (
-            any(TEST_PREFIX in (s.get("name") or s) for s in activated)
-            or TEST_PREFIX in text
-            or trigger_kw in text
-        )
-        check("B chat response mentions skill or activated_skills", lambda: skill_mentioned)
+            # Review to approved
+            c.post(f"/api/badcases/{case_b_id}/skill-prompt-drafts/{skill_draft_id}/review", {"status": "under_review"})
+            c.post(f"/api/badcases/{case_b_id}/skill-prompt-drafts/{skill_draft_id}/review", {"status": "approved"})
+            detail = c.get(f"/api/badcases/{case_b_id}")["badcase"]
+            skill_draft = next(d for d in detail["skill_prompt_drafts"] if d["id"] == skill_draft_id)
+            check("B skill draft approved", lambda: skill_draft.get("status") == "approved")
+
+            # Retest before publish
+            c.post(f"/api/badcases/{case_b_id}/retest")
+            detail = c.get(f"/api/badcases/{case_b_id}")["badcase"]
+            check("B retest_response present", lambda: bool(detail.get("retest_response")))
+
+            # Record original agent skills before binding
+            original_agent_skills = c.get(f"/api/agents/{target_agent_id}")["agent"].get("skill_ids", [])
+
+            # Publish skill draft to target agent
+            publish_resp = c.post(
+                f"/api/badcases/{case_b_id}/skill-prompt-drafts/{skill_draft_id}/apply",
+                {"target_agent_id": target_agent_id},
+            )
+            detail = c.get(f"/api/badcases/{case_b_id}")["badcase"]
+            check("B case moved to verifying", lambda: detail["status"] == "verifying")
+
+            # Verify skill created and agent binding exists
+            agent_detail = c.get(f"/api/agents/{target_agent_id}")["agent"]
+            created_skill_id = None
+            for sid in agent_detail.get("skill_ids", []):
+                skill = c.get(f"/api/skills/{sid}").get("skill", {})
+                if TEST_PREFIX in (skill.get("name") or ""):
+                    created_skill_id = sid
+                    break
+            check("B skill created and bound to agent", lambda: created_skill_id is not None)
+            if created_skill_id:
+                created_skill_ids.append(created_skill_id)
+                created_agent_skill_bindings.append({
+                    "agent_id": target_agent_id,
+                    "skill_id": created_skill_id,
+                    "original_skill_ids": original_agent_skills,
+                })
+
+            # Send original_query via chat and verify skill mention or activation
+            chat_resp = chat_sse(c, original_query)
+            activated = chat_resp.get("done", {}).get("activated_skills", []) or []
+            text = chat_resp.get("text", "")
+            skill_mentioned = (
+                any(TEST_PREFIX in (s.get("name") or s) for s in activated)
+                or TEST_PREFIX in text
+                or trigger_kw in text
+            )
+            check("B chat response mentions skill or activated_skills", lambda: skill_mentioned)
 
         # ------------------------------------------------------------------
         # C. MCP capability gap: classify -> Darwin -> gap draft -> apply -> stays fixing
@@ -372,19 +375,20 @@ def run(base_url: str) -> int:
         check("C status is fixing", lambda: detail["status"] == "fixing")
 
         if not detail.get("capability_gap_drafts"):
-            raise AssertionError("no capability_gap draft available; cannot proceed with capability gap test")
+            check("C capability_gap draft exists", lambda: False)
 
-        gap_draft = detail["capability_gap_drafts"][0]
-        gap_draft_id = gap_draft["id"]
+        if detail.get("capability_gap_drafts"):
+            gap_draft = detail["capability_gap_drafts"][0]
+            gap_draft_id = gap_draft["id"]
 
-        # Review and apply
-        c.post(f"/api/badcases/{case_c_id}/capability-gap-drafts/{gap_draft_id}/review", {"status": "under_review"})
-        c.post(f"/api/badcases/{case_c_id}/capability-gap-drafts/{gap_draft_id}/review", {"status": "approved"})
-        c.post(f"/api/badcases/{case_c_id}/capability-gap-drafts/{gap_draft_id}/apply")
-        detail = c.get(f"/api/badcases/{case_c_id}")["badcase"]
-        gap_draft = next(d for d in detail["capability_gap_drafts"] if d["id"] == gap_draft_id)
-        check("C case stays fixing", lambda: detail["status"] == "fixing")
-        check("C gap draft accepted", lambda: gap_draft.get("status") == "accepted")
+            # Review and apply
+            c.post(f"/api/badcases/{case_c_id}/capability-gap-drafts/{gap_draft_id}/review", {"status": "under_review"})
+            c.post(f"/api/badcases/{case_c_id}/capability-gap-drafts/{gap_draft_id}/review", {"status": "approved"})
+            c.post(f"/api/badcases/{case_c_id}/capability-gap-drafts/{gap_draft_id}/apply")
+            detail = c.get(f"/api/badcases/{case_c_id}")["badcase"]
+            gap_draft = next(d for d in detail["capability_gap_drafts"] if d["id"] == gap_draft_id)
+            check("C case stays fixing", lambda: detail["status"] == "fixing")
+            check("C gap draft accepted", lambda: gap_draft.get("status") == "accepted")
 
         # ------------------------------------------------------------------
         # D. Verifying without retest_response: verify-pass should be blocked
