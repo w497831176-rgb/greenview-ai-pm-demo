@@ -8,10 +8,15 @@
 
 ## 第一步：只读诊断
 
-1. 读取仓库 `https://github.com/w497831176-rgb/greenview-ai-pm-demo` 的 Git main 最新代码。
-2. 阅读以下两份交接文档（位于 `docs/handover/`）：
-   - `project-context-v1.3.3.md`
-   - `badcase-current-state-and-known-issues.md`
+1. 拉取交接分支：
+   ```bash
+   git fetch origin docs/yiai-property-handover-v1.3.3
+   ```
+2. 通过 Git 读取以下两份交接文档（它们**不在 main**，只在 `docs/yiai-property-handover-v1.3.3`）：
+   ```bash
+   git show origin/docs/yiai-property-handover-v1.3.3:docs/handover/project-context-v1.3.3.md
+   git show origin/docs/yiai-property-handover-v1.3.3:docs/handover/badcase-current-state-and-known-issues.md
+   ```
 3. 在**不修改任何代码**的前提下，输出你对当前架构、Badcase 状态机、已知问题的理解摘要。
 4. 不要立即写代码、不要立即部署、不要立即修复。
 

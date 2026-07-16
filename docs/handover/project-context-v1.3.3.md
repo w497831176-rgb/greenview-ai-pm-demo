@@ -20,18 +20,24 @@
 
 - **后端**：Python 3.12 + FastAPI + Agno Agent 框架，入口 `app/main.py`。
 - **前端**：单文件 `frontend/index.html` + Nginx 静态托管，使用本地 `tailwindcss.js` 与 `marked.min.js`，无外部 CDN。
-- **数据库**：Postgres 16 + pgvector（容器 `demo-os-db`），端口 `5433:5432`；同时保留 SQLite 运行时数据在 `/app/data/property_demo.db`（bind mount 到 `/volume1/docker/volumes/agno-demo-os/property-data`）。
-- **向量索引**：RAG 使用本地向量索引，索引文件保存在 `/app/data/rag_index`。
 
-### 2.2 Docker 服务
+### 2.2 数据层（重要）
+
+- **项目代码 / Git / compose**：位于 NAS `/volume3/docker/agno-demo-os`。
+- **demo-os-api 源码挂载**：`/volume3/docker/agno-demo-os` bind mount 到容器 `/app`，api 容器内代码变更随宿主机同步，无需 rebuild api 镜像。
+- **物业 Demo 业务事实数据**：实际使用 SQLite，路径为 `/volume1/docker/volumes/agno-demo-os/property-data/property_demo.db`。工单、知识文档、Badcase、Skill、Agent、Trace 等物业运行数据均以该 SQLite 为准。
+- **本地 RAG 索引**：位于 `/volume1/docker/volumes/agno-demo-os/property-data/rag_index`。
+- **Postgres/pgvector**：`demo-os-db` 容器运行，数据卷 `/volume3/docker/volumes/agno-demo-os/pgdata`，端口 `5433:5432`。它是 AgentOS 相关依赖，**不是**物业业务知识库的事实数据源。
+
+### 2.3 Docker 服务
 
 服务名与角色：
 
 - `demo-os-db`：Postgres/pgvector，数据卷 `/volume3/docker/volumes/agno-demo-os/pgdata`。
 - `demo-os-api`：FastAPI 服务，源代码通过 `.:/app` bind mount 热重载；运行时命令 `uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload`。
-- `demo-os-web`：Nginx 静态前端，端口 `18005:80`。
+- `demo-os-web`：Nginx 静态前端，端口 `18005:80`。**无源码 bind mount**，`frontend/index.html` 更新后必须 rebuild `demo-os-web` 镜像才能生效。
 
-### 2.3 NAS 部署约束
+### 2.4 NAS 部署约束
 
 - 仅通过 `docker compose` 管理容器，不直接使用 `docker run`。
 - compose 文件位于 `/volume3/docker/agno-demo-os/compose.yaml`。
@@ -74,7 +80,9 @@
 | `calendar-server` | `customer_service` | 当前日期、预约时间建议（只读） |
 | `workorder-server` | `maintenance` | 工单数量、待办列表等只读查询 |
 
-当前所有 MCP 工具均为只读；写操作（如指派工单、预约上门）属于能力缺口，系统会如实告知无法完成，并生成 `capability_gap` 草稿进入产品待办。
+当前所有 MCP 工具均为只读。聊天中发现缺少写操作（如指派工单、预约上门）时，系统只会如实告知当前无法完成，**不会**在聊天阶段自动创建能力缺口草稿。
+
+正确路径是：人工点踩或手工创建 Badcase → 分类为 `mcp_capability` → 执行 Darwin 分析 → 生成 `capability_gap` 草稿 → 人工确认并记录为产品待办。
 
 ### 3.5 Trace 与成本
 
