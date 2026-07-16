@@ -160,6 +160,119 @@ def run_platform_badcase(page: Page):
     results.append({"check": "classified badcase action buttons visible", "ok": True})
 
 
+def api_create_knowledge_draft(case_id: int) -> int:
+    resp = requests.post(
+        f"{BASE_URL}/api/badcases/{case_id}/extract-knowledge",
+        json={
+            "title": f"BROWSER_V141_知识草稿_{int(time.time())}",
+            "content": "浏览器验收测试生成的知识草稿内容，用于验证修复后复测生命周期。",
+            "category": "缴费",
+        },
+        timeout=60,
+    )
+    resp.raise_for_status()
+    return resp.json()["knowledge_draft"]["id"]
+
+
+def api_review_and_apply_knowledge(case_id: int, draft_id: int):
+    for status in ("under_review", "approved"):
+        requests.post(
+            f"{BASE_URL}/api/badcases/{case_id}/knowledge-drafts/{draft_id}/review",
+            json={"status": status},
+            timeout=30,
+        ).raise_for_status()
+    requests.post(
+        f"{BASE_URL}/api/badcases/{case_id}/knowledge-drafts/{draft_id}/apply",
+        timeout=30,
+    ).raise_for_status()
+
+
+def api_retest_badcase(case_id: int):
+    requests.post(f"{BASE_URL}/api/badcases/{case_id}/retest", timeout=120).raise_for_status()
+
+
+def api_verify_pass_badcase(case_id: int):
+    requests.post(
+        f"{BASE_URL}/api/badcases/{case_id}/verify",
+        json={"passed": True, "note": "浏览器验收通过"},
+        timeout=20,
+    ).raise_for_status()
+
+
+def open_badcase_detail(page: Page, case_id: int, status: str = "verifying"):
+    wait_visible(page, '.top-tab[data-top="platform"]').click()
+    page.wait_for_timeout(500)
+    wait_visible(page, '#sub-menu button[data-sub="badcases"]').click()
+    page.wait_for_timeout(800)
+    page.locator("#badcase-filter-status").select_option(status)
+    page.locator("#badcase-filter-source").select_option("")
+    with page.expect_response(lambda resp: "/api/badcases?" in resp.url and resp.status == 200, timeout=30000):
+        page.locator("#badcase-filter-btn").click()
+    page.wait_for_timeout(500)
+    # Wait for the list to render at least one row for the selected status.
+    page.locator("#badcases-content button[data-id]").first.wait_for(state="visible", timeout=15000)
+    wait_visible(page, f"button[data-id='{case_id}']").click()
+    page.wait_for_timeout(800)
+    wait_visible(page, "#badcase-detail-content")
+
+
+def run_badcase_retest_lifecycle(page: Page):
+    print("  [badcase lifecycle] create knowledge_gap case via API")
+    ts = str(int(time.time()))
+    case_id = api_create_badcase(f"DEMO_TEST_V141_LIFECYCLE_{ts}", category="knowledge_gap")
+
+    requests.post(
+        f"{BASE_URL}/api/badcases/{case_id}/classify",
+        json={"auto": False, "category": "knowledge_gap", "reason": "browser test"},
+        timeout=20,
+    ).raise_for_status()
+
+    draft_id = api_create_knowledge_draft(case_id)
+    api_review_and_apply_knowledge(case_id, draft_id)
+
+    open_badcase_detail(page, case_id)
+    screenshot(page, "09_badcase_verifying_no_retest")
+
+    # Verify UI state before post-apply retest
+    header = page.locator("#badcase-detail-header-status").first.inner_text()
+    assert "修复应用时间" in header, f"expected 修复应用时间 in header, got: {header}"
+    results.append({"check": "verifying header shows apply time", "ok": True})
+
+    retest_btn = page.locator("#badcase-retest").first
+    expect(retest_btn).to_be_visible(timeout=10000)
+    results.append({"check": "verifying shows 开始真实复测 button", "ok": True})
+
+    pass_btn = page.locator("#badcase-verify-pass").first
+    expect(pass_btn).to_be_disabled(timeout=10000)
+    results.append({"check": "verify-pass disabled before post-apply retest", "ok": True})
+
+    # Perform real retest via API, then refresh UI
+    api_retest_badcase(case_id)
+    page.reload(wait_until="networkidle", timeout=60000)
+    page.wait_for_timeout(800)
+    open_badcase_detail(page, case_id)
+    screenshot(page, "10_badcase_verifying_with_retest")
+
+    header2 = page.locator("#badcase-detail-header-status").first.inner_text()
+    assert "最近复测时间" in header2, f"expected 最近复测时间 in header, got: {header2}"
+    results.append({"check": "verifying header shows retest time after retest", "ok": True})
+
+    pass_btn2 = page.locator("#badcase-verify-pass").first
+    expect(pass_btn2).to_be_enabled(timeout=10000)
+    results.append({"check": "verify-pass enabled after post-apply retest", "ok": True})
+
+    # Complete lifecycle
+    api_verify_pass_badcase(case_id)
+    page.reload(wait_until="networkidle", timeout=60000)
+    page.wait_for_timeout(800)
+    open_badcase_detail(page, case_id, status="closed")
+    screenshot(page, "11_badcase_closed")
+
+    closed_header = page.locator("#badcase-detail-header-status").first.inner_text()
+    assert "已关闭" in closed_header, f"expected closed status, got: {closed_header}"
+    results.append({"check": "badcase closed after verify-pass", "ok": True})
+
+
 def run_cost_governance(page: Page):
     wait_visible(page, '#sub-menu button[data-sub="cost-governance"]').click()
     page.wait_for_timeout(1200)
@@ -169,6 +282,11 @@ def run_cost_governance(page: Page):
     # Overview period cards
     for text in ("今日调用次数", "今日总 Token", "今日估算成本", "平均单轮 Token"):
         assert_text(page, text, f"overview card '{text}'")
+
+    # Daily / monthly budget cards
+    for text in ("日预算", "月预算"):
+        assert_text(page, text, f"budget card '{text}'")
+    results.append({"check": "cost governance shows daily and monthly budget", "ok": True})
 
     # Period cards
     for text in ("今日", "近7天", "本月"):
@@ -218,6 +336,10 @@ def run_acceptance():
             # Platform tab: badcase operations
             run_platform_badcase(page)
             check_global_errors("platform badcase")
+
+            # V1.4.1: repair-after-apply retest lifecycle
+            run_badcase_retest_lifecycle(page)
+            check_global_errors("badcase retest lifecycle")
 
             # Cost governance page
             run_cost_governance(page)

@@ -77,7 +77,7 @@ ACTION_STATUS_REQUIREMENTS: Dict[str, Set[str]] = {
     "review-draft": {"fixing"},
     "apply-draft": {"fixing"},  # generic UI action for applying any approved draft
     "accept-capability-gap": {"fixing"},  # backward-compatible alias
-    "retest": {"fixing"},
+    "retest": {"fixing", "verifying"},
     "verify-pass": {"verifying"},
     "verify-fail": {"verifying"},
     "reject": {"pending", "classified", "fixing", "verifying"},
@@ -159,12 +159,24 @@ def allowed_actions(status: str) -> List[str]:
     return sorted([action for action, required in ACTION_STATUS_REQUIREMENTS.items() if status in required])
 
 
+def _has_post_apply_retest(badcase: Dict[str, Any]) -> bool:
+    """Return True iff a retest was performed after the most recent draft apply."""
+    last_applied_at = badcase.get("last_applied_at")
+    last_retest_at = badcase.get("last_retest_at")
+    if not last_retest_at:
+        return False
+    if not last_applied_at:
+        # No apply recorded yet; any retest is acceptable.
+        return bool(badcase.get("retest_response"))
+    return last_retest_at >= last_applied_at
+
+
 def effective_allowed_actions(badcase: Dict[str, Any]) -> List[str]:
     """Return frontend-visible actions, considering runtime evidence and category.
 
     - Terminal statuses: empty.
     - classified: only show category-relevant draft actions.
-    - verifying without retest_response: hide verify-pass.
+    - verifying: hide verify-pass until a retest has been run after the latest apply.
     """
     status = badcase.get("status", "pending")
     actions = allowed_actions(status)
@@ -176,7 +188,7 @@ def effective_allowed_actions(badcase: Dict[str, Any]) -> List[str]:
         if category not in KNOWLEDGE_CATEGORIES and category != "pending":
             actions = [a for a in actions if a != "extract-knowledge"]
 
-    if status == "verifying" and not badcase.get("retest_response"):
+    if status == "verifying" and not _has_post_apply_retest(badcase):
         actions = [a for a in actions if a != "verify-pass"]
 
     return actions

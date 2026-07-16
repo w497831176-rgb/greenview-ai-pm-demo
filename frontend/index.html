@@ -2840,7 +2840,9 @@
           category = bc.category || 'pending';
           const headerStatus = $('#badcase-detail-header-status');
           if (headerStatus) {
-            headerStatus.innerHTML = `状态：${statusBadge(bc.status)} <span class="text-slate-700 font-medium">${escapeHtml(bc.status_label || '')}</span>`;
+            const appliedHint = bc.last_applied_at ? ` · 修复应用时间：${formatTimeLabel(bc.last_applied_at)}` : '';
+            const retestHint = bc.last_retest_at ? ` · 最近复测时间：${formatTimeLabel(bc.last_retest_at)}` : '';
+            headerStatus.innerHTML = `状态：${statusBadge(bc.status)} <span class="text-slate-700 font-medium">${escapeHtml(bc.status_label || '')}</span>${appliedHint}${retestHint}`;
           }
           const kDrafts = bc.knowledge_drafts || [];
           const sDrafts = bc.skill_prompt_drafts || [];
@@ -2885,11 +2887,12 @@
               ${actionBtn('驳回 / 拒绝处理', 'reject', { id: 'badcase-reject', cls: 'w-full text-xs text-slate-500 hover:text-red-600 underline mt-2' })}
             `;
           } else if (bc.status === 'verifying') {
-            const noRetest = !bc.retest_response;
+            const hasPostApplyRetest = !!(bc.last_retest_at && bc.last_applied_at && bc.last_retest_at >= bc.last_applied_at);
             actionButtonsHtml = `
-              ${noRetest ? `<p class="text-xs text-amber-600 bg-amber-50 rounded-lg px-3 py-2 border border-amber-100">请先完成真实复测，验证通过不可用。</p>` : ''}
+              ${!hasPostApplyRetest ? `<p class="text-xs text-amber-600 bg-amber-50 rounded-lg px-3 py-2 border border-amber-100">请先在当前修复应用后完成一次真实复测，验证通过不可用。</p>` : ''}
+              ${actionBtn('开始真实复测', 'retest', { id: 'badcase-retest', cls: 'w-full px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl text-sm transition-colors' })}
               <div class="flex gap-2">
-                ${actionBtn('验证通过', 'verify-pass', { id: 'badcase-verify-pass', cls: 'flex-1 px-4 py-2 bg-green-600 hover:bg-green-700 text-white rounded-xl text-sm transition-colors', disabledTitle: noRetest ? '请先完成真实复测' : '当前状态不可验证' })}
+                ${actionBtn('验证通过', 'verify-pass', { id: 'badcase-verify-pass', cls: 'flex-1 px-4 py-2 bg-green-600 hover:bg-green-700 text-white rounded-xl text-sm transition-colors', disabledTitle: !hasPostApplyRetest ? '请先在当前修复应用后完成一次真实复测' : '当前状态不可验证' })}
                 ${actionBtn('验证不通过', 'verify-fail', { id: 'badcase-verify-fail', cls: 'flex-1 px-4 py-2 bg-red-50 hover:bg-red-100 text-red-700 rounded-xl text-sm transition-colors' })}
               </div>
               ${actionBtn('驳回 / 拒绝处理', 'reject', { id: 'badcase-reject', cls: 'w-full text-xs text-slate-500 hover:text-red-600 underline mt-2' })}
@@ -3035,7 +3038,7 @@
             }
           }
 
-          if (bc.status === 'fixing') {
+          if (bc.status === 'fixing' || bc.status === 'verifying') {
             const retestBtn = $('#badcase-retest');
             if (retestBtn && !retestBtn.disabled) {
               retestBtn.addEventListener('click', async () => {
@@ -3628,23 +3631,25 @@
 
       function renderBudget() {
         const b = state.budget || {};
+        const budgetCard = (label, value, note) => `
+          <div class="bg-slate-50 rounded-xl p-3 border border-slate-200">
+            <div class="text-[11px] text-slate-500">${label}</div>
+            <div class="text-lg font-semibold text-slate-900">${value ? '¥' + Number(value).toFixed(6) : '未设置'}</div>
+            ${note ? `<div class="text-[10px] text-slate-400 mt-1">${note}</div>` : ''}
+          </div>
+        `;
         return `
           <div class="bg-white rounded-2xl shadow-soft border border-slate-200 p-4">
             <div class="flex items-center justify-between mb-3">
-              <h3 class="font-semibold text-slate-900">预算预警阈值</h3>
+              <h3 class="font-semibold text-slate-900">预算治理阈值</h3>
               <button id="cg-edit-budget" type="button" class="px-3 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg text-xs">编辑阈值</button>
             </div>
-            <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
-              <div class="bg-slate-50 rounded-xl p-3 border border-slate-200">
-                <div class="text-[11px] text-slate-500">单次调用成本预警</div>
-                <div class="text-lg font-semibold text-slate-900">${b.per_call_threshold_cny ? '¥' + Number(b.per_call_threshold_cny).toFixed(6) : '未设置'}</div>
-              </div>
-              <div class="bg-slate-50 rounded-xl p-3 border border-slate-200">
-                <div class="text-[11px] text-slate-500">每日估算成本预警</div>
-                <div class="text-lg font-semibold text-slate-900">${b.daily_threshold_cny ? '¥' + Number(b.daily_threshold_cny).toFixed(6) : '未设置'}</div>
-              </div>
+            <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
+              ${budgetCard('单次调用成本预警', b.per_call_threshold_cny)}
+              ${budgetCard('日预算', b.daily_threshold_cny, '今日累计 >= 100% 将阻断 Darwin / A-B / AI 辅助分类')}
+              ${budgetCard('月预算', b.monthly_threshold_cny, '本月累计 >= 100% 将阻断 Darwin / A-B / AI 辅助分类')}
             </div>
-            <p class="text-[11px] text-slate-400 mt-2">仅预警，不阻断业主聊天</p>
+            <p class="text-[11px] text-slate-400 mt-2">成本数字为 provider-reported 或 local-estimated；未设置阈值不代表无限真实额度。业主常规 Flash 聊天始终可用。</p>
           </div>
         `;
       }
@@ -3654,14 +3659,16 @@
         const body = `
           <div class="space-y-3">
             ${formInput('单次调用成本预警（CNY）', 'budget-per-call', b.per_call_threshold_cny ?? '', '例如 0.5', 'number')}
-            ${formInput('每日估算成本预警（CNY）', 'budget-daily', b.daily_threshold_cny ?? '', '例如 10', 'number')}
-            <p class="text-xs text-slate-400">留空表示不启用。触发后仅在后台显示预警，不阻断业主聊天。</p>
+            ${formInput('每日估算成本预算（CNY）', 'budget-daily', b.daily_threshold_cny ?? '', '例如 10', 'number')}
+            ${formInput('每月估算成本预算（CNY）', 'budget-monthly', b.monthly_threshold_cny ?? '', '例如 100', 'number')}
+            <p class="text-xs text-slate-400">留空表示不启用。达到 100% 时 Darwin、A/B 测试、AI 辅助分类等非必要高成本操作会被阻断，业主常规 Flash 聊天不受影响。</p>
           </div>
         `;
         openModal('编辑预算阈值', body, async () => {
           const payload = {
             per_call_threshold_cny: parseFloat($('#budget-per-call').value) || null,
             daily_threshold_cny: parseFloat($('#budget-daily').value) || null,
+            monthly_threshold_cny: parseFloat($('#budget-monthly').value) || null,
           };
           try {
             await apiPut('/api/observability/budget', payload);
