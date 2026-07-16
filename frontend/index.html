@@ -163,7 +163,7 @@
         <div class="p-4 border-t border-slate-800/60">
           <div class="rounded-xl bg-gradient-to-br from-slate-800 to-slate-850 p-3 border border-slate-700/50">
             <p class="text-xs text-slate-400 mb-1">当前版本</p>
-            <p id="app-version" class="text-sm font-medium text-gold-400">V1.3</p>
+            <p id="app-version" class="text-sm font-medium text-gold-400"></p>
           </div>
         </div>
       </aside>
@@ -751,6 +751,15 @@
       `;
     }
 
+    function refreshSidebar() {
+      const sidebar = $('#chat-session-list');
+      if (!sidebar) return;
+      sidebar.innerHTML = renderSessionListItems();
+      sidebar.querySelectorAll('.session-item').forEach(btn => {
+        btn.addEventListener('click', () => switchChatSession(btn.dataset.sessionId));
+      });
+    }
+
     async function loadChatSessions() {
       try {
         const data = await apiGet('/api/chat/sessions?user_id=web-user');
@@ -846,14 +855,6 @@
         </div>
       `;
 
-      function refreshSidebar() {
-        const sidebar = $('#chat-session-list');
-        if (!sidebar) return;
-        sidebar.innerHTML = renderSessionListItems();
-        sidebar.querySelectorAll('.session-item').forEach(btn => {
-          btn.addEventListener('click', () => switchChatSession(btn.dataset.sessionId));
-        });
-      }
       refreshSidebar();
 
       const form = $('#chat-form');
@@ -903,7 +904,7 @@
           appendSystemMessage('您已发起转人工请求，物业工作人员会尽快回复。');
           showToast('已转人工，请等待工作人员回复', 'success');
           await loadChatSessions();
-          renderChatSessionsSidebar();
+          refreshSidebar();
         } catch (err) {
           showToast('转人工失败，请重试', 'error');
         }
@@ -915,16 +916,17 @@
           return;
         }
         await loadChatSessions();
+        refreshSidebar();
         await restoreChatMessages();
-        renderChatSessionsSidebar();
         showToast('会话已刷新', 'success');
       });
 
       await loadChatSessions();
       refreshSidebar();
       const newSessionBtn = $('#chat-new-session');
-      if (newSessionBtn) {
+      if (newSessionBtn && !newSessionBtn.dataset.bound) {
         newSessionBtn.addEventListener('click', createNewSession);
+        newSessionBtn.dataset.bound = '1';
       }
       restoreChatMessages();
     }
@@ -1309,7 +1311,7 @@
                 updateHandoffBanner(data.handoff_status || 'requested');
                 showToast('已转人工，请等待工作人员回复', 'success');
               }
-              loadChatSessions().then(() => renderChatSessionsSidebar());
+              loadChatSessions().then(() => refreshSidebar());
               STATE.currentTraceId = null;
             } else if (eventType === 'error') {
               accumulated += `\n\n[错误: ${data.error}]`;
@@ -2199,11 +2201,13 @@
 
     async function renderBadcasesPage(container) {
       const categoryLabels = {
-        knowledge: '知识缺失/错误',
-        skill: 'Skill 缺陷',
-        model: '模型回复质量',
-        tool: '工具调用失败',
-        other: '其他'
+        knowledge_gap: '知识库缺口',
+        skill_prompt: 'Skill/Prompt 问题',
+        mcp_capability: 'MCP/能力缺口',
+        routing: '路由问题',
+        response_quality: '模型回答质量',
+        other: '其他',
+        pending: '待分类'
       };
 
       container.innerHTML = `
@@ -2231,11 +2235,13 @@
               <label class="block text-xs text-slate-500 mb-1">分类</label>
               <select id="badcase-filter-category" class="w-full px-3 py-2 bg-white border border-slate-200 rounded-xl text-sm focus:outline-none focus:border-brand-400">
                 <option value="">全部分类</option>
-                <option value="knowledge">知识缺失/错误</option>
-                <option value="skill">Skill 缺陷</option>
-                <option value="model">模型回复质量</option>
-                <option value="tool">工具调用失败</option>
+                <option value="knowledge_gap">知识库缺口</option>
+                <option value="skill_prompt">Skill/Prompt 问题</option>
+                <option value="mcp_capability">MCP/能力缺口</option>
+                <option value="routing">路由问题</option>
+                <option value="response_quality">模型回答质量</option>
                 <option value="other">其他</option>
+                <option value="pending">待分类</option>
               </select>
             </div>
             <button id="badcase-filter-btn" class="px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white rounded-xl text-sm transition-colors">筛选</button>
@@ -2243,6 +2249,21 @@
           <div id="badcases-content">${loadingState()}</div>
         </div>
       `;
+
+      function sourceBadge(src) {
+        if (src === 'manual') return '<span class="text-[10px] px-2 py-0.5 rounded-full bg-indigo-50 text-indigo-600 border border-indigo-100">人工反馈</span>';
+        return '<span class="text-[10px] px-2 py-0.5 rounded-full bg-slate-100 text-slate-500 border border-slate-200">auto</span>';
+      }
+      function priorityBadge(priority) {
+        const color = priority === 'high' ? 'bg-red-500' : (priority === 'medium' ? 'bg-amber-500' : 'bg-slate-300');
+        const label = priority === 'high' ? '高' : (priority === 'medium' ? '中' : (priority === 'low' ? '低' : '默认'));
+        return `<span class="inline-flex items-center gap-1 text-xs text-slate-600"><span class="w-2 h-2 rounded-full ${color}"></span>${label}</span>`;
+      }
+      function traceSnippet(traceId) {
+        if (!traceId) return '<span class="text-xs text-slate-400">-</span>';
+        const short = traceId.length > 12 ? traceId.slice(0, 12) + '…' : traceId;
+        return `<a href="#observability?trace_id=${encodeURIComponent(traceId)}" class="font-mono text-xs text-brand-600 hover:text-brand-700 bg-slate-50 px-2 py-1 rounded border border-slate-200 whitespace-nowrap" title="${escapeHtml(traceId)}">${escapeHtml(short)}</a>`;
+      }
 
       async function loadBadcases() {
         const status = $('#badcase-filter-status').value;
@@ -2268,7 +2289,10 @@
                     <tr class="bg-slate-50 border-b border-slate-200">
                       <th class="px-4 py-3 text-left font-semibold text-slate-600">Query 摘要</th>
                       <th class="px-4 py-3 text-left font-semibold text-slate-600">分类</th>
+                      <th class="px-4 py-3 text-left font-semibold text-slate-600">来源</th>
+                      <th class="px-4 py-3 text-left font-semibold text-slate-600">优先级</th>
                       <th class="px-4 py-3 text-left font-semibold text-slate-600">状态</th>
+                      <th class="px-4 py-3 text-left font-semibold text-slate-600">Trace</th>
                       <th class="px-4 py-3 text-left font-semibold text-slate-600">时间</th>
                       <th class="px-4 py-3 text-left font-semibold text-slate-600">操作</th>
                     </tr>
@@ -2276,9 +2300,12 @@
                   <tbody class="divide-y divide-slate-100">
                     ${cases.map(c => `
                       <tr class="hover:bg-slate-50/70 transition-colors">
-                        <td class="px-4 py-3 font-medium text-slate-900 max-w-xs truncate" title="${escapeHtml(c.query)}">${escapeHtml((c.query || '').slice(0, 80))}${(c.query || '').length > 80 ? '...' : ''}</td>
+                        <td class="px-4 py-3 font-medium text-slate-900 max-w-xs truncate" title="${escapeHtml(c.original_query || c.query)}">${escapeHtml((c.original_query || c.query || '').slice(0, 80))}${(c.original_query || c.query || '').length > 80 ? '...' : ''}</td>
                         <td class="px-4 py-3"><span class="text-xs px-2 py-1 bg-slate-100 text-slate-600 rounded-full">${escapeHtml(categoryLabels[c.category] || c.category || '-')}</span></td>
+                        <td class="px-4 py-3">${sourceBadge(c.source)}</td>
+                        <td class="px-4 py-3">${priorityBadge(c.priority)}</td>
                         <td class="px-4 py-3">${statusBadge(c.status)}</td>
+                        <td class="px-4 py-3">${traceSnippet(c.trace_id)}</td>
                         <td class="px-4 py-3 text-slate-500 text-xs">${formatTimeLabel(c.created_at)}</td>
                         <td class="px-4 py-3">
                           <button data-id="${c.id}" class="badcase-process-btn text-xs px-3 py-1.5 bg-brand-600 hover:bg-brand-700 text-white rounded-lg transition-colors">处理</button>
@@ -2321,11 +2348,13 @@
         return;
       }
       const categoryLabels = {
-        knowledge: '知识缺失/错误',
-        skill: 'Skill 缺陷',
-        model: '模型回复质量',
-        tool: '工具调用失败',
-        other: '其他'
+        knowledge_gap: '知识库缺口',
+        skill_prompt: 'Skill/Prompt 问题',
+        mcp_capability: 'MCP/能力缺口',
+        routing: '路由问题',
+        response_quality: '模型回答质量',
+        other: '其他',
+        pending: '待分类'
       };
 
       async function runAction(path, body, successText) {
@@ -2359,29 +2388,65 @@
         renderContent();
       });
 
+      function sourceBadgeDetail(src) {
+        if (src === 'manual') return '<span class="text-xs px-2 py-1 rounded-full bg-indigo-50 text-indigo-600 border border-indigo-100">人工反馈</span>';
+        return '<span class="text-xs px-2 py-1 rounded-full bg-slate-100 text-slate-500 border border-slate-200">auto</span>';
+      }
+      async function copyToClipboard(text) {
+        try {
+          await navigator.clipboard.writeText(text);
+          showToast('已复制到剪贴板', 'success');
+        } catch (e) {
+          showToast('复制失败', 'error');
+        }
+      }
+      function parseDarwin(da) {
+        if (!da) return null;
+        try {
+          return typeof da === 'string' ? JSON.parse(da) : da;
+        } catch (e) {
+          return null;
+        }
+      }
+
       async function loadDetail() {
         try {
           const data = await apiGet(`/api/badcases/${id}`);
           const bc = data.badcase || data;
-          const drafts = bc.knowledge_drafts || bc.drafts || [];
+          const knowledgeDrafts = bc.knowledge_drafts || bc.drafts || [];
+          const skillDrafts = bc.skill_drafts || [];
+          const capabilityDrafts = bc.capability_drafts || bc.gap_drafts || [];
           const isClosed = bc.status === 'closed' || bc.status === 'rejected';
+          const traceLink = bc.trace_id ? `<a href="#observability?trace_id=${encodeURIComponent(bc.trace_id)}" class="font-mono text-xs text-brand-600 hover:text-brand-700 bg-slate-50 px-2 py-1 rounded border border-slate-200">${escapeHtml(bc.trace_id)}</a>` : '<span class="text-sm text-slate-400">-</span>';
+          const darwin = parseDarwin(bc.darwin_analysis);
+          const retest = bc.retest_result || null;
           $('#badcase-detail-content').innerHTML = `
             <div class="space-y-4">
               <div class="bg-white rounded-2xl shadow-soft border border-slate-200 p-5 flex flex-wrap gap-3 items-center justify-between">
-                <div class="text-sm text-slate-500">当前状态：<span class="font-medium text-slate-800">${statusBadge(bc.status)}</span></div>
+                <div class="flex flex-wrap items-center gap-3">
+                  <span class="text-sm text-slate-500">当前状态：<span class="font-medium text-slate-800">${statusBadge(bc.status)}</span></span>
+                  <span class="text-sm text-slate-500">来源：${sourceBadgeDetail(bc.source)}</span>
+                </div>
                 <div class="text-xs text-slate-400">状态流转：pending → classified → fixing → verifying → closed / rejected</div>
+              </div>
+              <div class="bg-white rounded-2xl shadow-soft border border-slate-200 p-5">
+                <h3 class="font-semibold text-slate-900 mb-2">Trace ID</h3>
+                <div class="flex flex-wrap items-center gap-2">
+                  ${traceLink}
+                  ${bc.trace_id ? `<button id="badcase-copy-trace" type="button" class="text-xs px-2 py-1 bg-slate-100 hover:bg-slate-200 text-slate-600 rounded-lg transition-colors">复制</button>` : ''}
+                </div>
               </div>
               <div class="grid grid-cols-1 lg:grid-cols-3 gap-4">
                 <div class="bg-white rounded-2xl shadow-soft border border-slate-200 p-5">
                   <h3 class="font-semibold text-slate-900 mb-3">原始问题</h3>
-                  <p class="text-sm text-slate-700 whitespace-pre-wrap bg-slate-50 rounded-lg p-3 border border-slate-200">${escapeHtml(bc.query || bc.title || '-')}</p>
+                  <p class="text-sm text-slate-700 whitespace-pre-wrap bg-slate-50 rounded-lg p-3 border border-slate-200">${escapeHtml(bc.original_query || bc.query || bc.title || '-')}</p>
                 </div>
                 <div class="bg-white rounded-2xl shadow-soft border border-slate-200 p-5">
                   <h3 class="font-semibold text-slate-900 mb-3">AI 回答</h3>
                   <div class="text-sm text-slate-700 whitespace-pre-wrap bg-slate-50 rounded-lg p-3 border border-slate-200">${escapeHtml(bc.ai_response || '（无回答内容）')}</div>
                 </div>
                 <div class="bg-white rounded-2xl shadow-soft border border-slate-200 p-5">
-                  <h3 class="font-semibold text-slate-900 mb-3">点踩原因 / 反馈</h3>
+                  <h3 class="font-semibold text-slate-900 mb-3">反馈原因</h3>
                   <div class="text-sm text-slate-700 whitespace-pre-wrap bg-red-50 rounded-lg p-3 border border-red-100">${escapeHtml(bc.feedback_reason || bc.description || '（未填写）')}</div>
                 </div>
               </div>
@@ -2395,13 +2460,15 @@
                   <form id="badcase-classify-form" class="space-y-2 mb-4">
                     <label class="block text-xs text-slate-500">分类调整</label>
                     <select id="badcase-category" class="w-full px-3 py-2 bg-white border border-slate-200 rounded-xl text-sm focus:outline-none focus:border-brand-400" ${isClosed ? 'disabled' : ''}>
-                      <option value="knowledge" ${bc.category === 'knowledge' ? 'selected' : ''}>知识缺失/错误</option>
-                      <option value="skill" ${bc.category === 'skill' ? 'selected' : ''}>Skill 缺陷</option>
-                      <option value="model" ${bc.category === 'model' ? 'selected' : ''}>模型回复质量</option>
-                      <option value="tool" ${bc.category === 'tool' ? 'selected' : ''}>工具调用失败</option>
+                      <option value="knowledge_gap" ${bc.category === 'knowledge_gap' ? 'selected' : ''}>知识库缺口</option>
+                      <option value="skill_prompt" ${bc.category === 'skill_prompt' ? 'selected' : ''}>Skill/Prompt 问题</option>
+                      <option value="mcp_capability" ${bc.category === 'mcp_capability' ? 'selected' : ''}>MCP/能力缺口</option>
+                      <option value="routing" ${bc.category === 'routing' ? 'selected' : ''}>路由问题</option>
+                      <option value="response_quality" ${bc.category === 'response_quality' ? 'selected' : ''}>模型回答质量</option>
                       <option value="other" ${bc.category === 'other' ? 'selected' : ''}>其他</option>
+                      <option value="pending" ${bc.category === 'pending' ? 'selected' : ''}>待分类</option>
                     </select>
-                    <button id="badcase-classify" type="button" class="w-full px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white rounded-xl text-sm transition-colors" ${isClosed ? 'disabled' : ''}>自动分类 / 保存分类</button>
+                    <button id="badcase-classify" type="button" class="w-full px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white rounded-xl text-sm transition-colors" ${isClosed ? 'disabled' : ''}>保存分类</button>
                   </form>
                   <div class="space-y-2 border-t border-slate-100 pt-4">
                     <button id="badcase-darwin" type="button" class="w-full px-4 py-2 bg-gold-500 hover:bg-gold-600 text-white rounded-xl text-sm transition-colors" ${isClosed ? 'disabled' : ''}>Darwin 优化修复方案</button>
@@ -2411,6 +2478,7 @@
                       <button id="badcase-verify-pass" type="button" class="flex-1 px-4 py-2 bg-green-600 hover:bg-green-700 text-white rounded-xl text-sm transition-colors" ${isClosed ? 'disabled' : ''}>验证通过</button>
                       <button id="badcase-verify-fail" type="button" class="flex-1 px-4 py-2 bg-red-50 hover:bg-red-100 text-red-700 rounded-xl text-sm transition-colors" ${isClosed ? 'disabled' : ''}>验证不通过</button>
                     </div>
+                    <button id="badcase-reject" type="button" class="w-full text-xs text-slate-500 hover:text-red-600 underline" ${isClosed ? 'disabled' : ''}>驳回 / 拒绝处理</button>
                   </div>
                   ${isClosed ? `<p class="text-xs text-slate-500 mt-3">该 Badcase 已${bc.status === 'rejected' ? '驳回' : '关闭'}，不可继续操作。</p>` : ''}
                 </div>
@@ -2419,21 +2487,117 @@
                   <div class="text-sm text-slate-700 whitespace-pre-wrap bg-slate-50 rounded-lg p-3 border border-slate-200 min-h-[100px]">${escapeHtml(bc.root_cause || '（待分析）')}</div>
                 </div>
                 <div class="bg-white rounded-2xl shadow-soft border border-slate-200 p-5">
-                  <h3 class="font-semibold text-slate-900 mb-3">修复计划</h3>
-                  <div class="text-sm text-slate-700 whitespace-pre-wrap bg-slate-50 rounded-lg p-3 border border-slate-200 min-h-[100px]">${escapeHtml(bc.fix_plan || '（待生成）')}</div>
+                  ${darwin ? `
+                    <h3 class="font-semibold text-slate-900 mb-3">Darwin 分析</h3>
+                    <div class="space-y-3 text-sm text-slate-700">
+                      <div>
+                        <div class="text-xs text-slate-500 mb-1">根因</div>
+                        <div class="whitespace-pre-wrap bg-slate-50 rounded-lg p-3 border border-slate-200">${escapeHtml(darwin.root_cause || '（无）')}</div>
+                      </div>
+                      <div>
+                        <div class="text-xs text-slate-500 mb-1">建议动作</div>
+                        <div class="whitespace-pre-wrap bg-slate-50 rounded-lg p-3 border border-slate-200">${escapeHtml(darwin.suggested_actions || '（无）')}</div>
+                      </div>
+                      <div>
+                        <div class="text-xs text-slate-500 mb-1">预期收益</div>
+                        <div class="whitespace-pre-wrap bg-slate-50 rounded-lg p-3 border border-slate-200">${escapeHtml(darwin.expected_impact || '（无）')}</div>
+                      </div>
+                      <div>
+                        <div class="text-xs text-slate-500 mb-1">风险</div>
+                        <div class="whitespace-pre-wrap bg-slate-50 rounded-lg p-3 border border-slate-200">${escapeHtml(darwin.risks || '（无）')}</div>
+                      </div>
+                    </div>
+                  ` : `
+                    <h3 class="font-semibold text-slate-900 mb-3">修复计划</h3>
+                    <div class="text-sm text-slate-700 whitespace-pre-wrap bg-slate-50 rounded-lg p-3 border border-slate-200 min-h-[100px]">${escapeHtml(bc.fix_plan || '（待生成）')}</div>
+                  `}
                 </div>
               </div>
-              ${drafts.length ? `
+              ${knowledgeDrafts.length ? `
                 <div class="bg-white rounded-2xl shadow-soft border border-slate-200 p-5">
-                  <h3 class="font-semibold text-slate-900 mb-3">知识草稿</h3>
+                  <h3 class="font-semibold text-slate-900 mb-3">知识库草稿</h3>
                   <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
-                    ${drafts.map((d, idx) => `
+                    ${knowledgeDrafts.map((d, idx) => `
                       <div class="bg-slate-50 rounded-xl p-3 border border-slate-200 text-sm">
                         <div class="font-medium text-slate-900 mb-1">#${idx + 1} ${escapeHtml(d.title || '未命名')}</div>
                         <div class="text-xs text-slate-500 mb-2">${escapeHtml((d.content || '').slice(0, 100))}${(d.content || '').length > 100 ? '...' : ''}</div>
                         <button data-draft-id="${d.id}" class="badcase-publish-draft px-3 py-1 bg-brand-600 hover:bg-brand-700 text-white rounded-lg text-xs transition-colors" ${isClosed ? 'disabled' : ''}>发布/应用</button>
                       </div>
                     `).join('')}
+                  </div>
+                </div>
+              ` : ''}
+              ${skillDrafts.length ? `
+                <div class="bg-white rounded-2xl shadow-soft border border-slate-200 p-5">
+                  <h3 class="font-semibold text-slate-900 mb-3">Skill/Prompt 草稿</h3>
+                  <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
+                    ${skillDrafts.map((d, idx) => `
+                      <div class="bg-slate-50 rounded-xl p-3 border border-slate-200 text-sm">
+                        <div class="font-medium text-slate-900 mb-1">#${idx + 1} ${escapeHtml(d.title || '未命名')}</div>
+                        <div class="text-xs text-slate-500 mb-2">${escapeHtml((d.content || d.prompt || '').slice(0, 100))}${(d.content || d.prompt || '').length > 100 ? '...' : ''}</div>
+                        <button data-draft-id="${d.id}" class="badcase-publish-skill-draft px-3 py-1 bg-brand-600 hover:bg-brand-700 text-white rounded-lg text-xs transition-colors" ${isClosed ? 'disabled' : ''}>发布/应用</button>
+                      </div>
+                    `).join('')}
+                  </div>
+                </div>
+              ` : ''}
+              ${capabilityDrafts.length ? `
+                <div class="bg-white rounded-2xl shadow-soft border border-slate-200 p-5">
+                  <h3 class="font-semibold text-slate-900 mb-3">能力缺口建议</h3>
+                  <p class="text-xs text-slate-500 mb-3">记录为待办事项，不会自动创建工具。</p>
+                  <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
+                    ${capabilityDrafts.map((d, idx) => `
+                      <div class="bg-slate-50 rounded-xl p-3 border border-slate-200 text-sm">
+                        <div class="font-medium text-slate-900 mb-1">#${idx + 1} ${escapeHtml(d.title || '未命名')}</div>
+                        <div class="text-xs text-slate-500 mb-2">${escapeHtml((d.content || d.description || '').slice(0, 100))}${(d.content || d.description || '').length > 100 ? '...' : ''}</div>
+                        <button data-draft-id="${d.id}" class="badcase-accept-capability-gap px-3 py-1 bg-amber-600 hover:bg-amber-700 text-white rounded-lg text-xs transition-colors" ${isClosed ? 'disabled' : ''}>记录待办</button>
+                      </div>
+                    `).join('')}
+                  </div>
+                </div>
+              ` : ''}
+              ${retest ? `
+                <div class="bg-white rounded-2xl shadow-soft border border-slate-200 p-5">
+                  <h3 class="font-semibold text-slate-900 mb-3">重测结果</h3>
+                  <div class="space-y-3 text-sm text-slate-700">
+                    <div>
+                      <div class="text-xs text-slate-500 mb-1">重测回答</div>
+                      <div class="whitespace-pre-wrap bg-slate-50 rounded-lg p-3 border border-slate-200">${escapeHtml(retest.retest_response || '（无）')}</div>
+                    </div>
+                    <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
+                      <div class="bg-slate-50 rounded-lg p-3 border border-slate-200">
+                        <div class="text-xs text-slate-500 mb-1">路由意图</div>
+                        <div class="font-medium text-slate-900">${escapeHtml((retest.retest_context && retest.retest_context.route_intent) || '-')}</div>
+                      </div>
+                      <div class="bg-slate-50 rounded-lg p-3 border border-slate-200">
+                        <div class="text-xs text-slate-500 mb-1">当前 Agent</div>
+                        <div class="font-medium text-slate-900">${escapeHtml(retest.current_agent || '-')}</div>
+                      </div>
+                      <div class="bg-slate-50 rounded-lg p-3 border border-slate-200">
+                        <div class="text-xs text-slate-500 mb-1">已命中 Skills</div>
+                        <div class="font-medium text-slate-900">${escapeHtml((retest.activated_skills || []).join('、') || '-')}</div>
+                      </div>
+                      <div class="bg-slate-50 rounded-lg p-3 border border-slate-200">
+                        <div class="text-xs text-slate-500 mb-1">引用标题</div>
+                        <div class="font-medium text-slate-900">${escapeHtml((retest.citations || []).map(c => c.title || c).join('、') || '-')}</div>
+                      </div>
+                      <div class="bg-slate-50 rounded-lg p-3 border border-slate-200">
+                        <div class="text-xs text-slate-500 mb-1">MCP 调用</div>
+                        <div class="font-medium text-slate-900">${escapeHtml((retest.mcp_calls || []).map(m => m.name || m).join('、') || '-')}</div>
+                      </div>
+                      <div class="bg-slate-50 rounded-lg p-3 border border-slate-200">
+                        <div class="text-xs text-slate-500 mb-1">模型</div>
+                        <div class="font-medium text-slate-900">${escapeHtml(retest.model_id || '-')}</div>
+                      </div>
+                      <div class="bg-slate-50 rounded-lg p-3 border border-slate-200">
+                        <div class="text-xs text-slate-500 mb-1">Trace ID</div>
+                        <div class="font-medium text-slate-900 font-mono text-xs">${escapeHtml(retest.trace_id || '-')}</div>
+                      </div>
+                      <div class="bg-slate-50 rounded-lg p-3 border border-slate-200">
+                        <div class="text-xs text-slate-500 mb-1">Auto Badcase ID</div>
+                        <div class="font-medium text-slate-900 font-mono text-xs">${escapeHtml(retest.auto_badcase_id || '-')}</div>
+                      </div>
+                    </div>
                   </div>
                 </div>
               ` : ''}
@@ -2458,6 +2622,10 @@
             </div>
           `;
 
+          if (bc.trace_id) {
+            $('#badcase-copy-trace').addEventListener('click', () => copyToClipboard(bc.trace_id));
+          }
+
           $('#badcase-classify').addEventListener('click', () => {
             const category = $('#badcase-category').value;
             runAction(`/api/badcases/${id}/classify`, { auto: false, category, reason: `手动分类为 ${category}` }, '已分类');
@@ -2476,16 +2644,36 @@
           });
 
           $('#badcase-verify-pass').addEventListener('click', () => {
-            runAction(`/api/badcases/${id}/verify`, { passed: true, note: '前端验证通过' }, '已验证关闭');
+            runAction(`/api/badcases/${id}/verify`, { passed: true }, '已验证关闭');
           });
 
           $('#badcase-verify-fail').addEventListener('click', () => {
-            runAction(`/api/badcases/${id}/verify`, { passed: false, note: '前端验证不通过' }, '已驳回');
+            const note = window.prompt('验证不通过原因（将回到修复阶段）：');
+            if (note === null) return;
+            runAction(`/api/badcases/${id}/verify`, { passed: false, note: note || '前端验证不通过' }, '已退回修复');
+          });
+
+          $('#badcase-reject').addEventListener('click', () => {
+            const reason = window.prompt('驳回原因：');
+            if (reason === null) return;
+            runAction(`/api/badcases/${id}/reject`, { rejected_reason: reason || '无原因' }, '已驳回');
           });
 
           $$('.badcase-publish-draft').forEach(btn => {
             btn.addEventListener('click', () => {
               runAction(`/api/badcases/${id}/publish-draft/${btn.dataset.draftId}`, {}, '草稿已发布');
+            });
+          });
+
+          $$('.badcase-publish-skill-draft').forEach(btn => {
+            btn.addEventListener('click', () => {
+              runAction(`/api/badcases/${id}/publish-skill-draft/${btn.dataset.draftId}`, {}, 'Skill/Prompt 草稿已发布');
+            });
+          });
+
+          $$('.badcase-accept-capability-gap').forEach(btn => {
+            btn.addEventListener('click', () => {
+              runAction(`/api/badcases/${id}/accept-capability-gap/${btn.dataset.draftId}`, {}, '已记录能力缺口待办');
             });
           });
         } catch (err) {

@@ -280,12 +280,13 @@ async def distribution(
     end: Optional[str] = Query(None),
 ):
     """Return token/cost distribution grouped by model/agent/intent/stage."""
-    column = {
-        "model": "model_id",
-        "agent": "agent_name",
-        "intent": "intent",
-        "stage": "stage",
-    }.get(group_by, "model_id")
+    column_map = {
+        "model": ("model_id", "model_calls"),
+        "agent": ("agent_name", "chat_traces"),
+        "intent": ("intent", "chat_traces"),
+        "stage": ("stage", "model_calls"),
+    }
+    column, table = column_map.get(group_by, ("model_id", "model_calls"))
 
     conn = _get_conn()
     cursor = conn.cursor()
@@ -301,7 +302,7 @@ async def distribution(
         date_filter = "WHERE created_at <= ?"
         params = [end]
 
-    if group_by == "stage":
+    if table == "model_calls":
         cursor.execute(
             f"""
             SELECT {column}, COUNT(*) as calls, SUM(total_tokens) as tokens,

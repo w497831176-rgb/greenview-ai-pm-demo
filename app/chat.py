@@ -34,14 +34,17 @@ from agents.property import create_property_agent
 from agents.router import classify_intent
 from db.property_db import (
     activate_handoff,
+    add_badcase_action,
     create_badcase,
     create_chat_session,
     create_chat_trace,
     ensure_chat_session,
     get_budget_thresholds,
+    get_chat_message,
     get_chat_session,
     get_enabled_price_for_model,
     get_model_calls_for_trace,
+    get_previous_user_message,
     is_handoff_active,
     is_handoff_requested,
     list_chat_messages,
@@ -628,6 +631,7 @@ class FeedbackRequest(BaseModel):
     session_id: str
     message_id: Optional[int] = None
     reason: str
+    type: Optional[str] = "thumb_down"  # thumb_up / thumb_down
 
 
 class HandoffRequest(BaseModel):
@@ -720,13 +724,13 @@ async def _stream_agent_response(
         # Record the router model call (metrics are not returned by the non-streaming router).
         try:
             router_cost, router_price = _calculate_cost(
-                MODEL.model if hasattr(MODEL, "model") else MODEL_ID,
+                MODEL_ID,
                 {"input_tokens": 0, "output_tokens": 0, "reasoning_tokens": 0, "cached_tokens": 0},
             )
             record_model_call(
                 trace_id=trace_id,
                 stage="router",
-                model_id=MODEL.model if hasattr(MODEL, "model") else MODEL_ID,
+                model_id=MODEL_ID,
                 model_selection_reason="owner-facing default",
                 latency_ms=router_latency_ms,
                 usage_source="unavailable",
@@ -754,7 +758,7 @@ async def _stream_agent_response(
                 bc = create_badcase(
                     title=(message[:60] + "...") if len(message) > 60 else message,
                     description="检索阶段未命中知识库，可能缺少相关文档。",
-                    category="knowledge",
+                    category="knowledge_gap",
                     evidence=f"user: {message}",
                     source_message_id=None,
                     session_id=session_id,
@@ -1111,28 +1115,88 @@ async def create_new_session(
     return {"session": session}
 
 
+@router.get("/sessions/{session_id}")
+async def chat_session_detail(session_id: str):
+    """Return a single chat session by id."""
+    session = get_chat_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return {"session": session}
+
+
 @router.post("/feedback")
 async def chat_feedback(request: FeedbackRequest):
     """Create a badcase from user feedback on an AI response."""
     if not request.reason or not request.reason.strip():
         raise HTTPException(status_code=400, detail="反馈描述不能为空")
 
-    title = "业主不满意 Agent 回答"
-    description = request.reason.strip()
+    reason = request.reason.strip()
+    msg = None
+    user_msg = None
     if request.message_id:
-        description = f"消息 ID: {request.message_id}\n{description}"
+        msg = get_chat_message(request.message_id)
+        if msg:
+            user_msg = get_previous_user_message(request.session_id, request.message_id)
+
+    original_query = ""
+    ai_response = ""
+    trace_id = None
+    context_json: Dict[str, Any] = {
+        "session_id": request.session_id,
+        "message_id": request.message_id,
+        "feedback_type": request.type,
+    }
+    if msg:
+        ai_response = msg.get("content") or ""
+        trace_id = msg.get("trace_id")
+        context_json.update({
+            "route_intent": msg.get("route_intent"),
+            "route_reason": msg.get("route_reason"),
+            "current_agent": msg.get("current_agent"),
+            "activated_skills": msg.get("activated_skills"),
+            "citations": msg.get("citations"),
+            "tool_calls": msg.get("tool_calls"),
+            "mcp_calls": msg.get("mcp_calls"),
+            "model_id": msg.get("model_id"),
+            "model_selection_reason": msg.get("model_selection_reason"),
+            "token_count": msg.get("token_count"),
+            "token_detail": msg.get("token_detail"),
+            "usage_source": msg.get("usage_source"),
+            "latency_ms": msg.get("latency_ms"),
+            "thinking_enabled": msg.get("thinking_enabled"),
+            "trace_id": trace_id,
+        })
+    if user_msg:
+        original_query = user_msg.get("content") or ""
+        context_json["user_message_id"] = user_msg.get("id")
 
     badcase = create_badcase(
-        title=title,
-        description=description,
-        category="model",
+        title=f"人工反馈：{reason[:40]}",
+        description=reason,
+        category="pending",
         status="pending",
         created_at=now_cn(),
-        evidence=request.reason.strip(),
+        evidence=reason,
         source_message_id=request.message_id,
         session_id=request.session_id,
+        source="manual",
+        original_query=original_query,
+        ai_response=ai_response,
+        feedback_reason=reason,
+        context_json=json.dumps(context_json, ensure_ascii=False, default=str),
+        trace_id=trace_id,
+        priority="high" if request.type == "thumb_down" else "medium",
+        message_id=request.message_id,
     )
-    return {"status": "ok", "badcase": badcase}
+    add_badcase_action(
+        badcase_id=badcase["id"],
+        action_type="manual_feedback",
+        action_detail=json.dumps({"reason": reason, "type": request.type}, ensure_ascii=False),
+        status_before="pending",
+        status_after="pending",
+        created_by="owner",
+    )
+    return {"status": "ok", "badcase": badcase, "source": "manual"}
 
 
 @router.post("/handoff")

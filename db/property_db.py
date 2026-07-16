@@ -462,6 +462,10 @@ def init_db():
     _migrate_v1_3_observability(cursor)
     conn.commit()
 
+    # V1.3.3 Badcase operational closure schema.
+    _migrate_v1_3_3_badcase_closure(cursor)
+    conn.commit()
+
     conn.close()
 
 
@@ -1539,6 +1543,77 @@ def _migrate_v1_3_observability(cursor):
     )
 
 
+def _migrate_v1_3_3_badcase_closure(cursor):
+    """Non-destructive migrations for V1.3.3 badcase operational closure."""
+    # Extend badcases with operational fields.
+    for col, dtype in [
+        ("source", "TEXT DEFAULT 'auto'"),
+        ("original_query", "TEXT"),
+        ("ai_response", "TEXT"),
+        ("feedback_reason", "TEXT"),
+        ("context_json", "TEXT"),
+        ("trace_id", "TEXT"),
+        ("priority", "TEXT DEFAULT 'medium'"),
+        ("message_id", "INTEGER"),
+        ("retest_response", "TEXT"),
+        ("retest_context_json", "TEXT"),
+        ("retest_trace_id", "TEXT"),
+        ("darwin_analysis", "TEXT"),
+        ("darwin_trace_id", "TEXT"),
+    ]:
+        try:
+            cursor.execute(f"ALTER TABLE badcases ADD COLUMN {col} {dtype}")
+        except sqlite3.OperationalError:
+            pass
+
+    # Knowledge drafts: add knowledge_doc_id reference.
+    try:
+        cursor.execute("ALTER TABLE knowledge_drafts ADD COLUMN knowledge_doc_id INTEGER")
+    except sqlite3.OperationalError:
+        pass
+
+    # Skill / Prompt drafts.
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS skill_prompt_drafts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            badcase_id INTEGER NOT NULL,
+            skill_id INTEGER,
+            skill_name TEXT,
+            title TEXT NOT NULL,
+            prompt_content TEXT,
+            trigger_keywords TEXT,
+            status TEXT DEFAULT 'draft',
+            created_at TEXT,
+            updated_at TEXT,
+            published_at TEXT,
+            published_by TEXT,
+            FOREIGN KEY (badcase_id) REFERENCES badcases(id)
+        )
+        """
+    )
+
+    # Capability gap drafts.
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS capability_gap_drafts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            badcase_id INTEGER NOT NULL,
+            title TEXT NOT NULL,
+            description TEXT,
+            gap_type TEXT,
+            suggested_action TEXT,
+            status TEXT DEFAULT 'draft',
+            created_at TEXT,
+            updated_at TEXT,
+            accepted_at TEXT,
+            accepted_by TEXT,
+            FOREIGN KEY (badcase_id) REFERENCES badcases(id)
+        )
+        """
+    )
+
+
 def create_work_order(
     work_order_id: str,
     room_id: str,
@@ -1781,6 +1856,14 @@ def create_badcase(
     session_id: Optional[str] = None,
     root_cause: Optional[str] = None,
     fix_plan: Optional[str] = None,
+    source: str = "auto",
+    original_query: Optional[str] = None,
+    ai_response: Optional[str] = None,
+    feedback_reason: Optional[str] = None,
+    context_json: Optional[str] = None,
+    trace_id: Optional[str] = None,
+    priority: str = "medium",
+    message_id: Optional[int] = None,
 ) -> Dict[str, Any]:
     now = created_at or now_cn("%Y-%m-%d %H:%M")
     conn = _get_conn()
@@ -1788,10 +1871,14 @@ def create_badcase(
     cursor.execute(
         """
         INSERT INTO badcases
-        (title, description, category, status, created_at, evidence, source_message_id, session_id, root_cause, fix_plan)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (title, description, category, status, created_at, evidence, source_message_id, session_id,
+         root_cause, fix_plan, source, original_query, ai_response, feedback_reason, context_json,
+         trace_id, priority, message_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (title, description, category, status, now, evidence, source_message_id, session_id, root_cause, fix_plan),
+        (title, description, category, status, now, evidence, source_message_id, session_id,
+         root_cause, fix_plan, source, original_query, ai_response, feedback_reason, context_json,
+         trace_id, priority, message_id),
     )
     case_id = cursor.lastrowid
     conn.commit()
@@ -1837,6 +1924,19 @@ def update_badcase(
     fix_plan: Optional[str] = None,
     verified_by: Optional[str] = None,
     rejected_reason: Optional[str] = None,
+    source: Optional[str] = None,
+    original_query: Optional[str] = None,
+    ai_response: Optional[str] = None,
+    feedback_reason: Optional[str] = None,
+    context_json: Optional[str] = None,
+    trace_id: Optional[str] = None,
+    priority: Optional[str] = None,
+    message_id: Optional[int] = None,
+    retest_response: Optional[str] = None,
+    retest_context_json: Optional[str] = None,
+    retest_trace_id: Optional[str] = None,
+    darwin_analysis: Optional[str] = None,
+    darwin_trace_id: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     now = now_cn("%Y-%m-%d %H:%M")
     conn = _get_conn()
@@ -1854,6 +1954,19 @@ def update_badcase(
         ("fix_plan", fix_plan),
         ("verified_by", verified_by),
         ("rejected_reason", rejected_reason),
+        ("source", source),
+        ("original_query", original_query),
+        ("ai_response", ai_response),
+        ("feedback_reason", feedback_reason),
+        ("context_json", context_json),
+        ("trace_id", trace_id),
+        ("priority", priority),
+        ("message_id", message_id),
+        ("retest_response", retest_response),
+        ("retest_context_json", retest_context_json),
+        ("retest_trace_id", retest_trace_id),
+        ("darwin_analysis", darwin_analysis),
+        ("darwin_trace_id", darwin_trace_id),
     ]:
         if val is not None:
             fields.append(f"{col} = ?")
@@ -1996,13 +2109,14 @@ def update_knowledge_draft(
     content: Optional[str] = None,
     category: Optional[str] = None,
     status: Optional[str] = None,
+    knowledge_doc_id: Optional[int] = None,
 ) -> Optional[Dict[str, Any]]:
     now = now_cn("%Y-%m-%d %H:%M")
     conn = _get_conn()
     cursor = conn.cursor()
     fields = ["updated_at = ?"]
     params = [now]
-    for col, val in [("title", title), ("content", content), ("category", category), ("status", status)]:
+    for col, val in [("title", title), ("content", content), ("category", category), ("status", status), ("knowledge_doc_id", knowledge_doc_id)]:
         if val is not None:
             fields.append(f"{col} = ?")
             params.append(val)
@@ -2020,6 +2134,221 @@ def delete_knowledge_draft(draft_id: int) -> bool:
     conn = _get_conn()
     cursor = conn.cursor()
     cursor.execute("DELETE FROM knowledge_drafts WHERE id = ?", (draft_id,))
+    deleted = cursor.rowcount > 0
+    conn.commit()
+    conn.close()
+    return deleted
+
+
+# -----------------------------------------------------------------------------
+# Skill / Prompt Drafts
+# -----------------------------------------------------------------------------
+
+def create_skill_prompt_draft(
+    badcase_id: int,
+    title: str,
+    skill_name: str,
+    prompt_content: str,
+    trigger_keywords: Optional[str] = None,
+    skill_id: Optional[int] = None,
+    status: str = "draft",
+) -> Dict[str, Any]:
+    now = now_cn("%Y-%m-%d %H:%M")
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        INSERT INTO skill_prompt_drafts
+        (badcase_id, skill_id, skill_name, title, prompt_content, trigger_keywords, status, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (badcase_id, skill_id, skill_name, title, prompt_content, trigger_keywords, status, now, now),
+    )
+    draft_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return get_skill_prompt_draft(draft_id)
+
+
+def get_skill_prompt_draft(draft_id: int) -> Optional[Dict[str, Any]]:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM skill_prompt_drafts WHERE id = ?", (draft_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def list_skill_prompt_drafts(
+    badcase_id: Optional[int] = None,
+    status: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    query = "SELECT * FROM skill_prompt_drafts WHERE 1=1"
+    params = []
+    if badcase_id is not None:
+        query += " AND badcase_id = ?"
+        params.append(badcase_id)
+    if status:
+        query += " AND status = ?"
+        params.append(status)
+    query += " ORDER BY created_at DESC"
+    cursor.execute(query, params)
+    rows = cursor.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def update_skill_prompt_draft(
+    draft_id: int,
+    title: Optional[str] = None,
+    skill_name: Optional[str] = None,
+    prompt_content: Optional[str] = None,
+    trigger_keywords: Optional[str] = None,
+    skill_id: Optional[int] = None,
+    status: Optional[str] = None,
+    published_at: Optional[str] = None,
+    published_by: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    now = now_cn("%Y-%m-%d %H:%M")
+    conn = _get_conn()
+    cursor = conn.cursor()
+    fields = ["updated_at = ?"]
+    params = [now]
+    for col, val in [
+        ("title", title),
+        ("skill_name", skill_name),
+        ("prompt_content", prompt_content),
+        ("trigger_keywords", trigger_keywords),
+        ("skill_id", skill_id),
+        ("status", status),
+        ("published_at", published_at),
+        ("published_by", published_by),
+    ]:
+        if val is not None:
+            fields.append(f"{col} = ?")
+            params.append(val)
+    params.append(draft_id)
+    cursor.execute(
+        f"UPDATE skill_prompt_drafts SET {', '.join(fields)} WHERE id = ?",
+        params,
+    )
+    conn.commit()
+    conn.close()
+    return get_skill_prompt_draft(draft_id)
+
+
+def delete_skill_prompt_draft(draft_id: int) -> bool:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM skill_prompt_drafts WHERE id = ?", (draft_id,))
+    deleted = cursor.rowcount > 0
+    conn.commit()
+    conn.close()
+    return deleted
+
+
+# -----------------------------------------------------------------------------
+# Capability Gap Drafts
+# -----------------------------------------------------------------------------
+
+def create_capability_gap_draft(
+    badcase_id: int,
+    title: str,
+    description: str,
+    gap_type: str,
+    suggested_action: Optional[str] = None,
+    status: str = "draft",
+) -> Dict[str, Any]:
+    now = now_cn("%Y-%m-%d %H:%M")
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        INSERT INTO capability_gap_drafts
+        (badcase_id, title, description, gap_type, suggested_action, status, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (badcase_id, title, description, gap_type, suggested_action, status, now, now),
+    )
+    draft_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return get_capability_gap_draft(draft_id)
+
+
+def get_capability_gap_draft(draft_id: int) -> Optional[Dict[str, Any]]:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM capability_gap_drafts WHERE id = ?", (draft_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def list_capability_gap_drafts(
+    badcase_id: Optional[int] = None,
+    status: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    query = "SELECT * FROM capability_gap_drafts WHERE 1=1"
+    params = []
+    if badcase_id is not None:
+        query += " AND badcase_id = ?"
+        params.append(badcase_id)
+    if status:
+        query += " AND status = ?"
+        params.append(status)
+    query += " ORDER BY created_at DESC"
+    cursor.execute(query, params)
+    rows = cursor.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def update_capability_gap_draft(
+    draft_id: int,
+    title: Optional[str] = None,
+    description: Optional[str] = None,
+    gap_type: Optional[str] = None,
+    suggested_action: Optional[str] = None,
+    status: Optional[str] = None,
+    accepted_at: Optional[str] = None,
+    accepted_by: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    now = now_cn("%Y-%m-%d %H:%M")
+    conn = _get_conn()
+    cursor = conn.cursor()
+    fields = ["updated_at = ?"]
+    params = [now]
+    for col, val in [
+        ("title", title),
+        ("description", description),
+        ("gap_type", gap_type),
+        ("suggested_action", suggested_action),
+        ("status", status),
+        ("accepted_at", accepted_at),
+        ("accepted_by", accepted_by),
+    ]:
+        if val is not None:
+            fields.append(f"{col} = ?")
+            params.append(val)
+    params.append(draft_id)
+    cursor.execute(
+        f"UPDATE capability_gap_drafts SET {', '.join(fields)} WHERE id = ?",
+        params,
+    )
+    conn.commit()
+    conn.close()
+    return get_capability_gap_draft(draft_id)
+
+
+def delete_capability_gap_draft(draft_id: int) -> bool:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM capability_gap_drafts WHERE id = ?", (draft_id,))
     deleted = cursor.rowcount > 0
     conn.commit()
     conn.close()
@@ -2391,6 +2720,19 @@ def get_chat_message(message_id: int) -> Optional[Dict[str, Any]]:
     conn = _get_conn()
     cursor = conn.cursor()
     cursor.execute("SELECT * FROM chat_messages WHERE id = ?", (message_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return _normalize_chat_message(dict(row)) if row else None
+
+
+def get_previous_user_message(session_id: str, ai_message_id: int) -> Optional[Dict[str, Any]]:
+    """Return the most recent user message before the given AI message in a session."""
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT * FROM chat_messages WHERE session_id = ? AND role = 'user' AND id < ? ORDER BY id DESC LIMIT 1",
+        (session_id, ai_message_id),
+    )
     row = cursor.fetchone()
     conn.close()
     return _normalize_chat_message(dict(row)) if row else None
