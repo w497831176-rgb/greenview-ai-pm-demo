@@ -1538,14 +1538,15 @@ def _migrate_v1_3_observability(cursor):
         )
         """
     )
-    cursor.execute(
-        "INSERT OR IGNORE INTO budget_thresholds (id, per_call_threshold_cny, daily_threshold_cny, monthly_threshold_cny, updated_at) VALUES (1, NULL, NULL, NULL, ?)",
-        (now,),
-    )
+    # Ensure the monthly column exists on existing databases before inserting.
     try:
         cursor.execute("ALTER TABLE budget_thresholds ADD COLUMN monthly_threshold_cny REAL")
     except sqlite3.OperationalError:
         pass
+    cursor.execute(
+        "INSERT OR IGNORE INTO budget_thresholds (id, per_call_threshold_cny, daily_threshold_cny, monthly_threshold_cny, updated_at) VALUES (1, NULL, NULL, NULL, ?)",
+        (now,),
+    )
 
 
 def _migrate_v1_3_3_badcase_closure(cursor):
