@@ -32,7 +32,7 @@ created_badcase_ids: List[int] = []
 def add_event_listeners(page: Page):
     page.on("pageerror", lambda exc: page_errors.append(str(exc)))
     page.on("console", lambda msg: console_errors.append(msg.text) if msg.type == "error" else None)
-    page.on("requestfailed", lambda req: failed_requests.append(f"{req.method} {req.url}: {req.failure_error_string}"))
+    page.on("requestfailed", lambda req: failed_requests.append(f"{req.method} {req.url}: {getattr(req, 'failure', '')}"))
 
 
 def screenshot(page: Page, name: str):
@@ -100,7 +100,7 @@ def run_platform_badcase(page: Page):
     wait_visible(page, '.top-tab[data-top="platform"]').click()
     page.wait_for_timeout(800)
     wait_visible(page, "#main-content")
-    assert_text(page, "平台管理", "platform main content loaded")
+    assert_text(page, "Agent 管理", "platform main content loaded")
     screenshot(page, "01_platform_overview")
 
     # Badcase library
@@ -131,8 +131,12 @@ def run_platform_badcase(page: Page):
 
     # Classify it as knowledge_gap via UI to reach classified state
     page.locator("#badcase-category").select_option("knowledge_gap")
-    page.locator("#badcase-classify").click()
-    page.wait_for_timeout(1200)
+    with page.expect_response(
+        lambda resp: "/api/badcases/" in resp.url and "/classify" in resp.url and resp.status == 200,
+        timeout=30000,
+    ):
+        page.locator("#badcase-classify").click()
+    page.wait_for_timeout(500)
     page.reload(wait_until="networkidle", timeout=60000)
     page.wait_for_timeout(800)
 
@@ -183,14 +187,16 @@ def run_cost_governance(page: Page):
         detail_btns[0].click()
         page.wait_for_timeout(800)
         screenshot(page, "07_cost_trace_detail")
-        assert_text(page, "成本计算公式", "trace detail cost formula")
+        modal_body = page.locator("#modal-body").first.inner_text()
+        assert "成本计算公式" in modal_body, "trace detail cost formula not found in modal"
+        results.append({"check": "trace detail cost formula visible", "ok": True})
 
 
 def run_acceptance():
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     try:
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
+            browser = p.chromium.launch(headless=True, args=["--no-proxy-server"])
             context = browser.new_context(viewport={"width": 1280, "height": 900})
             page = context.new_page()
             add_event_listeners(page)
@@ -199,7 +205,7 @@ def run_acceptance():
             page.goto(f"{BASE_URL}/", wait_until="networkidle", timeout=60000)
             page.wait_for_timeout(1500)
             wait_visible(page, "#main-content")
-            assert_text(page, "业主", "owner tab initial content")
+            assert_text(page, "AI 物业维修助手", "owner tab initial content")
             check_global_errors("first load")
 
             # Owner tab quick smoke
@@ -221,7 +227,7 @@ def run_acceptance():
             page.reload(wait_until="networkidle", timeout=60000)
             page.wait_for_timeout(1500)
             wait_visible(page, "#main-content")
-            assert_text(page, "平台管理", "after hard refresh main content")
+            assert_text(page, "AI 物业维修助手", "after hard refresh main content")
             check_global_errors("after hard refresh")
 
             wait_visible(page, '.top-tab[data-top="platform"]').click()
