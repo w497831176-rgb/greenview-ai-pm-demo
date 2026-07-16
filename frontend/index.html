@@ -2356,6 +2356,40 @@
         other: '其他',
         pending: '待分类'
       };
+      const actionTypeLabels = {
+        classify: '分类',
+        'darwin-fix': 'Darwin 优化修复',
+        'extract-knowledge': '提取知识草稿',
+        retest: '复测',
+        verify: '验证',
+        'verify-pass': '验证通过',
+        'verify-fail': '验证不通过',
+        reject: '驳回',
+        transition: '状态流转',
+        update: '更新字段',
+        'edit-knowledge-draft': '编辑知识草稿',
+        'edit-skill-prompt-draft': '编辑 Skill/Prompt 草稿',
+        'edit-capability-gap-draft': '编辑能力缺口草稿',
+        'review-knowledge-draft': '审核知识草稿',
+        'review-skill-prompt-draft': '审核 Skill/Prompt 草稿',
+        'review-capability-gap-draft': '审核能力缺口草稿',
+        'apply-knowledge-draft': '应用知识草稿',
+        'apply-skill-prompt-draft': '应用 Skill/Prompt 草稿',
+        'apply-capability-gap-draft': '记录能力缺口待办',
+        'publish-knowledge': '发布知识',
+        'publish-skill-prompt': '发布 Skill/Prompt',
+        'accept-capability-gap': '记录能力缺口',
+        'switch-model-retry': '模型重试',
+        'check-tools': '工具检查'
+      };
+      const draftStatusLabels = {
+        draft: '草稿',
+        under_review: '审核中',
+        approved: '已通过',
+        published: '已发布',
+        rejected: '已驳回',
+        accepted: '已采纳'
+      };
 
       async function runAction(path, body, successText) {
         try {
@@ -2388,18 +2422,11 @@
         renderContent();
       });
 
-      function sourceBadgeDetail(src) {
-        if (src === 'manual') return '<span class="text-xs px-2 py-1 rounded-full bg-indigo-50 text-indigo-600 border border-indigo-100">人工反馈</span>';
-        return '<span class="text-xs px-2 py-1 rounded-full bg-slate-100 text-slate-500 border border-slate-200">auto</span>';
+      function sourceBadgeDetail(srcLabel) {
+        if (srcLabel === '人工反馈') return '<span class="text-xs px-2 py-1 rounded-full bg-indigo-50 text-indigo-600 border border-indigo-100">人工反馈</span>';
+        return '<span class="text-xs px-2 py-1 rounded-full bg-slate-100 text-slate-500 border border-slate-200">自动发现</span>';
       }
-      async function copyToClipboard(text) {
-        try {
-          await navigator.clipboard.writeText(text);
-          showToast('已复制到剪贴板', 'success');
-        } catch (e) {
-          showToast('复制失败', 'error');
-        }
-      }
+
       function parseDarwin(da) {
         if (!da) return null;
         try {
@@ -2409,83 +2436,284 @@
         }
       }
 
+      function renderContextValue(v) {
+        if (v === null || v === undefined) return '<span class="text-slate-400">-</span>';
+        if (Array.isArray(v)) {
+          const items = v.map(x => (typeof x === 'string' ? escapeHtml(x) : escapeHtml(JSON.stringify(x)))).join('、');
+          return items ? `<div class="text-sm text-slate-700">${items}</div>` : '<span class="text-slate-400">-</span>';
+        }
+        if (typeof v === 'object') {
+          return `<pre class="text-xs bg-slate-50 p-2 rounded border border-slate-200 overflow-x-auto">${escapeHtml(JSON.stringify(v, null, 2))}</pre>`;
+        }
+        return `<div class="text-sm text-slate-700 whitespace-pre-wrap">${escapeHtml(String(v))}</div>`;
+      }
+
+      function renderKeyValue(obj) {
+        if (!obj || typeof obj !== 'object' || Object.keys(obj).length === 0) {
+          return '<p class="text-sm text-slate-400">-</p>';
+        }
+        return `
+          <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+            ${Object.entries(obj).map(([k, v]) => `
+              <div class="bg-slate-50 rounded-lg p-3 border border-slate-200">
+                <div class="text-xs text-slate-500 mb-1">${escapeHtml(k)}</div>
+                ${renderContextValue(v)}
+              </div>
+            `).join('')}
+          </div>
+        `;
+      }
+
+      function renderDetail(detail) {
+        if (!detail || typeof detail !== 'object' || Object.keys(detail).length === 0) return '';
+        const lines = Object.entries(detail).map(([k, v]) => {
+          let text;
+          if (v === null || v === undefined) text = '-';
+          else if (typeof v === 'object') text = JSON.stringify(v, null, 2);
+          else text = String(v);
+          return `<div class="text-xs text-slate-600"><span class="font-medium text-slate-700">${escapeHtml(k)}:</span> <span class="whitespace-pre-wrap">${escapeHtml(text)}</span></div>`;
+        }).join('');
+        return `<div class="mt-1 pl-2 border-l border-slate-200 space-y-0.5">${lines}</div>`;
+      }
+
+      function transitionBadge(before, beforeLabel, after, afterLabel) {
+        const styleMap = {
+          pending: 'bg-amber-50 text-amber-700 border-amber-200',
+          classified: 'bg-indigo-50 text-indigo-700 border-indigo-200',
+          fixing: 'bg-brand-50 text-brand-700 border-brand-200',
+          verifying: 'bg-sky-50 text-sky-700 border-sky-200',
+          closed: 'bg-slate-100 text-slate-600 border-slate-200',
+          rejected: 'bg-red-50 text-red-700 border-red-200'
+        };
+        const beforeClass = styleMap[before] || 'bg-slate-100 text-slate-600 border-slate-200';
+        const afterClass = styleMap[after] || 'bg-slate-100 text-slate-600 border-slate-200';
+        return `<span class="px-2 py-0.5 rounded-full text-[10px] font-medium border ${beforeClass}">${escapeHtml(beforeLabel || before)}</span><span class="text-slate-400">→</span><span class="px-2 py-0.5 rounded-full text-[10px] font-medium border ${afterClass}">${escapeHtml(afterLabel || after)}</span>`;
+      }
+
+      function draftField(type, d) {
+        if (type === 'knowledge') return d.content || '';
+        if (type === 'skill_prompt') return d.prompt_content || '';
+        return d.description || '';
+      }
+
+      function draftFields(type, d) {
+        if (type === 'knowledge') {
+          return [
+            { key: 'title', label: '标题', value: d.title || '' },
+            { key: 'content', label: '正文', value: d.content || '', textarea: true },
+            { key: 'category', label: '分类', value: d.category || '' }
+          ];
+        }
+        if (type === 'skill_prompt') {
+          return [
+            { key: 'title', label: '标题', value: d.title || '' },
+            { key: 'skill_name', label: 'Skill 名称', value: d.skill_name || '' },
+            { key: 'prompt_content', label: 'Prompt 内容', value: d.prompt_content || '', textarea: true },
+            { key: 'trigger_keywords', label: '触发关键词', value: d.trigger_keywords || '' }
+          ];
+        }
+        return [
+          { key: 'title', label: '标题', value: d.title || '' },
+          { key: 'description', label: '缺口描述', value: d.description || '', textarea: true },
+          { key: 'gap_type', label: '缺口类型', value: d.gap_type || '' },
+          { key: 'suggested_action', label: '建议动作', value: d.suggested_action || '', textarea: true }
+        ];
+      }
+
+      function draftEndpoint(type) {
+        if (type === 'knowledge') return 'knowledge-drafts';
+        if (type === 'skill_prompt') return 'skill-prompt-drafts';
+        return 'capability-gap-drafts';
+      }
+
+      function openDraftView(d, type) {
+        const fields = draftFields(type, d);
+        const body = fields.map(f => `
+          <div class="mb-3">
+            <label class="block text-xs text-slate-500 mb-1">${escapeHtml(f.label)}</label>
+            <div class="text-sm text-slate-700 whitespace-pre-wrap bg-slate-50 rounded-lg p-3 border border-slate-200">${escapeHtml(f.value || '-')}</div>
+          </div>
+        `).join('');
+        openModal(`${escapeHtml(draftStatusLabels[d.status] || d.status)} - ${escapeHtml(d.title || '草稿')}`, body, () => closeModal(), '关闭');
+      }
+
+      function openDraftEdit(d, type) {
+        const fields = draftFields(type, d);
+        const body = fields.map(f => `
+          <div class="mb-3">
+            <label class="block text-xs text-slate-500 mb-1">${escapeHtml(f.label)}</label>
+            ${f.textarea
+              ? `<textarea id="draft-edit-${f.key}" rows="5" class="w-full px-3 py-2 bg-white border border-slate-200 rounded-xl text-sm focus:outline-none focus:border-brand-400">${escapeHtml(f.value)}</textarea>`
+              : `<input id="draft-edit-${f.key}" type="text" value="${escapeHtml(f.value)}" class="w-full px-3 py-2 bg-white border border-slate-200 rounded-xl text-sm focus:outline-none focus:border-brand-400">`}
+          </div>
+        `).join('');
+        openModal(`编辑${type === 'knowledge' ? '知识' : type === 'skill_prompt' ? 'Skill/Prompt' : '能力缺口'}草稿`, body, async () => {
+          const payload = {};
+          fields.forEach(f => { payload[f.key] = $(`#draft-edit-${f.key}`).value; });
+          try {
+            await apiPut(`/api/badcases/${id}/${draftEndpoint(type)}/${d.id}`, payload);
+            showToast('草稿已保存', 'success');
+            closeModal();
+            await loadDetail();
+          } catch (err) {
+            showToast('保存失败：' + err.message, 'error');
+          }
+        });
+      }
+
+      function renderDraftCard(d, type, idx) {
+        const content = draftField(type, d);
+        const snippet = (content || '').slice(0, 120);
+        const status = d.status || 'draft';
+        const terminalDraft = type === 'capability_gap' ? ['accepted', 'rejected'].includes(status) : ['published', 'rejected'].includes(status);
+        const canEdit = !isTerminal && allowed.has('edit-draft') && !terminalDraft;
+        const canReview = !isTerminal && allowed.has('review-draft') && !terminalDraft;
+        const canApply = !isTerminal && status === 'approved' && allowed.has('apply-draft');
+        return `
+          <div class="bg-slate-50 rounded-xl p-3 border border-slate-200 text-sm">
+            <div class="flex items-center justify-between mb-1 gap-2">
+              <span class="font-medium text-slate-900 truncate">#${idx + 1} ${escapeHtml(d.title || '未命名')}</span>
+              <span class="shrink-0 text-[10px] px-2 py-0.5 rounded-full border bg-white text-slate-600 border-slate-200">${escapeHtml(draftStatusLabels[status] || status)}</span>
+            </div>
+            <div class="text-xs text-slate-500 mb-2 min-h-[2.5em]">${escapeHtml(snippet)}${(content || '').length > 120 ? '...' : ''}</div>
+            <div class="flex flex-wrap gap-2">
+              <button data-draft-id="${d.id}" data-draft-type="${type}" class="badcase-draft-view px-2 py-1 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg text-xs transition-colors">查看全文</button>
+              <button data-draft-id="${d.id}" data-draft-type="${type}" class="badcase-draft-edit px-2 py-1 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg text-xs transition-colors" ${canEdit ? '' : 'disabled title="当前状态不可编辑或草稿已终态"'}>编辑</button>
+              <button data-draft-id="${d.id}" data-draft-type="${type}" data-review="approved" class="badcase-draft-review px-2 py-1 bg-green-50 hover:bg-green-100 text-green-700 rounded-lg text-xs transition-colors" ${canReview ? '' : 'disabled title="当前状态不可审核"'}>通过审核</button>
+              <button data-draft-id="${d.id}" data-draft-type="${type}" data-review="under_review" class="badcase-draft-review px-2 py-1 bg-amber-50 hover:bg-amber-100 text-amber-700 rounded-lg text-xs transition-colors" ${canReview ? '' : 'disabled title="当前状态不可审核"'}>退回草稿</button>
+              <button data-draft-id="${d.id}" data-draft-type="${type}" data-review="rejected" class="badcase-draft-review px-2 py-1 bg-red-50 hover:bg-red-100 text-red-700 rounded-lg text-xs transition-colors" ${canReview ? '' : 'disabled title="当前状态不可审核"'}>驳回</button>
+              ${canApply ? `<button data-draft-id="${d.id}" data-draft-type="${type}" class="badcase-draft-apply px-2 py-1 bg-brand-600 hover:bg-brand-700 text-white rounded-lg text-xs transition-colors">应用已审核草稿</button>` : ''}
+            </div>
+          </div>
+        `;
+      }
+
+      function renderDraftSection(type, drafts, title) {
+        if (!drafts.length) return '';
+        return `
+          <div class="bg-white rounded-2xl shadow-soft border border-slate-200 p-5">
+            <h3 class="font-semibold text-slate-900 mb-3">${title}</h3>
+            <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
+              ${drafts.map((d, idx) => renderDraftCard(d, type, idx)).join('')}
+            </div>
+          </div>
+        `;
+      }
+
+      let allowed = new Set();
+      let isTerminal = false;
+      let category = 'pending';
+
       async function loadDetail() {
         try {
           const data = await apiGet(`/api/badcases/${id}`);
           const bc = data.badcase || data;
-          const knowledgeDrafts = bc.knowledge_drafts || bc.drafts || [];
-          const skillDrafts = bc.skill_drafts || [];
-          const capabilityDrafts = bc.capability_drafts || bc.gap_drafts || [];
-          const isClosed = bc.status === 'closed' || bc.status === 'rejected';
-          const traceLink = bc.trace_id ? `<a href="#observability?trace_id=${encodeURIComponent(bc.trace_id)}" class="font-mono text-xs text-brand-600 hover:text-brand-700 bg-slate-50 px-2 py-1 rounded border border-slate-200">${escapeHtml(bc.trace_id)}</a>` : '<span class="text-sm text-slate-400">-</span>';
+          allowed = new Set(bc.allowed_actions || []);
+          isTerminal = bc.is_terminal;
+          category = bc.category || 'pending';
+          const kDrafts = bc.knowledge_drafts || [];
+          const sDrafts = bc.skill_prompt_drafts || [];
+          const cDrafts = bc.capability_gap_drafts || [];
           const darwin = parseDarwin(bc.darwin_analysis);
-          const retest = bc.retest_result || null;
+          const retestContext = bc.retest_context || {};
+
+          const categoryDraftMap = {
+            knowledge_gap: { label: '提取知识草稿', action: 'extract-knowledge', path: `/api/badcases/${id}/extract-knowledge` },
+            skill_prompt: { label: '生成 Skill/Prompt 草稿', action: 'darwin-fix', path: `/api/badcases/${id}/darwin-fix` },
+            mcp_capability: { label: '记录能力缺口草稿', action: 'darwin-fix', path: `/api/badcases/${id}/darwin-fix` },
+            routing: { label: '生成修复计划草稿', action: 'darwin-fix', path: `/api/badcases/${id}/darwin-fix` },
+            response_quality: { label: '生成修复计划草稿', action: 'darwin-fix', path: `/api/badcases/${id}/darwin-fix` }
+          };
+          const catDraft = categoryDraftMap[category];
+          const catDraftBtn = catDraft ? `<button id="badcase-category-draft" type="button" class="w-full px-4 py-2 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 rounded-xl text-sm transition-colors" ${allowed.has(catDraft.action) ? '' : 'disabled title="当前状态不可执行该操作"'}>${escapeHtml(catDraft.label)}</button>` : '';
+
+          let actionButtonsHtml = '';
+          if (isTerminal) {
+            actionButtonsHtml = `<p class="text-xs text-slate-500 mt-3">该 Badcase 已${bc.status === 'rejected' ? '驳回' : '关闭'}，不可继续操作。</p>`;
+          } else if (bc.status === 'pending') {
+            actionButtonsHtml = `
+              <button id="badcase-classify" type="button" class="w-full px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white rounded-xl text-sm transition-colors" ${allowed.has('classify') ? '' : 'disabled title="当前状态不可分类"'}>保存分类</button>
+              <button id="badcase-reject" type="button" class="w-full text-xs text-slate-500 hover:text-red-600 underline mt-2" ${allowed.has('reject') ? '' : 'disabled title="当前状态不可驳回"'}>驳回 / 拒绝处理</button>
+            `;
+          } else if (bc.status === 'classified') {
+            actionButtonsHtml = `
+              <button id="badcase-darwin" type="button" class="w-full px-4 py-2 bg-gold-500 hover:bg-gold-600 text-white rounded-xl text-sm transition-colors" ${allowed.has('darwin-fix') ? '' : 'disabled title="当前状态不可执行 Darwin 优化"'}>Darwin 优化修复方案</button>
+              ${catDraftBtn}
+              <button id="badcase-reject" type="button" class="w-full text-xs text-slate-500 hover:text-red-600 underline mt-2" ${allowed.has('reject') ? '' : 'disabled title="当前状态不可驳回"'}>驳回 / 拒绝处理</button>
+            `;
+          } else if (bc.status === 'fixing') {
+            actionButtonsHtml = `
+              <p class="text-xs text-slate-500">请在下方草稿卡片中查看、编辑、审核并应用。</p>
+              <button id="badcase-reject" type="button" class="w-full text-xs text-slate-500 hover:text-red-600 underline mt-2" ${allowed.has('reject') ? '' : 'disabled title="当前状态不可驳回"'}>驳回 / 拒绝处理</button>
+            `;
+          } else if (bc.status === 'verifying') {
+            actionButtonsHtml = `
+              <button id="badcase-retest" type="button" class="w-full px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl text-sm transition-colors" ${allowed.has('retest') ? '' : 'disabled title="当前状态不可复测"'}>复测</button>
+              <div class="flex gap-2">
+                <button id="badcase-verify-pass" type="button" class="flex-1 px-4 py-2 bg-green-600 hover:bg-green-700 text-white rounded-xl text-sm transition-colors" ${allowed.has('verify-pass') ? '' : 'disabled title="当前状态不可验证"'}>验证通过</button>
+                <button id="badcase-verify-fail" type="button" class="flex-1 px-4 py-2 bg-red-50 hover:bg-red-100 text-red-700 rounded-xl text-sm transition-colors" ${allowed.has('verify-fail') ? '' : 'disabled title="当前状态不可验证"'}>验证不通过</button>
+              </div>
+              <button id="badcase-reject" type="button" class="w-full text-xs text-slate-500 hover:text-red-600 underline mt-2" ${allowed.has('reject') ? '' : 'disabled title="当前状态不可驳回"'}>驳回 / 拒绝处理</button>
+            `;
+          }
+
           $('#badcase-detail-content').innerHTML = `
             <div class="space-y-4">
               <div class="bg-white rounded-2xl shadow-soft border border-slate-200 p-5 flex flex-wrap gap-3 items-center justify-between">
                 <div class="flex flex-wrap items-center gap-3">
-                  <span class="text-sm text-slate-500">当前状态：<span class="font-medium text-slate-800">${statusBadge(bc.status)}</span></span>
-                  <span class="text-sm text-slate-500">来源：${sourceBadgeDetail(bc.source)}</span>
+                  <span class="text-sm text-slate-500">当前状态：${statusBadge(bc.status)} <span class="text-slate-700 font-medium">${escapeHtml(bc.status_label || '')}</span></span>
+                  <span class="text-sm text-slate-500">分类：<span class="font-medium text-slate-800">${escapeHtml(bc.category_label || categoryLabels[category] || category)}</span></span>
+                  <span class="text-sm text-slate-500">来源：${sourceBadgeDetail(bc.source_label)}</span>
                 </div>
                 <div class="text-xs text-slate-400">状态流转：pending → classified → fixing → verifying → closed / rejected</div>
               </div>
+
               <div class="bg-white rounded-2xl shadow-soft border border-slate-200 p-5">
-                <h3 class="font-semibold text-slate-900 mb-2">Trace ID</h3>
-                <div class="flex flex-wrap items-center gap-2">
-                  ${traceLink}
-                  ${bc.trace_id ? `<button id="badcase-copy-trace" type="button" class="text-xs px-2 py-1 bg-slate-100 hover:bg-slate-200 text-slate-600 rounded-lg transition-colors">复制</button>` : ''}
-                </div>
+                <h3 class="font-semibold text-slate-900 mb-2">问题查询</h3>
+                <div class="text-sm text-slate-700 whitespace-pre-wrap bg-slate-50 rounded-lg p-3 border border-slate-200">${escapeHtml(bc.query || '-')}</div>
               </div>
-              <div class="grid grid-cols-1 lg:grid-cols-3 gap-4">
-                <div class="bg-white rounded-2xl shadow-soft border border-slate-200 p-5">
-                  <h3 class="font-semibold text-slate-900 mb-3">原始问题</h3>
-                  <p class="text-sm text-slate-700 whitespace-pre-wrap bg-slate-50 rounded-lg p-3 border border-slate-200">${escapeHtml(bc.original_query || bc.query || bc.title || '-')}</p>
-                </div>
-                <div class="bg-white rounded-2xl shadow-soft border border-slate-200 p-5">
-                  <h3 class="font-semibold text-slate-900 mb-3">AI 回答</h3>
-                  <div class="text-sm text-slate-700 whitespace-pre-wrap bg-slate-50 rounded-lg p-3 border border-slate-200">${escapeHtml(bc.ai_response || '（无回答内容）')}</div>
-                </div>
-                <div class="bg-white rounded-2xl shadow-soft border border-slate-200 p-5">
-                  <h3 class="font-semibold text-slate-900 mb-3">反馈原因</h3>
-                  <div class="text-sm text-slate-700 whitespace-pre-wrap bg-red-50 rounded-lg p-3 border border-red-100">${escapeHtml(bc.feedback_reason || bc.description || '（未填写）')}</div>
-                </div>
+
+              <div class="bg-white rounded-2xl shadow-soft border border-slate-200 p-5">
+                <h3 class="font-semibold text-slate-900 mb-3">上下文信息</h3>
+                ${renderKeyValue(bc.context)}
               </div>
+
+              <div class="bg-white rounded-2xl shadow-soft border border-slate-200 p-5">
+                <h3 class="font-semibold text-slate-900 mb-2">证据 / 反馈</h3>
+                <div class="text-sm text-slate-700 whitespace-pre-wrap bg-red-50 rounded-lg p-3 border border-red-100">${escapeHtml(bc.evidence || '（未填写）')}</div>
+              </div>
+
               <div class="grid grid-cols-1 lg:grid-cols-3 gap-4">
                 <div class="bg-white rounded-2xl shadow-soft border border-slate-200 p-5">
                   <h3 class="font-semibold text-slate-900 mb-3">分类与修复</h3>
                   <div class="mb-4">
                     <label class="block text-xs text-slate-500 mb-1">当前分类</label>
-                    <div class="text-sm text-slate-900 font-medium">${escapeHtml(categoryLabels[bc.category] || bc.category || '未分类')}</div>
+                    <div class="text-sm text-slate-900 font-medium">${escapeHtml(bc.category_label || categoryLabels[category] || category)}</div>
                   </div>
-                  <form id="badcase-classify-form" class="space-y-2 mb-4">
-                    <label class="block text-xs text-slate-500">分类调整</label>
-                    <select id="badcase-category" class="w-full px-3 py-2 bg-white border border-slate-200 rounded-xl text-sm focus:outline-none focus:border-brand-400" ${isClosed ? 'disabled' : ''}>
-                      <option value="knowledge_gap" ${bc.category === 'knowledge_gap' ? 'selected' : ''}>知识库缺口</option>
-                      <option value="skill_prompt" ${bc.category === 'skill_prompt' ? 'selected' : ''}>Skill/Prompt 问题</option>
-                      <option value="mcp_capability" ${bc.category === 'mcp_capability' ? 'selected' : ''}>MCP/能力缺口</option>
-                      <option value="routing" ${bc.category === 'routing' ? 'selected' : ''}>路由问题</option>
-                      <option value="response_quality" ${bc.category === 'response_quality' ? 'selected' : ''}>模型回答质量</option>
-                      <option value="other" ${bc.category === 'other' ? 'selected' : ''}>其他</option>
-                      <option value="pending" ${bc.category === 'pending' ? 'selected' : ''}>待分类</option>
-                    </select>
-                    <button id="badcase-classify" type="button" class="w-full px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white rounded-xl text-sm transition-colors" ${isClosed ? 'disabled' : ''}>保存分类</button>
-                  </form>
+                  ${bc.status === 'pending' ? `
+                    <form id="badcase-classify-form" class="space-y-2 mb-4">
+                      <label class="block text-xs text-slate-500">分类调整</label>
+                      <select id="badcase-category" class="w-full px-3 py-2 bg-white border border-slate-200 rounded-xl text-sm focus:outline-none focus:border-brand-400">
+                        <option value="knowledge_gap" ${category === 'knowledge_gap' ? 'selected' : ''}>知识库缺口</option>
+                        <option value="skill_prompt" ${category === 'skill_prompt' ? 'selected' : ''}>Skill/Prompt 问题</option>
+                        <option value="mcp_capability" ${category === 'mcp_capability' ? 'selected' : ''}>MCP/能力缺口</option>
+                        <option value="routing" ${category === 'routing' ? 'selected' : ''}>路由问题</option>
+                        <option value="response_quality" ${category === 'response_quality' ? 'selected' : ''}>模型回答质量</option>
+                        <option value="other" ${category === 'other' ? 'selected' : ''}>其他</option>
+                        <option value="pending" ${category === 'pending' ? 'selected' : ''}>待分类</option>
+                      </select>
+                    </form>
+                  ` : ''}
                   <div class="space-y-2 border-t border-slate-100 pt-4">
-                    <button id="badcase-darwin" type="button" class="w-full px-4 py-2 bg-gold-500 hover:bg-gold-600 text-white rounded-xl text-sm transition-colors" ${isClosed ? 'disabled' : ''}>Darwin 优化修复方案</button>
-                    <button id="badcase-extract" type="button" class="w-full px-4 py-2 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 rounded-xl text-sm transition-colors" ${isClosed ? 'disabled' : ''}>提取知识草稿</button>
-                    <button id="badcase-retest" type="button" class="w-full px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl text-sm transition-colors" ${isClosed ? 'disabled' : ''}>复测</button>
-                    <div class="flex gap-2">
-                      <button id="badcase-verify-pass" type="button" class="flex-1 px-4 py-2 bg-green-600 hover:bg-green-700 text-white rounded-xl text-sm transition-colors" ${isClosed ? 'disabled' : ''}>验证通过</button>
-                      <button id="badcase-verify-fail" type="button" class="flex-1 px-4 py-2 bg-red-50 hover:bg-red-100 text-red-700 rounded-xl text-sm transition-colors" ${isClosed ? 'disabled' : ''}>验证不通过</button>
-                    </div>
-                    <button id="badcase-reject" type="button" class="w-full text-xs text-slate-500 hover:text-red-600 underline" ${isClosed ? 'disabled' : ''}>驳回 / 拒绝处理</button>
+                    ${actionButtonsHtml}
                   </div>
-                  ${isClosed ? `<p class="text-xs text-slate-500 mt-3">该 Badcase 已${bc.status === 'rejected' ? '驳回' : '关闭'}，不可继续操作。</p>` : ''}
                 </div>
+
                 <div class="bg-white rounded-2xl shadow-soft border border-slate-200 p-5">
                   <h3 class="font-semibold text-slate-900 mb-3">根因分析</h3>
                   <div class="text-sm text-slate-700 whitespace-pre-wrap bg-slate-50 rounded-lg p-3 border border-slate-200 min-h-[100px]">${escapeHtml(bc.root_cause || '（待分析）')}</div>
                 </div>
+
                 <div class="bg-white rounded-2xl shadow-soft border border-slate-200 p-5">
                   ${darwin ? `
                     <h3 class="font-semibold text-slate-900 mb-3">Darwin 分析</h3>
@@ -2496,7 +2724,7 @@
                       </div>
                       <div>
                         <div class="text-xs text-slate-500 mb-1">建议动作</div>
-                        <div class="whitespace-pre-wrap bg-slate-50 rounded-lg p-3 border border-slate-200">${escapeHtml(darwin.suggested_actions || '（无）')}</div>
+                        <div class="whitespace-pre-wrap bg-slate-50 rounded-lg p-3 border border-slate-200">${escapeHtml(Array.isArray(darwin.suggested_actions) ? darwin.suggested_actions.join('\n') : (darwin.suggested_actions || '（无）'))}</div>
                       </div>
                       <div>
                         <div class="text-xs text-slate-500 mb-1">预期收益</div>
@@ -2513,94 +2741,33 @@
                   `}
                 </div>
               </div>
-              ${knowledgeDrafts.length ? `
+
+              ${renderDraftSection('knowledge', kDrafts, '知识库草稿')}
+              ${renderDraftSection('skill_prompt', sDrafts, 'Skill/Prompt 草稿')}
+              ${renderDraftSection('capability_gap', cDrafts, '能力缺口建议')}
+
+              ${bc.retest_response ? `
                 <div class="bg-white rounded-2xl shadow-soft border border-slate-200 p-5">
-                  <h3 class="font-semibold text-slate-900 mb-3">知识库草稿</h3>
-                  <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
-                    ${knowledgeDrafts.map((d, idx) => `
-                      <div class="bg-slate-50 rounded-xl p-3 border border-slate-200 text-sm">
-                        <div class="font-medium text-slate-900 mb-1">#${idx + 1} ${escapeHtml(d.title || '未命名')}</div>
-                        <div class="text-xs text-slate-500 mb-2">${escapeHtml((d.content || '').slice(0, 100))}${(d.content || '').length > 100 ? '...' : ''}</div>
-                        <button data-draft-id="${d.id}" class="badcase-publish-draft px-3 py-1 bg-brand-600 hover:bg-brand-700 text-white rounded-lg text-xs transition-colors" ${isClosed ? 'disabled' : ''}>发布/应用</button>
-                      </div>
-                    `).join('')}
-                  </div>
-                </div>
-              ` : ''}
-              ${skillDrafts.length ? `
-                <div class="bg-white rounded-2xl shadow-soft border border-slate-200 p-5">
-                  <h3 class="font-semibold text-slate-900 mb-3">Skill/Prompt 草稿</h3>
-                  <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
-                    ${skillDrafts.map((d, idx) => `
-                      <div class="bg-slate-50 rounded-xl p-3 border border-slate-200 text-sm">
-                        <div class="font-medium text-slate-900 mb-1">#${idx + 1} ${escapeHtml(d.title || '未命名')}</div>
-                        <div class="text-xs text-slate-500 mb-2">${escapeHtml((d.content || d.prompt || '').slice(0, 100))}${(d.content || d.prompt || '').length > 100 ? '...' : ''}</div>
-                        <button data-draft-id="${d.id}" class="badcase-publish-skill-draft px-3 py-1 bg-brand-600 hover:bg-brand-700 text-white rounded-lg text-xs transition-colors" ${isClosed ? 'disabled' : ''}>发布/应用</button>
-                      </div>
-                    `).join('')}
-                  </div>
-                </div>
-              ` : ''}
-              ${capabilityDrafts.length ? `
-                <div class="bg-white rounded-2xl shadow-soft border border-slate-200 p-5">
-                  <h3 class="font-semibold text-slate-900 mb-3">能力缺口建议</h3>
-                  <p class="text-xs text-slate-500 mb-3">记录为待办事项，不会自动创建工具。</p>
-                  <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
-                    ${capabilityDrafts.map((d, idx) => `
-                      <div class="bg-slate-50 rounded-xl p-3 border border-slate-200 text-sm">
-                        <div class="font-medium text-slate-900 mb-1">#${idx + 1} ${escapeHtml(d.title || '未命名')}</div>
-                        <div class="text-xs text-slate-500 mb-2">${escapeHtml((d.content || d.description || '').slice(0, 100))}${(d.content || d.description || '').length > 100 ? '...' : ''}</div>
-                        <button data-draft-id="${d.id}" class="badcase-accept-capability-gap px-3 py-1 bg-amber-600 hover:bg-amber-700 text-white rounded-lg text-xs transition-colors" ${isClosed ? 'disabled' : ''}>记录待办</button>
-                      </div>
-                    `).join('')}
-                  </div>
-                </div>
-              ` : ''}
-              ${retest ? `
-                <div class="bg-white rounded-2xl shadow-soft border border-slate-200 p-5">
-                  <h3 class="font-semibold text-slate-900 mb-3">重测结果</h3>
+                  <h3 class="font-semibold text-slate-900 mb-3">复测结果</h3>
                   <div class="space-y-3 text-sm text-slate-700">
                     <div>
-                      <div class="text-xs text-slate-500 mb-1">重测回答</div>
-                      <div class="whitespace-pre-wrap bg-slate-50 rounded-lg p-3 border border-slate-200">${escapeHtml(retest.retest_response || '（无）')}</div>
+                      <div class="text-xs text-slate-500 mb-1">复测回答</div>
+                      <div class="whitespace-pre-wrap bg-slate-50 rounded-lg p-3 border border-slate-200">${escapeHtml(bc.retest_response)}</div>
                     </div>
-                    <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
-                      <div class="bg-slate-50 rounded-lg p-3 border border-slate-200">
-                        <div class="text-xs text-slate-500 mb-1">路由意图</div>
-                        <div class="font-medium text-slate-900">${escapeHtml((retest.retest_context && retest.retest_context.route_intent) || '-')}</div>
-                      </div>
-                      <div class="bg-slate-50 rounded-lg p-3 border border-slate-200">
-                        <div class="text-xs text-slate-500 mb-1">当前 Agent</div>
-                        <div class="font-medium text-slate-900">${escapeHtml(retest.current_agent || '-')}</div>
-                      </div>
-                      <div class="bg-slate-50 rounded-lg p-3 border border-slate-200">
-                        <div class="text-xs text-slate-500 mb-1">已命中 Skills</div>
-                        <div class="font-medium text-slate-900">${escapeHtml((retest.activated_skills || []).join('、') || '-')}</div>
-                      </div>
-                      <div class="bg-slate-50 rounded-lg p-3 border border-slate-200">
-                        <div class="text-xs text-slate-500 mb-1">引用标题</div>
-                        <div class="font-medium text-slate-900">${escapeHtml((retest.citations || []).map(c => c.title || c).join('、') || '-')}</div>
-                      </div>
-                      <div class="bg-slate-50 rounded-lg p-3 border border-slate-200">
-                        <div class="text-xs text-slate-500 mb-1">MCP 调用</div>
-                        <div class="font-medium text-slate-900">${escapeHtml((retest.mcp_calls || []).map(m => m.name || m).join('、') || '-')}</div>
-                      </div>
-                      <div class="bg-slate-50 rounded-lg p-3 border border-slate-200">
-                        <div class="text-xs text-slate-500 mb-1">模型</div>
-                        <div class="font-medium text-slate-900">${escapeHtml(retest.model_id || '-')}</div>
-                      </div>
-                      <div class="bg-slate-50 rounded-lg p-3 border border-slate-200">
-                        <div class="text-xs text-slate-500 mb-1">Trace ID</div>
-                        <div class="font-medium text-slate-900 font-mono text-xs">${escapeHtml(retest.trace_id || '-')}</div>
-                      </div>
-                      <div class="bg-slate-50 rounded-lg p-3 border border-slate-200">
-                        <div class="text-xs text-slate-500 mb-1">Auto Badcase ID</div>
-                        <div class="font-medium text-slate-900 font-mono text-xs">${escapeHtml(retest.auto_badcase_id || '-')}</div>
-                      </div>
+                    <div>
+                      <div class="text-xs text-slate-500 mb-1">复测上下文</div>
+                      ${renderKeyValue(retestContext)}
                     </div>
+                    ${bc.retest_trace_id ? `
+                      <div>
+                        <div class="text-xs text-slate-500 mb-1">复测 Trace ID</div>
+                        <div class="font-mono text-xs text-brand-600 bg-slate-50 px-2 py-1 rounded border border-slate-200 inline-block">${escapeHtml(bc.retest_trace_id)}</div>
+                      </div>
+                    ` : ''}
                   </div>
                 </div>
               ` : ''}
+
               ${(bc.actions || []).length ? `
                 <div class="bg-white rounded-2xl shadow-soft border border-slate-200 p-5">
                   <h3 class="font-semibold text-slate-900 mb-3">操作历史</h3>
@@ -2609,10 +2776,11 @@
                       <li class="border-l-2 border-slate-200 pl-3">
                         <div class="flex flex-wrap items-center gap-2 text-xs text-slate-500">
                           <span>${formatTimeLabel(a.created_at)}</span>
-                          ${a.from_status ? `<span>${statusBadge(a.from_status)}</span><span>→</span><span>${statusBadge(a.to_status)}</span>` : ''}
+                          ${a.status_before !== null && a.status_before !== undefined ? transitionBadge(a.status_before, a.status_before_label, a.status_after, a.status_after_label) : ''}
                         </div>
-                        <div class="mt-1"><b class="font-medium text-slate-900">${escapeHtml(a.action)}</b>
-                          ${a.details && a.details.reason ? `：${escapeHtml(a.details.reason)}` : ''}
+                        <div class="mt-1">
+                          <b class="font-medium text-slate-900">${escapeHtml(actionTypeLabels[a.action_type] || a.action_type)}</b>
+                          ${renderDetail(a.action_detail_parsed)}
                         </div>
                       </li>
                     `).join('')}
@@ -2622,58 +2790,103 @@
             </div>
           `;
 
-          if (bc.trace_id) {
-            $('#badcase-copy-trace').addEventListener('click', () => copyToClipboard(bc.trace_id));
+          if (bc.status === 'pending') {
+            $('#badcase-classify').addEventListener('click', () => {
+              const selected = $('#badcase-category').value;
+              runAction(`/api/badcases/${id}/classify`, { auto: false, category: selected, reason: `手动分类为 ${selected}` }, '已保存分类');
+            });
           }
 
-          $('#badcase-classify').addEventListener('click', () => {
-            const category = $('#badcase-category').value;
-            runAction(`/api/badcases/${id}/classify`, { auto: false, category, reason: `手动分类为 ${category}` }, '已分类');
-          });
+          if (bc.status === 'classified') {
+            $('#badcase-darwin').addEventListener('click', () => {
+              runAction(`/api/badcases/${id}/darwin-fix`, {}, 'Darwin 优化完成');
+            });
+            if (catDraft) {
+              const btn = $('#badcase-category-draft');
+              if (btn && !btn.disabled) {
+                btn.addEventListener('click', () => {
+                  runAction(catDraft.path, {}, catDraft.label + '完成');
+                });
+              }
+            }
+          }
 
-          $('#badcase-darwin').addEventListener('click', () => {
-            runAction(`/api/badcases/${id}/darwin-fix`, {}, 'Darwin 优化完成');
-          });
+          if (bc.status === 'verifying') {
+            $('#badcase-retest').addEventListener('click', () => {
+              runAction(`/api/badcases/${id}/retest`, {}, '已发起复测');
+            });
+            $('#badcase-verify-pass').addEventListener('click', () => {
+              runAction(`/api/badcases/${id}/verify`, { passed: true }, '已验证关闭');
+            });
+            $('#badcase-verify-fail').addEventListener('click', () => {
+              const note = window.prompt('验证不通过原因（将回到修复阶段）：');
+              if (note === null) return;
+              if (!note.trim()) {
+                showToast('验证不通过原因不能为空', 'error');
+                return;
+              }
+              runAction(`/api/badcases/${id}/verify`, { passed: false, note: note.trim() }, '已退回修复');
+            });
+          }
 
-          $('#badcase-extract').addEventListener('click', () => {
-            runAction(`/api/badcases/${id}/extract-knowledge`, {}, '已提取知识草稿');
-          });
+          const rejectBtn = $('#badcase-reject');
+          if (rejectBtn && !rejectBtn.disabled) {
+            rejectBtn.addEventListener('click', () => {
+              const reason = window.prompt('驳回原因：');
+              if (reason === null) return;
+              if (!reason.trim()) {
+                showToast('驳回原因不能为空', 'error');
+                return;
+              }
+              runAction(`/api/badcases/${id}/reject`, { rejected_reason: reason.trim() }, '已驳回');
+            });
+          }
 
-          $('#badcase-retest').addEventListener('click', () => {
-            runAction(`/api/badcases/${id}/retest`, {}, '已发起复测');
-          });
-
-          $('#badcase-verify-pass').addEventListener('click', () => {
-            runAction(`/api/badcases/${id}/verify`, { passed: true }, '已验证关闭');
-          });
-
-          $('#badcase-verify-fail').addEventListener('click', () => {
-            const note = window.prompt('验证不通过原因（将回到修复阶段）：');
-            if (note === null) return;
-            runAction(`/api/badcases/${id}/verify`, { passed: false, note: note || '前端验证不通过' }, '已退回修复');
-          });
-
-          $('#badcase-reject').addEventListener('click', () => {
-            const reason = window.prompt('驳回原因：');
-            if (reason === null) return;
-            runAction(`/api/badcases/${id}/reject`, { rejected_reason: reason || '无原因' }, '已驳回');
-          });
-
-          $$('.badcase-publish-draft').forEach(btn => {
+          $$('.badcase-draft-view').forEach(btn => {
             btn.addEventListener('click', () => {
-              runAction(`/api/badcases/${id}/publish-draft/${btn.dataset.draftId}`, {}, '草稿已发布');
+              const type = btn.dataset.draftType;
+              const draftId = Number(btn.dataset.draftId);
+              let d;
+              if (type === 'knowledge') d = kDrafts.find(x => x.id === draftId);
+              else if (type === 'skill_prompt') d = sDrafts.find(x => x.id === draftId);
+              else d = cDrafts.find(x => x.id === draftId);
+              if (d) openDraftView(d, type);
             });
           });
 
-          $$('.badcase-publish-skill-draft').forEach(btn => {
+          $$('.badcase-draft-edit').forEach(btn => {
+            if (btn.disabled) return;
             btn.addEventListener('click', () => {
-              runAction(`/api/badcases/${id}/publish-skill-draft/${btn.dataset.draftId}`, {}, 'Skill/Prompt 草稿已发布');
+              const type = btn.dataset.draftType;
+              const draftId = Number(btn.dataset.draftId);
+              let d;
+              if (type === 'knowledge') d = kDrafts.find(x => x.id === draftId);
+              else if (type === 'skill_prompt') d = sDrafts.find(x => x.id === draftId);
+              else d = cDrafts.find(x => x.id === draftId);
+              if (d) openDraftEdit(d, type);
             });
           });
 
-          $$('.badcase-accept-capability-gap').forEach(btn => {
+          $$('.badcase-draft-review').forEach(btn => {
+            if (btn.disabled) return;
             btn.addEventListener('click', () => {
-              runAction(`/api/badcases/${id}/accept-capability-gap/${btn.dataset.draftId}`, {}, '已记录能力缺口待办');
+              const type = btn.dataset.draftType;
+              const draftId = Number(btn.dataset.draftId);
+              const status = btn.dataset.review;
+              runAction(`/api/badcases/${id}/${draftEndpoint(type)}/${draftId}/review`, { status }, '审核完成');
+            });
+          });
+
+          $$('.badcase-draft-apply').forEach(btn => {
+            btn.addEventListener('click', () => {
+              const type = btn.dataset.draftType;
+              const draftId = Number(btn.dataset.draftId);
+              const body = {};
+              if (type === 'skill_prompt') {
+                const target = window.prompt('目标 Skill ID（可选，留空则新建）：');
+                if (target && target.trim()) body.target_skill_id = Number(target.trim());
+              }
+              runAction(`/api/badcases/${id}/${draftEndpoint(type)}/${draftId}/apply`, body, type === 'capability_gap' ? '已记录能力缺口待办' : '草稿已应用');
             });
           });
         } catch (err) {
@@ -2683,6 +2896,7 @@
 
       await loadDetail();
     }
+
 
     async function renderCostGovernancePage(container) {
       container.innerHTML = loadingState();
