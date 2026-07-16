@@ -1511,7 +1511,8 @@ async def _consume_chat_stream(message: str, session_id: str, user_id: str = "re
 async def retest_badcase(case_id: int, request: SwitchModelRetryRequest = SwitchModelRetryRequest()):
     """Retest the badcase user message through the real chat runtime.
 
-    Only moves the case from fixing to verifying when the retest chat succeeds.
+    Keeps the case in fixing so the operator can still apply an approved draft.
+    The case moves to verifying only when a draft is applied or published.
     """
     case = _load_case(case_id)
     _require_case_status(case, "retest", {"fixing"})
@@ -1594,7 +1595,9 @@ async def retest_badcase(case_id: int, request: SwitchModelRetryRequest = Switch
         pass
 
     before = case["status"]
-    new_status = "verifying"
+    # Retest stays in fixing so the operator can still apply an approved draft.
+    # The case only moves to verifying when a draft is applied or published.
+    new_status = "fixing"
     updated = db_update_badcase(
         case_id,
         status=new_status,
