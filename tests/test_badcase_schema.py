@@ -123,10 +123,11 @@ def test_allowed_actions_per_status():
         "apply-draft",
         "edit-draft",
         "reject",
+        "retest",
         "review-draft",
         "transition",
     }
-    assert set(allowed_actions("verifying")) == {"retest", "reject", "transition", "verify-fail", "verify-pass"}
+    assert set(allowed_actions("verifying")) == {"reject", "transition", "verify-fail", "verify-pass"}
     assert allowed_actions("closed") == []
     assert allowed_actions("rejected") == []
 
@@ -165,7 +166,7 @@ def test_effective_allowed_actions_hides_verify_pass_without_retest():
     bc = {"status": "verifying", "retest_response": ""}
     actions = set(effective_allowed_actions(bc))
     assert "verify-pass" not in actions
-    assert "retest" in actions
+    assert "retest" not in actions
     assert "verify-fail" in actions
     assert "reject" in actions
 
@@ -174,7 +175,7 @@ def test_effective_allowed_actions_shows_verify_pass_with_retest():
     bc = {"status": "verifying", "retest_response": "已修复"}
     actions = set(effective_allowed_actions(bc))
     assert "verify-pass" in actions
-    assert "retest" in actions
+    assert "retest" not in actions
     assert "verify-fail" in actions
     assert "reject" in actions
 

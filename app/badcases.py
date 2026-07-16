@@ -30,12 +30,16 @@ from app.badcase_schema import (
     is_draft_editable,
     is_draft_terminal,
     is_terminal_status,
+    repair_path_for_category,
     require_status,
     validate_draft_status_transition,
     validate_status_transition,
     _enrich_badcase,
 )
-from app.settings import MODEL, build_model
+from app.observability import _check_budget
+from app.settings import MODEL, MODEL_ID, build_model
+
+_BUDGET_BLOCKED_DETAIL = "预算已达上限，Darwin/AI 分类等 Pro/额外评估操作被阻止，请联系管理员调整预算或等待次日刷新"
 from db.property_db import (
     add_badcase_action,
     create_badcase as db_create_badcase,
@@ -46,12 +50,15 @@ from db.property_db import (
     create_skill_prompt_draft as db_create_skill_prompt_draft,
     delete_badcase as db_delete_badcase,
     delete_knowledge_doc as db_delete_knowledge_doc,
+    get_agent_by_agent_id,
     get_badcase as db_get_badcase,
     get_capability_gap_draft as db_get_capability_gap_draft,
     get_chat_message,
     get_enabled_price_for_model,
     get_knowledge_draft as db_get_knowledge_draft,
+    get_skill,
     get_skill_by_name,
+    get_agent_skills,
     get_skill_prompt_draft as db_get_skill_prompt_draft,
     list_badcase_actions,
     list_badcases as db_list_badcases,
@@ -60,9 +67,11 @@ from db.property_db import (
     list_skill_prompt_drafts as db_list_skill_prompt_drafts,
     list_skills,
     record_model_call,
+    set_agent_skills,
     update_badcase as db_update_badcase,
     update_capability_gap_draft as db_update_capability_gap_draft,
     update_knowledge_draft as db_update_knowledge_draft,
+    update_skill as db_update_skill,
     update_skill_prompt_draft as db_update_skill_prompt_draft,
 )
 
@@ -134,6 +143,7 @@ class TransitionRequest(BaseModel):
 
 class PublishSkillDraftRequest(BaseModel):
     target_skill_id: Optional[int] = None
+    target_agent_id: Optional[str] = None
 
 
 class AcceptGapRequest(BaseModel):
@@ -309,13 +319,29 @@ def _find_darwin_skill() -> Optional[Dict[str, Any]]:
 
 
 @router.get("")
-async def list_badcases(status: Optional[str] = None, category: Optional[str] = None):
+async def list_badcases(
+    status: Optional[str] = None,
+    category: Optional[str] = None,
+    source: Optional[str] = None,
+    has_trace: Optional[bool] = None,
+    has_retest: Optional[bool] = None,
+    created_after: Optional[str] = None,
+    created_before: Optional[str] = None,
+):
     """List badcases with optional filters."""
     if status and status not in VALID_STATUSES:
         raise HTTPException(status_code=400, detail=f"invalid status: {status}")
     if category and category not in VALID_CATEGORIES:
         raise HTTPException(status_code=400, detail=f"invalid category: {category}")
-    cases = db_list_badcases(status=status, category=category)
+    cases = db_list_badcases(
+        status=status,
+        category=category,
+        source=source,
+        has_trace=has_trace,
+        has_retest=has_retest,
+        created_after=created_after,
+        created_before=created_before,
+    )
     return {"badcases": [_enrich_badcase(c) for c in cases], "count": len(cases)}
 
 
@@ -401,9 +427,41 @@ async def classify_badcase(case_id: int, request: ClassifyRequest = ClassifyRequ
     else:
         context_obj = context or {}
 
+    classify_trace_id = uuid.uuid4().hex[:16]
+    model_id = "deepseek-v4-flash"
+    raw = ""
+    parsed: Dict[str, Any] = {}
+    usage: Dict[str, Optional[int]] = {}
+    status = "success"
+    error_summary = None
+    start = time.time()
+
+    # AI classification is an extra evaluation step; enforce the daily budget
+    # only when the caller asks for automatic (LLM-based) classification.
+    if request.auto:
+        budget = _check_budget("badcase_classify")
+        if budget.get("alert_level") == "blocked":
+            try:
+                record_model_call(
+                    trace_id=classify_trace_id,
+                    stage="badcase_classify",
+                    model_id=model_id,
+                    status="blocked",
+                    latency_ms=0,
+                    usage_source="unavailable",
+                    model_selection_reason="Badcase classification blocked by daily budget",
+                    error_summary=budget.get("reason") or _BUDGET_BLOCKED_DETAIL,
+                    estimated_cost_cny=None,
+                    price_snapshot=None,
+                )
+            except Exception:
+                pass
+            raise HTTPException(status_code=403, detail=_BUDGET_BLOCKED_DETAIL)
+
     if request.auto:
         prompt = (
-            "你是一名 AI 运营问题分类专家。请根据下面的 Badcase 信息，从以下类别中选择一个最贴切的，并给出理由和优先级：\n"
+            "你是一名 AI 运营问题分类专家。请根据下面的 Badcase 信息，从以下类别中选择一个最贴切的，"
+            "给出根因假设、修复路径建议、优先级，并严格输出 JSON：\n"
             "- knowledge_gap：知识库内容缺失、错误或未命中\n"
             "- skill_prompt：Skill 触发条件或 Prompt 指令缺陷\n"
             "- mcp_capability：MCP/外部工具/系统能力缺失或调用失败\n"
@@ -416,12 +474,20 @@ async def classify_badcase(case_id: int, request: ClassifyRequest = ClassifyRequ
             f"原问题：{case.get('original_query', '')}\n"
             f"原回答：{case.get('ai_response', '')[:500]}\n"
             f"上下文：{json.dumps(context_obj, ensure_ascii=False)[:800]}\n\n"
-            "请严格输出 JSON：{\"category\": \"<类别>\", \"reason\": \"<一句话理由>\", \"priority\": \"<high|medium|low>\"}"
+            "输出字段：suggested_category, root_cause_hypothesis, repair_path_suggestion, priority。"
+            "repair_path_suggestion 应从 knowledge、skill_prompt、mcp_capability、ops_only 中选择。"
         )
-        raw, _ = await _llm_generate(prompt)
-        parsed = _extract_json(raw) or {}
-        category = parsed.get("category", "other")
-        reason = parsed.get("reason", "自动分类失败，归入 other")
+        try:
+            raw, usage = await _llm_generate(prompt, model_id=model_id)
+            parsed = _extract_json(raw) or {}
+        except Exception as e:
+            logger.exception("AI classification failed")
+            status = "failed"
+            error_summary = str(e)[:300]
+
+        category = parsed.get("suggested_category", parsed.get("category", "other"))
+        reason = parsed.get("root_cause_hypothesis", parsed.get("reason", "自动分类失败，归入 other"))
+        repair_path = parsed.get("repair_path_suggestion", repair_path_for_category(category))
         priority = parsed.get("priority", "medium")
         if category not in VALID_CATEGORIES:
             category = "other"
@@ -430,9 +496,36 @@ async def classify_badcase(case_id: int, request: ClassifyRequest = ClassifyRequ
     else:
         category = request.category or "other"
         reason = request.reason
+        repair_path = repair_path_for_category(category)
         priority = "medium"
         if category not in VALID_CATEGORIES:
             raise HTTPException(status_code=400, detail=f"invalid category: {category}")
+
+    if request.auto:
+        latency_ms = int((time.time() - start) * 1000)
+        total_tokens = usage.get("total_tokens") or (usage.get("input_tokens") or 0) + (usage.get("output_tokens") or 0)
+        usage_source = "provider_reported" if usage.get("total_tokens") else "estimated_tokenization" if total_tokens else "unavailable"
+        cost_cny, snapshot = _calculate_cost(model_id, usage)
+        try:
+            record_model_call(
+                trace_id=classify_trace_id,
+                stage="badcase_classify",
+                model_id=model_id,
+                status=status,
+                latency_ms=latency_ms,
+                input_tokens=usage.get("input_tokens"),
+                output_tokens=usage.get("output_tokens"),
+                reasoning_tokens=usage.get("reasoning_tokens"),
+                cached_tokens=usage.get("cached_tokens"),
+                total_tokens=total_tokens,
+                usage_source=usage_source,
+                model_selection_reason="Badcase classification uses Flash",
+                error_summary=error_summary,
+                price_snapshot=snapshot,
+                estimated_cost_cny=cost_cny,
+            )
+        except Exception:
+            pass
 
     new_status = "classified"
     updated = db_update_badcase(
@@ -440,16 +533,30 @@ async def classify_badcase(case_id: int, request: ClassifyRequest = ClassifyRequ
         category=category,
         status=new_status,
         root_cause=reason,
+        fix_plan=repair_path,
         priority=priority,
     )
     _record_action(
         case_id,
         "classify",
-        {"category": category, "reason": reason, "priority": priority, "raw": raw if request.auto else None},
+        {
+            "category": category,
+            "reason": reason,
+            "repair_path_suggestion": repair_path,
+            "priority": priority,
+            "raw": raw if request.auto else None,
+            "classify_trace_id": classify_trace_id,
+        },
         case["status"],
         new_status,
     )
-    return {"badcase": _enrich_badcase(updated), "reason": reason, "priority": priority}
+    return {
+        "badcase": _enrich_badcase(updated),
+        "suggested_category": category,
+        "root_cause_hypothesis": reason,
+        "repair_path_suggestion": repair_path,
+        "priority": priority,
+    }
 
 
 @router.post("/{case_id}/extract-knowledge")
@@ -512,14 +619,18 @@ async def publish_knowledge_draft(case_id: int, draft_id: int):
 async def publish_skill_prompt_draft_endpoint(
     case_id: int, draft_id: int, request: PublishSkillDraftRequest = PublishSkillDraftRequest()
 ):
-    """Backward-compatible alias: blocked until batch 2 agent binding is implemented."""
+    """Backward-compatible alias: apply an approved skill/prompt draft to an agent."""
     case = _load_case(case_id)
     _require_case_status(case, "publish-skill-draft", {"fixing"})
     draft = _load_draft(draft_id, case_id, db_get_skill_prompt_draft, "skill/prompt draft")
     if draft.get("status") != "approved":
         raise HTTPException(status_code=400, detail="draft must be approved before applying")
 
-    await _apply_skill_prompt_draft(case_id, draft_id, draft, case, "publish-skill-prompt")
+    updated = await _apply_skill_prompt_draft(
+        case_id, draft_id, draft, case, "publish-skill-prompt", request.target_agent_id
+    )
+    _attach_drafts(updated)
+    return {"badcase": _enrich_badcase(updated)}
 
 
 @router.post("/{case_id}/accept-capability-gap/{draft_id}")
@@ -597,13 +708,119 @@ async def _apply_knowledge_draft(
 
 
 async def _apply_skill_prompt_draft(
-    case_id: int, draft_id: int, draft: Dict[str, Any], case: Dict[str, Any], action_type: str
-) -> None:
-    """Skill/Prompt drafts cannot be applied until batch 2 agent binding is implemented."""
-    raise HTTPException(
-        status_code=409,
-        detail="待第二批：选择目标 Agent 并建立 agent_skills 绑定后才能应用到运行时",
+    case_id: int,
+    draft_id: int,
+    draft: Dict[str, Any],
+    case: Dict[str, Any],
+    action_type: str,
+    target_agent_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Create or update a formal Skill from an approved draft and bind it to an Agent.
+
+    The badcase only moves to verifying once the agent binding succeeds.
+    """
+    if draft.get("status") != "approved":
+        raise HTTPException(status_code=400, detail="draft must be approved before applying")
+    if not target_agent_id:
+        # Preserve the v1.3.4 first-batch contract: applying without a target agent
+        # is intentionally blocked until an agent is selected.
+        raise HTTPException(
+            status_code=409,
+            detail="待选择目标 Agent：请提供 target_agent_id 以建立 agent_skills 绑定",
+        )
+
+    agent = get_agent_by_agent_id(target_agent_id)
+    if not agent:
+        raise HTTPException(status_code=400, detail=f"target agent not found: {target_agent_id}")
+
+    skill_name = draft.get("skill_name") or draft.get("title") or "未命名 Skill"
+    description = draft.get("title") or skill_name
+    instructions = draft.get("prompt_content") or ""
+    trigger_condition = draft.get("trigger_keywords") or ""
+
+    # Create or update the formal Skill.
+    skill_id = draft.get("skill_id")
+    existing_skill = get_skill(skill_id) if skill_id else None
+    try:
+        if existing_skill:
+            skill = db_update_skill(
+                skill_id=existing_skill["id"],
+                name=skill_name,
+                description=description,
+                instructions=instructions,
+                category=existing_skill.get("category") or "skill_prompt",
+                enabled=existing_skill.get("enabled", True),
+                trigger_condition=trigger_condition,
+                skill_metadata=existing_skill.get("skill_metadata"),
+                storage_path=existing_skill.get("storage_path", ""),
+                model_id=existing_skill.get("model_id"),
+            )
+        else:
+            existing_by_name = get_skill_by_name(skill_name)
+            if existing_by_name:
+                skill = db_update_skill(
+                    skill_id=existing_by_name["id"],
+                    name=skill_name,
+                    description=description,
+                    instructions=instructions,
+                    category=existing_by_name.get("category") or "skill_prompt",
+                    enabled=existing_by_name.get("enabled", True),
+                    trigger_condition=trigger_condition,
+                    skill_metadata=existing_by_name.get("skill_metadata"),
+                    storage_path=existing_by_name.get("storage_path", ""),
+                    model_id=existing_by_name.get("model_id"),
+                )
+            else:
+                skill = db_create_skill(
+                    name=skill_name,
+                    description=description,
+                    instructions=instructions,
+                    category="skill_prompt",
+                    enabled=True,
+                    trigger_condition=trigger_condition,
+                )
+    except Exception as exc:
+        logger.exception("failed to create/update formal skill from draft")
+        raise HTTPException(status_code=500, detail=f"Skill 持久化失败：{exc}")
+
+    if not skill:
+        raise HTTPException(status_code=500, detail="Skill 创建/更新后未返回有效记录")
+
+    skill_id = skill["id"]
+
+    # Bind the skill to the target agent, preserving existing bindings.
+    before_skill_ids = get_agent_skills(target_agent_id)
+    try:
+        new_skill_ids = list(dict.fromkeys(before_skill_ids + [skill_id]))
+        set_agent_skills(target_agent_id, new_skill_ids)
+    except Exception as exc:
+        logger.exception("failed to bind skill to agent")
+        raise HTTPException(status_code=500, detail=f"Skill 绑定到 Agent 失败：{exc}")
+
+    after_skill_ids = get_agent_skills(target_agent_id)
+    now = datetime.now(timezone.utc).isoformat()
+
+    db_update_skill_prompt_draft(
+        draft_id,
+        status="published",
+        skill_id=skill_id,
+        published_at=now,
+        published_by="operator",
     )
+
+    detail = {
+        "draft_id": draft_id,
+        "draft_snapshot": _draft_snapshot(draft, _SKILL_DRAFT_SNAPSHOT_FIELDS),
+        "skill_id": skill_id,
+        "agent_id": target_agent_id,
+        "agent_name": agent.get("name"),
+        "version": skill.get("updated_at") or now,
+        "timestamp": now,
+        "agent_skills_before": before_skill_ids,
+        "agent_skills_after": after_skill_ids,
+    }
+    updated = _move_to_verifying_after_apply(case, case_id, action_type, detail)
+    return updated
 
 
 async def _apply_capability_gap_draft(
@@ -620,7 +837,9 @@ async def _apply_capability_gap_draft(
     detail = {
         "draft_id": draft_id,
         "draft_snapshot": _draft_snapshot(draft, _CAPABILITY_GAP_DRAFT_SNAPSHOT_FIELDS),
-        "note": note,
+        "note": note or "待建设能力",
+        "status": "accepted",
+        "message": "能力缺口已记录为产品待办，未自动创建真实工具",
     }
     _record_action(case_id, action_type, detail, case["status"], case["status"])
     return case
@@ -757,14 +976,18 @@ async def review_skill_prompt_draft(
 async def apply_skill_prompt_draft(
     case_id: int, draft_id: int, request: PublishSkillDraftRequest = PublishSkillDraftRequest()
 ):
-    """Skill/Prompt drafts cannot be applied until batch 2 agent binding is implemented."""
+    """Apply an approved skill/prompt draft to a target agent."""
     case = _load_case(case_id)
     _require_case_status(case, "apply-skill-prompt-draft", {"fixing"})
     draft = _load_draft(draft_id, case_id, db_get_skill_prompt_draft, "skill/prompt draft")
     if draft.get("status") != "approved":
         raise HTTPException(status_code=400, detail="draft must be approved before applying")
 
-    await _apply_skill_prompt_draft(case_id, draft_id, draft, case, "apply-skill-prompt-draft")
+    updated = await _apply_skill_prompt_draft(
+        case_id, draft_id, draft, case, "apply-skill-prompt-draft", request.target_agent_id
+    )
+    _attach_drafts(updated)
+    return {"badcase": _enrich_badcase(updated)}
 
 
 @router.put("/{case_id}/capability-gap-drafts/{draft_id}")
@@ -917,10 +1140,14 @@ async def darwin_fix(case_id: int, request: DarwinFixRequest = DarwinFixRequest(
         f"上下文：{json.dumps(context_obj, ensure_ascii=False)[:1000]}\n\n"
         "请严格输出 JSON（不要 Markdown 代码块）：\n"
         "{\n"
-        '  "root_cause": "<根因分析>",\n'
-        '  "suggested_actions": ["<建议动作1>", "<建议动作2>"],\n'
+        '  "phenomenon_impact": "<问题现象与业务影响>",\n'
+        '  "root_cause_hypothesis": "<根因假设>",\n'
+        '  "evidence_uncertainties": "<证据与不确定性>",\n'
+        '  "repair_path_suggestion": "<建议修复路径：knowledge|skill_prompt|mcp_capability|ops_only>",\n'
+        '  "recommended_category": "<推荐分类>",\n'
         '  "expected_impact": "<预期影响>",\n'
         '  "risks": "<风险说明>",\n'
+        '  "suggested_actions": ["<建议动作1>", "<建议动作2>"],\n'
         '  "drafts": [\n'
         '    {"type": "knowledge", "title": "<知识库草稿标题>", "content": "<正文>", "target_doc_title": "<目标文档名，可选>"},\n'
         '    {"type": "skill_prompt", "title": "<Skill草稿标题>", "skill_name": "<Skill名称>", "prompt_content": "<Prompt内容>", "trigger_keywords": "<触发关键词>"},\n'
@@ -937,6 +1164,27 @@ async def darwin_fix(case_id: int, request: DarwinFixRequest = DarwinFixRequest(
     status = "success"
     error_summary = None
     usage = {}
+
+    # Darwin uses Pro and is an extra evaluation step; enforce the daily budget.
+    budget = _check_budget("darwin")
+    if budget.get("alert_level") == "blocked":
+        try:
+            record_model_call(
+                trace_id=darwin_trace_id,
+                stage="darwin",
+                model_id=model_id,
+                status="blocked",
+                latency_ms=0,
+                usage_source="unavailable",
+                model_selection_reason="Darwin deep analysis blocked by daily budget",
+                error_summary=budget.get("reason") or _BUDGET_BLOCKED_DETAIL,
+                estimated_cost_cny=None,
+                price_snapshot=None,
+            )
+        except Exception:
+            pass
+        raise HTTPException(status_code=403, detail=_BUDGET_BLOCKED_DETAIL)
+
     try:
         analysis_text, usage = await _llm_generate(prompt, model_id=model_id)
     except Exception as e:
@@ -973,7 +1221,11 @@ async def darwin_fix(case_id: int, request: DarwinFixRequest = DarwinFixRequest(
     analysis_obj = _extract_json(analysis_text) or {}
     if not analysis_obj and status == "success":
         analysis_obj = {
-            "root_cause": "Darwin 返回无法解析",
+            "phenomenon_impact": "Darwin 返回无法解析",
+            "root_cause_hypothesis": "Darwin 返回无法解析",
+            "evidence_uncertainties": "无法评估",
+            "repair_path_suggestion": repair_path_for_category(case.get("category", "other")),
+            "recommended_category": case.get("category", "other"),
             "suggested_actions": ["检查 Darwin 输出格式"],
             "expected_impact": "无法评估",
             "risks": "无法评估",
@@ -981,11 +1233,23 @@ async def darwin_fix(case_id: int, request: DarwinFixRequest = DarwinFixRequest(
         }
 
     # Ensure required keys exist.
-    analysis_obj.setdefault("root_cause", "")
+    analysis_obj.setdefault("phenomenon_impact", "")
+    analysis_obj.setdefault("root_cause_hypothesis", analysis_obj.get("root_cause", ""))
+    analysis_obj.setdefault("evidence_uncertainties", "")
+    analysis_obj.setdefault("repair_path_suggestion", repair_path_for_category(case.get("category", "other")))
+    analysis_obj.setdefault("recommended_category", case.get("category", "other"))
     analysis_obj.setdefault("suggested_actions", [])
     analysis_obj.setdefault("expected_impact", "")
     analysis_obj.setdefault("risks", "")
     analysis_obj.setdefault("drafts", [])
+
+    # Enrich with runtime metadata.
+    analysis_obj["model"] = model_id
+    analysis_obj["trace_id"] = darwin_trace_id
+    analysis_obj["token_cost_estimate"] = cost_cny
+
+    # Keep a backward-compatible root_cause alias for downstream consumers.
+    analysis_obj.setdefault("root_cause", analysis_obj["root_cause_hypothesis"])
 
     created_drafts: List[Dict[str, Any]] = []
     for draft in analysis_obj.get("drafts", []) or []:
@@ -1055,7 +1319,7 @@ async def darwin_fix(case_id: int, request: DarwinFixRequest = DarwinFixRequest(
     new_status = "fixing"
     updated = db_update_badcase(
         case_id,
-        root_cause=analysis_obj.get("root_cause", case.get("root_cause")),
+        root_cause=analysis_obj.get("root_cause_hypothesis", case.get("root_cause")),
         fix_plan=json.dumps(analysis_obj.get("suggested_actions", []), ensure_ascii=False),
         darwin_analysis=json.dumps(analysis_obj, ensure_ascii=False),
         darwin_trace_id=darwin_trace_id,
@@ -1245,9 +1509,12 @@ async def _consume_chat_stream(message: str, session_id: str, user_id: str = "re
 
 @router.post("/{case_id}/retest")
 async def retest_badcase(case_id: int, request: SwitchModelRetryRequest = SwitchModelRetryRequest()):
-    """Retest the badcase user message through the real chat runtime."""
+    """Retest the badcase user message through the real chat runtime.
+
+    Only moves the case from fixing to verifying when the retest chat succeeds.
+    """
     case = _load_case(case_id)
-    _require_case_status(case, "retest", {"verifying"})
+    _require_case_status(case, "retest", {"fixing"})
 
     user_message = request.user_message or case.get("original_query")
     if not user_message and case.get("source_message_id"):
@@ -1266,25 +1533,65 @@ async def retest_badcase(case_id: int, request: SwitchModelRetryRequest = Switch
         result = await _consume_chat_stream(user_message, retest_session_id, user_id="retest")
     except Exception as e:
         logger.exception("retest chat stream failed")
+        # Keep the case in fixing on retest error.
+        _record_action(
+            case_id,
+            "retest",
+            {"retest_session_id": retest_session_id, "error": str(e)[:300]},
+            case["status"],
+            case["status"],
+        )
         raise HTTPException(status_code=502, detail=f"retest failed: {e}")
 
     answer = result.get("answer", "")
     done = result.get("done", {})
+    token_detail = done.get("token_detail") or {}
+    retest_trace_id = done.get("trace_id") or f"retest-{uuid.uuid4().hex[:16]}"
+    model_id = done.get("model_id") or MODEL_ID
+
     retest_context = {
         "session_id": retest_session_id,
         "route_intent": done.get("route_intent"),
         "current_agent": done.get("current_agent"),
         "activated_skills": done.get("activated_skills"),
-        "citations": done.get("citations"),
+        "rag_citations": done.get("citations"),
         "tool_calls": done.get("tool_calls"),
-        "mcp_calls": done.get("mcp_calls"),
-        "model_id": done.get("model_id"),
+        "mcp_tool_calls": done.get("mcp_calls"),
+        "model_id": model_id,
+        "trace_id": retest_trace_id,
         "token_count": done.get("token_count"),
-        "trace_id": done.get("trace_id"),
-        "auto_badcase_id": done.get("auto_badcase_id"),
+        "token_detail": token_detail,
         "usage_source": done.get("usage_source"),
+        "auto_badcase_id": done.get("auto_badcase_id"),
     }
-    retest_trace_id = done.get("trace_id")
+
+    # Record a retest-stage model call for cost observability.
+    try:
+        usage = {
+            "input_tokens": token_detail.get("input_tokens") if token_detail else None,
+            "output_tokens": token_detail.get("output_tokens") if token_detail else None,
+            "reasoning_tokens": token_detail.get("reasoning_tokens") if token_detail else None,
+            "cached_tokens": token_detail.get("cached_tokens") if token_detail else None,
+            "total_tokens": token_detail.get("total_tokens") or done.get("token_count"),
+        }
+        retest_cost, retest_price = _calculate_cost(model_id, usage)
+        record_model_call(
+            trace_id=retest_trace_id,
+            stage="retest",
+            model_id=model_id,
+            model_selection_reason="real retest through chat runtime",
+            input_tokens=usage.get("input_tokens"),
+            output_tokens=usage.get("output_tokens"),
+            reasoning_tokens=usage.get("reasoning_tokens"),
+            cached_tokens=usage.get("cached_tokens"),
+            total_tokens=usage.get("total_tokens"),
+            usage_source=done.get("usage_source", "unavailable"),
+            status="success",
+            estimated_cost_cny=retest_cost,
+            price_snapshot=retest_price,
+        )
+    except Exception:
+        pass
 
     before = case["status"]
     new_status = "verifying"
@@ -1301,6 +1608,7 @@ async def retest_badcase(case_id: int, request: SwitchModelRetryRequest = Switch
         {
             "retest_session_id": retest_session_id,
             "retest_trace_id": retest_trace_id,
+            "model_id": model_id,
             "answer_preview": answer[:200],
         },
         before,

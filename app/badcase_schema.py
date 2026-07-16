@@ -40,6 +40,22 @@ STATUS_LABELS = {
     "rejected": "已驳回",
 }
 
+ACTION_LABELS = {
+    "classify": "分类",
+    "darwin-fix": "Darwin 深度分析",
+    "extract-knowledge": "生成修复草稿",
+    "generate-repair-drafts": "生成修复草稿",
+    "edit-draft": "编辑草稿",
+    "review-draft": "审核草稿",
+    "apply-draft": "应用草稿",
+    "accept-capability-gap": "接受能力缺口",
+    "retest": "真实复测",
+    "verify-pass": "验证通过",
+    "verify-fail": "验证不通过",
+    "reject": "驳回",
+    "transition": "状态跳转",
+}
+
 # Canonical state machine transitions.
 # Each key is the source status; the value is the set of statuses reachable
 # through normal lifecycle actions (excluding the admin-only transition fallback).
@@ -56,12 +72,12 @@ STATUS_TRANSITIONS: Dict[str, Set[str]] = {
 ACTION_STATUS_REQUIREMENTS: Dict[str, Set[str]] = {
     "classify": {"pending"},
     "darwin-fix": {"classified"},
-    "extract-knowledge": {"classified"},
+    "extract-knowledge": {"classified"},  # knowledge-gap repair draft
     "edit-draft": {"fixing"},
     "review-draft": {"fixing"},
     "apply-draft": {"fixing"},  # generic UI action for applying any approved draft
     "accept-capability-gap": {"fixing"},  # backward-compatible alias
-    "retest": {"verifying"},
+    "retest": {"fixing"},
     "verify-pass": {"verifying"},
     "verify-fail": {"verifying"},
     "reject": {"pending", "classified", "fixing", "verifying"},
@@ -144,15 +160,25 @@ def allowed_actions(status: str) -> List[str]:
 
 
 def effective_allowed_actions(badcase: Dict[str, Any]) -> List[str]:
-    """Return frontend-visible actions, considering runtime evidence.
+    """Return frontend-visible actions, considering runtime evidence and category.
 
     - Terminal statuses: empty.
+    - classified: only show category-relevant draft actions.
     - verifying without retest_response: hide verify-pass.
     """
     status = badcase.get("status", "pending")
     actions = allowed_actions(status)
+    category = badcase.get("category", "pending")
+
+    if status == "classified":
+        # Only knowledge-gap cases expose the explicit knowledge draft action;
+        # other categories rely on Darwin-fix to generate the right draft type.
+        if category not in KNOWLEDGE_CATEGORIES and category != "pending":
+            actions = [a for a in actions if a != "extract-knowledge"]
+
     if status == "verifying" and not badcase.get("retest_response"):
         actions = [a for a in actions if a != "verify-pass"]
+
     return actions
 
 
@@ -234,7 +260,13 @@ def _enrich_badcase(badcase: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any
     enriched["category_label"] = CATEGORY_LABELS.get(enriched.get("category", ""), enriched.get("category", "-"))
     enriched["status_label"] = STATUS_LABELS.get(enriched.get("status", ""), enriched.get("status", "-"))
     enriched["source"] = enriched.get("source") or "auto"
-    enriched["source_label"] = "人工反馈" if enriched.get("source") == "manual" else "自动发现"
+    source = enriched.get("source")
+    if source == "manual":
+        enriched["source_label"] = "人工反馈"
+    elif source == "user_feedback":
+        enriched["source_label"] = "用户反馈"
+    else:
+        enriched["source_label"] = "自动发现"
 
     # Structured context objects (parsed JSON).
     enriched["context"] = _parse_json_field(enriched.get("context_json"))

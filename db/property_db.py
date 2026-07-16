@@ -1895,7 +1895,15 @@ def get_badcase(case_id: int) -> Optional[Dict[str, Any]]:
     return dict(row) if row else None
 
 
-def list_badcases(status: Optional[str] = None, category: Optional[str] = None) -> List[Dict[str, Any]]:
+def list_badcases(
+    status: Optional[str] = None,
+    category: Optional[str] = None,
+    source: Optional[str] = None,
+    has_trace: Optional[bool] = None,
+    has_retest: Optional[bool] = None,
+    created_after: Optional[str] = None,
+    created_before: Optional[str] = None,
+) -> List[Dict[str, Any]]:
     conn = _get_conn()
     cursor = conn.cursor()
     query = "SELECT * FROM badcases WHERE 1=1"
@@ -1906,6 +1914,23 @@ def list_badcases(status: Optional[str] = None, category: Optional[str] = None) 
     if category:
         query += " AND category = ?"
         params.append(category)
+    if source:
+        query += " AND source = ?"
+        params.append(source)
+    if has_trace is True:
+        query += " AND darwin_trace_id IS NOT NULL AND darwin_trace_id != ''"
+    elif has_trace is False:
+        query += " AND (darwin_trace_id IS NULL OR darwin_trace_id = '')"
+    if has_retest is True:
+        query += " AND retest_response IS NOT NULL AND retest_response != ''"
+    elif has_retest is False:
+        query += " AND (retest_response IS NULL OR retest_response = '')"
+    if created_after:
+        query += " AND created_at >= ?"
+        params.append(created_after)
+    if created_before:
+        query += " AND created_at <= ?"
+        params.append(created_before)
     query += " ORDER BY created_at DESC"
     cursor.execute(query, params)
     rows = cursor.fetchall()
@@ -2048,6 +2073,25 @@ def list_badcase_actions(badcase_id: int) -> List[Dict[str, Any]]:
     rows = cursor.fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+
+def get_badcase_id_by_trace_id(trace_id: str) -> Optional[int]:
+    """Return the badcase id linked to a trace/darwin/retest trace id, if any."""
+    if not trace_id:
+        return None
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT id FROM badcases
+        WHERE trace_id = ? OR darwin_trace_id = ? OR retest_trace_id = ?
+        ORDER BY id DESC LIMIT 1
+        """,
+        (trace_id, trace_id, trace_id),
+    )
+    row = cursor.fetchone()
+    conn.close()
+    return row["id"] if row else None
 
 
 # ---------------------------------------------------------------------------
