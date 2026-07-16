@@ -70,6 +70,43 @@ ACTION_STATUS_REQUIREMENTS: Dict[str, Set[str]] = {
     # backend diagnostic helper available from pending/classified.
 }
 
+# Draft status transitions.
+# knowledge/skill_prompt: draft -> under_review -> approved -> published
+# capability_gap:       draft -> under_review -> approved -> accepted
+# All types may also go from draft/under_review -> rejected.
+DRAFT_STATUS_TRANSITIONS: Dict[str, Dict[str, Set[str]]] = {
+    "knowledge": {
+        "draft": {"under_review", "rejected"},
+        "under_review": {"approved", "rejected"},
+        "approved": {"published"},
+        "published": set(),
+        "rejected": set(),
+    },
+    "skill_prompt": {
+        "draft": {"under_review", "rejected"},
+        "under_review": {"approved", "rejected"},
+        "approved": {"published"},
+        "published": set(),
+        "rejected": set(),
+    },
+    "capability_gap": {
+        "draft": {"under_review", "rejected"},
+        "under_review": {"approved", "rejected"},
+        "approved": {"accepted"},
+        "accepted": set(),
+        "rejected": set(),
+    },
+}
+
+DRAFT_TYPE_ALIASES = {
+    "knowledge": "knowledge",
+    "knowledge_draft": "knowledge",
+    "skill_prompt": "skill_prompt",
+    "skill_prompt_draft": "skill_prompt",
+    "capability_gap": "capability_gap",
+    "capability_gap_draft": "capability_gap",
+}
+
 # Categories for which "extract knowledge" is the primary repair path.
 KNOWLEDGE_CATEGORIES = {"knowledge_gap"}
 # Categories for which "skill/prompt draft" is the primary repair path.
@@ -97,10 +134,55 @@ def allowed_target_statuses(from_status: str) -> List[str]:
 
 
 def allowed_actions(status: str) -> List[str]:
-    """Return the actions that are legal from the given status."""
-    if status not in VALID_STATUSES:
+    """Return the actions that are legal from the given status.
+
+    Terminal statuses intentionally expose no actions to the frontend.
+    """
+    if status not in VALID_STATUSES or is_terminal_status(status):
         return []
     return sorted([action for action, required in ACTION_STATUS_REQUIREMENTS.items() if status in required])
+
+
+def effective_allowed_actions(badcase: Dict[str, Any]) -> List[str]:
+    """Return frontend-visible actions, considering runtime evidence.
+
+    - Terminal statuses: empty.
+    - verifying without retest_response: hide verify-pass.
+    """
+    status = badcase.get("status", "pending")
+    actions = allowed_actions(status)
+    if status == "verifying" and not badcase.get("retest_response"):
+        actions = [a for a in actions if a != "verify-pass"]
+    return actions
+
+
+def _normalize_draft_type(draft_type: str) -> str:
+    return DRAFT_TYPE_ALIASES.get(draft_type, draft_type)
+
+
+def validate_draft_status_transition(draft_type: str, from_status: str, to_status: str) -> None:
+    """Raise ValueError if the draft status transition is illegal."""
+    normalized = _normalize_draft_type(draft_type)
+    transitions = DRAFT_STATUS_TRANSITIONS.get(normalized)
+    if not transitions:
+        raise ValueError(f"unknown draft type: {draft_type}")
+    if from_status not in transitions:
+        raise ValueError(f"invalid source status for {normalized} draft: {from_status}")
+    if to_status not in transitions.get(from_status, set()):
+        raise ValueError(f"cannot transition {normalized} draft from '{from_status}' to '{to_status}'")
+
+
+def is_draft_terminal(draft_type: str, status: str) -> bool:
+    normalized = _normalize_draft_type(draft_type)
+    transitions = DRAFT_STATUS_TRANSITIONS.get(normalized)
+    if not transitions:
+        return False
+    return status in transitions and not transitions[status]
+
+
+def is_draft_editable(draft_type: str, status: str) -> bool:
+    """A draft is editable unless it has reached a terminal status."""
+    return not is_draft_terminal(draft_type, status)
 
 
 def require_status(case_status: str, action: str, allowed: Set[str]) -> None:
@@ -175,9 +257,8 @@ def _enrich_badcase(badcase: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any
     enriched["actions"] = [_format_action(a) for a in actions]
 
     # Allowed actions for the current status (frontend button guidance).
-    status = enriched.get("status", "pending")
-    enriched["allowed_actions"] = allowed_actions(status)
-    enriched["is_terminal"] = is_terminal_status(status)
+    enriched["allowed_actions"] = effective_allowed_actions(enriched)
+    enriched["is_terminal"] = is_terminal_status(enriched.get("status", "pending"))
 
     # Ensure retest_response is exposed directly.
     enriched["retest_response"] = enriched.get("retest_response") or ""

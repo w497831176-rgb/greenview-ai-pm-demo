@@ -2409,7 +2409,7 @@
             </button>
             <div>
               <h2 class="text-xl font-semibold text-slate-900">Badcase #${id}</h2>
-              <p class="text-sm text-slate-500">状态：${statusBadge('pending')}</p>
+              <p id="badcase-detail-header-status" class="text-sm text-slate-500">状态：加载中…</p>
             </div>
           </div>
           <div id="badcase-detail-content">${loadingState()}</div>
@@ -2568,7 +2568,12 @@
         const terminalDraft = type === 'capability_gap' ? ['accepted', 'rejected'].includes(status) : ['published', 'rejected'].includes(status);
         const canEdit = !isTerminal && allowed.has('edit-draft') && !terminalDraft;
         const canReview = !isTerminal && allowed.has('review-draft') && !terminalDraft;
-        const canApply = !isTerminal && status === 'approved' && allowed.has('apply-draft');
+        const canApplyKnowledge = !isTerminal && status === 'approved' && allowed.has('apply-draft') && type === 'knowledge';
+        const canApplyGap = !isTerminal && status === 'approved' && allowed.has('apply-draft') && type === 'capability_gap';
+        const applyConfirm = {
+          knowledge: '应用后系统将：\n1. 写入正式知识库文档；\n2. 重建向量索引；\n3. 将 Badcase 推进到“验证中”。\n\n请确认索引服务可用。',
+          capability_gap: '应用后系统将：\n1. 把能力缺口记录为产品待办；\n2. 不会创建任何 MCP 工具或真实能力；\n3. Badcase 仍保持“修复中”。\n\n请确认。'
+        };
         return `
           <div class="bg-slate-50 rounded-xl p-3 border border-slate-200 text-sm">
             <div class="flex items-center justify-between mb-1 gap-2">
@@ -2582,7 +2587,9 @@
               <button data-draft-id="${d.id}" data-draft-type="${type}" data-review="approved" class="badcase-draft-review px-2 py-1 bg-green-50 hover:bg-green-100 text-green-700 rounded-lg text-xs transition-colors" ${canReview ? '' : 'disabled title="当前状态不可审核"'}>通过审核</button>
               <button data-draft-id="${d.id}" data-draft-type="${type}" data-review="under_review" class="badcase-draft-review px-2 py-1 bg-amber-50 hover:bg-amber-100 text-amber-700 rounded-lg text-xs transition-colors" ${canReview ? '' : 'disabled title="当前状态不可审核"'}>退回草稿</button>
               <button data-draft-id="${d.id}" data-draft-type="${type}" data-review="rejected" class="badcase-draft-review px-2 py-1 bg-red-50 hover:bg-red-100 text-red-700 rounded-lg text-xs transition-colors" ${canReview ? '' : 'disabled title="当前状态不可审核"'}>驳回</button>
-              ${canApply ? `<button data-draft-id="${d.id}" data-draft-type="${type}" class="badcase-draft-apply px-2 py-1 bg-brand-600 hover:bg-brand-700 text-white rounded-lg text-xs transition-colors">应用已审核草稿</button>` : ''}
+              ${canApplyKnowledge ? `<button data-draft-id="${d.id}" data-draft-type="${type}" data-confirm="${escapeHtml(applyConfirm.knowledge)}" class="badcase-draft-apply px-2 py-1 bg-brand-600 hover:bg-brand-700 text-white rounded-lg text-xs transition-colors">应用已审核草稿</button>` : ''}
+              ${type === 'skill_prompt' && status === 'approved' ? `<span class="px-2 py-1 bg-slate-100 text-slate-500 rounded-lg text-xs">待第二批：选择目标 Agent 并建立 agent_skills 绑定后才能应用到运行时</span>` : ''}
+              ${canApplyGap ? `<button data-draft-id="${d.id}" data-draft-type="${type}" data-confirm="${escapeHtml(applyConfirm.capability_gap)}" class="badcase-draft-apply px-2 py-1 bg-brand-600 hover:bg-brand-700 text-white rounded-lg text-xs transition-colors">记录产品待办</button>` : ''}
             </div>
           </div>
         `;
@@ -2611,6 +2618,10 @@
           allowed = new Set(bc.allowed_actions || []);
           isTerminal = bc.is_terminal;
           category = bc.category || 'pending';
+          const headerStatus = $('#badcase-detail-header-status');
+          if (headerStatus) {
+            headerStatus.innerHTML = `状态：${statusBadge(bc.status)} <span class="text-slate-700 font-medium">${escapeHtml(bc.status_label || '')}</span>`;
+          }
           const kDrafts = bc.knowledge_drafts || [];
           const sDrafts = bc.skill_prompt_drafts || [];
           const cDrafts = bc.capability_gap_drafts || [];
@@ -2647,10 +2658,13 @@
               <button id="badcase-reject" type="button" class="w-full text-xs text-slate-500 hover:text-red-600 underline mt-2" ${allowed.has('reject') ? '' : 'disabled title="当前状态不可驳回"'}>驳回 / 拒绝处理</button>
             `;
           } else if (bc.status === 'verifying') {
+            const noRetest = !bc.retest_response;
+            const verifyPassTitle = noRetest ? '请先完成真实复测' : '当前状态不可验证';
             actionButtonsHtml = `
               <button id="badcase-retest" type="button" class="w-full px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl text-sm transition-colors" ${allowed.has('retest') ? '' : 'disabled title="当前状态不可复测"'}>复测</button>
+              ${noRetest ? `<p class="text-xs text-amber-600 bg-amber-50 rounded-lg px-3 py-2 border border-amber-100">当前尚未进行真实复测，验证通过不可用。请先点击“复测”。</p>` : ''}
               <div class="flex gap-2">
-                <button id="badcase-verify-pass" type="button" class="flex-1 px-4 py-2 bg-green-600 hover:bg-green-700 text-white rounded-xl text-sm transition-colors" ${allowed.has('verify-pass') ? '' : 'disabled title="当前状态不可验证"'}>验证通过</button>
+                <button id="badcase-verify-pass" type="button" class="flex-1 px-4 py-2 bg-green-600 hover:bg-green-700 text-white rounded-xl text-sm transition-colors" ${allowed.has('verify-pass') ? '' : 'disabled title="${verifyPassTitle}"'}>验证通过</button>
                 <button id="badcase-verify-fail" type="button" class="flex-1 px-4 py-2 bg-red-50 hover:bg-red-100 text-red-700 rounded-xl text-sm transition-colors" ${allowed.has('verify-fail') ? '' : 'disabled title="当前状态不可验证"'}>验证不通过</button>
               </div>
               <button id="badcase-reject" type="button" class="w-full text-xs text-slate-500 hover:text-red-600 underline mt-2" ${allowed.has('reject') ? '' : 'disabled title="当前状态不可驳回"'}>驳回 / 拒绝处理</button>
@@ -2881,11 +2895,9 @@
             btn.addEventListener('click', () => {
               const type = btn.dataset.draftType;
               const draftId = Number(btn.dataset.draftId);
+              const confirmMsg = btn.dataset.confirm || '确认应用该草稿？';
+              if (!window.confirm(confirmMsg)) return;
               const body = {};
-              if (type === 'skill_prompt') {
-                const target = window.prompt('目标 Skill ID（可选，留空则新建）：');
-                if (target && target.trim()) body.target_skill_id = Number(target.trim());
-              }
               runAction(`/api/badcases/${id}/${draftEndpoint(type)}/${draftId}/apply`, body, type === 'capability_gap' ? '已记录能力缺口待办' : '草稿已应用');
             });
           });

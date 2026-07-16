@@ -26,8 +26,12 @@ from app.badcase_schema import (
     VALID_CATEGORIES,
     VALID_STATUSES,
     allowed_actions,
+    effective_allowed_actions,
+    is_draft_editable,
+    is_draft_terminal,
     is_terminal_status,
     require_status,
+    validate_draft_status_transition,
     validate_status_transition,
     _enrich_badcase,
 )
@@ -41,12 +45,12 @@ from db.property_db import (
     create_skill as db_create_skill,
     create_skill_prompt_draft as db_create_skill_prompt_draft,
     delete_badcase as db_delete_badcase,
+    delete_knowledge_doc as db_delete_knowledge_doc,
     get_badcase as db_get_badcase,
     get_capability_gap_draft as db_get_capability_gap_draft,
     get_chat_message,
     get_enabled_price_for_model,
     get_knowledge_draft as db_get_knowledge_draft,
-    get_skill,
     get_skill_by_name,
     get_skill_prompt_draft as db_get_skill_prompt_draft,
     list_badcase_actions,
@@ -59,7 +63,6 @@ from db.property_db import (
     update_badcase as db_update_badcase,
     update_capability_gap_draft as db_update_capability_gap_draft,
     update_knowledge_draft as db_update_knowledge_draft,
-    update_skill as db_update_skill,
     update_skill_prompt_draft as db_update_skill_prompt_draft,
 )
 
@@ -162,9 +165,6 @@ class EditCapabilityGapDraftRequest(BaseModel):
     suggested_action: Optional[str] = None
 
 
-VALID_DRAFT_STATUSES = {"draft", "under_review", "approved", "published", "rejected", "accepted"}
-
-
 def _record_action(badcase_id: int, action_type: str, detail: Any, before: str, after: str, created_by: str = "system"):
     """Record a badcase lifecycle action."""
     return add_badcase_action(
@@ -207,6 +207,24 @@ def _attach_drafts(case: Dict[str, Any]) -> Dict[str, Any]:
     case["skill_prompt_drafts"] = db_list_skill_prompt_drafts(badcase_id=case_id)
     case["capability_gap_drafts"] = db_list_capability_gap_drafts(badcase_id=case_id)
     return case
+
+
+def _draft_snapshot(draft: Dict[str, Any], fields: List[str]) -> Dict[str, Any]:
+    """Return a snapshot of the draft fields that matter for audit history."""
+    return {field: draft.get(field) for field in fields if draft.get(field) is not None}
+
+
+_KNOWLEDGE_DRAFT_SNAPSHOT_FIELDS = ["id", "title", "content", "category", "status"]
+_SKILL_DRAFT_SNAPSHOT_FIELDS = ["id", "title", "skill_name", "prompt_content", "trigger_keywords", "status"]
+_CAPABILITY_GAP_DRAFT_SNAPSHOT_FIELDS = ["id", "title", "description", "gap_type", "suggested_action", "status"]
+
+
+def _require_draft_transition(draft_type: str, draft: Dict[str, Any], new_status: str) -> None:
+    """Enforce strict draft status transitions and raise HTTP 400 on violation."""
+    try:
+        validate_draft_status_transition(draft_type, draft.get("status", "draft"), new_status)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
 
 def _extract_usage(usage_obj: Any) -> Dict[str, Optional[int]]:
@@ -479,130 +497,55 @@ async def extract_knowledge(case_id: int, request: ExtractKnowledgeRequest = Ext
 @router.post("/{case_id}/publish-draft/{draft_id}")
 async def publish_knowledge_draft(case_id: int, draft_id: int):
     """Backward-compatible alias: apply an approved knowledge draft."""
-    import rag_indexer
-
     case = _load_case(case_id)
     _require_case_status(case, "publish-draft", {"fixing"})
     draft = _load_draft(draft_id, case_id, db_get_knowledge_draft, "knowledge draft")
     if draft.get("status") != "approved":
         raise HTTPException(status_code=400, detail="draft must be approved before applying")
 
-    doc = db_create_knowledge_doc(
-        title=draft["title"],
-        content=draft["content"],
-        category=draft.get("category", "未分类"),
-    )
-    try:
-        rag_indexer.reindex_document(doc["id"])
-    except Exception as exc:
-        logger.exception("reindex after publish failed")
-        # Continue; the doc exists but index may be stale.
-
-    db_update_knowledge_draft(draft_id, status="published", knowledge_doc_id=doc["id"])
-
-    before = case["status"]
-    new_status = before
-    if before == "fixing":
-        new_status = "verifying"
-        updated = db_update_badcase(case_id, status=new_status, fix_plan="knowledge published")
-        case = updated or case
-    _record_action(case_id, "publish-knowledge", {"doc_id": doc["id"], "draft_id": draft_id}, before, new_status)
-
-    return {"badcase": _enrich_badcase(case), "knowledge_doc": doc}
+    updated, doc = await _apply_knowledge_draft(case_id, draft_id, draft, case, "publish-knowledge")
+    _attach_drafts(updated)
+    return {"badcase": _enrich_badcase(updated), "knowledge_doc": doc}
 
 
 @router.post("/{case_id}/publish-skill-draft/{draft_id}")
 async def publish_skill_prompt_draft_endpoint(
     case_id: int, draft_id: int, request: PublishSkillDraftRequest = PublishSkillDraftRequest()
 ):
-    """Backward-compatible alias: apply an approved skill/prompt draft."""
+    """Backward-compatible alias: blocked until batch 2 agent binding is implemented."""
     case = _load_case(case_id)
     _require_case_status(case, "publish-skill-draft", {"fixing"})
     draft = _load_draft(draft_id, case_id, db_get_skill_prompt_draft, "skill/prompt draft")
     if draft.get("status") != "approved":
         raise HTTPException(status_code=400, detail="draft must be approved before applying")
 
-    target_skill_id = request.target_skill_id or draft.get("skill_id")
-    now = datetime.now(timezone.utc).isoformat()
-    if target_skill_id:
-        existing = get_skill(target_skill_id)
-        # Use imported alias db_update_skill.
-        db_update_skill(
-            skill_id=target_skill_id,
-            name=draft.get("skill_name") or (existing.get("name") if existing else f"skill-{draft['id']}"),
-            description=(existing.get("description") if existing else ""),
-            instructions=draft.get("prompt_content", ""),
-            category=(existing.get("category") if existing else "运维"),
-            enabled=True,
-            trigger_condition=draft.get("trigger_keywords", ""),
-        )
-    else:
-        new_skill = db_create_skill(
-            name=draft.get("skill_name") or f"skill-{draft['id']}",
-            description="",
-            instructions=draft.get("prompt_content", ""),
-            category="运维",
-            enabled=True,
-            trigger_condition=draft.get("trigger_keywords", ""),
-        )
-        target_skill_id = new_skill["id"]
-
-    db_update_skill_prompt_draft(
-        draft_id,
-        skill_id=target_skill_id,
-        status="published",
-        published_at=now,
-        published_by="operator",
-    )
-
-    before = case["status"]
-    new_status = before
-    if before == "fixing":
-        new_status = "verifying"
-        updated = db_update_badcase(case_id, status=new_status, fix_plan="skill/prompt published")
-        case = updated or case
-    _record_action(case_id, "publish-skill-prompt", {"skill_id": target_skill_id, "draft_id": draft_id}, before, new_status)
-
-    return {"badcase": _enrich_badcase(case), "skill_id": target_skill_id}
+    await _apply_skill_prompt_draft(case_id, draft_id, draft, case, "publish-skill-prompt")
 
 
 @router.post("/{case_id}/accept-capability-gap/{draft_id}")
 async def accept_capability_gap_endpoint(
     case_id: int, draft_id: int, request: AcceptGapRequest = AcceptGapRequest()
 ):
-    """Backward-compatible alias: apply an approved capability gap as a product backlog item."""
+    """Backward-compatible alias: accept an approved capability gap as backlog."""
     case = _load_case(case_id)
     _require_case_status(case, "accept-capability-gap", {"fixing"})
     draft = _load_draft(draft_id, case_id, db_get_capability_gap_draft, "capability gap draft")
     if draft.get("status") != "approved":
         raise HTTPException(status_code=400, detail="draft must be approved before applying")
 
-    now = datetime.now(timezone.utc).isoformat()
-    db_update_capability_gap_draft(
-        draft_id,
-        status="accepted",
-        accepted_at=now,
-        accepted_by="operator",
-    )
-    _record_action(
-        case_id,
-        "accept-capability-gap",
-        {"draft_id": draft_id, "note": request.note},
-        case["status"],
-        case["status"],
+    await _apply_capability_gap_draft(
+        case_id, draft_id, draft, case, "accept-capability-gap", request.note
     )
     _attach_drafts(case)
-    return {"badcase": _enrich_badcase(case), "note": "能力缺口已记录为产品待办，未自动创建工具"}
+    return {
+        "badcase": _enrich_badcase(case),
+        "note": "能力缺口已记录为产品待办，未自动创建工具；Badcase 仍保持修复中",
+    }
 
 
 # -----------------------------------------------------------------------------
 # Draft review / edit / apply endpoints
 # -----------------------------------------------------------------------------
-
-
-def _validate_draft_status(status: str) -> None:
-    if status not in VALID_DRAFT_STATUSES:
-        raise HTTPException(status_code=400, detail=f"invalid draft status: {status}")
 
 
 def _move_to_verifying_after_apply(case: Dict[str, Any], case_id: int, action_type: str, detail: Any) -> Dict[str, Any]:
@@ -614,24 +557,103 @@ def _move_to_verifying_after_apply(case: Dict[str, Any], case_id: int, action_ty
     return updated or case
 
 
+async def _apply_knowledge_draft(
+    case_id: int, draft_id: int, draft: Dict[str, Any], case: Dict[str, Any], action_type: str
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Create a knowledge doc, reindex it, and only then publish the draft.
+
+    If reindex fails, delete the orphan doc and keep the draft approved/case fixing.
+    """
+    import rag_indexer
+
+    doc = db_create_knowledge_doc(
+        title=draft["title"],
+        content=draft["content"],
+        category=draft.get("category", "未分类"),
+    )
+    try:
+        rag_indexer.reindex_document(doc["id"])
+    except Exception as exc:
+        logger.exception("reindex after %s failed", action_type)
+        # Clean up the orphan document so we don't leave an unindexed doc behind.
+        try:
+            db_delete_knowledge_doc(doc["id"])
+        except Exception:
+            logger.exception("failed to delete orphan knowledge doc %s", doc["id"])
+        raise HTTPException(
+            status_code=500,
+            detail=f"知识库索引失败，应用未生效：{exc}",
+        )
+
+    db_update_knowledge_draft(draft_id, status="published", knowledge_doc_id=doc["id"])
+    detail = {
+        "doc_id": doc["id"],
+        "draft_id": draft_id,
+        "draft_snapshot": _draft_snapshot(draft, _KNOWLEDGE_DRAFT_SNAPSHOT_FIELDS),
+        "index_result": "success",
+    }
+    updated = _move_to_verifying_after_apply(case, case_id, action_type, detail)
+    return updated, doc
+
+
+async def _apply_skill_prompt_draft(
+    case_id: int, draft_id: int, draft: Dict[str, Any], case: Dict[str, Any], action_type: str
+) -> None:
+    """Skill/Prompt drafts cannot be applied until batch 2 agent binding is implemented."""
+    raise HTTPException(
+        status_code=409,
+        detail="待第二批：选择目标 Agent 并建立 agent_skills 绑定后才能应用到运行时",
+    )
+
+
+async def _apply_capability_gap_draft(
+    case_id: int, draft_id: int, draft: Dict[str, Any], case: Dict[str, Any], action_type: str, note: str = ""
+) -> Dict[str, Any]:
+    """Accept a capability gap as backlog only; do not move case to verifying."""
+    now = datetime.now(timezone.utc).isoformat()
+    db_update_capability_gap_draft(
+        draft_id,
+        status="accepted",
+        accepted_at=now,
+        accepted_by="operator",
+    )
+    detail = {
+        "draft_id": draft_id,
+        "draft_snapshot": _draft_snapshot(draft, _CAPABILITY_GAP_DRAFT_SNAPSHOT_FIELDS),
+        "note": note,
+    }
+    _record_action(case_id, action_type, detail, case["status"], case["status"])
+    return case
+
+
 @router.put("/{case_id}/knowledge-drafts/{draft_id}")
 async def edit_knowledge_draft(
     case_id: int, draft_id: int, request: EditKnowledgeDraftRequest = EditKnowledgeDraftRequest()
 ):
-    """Edit a knowledge draft (fixing status only)."""
+    """Edit a knowledge draft (fixing status only). Approved drafts reset to draft."""
     case = _load_case(case_id)
     _require_case_status(case, "edit-knowledge-draft", {"fixing"})
     draft = _load_draft(draft_id, case_id, db_get_knowledge_draft, "knowledge draft")
-    if draft.get("status") in ("published", "rejected"):
-        raise HTTPException(status_code=400, detail="cannot edit published or rejected draft")
+    if not is_draft_editable("knowledge", draft.get("status", "draft")):
+        raise HTTPException(status_code=400, detail="cannot edit terminal draft")
 
+    before = _draft_snapshot(draft, _KNOWLEDGE_DRAFT_SNAPSHOT_FIELDS)
+    new_status = "draft" if draft.get("status") == "approved" else draft.get("status")
     updated = db_update_knowledge_draft(
         draft_id,
         title=request.title,
         content=request.content,
         category=request.category,
+        status=new_status,
     )
-    _record_action(case_id, "edit-knowledge-draft", {"draft_id": draft_id}, case["status"], case["status"])
+    after = _draft_snapshot(updated or draft, _KNOWLEDGE_DRAFT_SNAPSHOT_FIELDS)
+    _record_action(
+        case_id,
+        "edit-knowledge-draft",
+        {"draft_id": draft_id, "before": before, "after": after},
+        case["status"],
+        case["status"],
+    )
     _attach_drafts(case)
     return {"badcase": _enrich_badcase(case), "knowledge_draft": updated}
 
@@ -640,19 +662,19 @@ async def edit_knowledge_draft(
 async def review_knowledge_draft(
     case_id: int, draft_id: int, request: ReviewDraftRequest = ReviewDraftRequest()
 ):
-    """Review a knowledge draft: draft/under_review -> approved/rejected/under_review."""
+    """Review a knowledge draft with strict status transitions."""
     case = _load_case(case_id)
     _require_case_status(case, "review-knowledge-draft", {"fixing"})
     draft = _load_draft(draft_id, case_id, db_get_knowledge_draft, "knowledge draft")
-    _validate_draft_status(request.status)
-    if draft.get("status") in ("published", "rejected"):
-        raise HTTPException(status_code=400, detail="cannot review published or rejected draft")
+    _require_draft_transition("knowledge", draft, request.status)
 
+    before = _draft_snapshot(draft, _KNOWLEDGE_DRAFT_SNAPSHOT_FIELDS)
     updated = db_update_knowledge_draft(draft_id, status=request.status)
+    after = _draft_snapshot(updated or draft, _KNOWLEDGE_DRAFT_SNAPSHOT_FIELDS)
     _record_action(
         case_id,
         "review-knowledge-draft",
-        {"draft_id": draft_id, "status": request.status, "note": request.note},
+        {"draft_id": draft_id, "before": before, "after": after, "note": request.note},
         case["status"],
         case["status"],
     )
@@ -663,28 +685,13 @@ async def review_knowledge_draft(
 @router.post("/{case_id}/knowledge-drafts/{draft_id}/apply")
 async def apply_knowledge_draft(case_id: int, draft_id: int):
     """Apply an approved knowledge draft to the official knowledge base and reindex."""
-    import rag_indexer
-
     case = _load_case(case_id)
     _require_case_status(case, "apply-knowledge-draft", {"fixing"})
     draft = _load_draft(draft_id, case_id, db_get_knowledge_draft, "knowledge draft")
     if draft.get("status") != "approved":
         raise HTTPException(status_code=400, detail="draft must be approved before applying")
 
-    doc = db_create_knowledge_doc(
-        title=draft["title"],
-        content=draft["content"],
-        category=draft.get("category", "未分类"),
-    )
-    try:
-        rag_indexer.reindex_document(doc["id"])
-    except Exception as exc:
-        logger.exception("reindex after apply failed")
-
-    db_update_knowledge_draft(draft_id, status="published", knowledge_doc_id=doc["id"])
-    updated = _move_to_verifying_after_apply(
-        case, case_id, "apply-knowledge-draft", {"doc_id": doc["id"], "draft_id": draft_id}
-    )
+    updated, doc = await _apply_knowledge_draft(case_id, draft_id, draft, case, "apply-knowledge-draft")
     _attach_drafts(updated)
     return {"badcase": _enrich_badcase(updated), "knowledge_doc": doc}
 
@@ -693,21 +700,31 @@ async def apply_knowledge_draft(case_id: int, draft_id: int):
 async def edit_skill_prompt_draft(
     case_id: int, draft_id: int, request: EditSkillDraftRequest = EditSkillDraftRequest()
 ):
-    """Edit a skill/prompt draft (fixing status only)."""
+    """Edit a skill/prompt draft (fixing status only). Approved drafts reset to draft."""
     case = _load_case(case_id)
     _require_case_status(case, "edit-skill-prompt-draft", {"fixing"})
     draft = _load_draft(draft_id, case_id, db_get_skill_prompt_draft, "skill/prompt draft")
-    if draft.get("status") in ("published", "rejected"):
-        raise HTTPException(status_code=400, detail="cannot edit published or rejected draft")
+    if not is_draft_editable("skill_prompt", draft.get("status", "draft")):
+        raise HTTPException(status_code=400, detail="cannot edit terminal draft")
 
+    before = _draft_snapshot(draft, _SKILL_DRAFT_SNAPSHOT_FIELDS)
+    new_status = "draft" if draft.get("status") == "approved" else draft.get("status")
     updated = db_update_skill_prompt_draft(
         draft_id,
         title=request.title,
         skill_name=request.skill_name,
         prompt_content=request.prompt_content,
         trigger_keywords=request.trigger_keywords,
+        status=new_status,
     )
-    _record_action(case_id, "edit-skill-prompt-draft", {"draft_id": draft_id}, case["status"], case["status"])
+    after = _draft_snapshot(updated or draft, _SKILL_DRAFT_SNAPSHOT_FIELDS)
+    _record_action(
+        case_id,
+        "edit-skill-prompt-draft",
+        {"draft_id": draft_id, "before": before, "after": after},
+        case["status"],
+        case["status"],
+    )
     _attach_drafts(case)
     return {"badcase": _enrich_badcase(case), "skill_prompt_draft": updated}
 
@@ -716,19 +733,19 @@ async def edit_skill_prompt_draft(
 async def review_skill_prompt_draft(
     case_id: int, draft_id: int, request: ReviewDraftRequest = ReviewDraftRequest()
 ):
-    """Review a skill/prompt draft."""
+    """Review a skill/prompt draft with strict status transitions."""
     case = _load_case(case_id)
     _require_case_status(case, "review-skill-prompt-draft", {"fixing"})
     draft = _load_draft(draft_id, case_id, db_get_skill_prompt_draft, "skill/prompt draft")
-    _validate_draft_status(request.status)
-    if draft.get("status") in ("published", "rejected"):
-        raise HTTPException(status_code=400, detail="cannot review published or rejected draft")
+    _require_draft_transition("skill_prompt", draft, request.status)
 
+    before = _draft_snapshot(draft, _SKILL_DRAFT_SNAPSHOT_FIELDS)
     updated = db_update_skill_prompt_draft(draft_id, status=request.status)
+    after = _draft_snapshot(updated or draft, _SKILL_DRAFT_SNAPSHOT_FIELDS)
     _record_action(
         case_id,
         "review-skill-prompt-draft",
-        {"draft_id": draft_id, "status": request.status, "note": request.note},
+        {"draft_id": draft_id, "before": before, "after": after, "note": request.note},
         case["status"],
         case["status"],
     )
@@ -740,70 +757,45 @@ async def review_skill_prompt_draft(
 async def apply_skill_prompt_draft(
     case_id: int, draft_id: int, request: PublishSkillDraftRequest = PublishSkillDraftRequest()
 ):
-    """Apply an approved skill/prompt draft to an existing skill or create a new skill."""
+    """Skill/Prompt drafts cannot be applied until batch 2 agent binding is implemented."""
     case = _load_case(case_id)
     _require_case_status(case, "apply-skill-prompt-draft", {"fixing"})
     draft = _load_draft(draft_id, case_id, db_get_skill_prompt_draft, "skill/prompt draft")
     if draft.get("status") != "approved":
         raise HTTPException(status_code=400, detail="draft must be approved before applying")
 
-    target_skill_id = request.target_skill_id or draft.get("skill_id")
-    now = datetime.now(timezone.utc).isoformat()
-    if target_skill_id:
-        existing = get_skill(target_skill_id)
-        db_update_skill(
-            skill_id=target_skill_id,
-            name=draft.get("skill_name") or (existing.get("name") if existing else f"skill-{draft['id']}"),
-            description=(existing.get("description") if existing else ""),
-            instructions=draft.get("prompt_content", ""),
-            category=(existing.get("category") if existing else "运维"),
-            enabled=True,
-            trigger_condition=draft.get("trigger_keywords", ""),
-        )
-    else:
-        new_skill = db_create_skill(
-            name=draft.get("skill_name") or f"skill-{draft['id']}",
-            description="",
-            instructions=draft.get("prompt_content", ""),
-            category="运维",
-            enabled=True,
-            trigger_condition=draft.get("trigger_keywords", ""),
-        )
-        target_skill_id = new_skill["id"]
-
-    db_update_skill_prompt_draft(
-        draft_id,
-        skill_id=target_skill_id,
-        status="published",
-        published_at=now,
-        published_by="operator",
-    )
-    updated = _move_to_verifying_after_apply(
-        case, case_id, "apply-skill-prompt-draft", {"skill_id": target_skill_id, "draft_id": draft_id}
-    )
-    _attach_drafts(updated)
-    return {"badcase": _enrich_badcase(updated), "skill_id": target_skill_id}
+    await _apply_skill_prompt_draft(case_id, draft_id, draft, case, "apply-skill-prompt-draft")
 
 
 @router.put("/{case_id}/capability-gap-drafts/{draft_id}")
 async def edit_capability_gap_draft(
     case_id: int, draft_id: int, request: EditCapabilityGapDraftRequest = EditCapabilityGapDraftRequest()
 ):
-    """Edit a capability gap draft (fixing status only)."""
+    """Edit a capability gap draft (fixing status only). Approved drafts reset to draft."""
     case = _load_case(case_id)
     _require_case_status(case, "edit-capability-gap-draft", {"fixing"})
     draft = _load_draft(draft_id, case_id, db_get_capability_gap_draft, "capability gap draft")
-    if draft.get("status") in ("accepted", "rejected"):
-        raise HTTPException(status_code=400, detail="cannot edit accepted or rejected draft")
+    if not is_draft_editable("capability_gap", draft.get("status", "draft")):
+        raise HTTPException(status_code=400, detail="cannot edit terminal draft")
 
+    before = _draft_snapshot(draft, _CAPABILITY_GAP_DRAFT_SNAPSHOT_FIELDS)
+    new_status = "draft" if draft.get("status") == "approved" else draft.get("status")
     updated = db_update_capability_gap_draft(
         draft_id,
         title=request.title,
         description=request.description,
         gap_type=request.gap_type,
         suggested_action=request.suggested_action,
+        status=new_status,
     )
-    _record_action(case_id, "edit-capability-gap-draft", {"draft_id": draft_id}, case["status"], case["status"])
+    after = _draft_snapshot(updated or draft, _CAPABILITY_GAP_DRAFT_SNAPSHOT_FIELDS)
+    _record_action(
+        case_id,
+        "edit-capability-gap-draft",
+        {"draft_id": draft_id, "before": before, "after": after},
+        case["status"],
+        case["status"],
+    )
     _attach_drafts(case)
     return {"badcase": _enrich_badcase(case), "capability_gap_draft": updated}
 
@@ -812,19 +804,19 @@ async def edit_capability_gap_draft(
 async def review_capability_gap_draft(
     case_id: int, draft_id: int, request: ReviewDraftRequest = ReviewDraftRequest()
 ):
-    """Review a capability gap draft."""
+    """Review a capability gap draft with strict status transitions."""
     case = _load_case(case_id)
     _require_case_status(case, "review-capability-gap-draft", {"fixing"})
     draft = _load_draft(draft_id, case_id, db_get_capability_gap_draft, "capability gap draft")
-    _validate_draft_status(request.status)
-    if draft.get("status") in ("accepted", "rejected"):
-        raise HTTPException(status_code=400, detail="cannot review accepted or rejected draft")
+    _require_draft_transition("capability_gap", draft, request.status)
 
+    before = _draft_snapshot(draft, _CAPABILITY_GAP_DRAFT_SNAPSHOT_FIELDS)
     updated = db_update_capability_gap_draft(draft_id, status=request.status)
+    after = _draft_snapshot(updated or draft, _CAPABILITY_GAP_DRAFT_SNAPSHOT_FIELDS)
     _record_action(
         case_id,
         "review-capability-gap-draft",
-        {"draft_id": draft_id, "status": request.status, "note": request.note},
+        {"draft_id": draft_id, "before": before, "after": after, "note": request.note},
         case["status"],
         case["status"],
     )
@@ -843,23 +835,13 @@ async def apply_capability_gap_draft(
     if draft.get("status") != "approved":
         raise HTTPException(status_code=400, detail="draft must be approved before applying")
 
-    now = datetime.now(timezone.utc).isoformat()
-    db_update_capability_gap_draft(
-        draft_id,
-        status="accepted",
-        accepted_at=now,
-        accepted_by="operator",
+    await _apply_capability_gap_draft(
+        case_id, draft_id, draft, case, "apply-capability-gap-draft", request.note
     )
-    updated = _move_to_verifying_after_apply(
-        case,
-        case_id,
-        "apply-capability-gap-draft",
-        {"draft_id": draft_id, "note": request.note},
-    )
-    _attach_drafts(updated)
+    _attach_drafts(case)
     return {
-        "badcase": _enrich_badcase(updated),
-        "note": "能力缺口已记录为产品待办，未自动创建工具",
+        "badcase": _enrich_badcase(case),
+        "note": "能力缺口已记录为产品待办，未自动创建工具；Badcase 仍保持修复中",
     }
 
 
@@ -1174,10 +1156,12 @@ async def verify_badcase(case_id: int, request: VerifyRequest = VerifyRequest())
 
 @router.post("/{case_id}/transition")
 async def transition_badcase(case_id: int, request: TransitionRequest = TransitionRequest()):
-    """Manually transition a badcase to another valid state (state machine still enforced)."""
+    """Manually transition a badcase to another valid state (state machine enforced)."""
     case = _load_case(case_id)
     if request.status not in VALID_STATUSES:
         raise HTTPException(status_code=400, detail=f"invalid status: {request.status}")
+    if is_terminal_status(case["status"]) and case["status"] != request.status:
+        raise HTTPException(status_code=400, detail="cannot transition out of terminal status")
     try:
         validate_status_transition(case["status"], request.status)
     except ValueError as exc:

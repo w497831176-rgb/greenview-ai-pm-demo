@@ -21,9 +21,13 @@ from app.badcase_schema import (
     _format_action,
     allowed_actions,
     allowed_target_statuses,
+    effective_allowed_actions,
+    is_draft_editable,
+    is_draft_terminal,
     is_terminal_status,
     repair_path_for_category,
     require_status,
+    validate_draft_status_transition,
     validate_status_transition,
 )
 
@@ -123,8 +127,8 @@ def test_allowed_actions_per_status():
         "transition",
     }
     assert set(allowed_actions("verifying")) == {"retest", "reject", "transition", "verify-fail", "verify-pass"}
-    assert allowed_actions("closed") == ["transition"]
-    assert allowed_actions("rejected") == ["transition"]
+    assert allowed_actions("closed") == []
+    assert allowed_actions("rejected") == []
 
 
 def test_require_status_rejects_wrong_status():
@@ -152,6 +156,79 @@ def test_repair_path_for_category():
     assert repair_path_for_category("other") == "darwin"
 
 
+def test_terminal_allowed_actions_are_empty():
+    assert effective_allowed_actions({"status": "closed"}) == []
+    assert effective_allowed_actions({"status": "rejected"}) == []
+
+
+def test_effective_allowed_actions_hides_verify_pass_without_retest():
+    bc = {"status": "verifying", "retest_response": ""}
+    actions = set(effective_allowed_actions(bc))
+    assert "verify-pass" not in actions
+    assert "retest" in actions
+    assert "verify-fail" in actions
+    assert "reject" in actions
+
+
+def test_effective_allowed_actions_shows_verify_pass_with_retest():
+    bc = {"status": "verifying", "retest_response": "已修复"}
+    actions = set(effective_allowed_actions(bc))
+    assert "verify-pass" in actions
+    assert "retest" in actions
+    assert "verify-fail" in actions
+    assert "reject" in actions
+
+
+def test_effective_allowed_actions_for_non_verifying_unchanged():
+    bc = {"status": "fixing", "retest_response": ""}
+    assert set(effective_allowed_actions(bc)) == set(allowed_actions("fixing"))
+
+
+def test_draft_status_transitions_knowledge_and_skill():
+    # happy path
+    validate_draft_status_transition("knowledge", "draft", "under_review")
+    validate_draft_status_transition("knowledge", "under_review", "approved")
+    validate_draft_status_transition("knowledge", "approved", "published")
+    validate_draft_status_transition("skill_prompt", "draft", "rejected")
+    validate_draft_status_transition("skill_prompt", "under_review", "rejected")
+
+    # illegal direct to published
+    for draft_type in ("knowledge", "skill_prompt"):
+        for illegal in ("draft", "under_review", "rejected"):
+            try:
+                validate_draft_status_transition(draft_type, illegal, "published")
+                raise AssertionError(f"expected ValueError for {draft_type} {illegal} -> published")
+            except ValueError:
+                pass
+
+
+def test_draft_status_transitions_capability_gap():
+    validate_draft_status_transition("capability_gap", "draft", "under_review")
+    validate_draft_status_transition("capability_gap", "under_review", "approved")
+    validate_draft_status_transition("capability_gap", "approved", "accepted")
+    validate_draft_status_transition("capability_gap", "under_review", "rejected")
+
+    for illegal in ("draft", "under_review", "rejected"):
+        try:
+            validate_draft_status_transition("capability_gap", illegal, "accepted")
+            raise AssertionError(f"expected ValueError for capability_gap {illegal} -> accepted")
+        except ValueError:
+            pass
+
+
+def test_draft_terminal_and_editable():
+    assert is_draft_terminal("knowledge", "published")
+    assert is_draft_terminal("knowledge", "rejected")
+    assert not is_draft_terminal("knowledge", "approved")
+    assert is_draft_terminal("capability_gap", "accepted")
+
+    assert is_draft_editable("knowledge", "draft")
+    assert is_draft_editable("knowledge", "under_review")
+    assert is_draft_editable("knowledge", "approved")
+    assert not is_draft_editable("knowledge", "published")
+    assert not is_draft_editable("knowledge", "rejected")
+
+
 if __name__ == "__main__":
     test_enrich_badcase_exposes_stable_schema()
     test_enrich_badcase_action_parsing_fallback()
@@ -161,4 +238,11 @@ if __name__ == "__main__":
     test_require_status_rejects_wrong_status()
     test_is_terminal_status()
     test_repair_path_for_category()
+    test_terminal_allowed_actions_are_empty()
+    test_effective_allowed_actions_hides_verify_pass_without_retest()
+    test_effective_allowed_actions_shows_verify_pass_with_retest()
+    test_effective_allowed_actions_for_non_verifying_unchanged()
+    test_draft_status_transitions_knowledge_and_skill()
+    test_draft_status_transitions_capability_gap()
+    test_draft_terminal_and_editable()
     print("All badcase_schema tests passed.")
