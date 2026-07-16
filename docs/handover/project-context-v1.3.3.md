@@ -66,8 +66,10 @@
 
 ### 3.3 RAG
 
-- 知识库文档存储在 Postgres，由 `rag_indexer` 构建本地向量索引。
-- 检索阶段返回 `citations`（doc_id / doc_title / chunk_index / chunk_id / supporting text / score）。
+- 物业知识文档、分片元数据、索引状态等业务事实数据存储在 SQLite：`/volume1/docker/volumes/agno-demo-os/property-data/property_demo.db`。
+- 本地 RAG 向量索引目录：`/volume1/docker/volumes/agno-demo-os/property-data/rag_index`。
+- Postgres/pgvector 仅为 AgentOS 依赖，不是物业知识库或物业业务事实数据源。
+- 检索阶段返回 `citations`（doc_id / doc_title / chunk_index / chunk_id / supporting text / score），由 SQLite 文档记录与本地 RAG 检索结果共同生成。
 - 当检索零召回时，`app/chat.py` 会自动创建 `category=knowledge_gap` 的 Badcase（source=auto）。
 
 ### 3.4 MCP
