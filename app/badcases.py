@@ -25,6 +25,8 @@ logger = logging.getLogger(__name__)
 from app.badcase_schema import (
     VALID_CATEGORIES,
     VALID_STATUSES,
+    _enrich_badcase,
+    _has_post_apply_retest,
     allowed_actions,
     effective_allowed_actions,
     is_draft_editable,
@@ -34,7 +36,6 @@ from app.badcase_schema import (
     require_status,
     validate_draft_status_transition,
     validate_status_transition,
-    _enrich_badcase,
 )
 from app.observability import _check_budget
 from app.settings import MODEL, MODEL_ID, build_model
@@ -66,6 +67,7 @@ from db.property_db import (
     list_knowledge_drafts as db_list_knowledge_drafts,
     list_skill_prompt_drafts as db_list_skill_prompt_drafts,
     list_skills,
+    now_cn,
     record_model_call,
     set_agent_skills,
     update_badcase as db_update_badcase,
@@ -660,10 +662,23 @@ async def accept_capability_gap_endpoint(
 
 
 def _move_to_verifying_after_apply(case: Dict[str, Any], case_id: int, action_type: str, detail: Any) -> Dict[str, Any]:
-    """Move badcase from fixing to verifying after a draft has been applied."""
+    """Move badcase from fixing to verifying after a draft has been applied.
+
+    Clears any pre-apply retest evidence so that verify-pass can only be
+    granted after a post-apply retest.
+    """
     before = case["status"]
     new_status = "verifying"
-    updated = db_update_badcase(case_id, status=new_status, fix_plan=f"{action_type} applied")
+    applied_at = now_cn()
+    updated = db_update_badcase(
+        case_id,
+        status=new_status,
+        fix_plan=f"{action_type} applied",
+        retest_response="",
+        retest_context_json="",
+        retest_trace_id="",
+        last_applied_at=applied_at,
+    )
     _record_action(case_id, action_type, detail, before, new_status)
     return updated or case
 
@@ -1404,8 +1419,11 @@ async def verify_badcase(case_id: int, request: VerifyRequest = VerifyRequest())
     _require_case_status(case, "verify", {"verifying"})
 
     if request.passed:
-        if not case.get("retest_response"):
-            raise HTTPException(status_code=400, detail="retest_response missing")
+        if not _has_post_apply_retest(case):
+            raise HTTPException(
+                status_code=400,
+                detail="请先在当前修复应用后完成一次真实复测",
+            )
         new_status = "closed"
         updated = db_update_badcase(case_id, status=new_status, verified_by="operator")
     else:
@@ -1511,11 +1529,12 @@ async def _consume_chat_stream(message: str, session_id: str, user_id: str = "re
 async def retest_badcase(case_id: int, request: SwitchModelRetryRequest = SwitchModelRetryRequest()):
     """Retest the badcase user message through the real chat runtime.
 
-    Keeps the case in fixing so the operator can still apply an approved draft.
-    The case moves to verifying only when a draft is applied or published.
+    Allowed from both `fixing` (pre-apply diagnosis) and `verifying` (post-apply
+    validation). The status does not change; a post-apply retest keeps the case
+    in `verifying` so the operator can proceed to verify-pass.
     """
     case = _load_case(case_id)
-    _require_case_status(case, "retest", {"fixing"})
+    _require_case_status(case, "retest", {"fixing", "verifying"})
 
     user_message = request.user_message or case.get("original_query")
     if not user_message and case.get("source_message_id"):
@@ -1595,15 +1614,17 @@ async def retest_badcase(case_id: int, request: SwitchModelRetryRequest = Switch
         pass
 
     before = case["status"]
-    # Retest stays in fixing so the operator can still apply an approved draft.
-    # The case only moves to verifying when a draft is applied or published.
-    new_status = "fixing"
+    # Retest does not change the status. In fixing it is a pre-apply diagnosis;
+    # in verifying it is the post-apply validation required before verify-pass.
+    new_status = before
+    retest_at = now_cn()
     updated = db_update_badcase(
         case_id,
         status=new_status,
         retest_response=answer,
         retest_context_json=json.dumps(retest_context, ensure_ascii=False, default=str),
         retest_trace_id=retest_trace_id,
+        last_retest_at=retest_at,
     )
     _record_action(
         case_id,

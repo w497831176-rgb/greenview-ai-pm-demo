@@ -1533,14 +1533,19 @@ def _migrate_v1_3_observability(cursor):
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             per_call_threshold_cny REAL,
             daily_threshold_cny REAL,
+            monthly_threshold_cny REAL,
             updated_at TEXT
         )
         """
     )
     cursor.execute(
-        "INSERT OR IGNORE INTO budget_thresholds (id, per_call_threshold_cny, daily_threshold_cny, updated_at) VALUES (1, NULL, NULL, ?)",
+        "INSERT OR IGNORE INTO budget_thresholds (id, per_call_threshold_cny, daily_threshold_cny, monthly_threshold_cny, updated_at) VALUES (1, NULL, NULL, NULL, ?)",
         (now,),
     )
+    try:
+        cursor.execute("ALTER TABLE budget_thresholds ADD COLUMN monthly_threshold_cny REAL")
+    except sqlite3.OperationalError:
+        pass
 
 
 def _migrate_v1_3_3_badcase_closure(cursor):
@@ -1560,6 +1565,8 @@ def _migrate_v1_3_3_badcase_closure(cursor):
         ("retest_trace_id", "TEXT"),
         ("darwin_analysis", "TEXT"),
         ("darwin_trace_id", "TEXT"),
+        ("last_applied_at", "TEXT"),
+        ("last_retest_at", "TEXT"),
     ]:
         try:
             cursor.execute(f"ALTER TABLE badcases ADD COLUMN {col} {dtype}")
@@ -1962,6 +1969,8 @@ def update_badcase(
     retest_trace_id: Optional[str] = None,
     darwin_analysis: Optional[str] = None,
     darwin_trace_id: Optional[str] = None,
+    last_applied_at: Optional[str] = None,
+    last_retest_at: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     now = now_cn("%Y-%m-%d %H:%M")
     conn = _get_conn()
@@ -1992,6 +2001,8 @@ def update_badcase(
         ("retest_trace_id", retest_trace_id),
         ("darwin_analysis", darwin_analysis),
         ("darwin_trace_id", darwin_trace_id),
+        ("last_applied_at", last_applied_at),
+        ("last_retest_at", last_retest_at),
     ]:
         if val is not None:
             fields.append(f"{col} = ?")
@@ -3358,12 +3369,23 @@ def get_budget_thresholds() -> Dict[str, Any]:
     cursor.execute("SELECT * FROM budget_thresholds WHERE id = 1")
     row = cursor.fetchone()
     conn.close()
-    return dict(row) if row else {"id": 1, "per_call_threshold_cny": None, "daily_threshold_cny": None}
+    if not row:
+        return {
+            "id": 1,
+            "per_call_threshold_cny": None,
+            "daily_threshold_cny": None,
+            "monthly_threshold_cny": None,
+        }
+    thresholds = dict(row)
+    # Ensure the new key exists for clients using an older migrated row.
+    thresholds.setdefault("monthly_threshold_cny", None)
+    return thresholds
 
 
 def update_budget_thresholds(
     per_call_threshold_cny: Optional[float] = None,
     daily_threshold_cny: Optional[float] = None,
+    monthly_threshold_cny: Optional[float] = None,
 ) -> Dict[str, Any]:
     now = now_cn()
     conn = _get_conn()
@@ -3371,15 +3393,15 @@ def update_budget_thresholds(
     cursor.execute(
         """
         UPDATE budget_thresholds
-        SET per_call_threshold_cny = ?, daily_threshold_cny = ?, updated_at = ?
+        SET per_call_threshold_cny = ?, daily_threshold_cny = ?, monthly_threshold_cny = ?, updated_at = ?
         WHERE id = 1
         """,
-        (per_call_threshold_cny, daily_threshold_cny, now),
+        (per_call_threshold_cny, daily_threshold_cny, monthly_threshold_cny, now),
     )
     if cursor.rowcount == 0:
         cursor.execute(
-            "INSERT OR IGNORE INTO budget_thresholds (id, per_call_threshold_cny, daily_threshold_cny, updated_at) VALUES (1, ?, ?, ?)",
-            (per_call_threshold_cny, daily_threshold_cny, now),
+            "INSERT OR IGNORE INTO budget_thresholds (id, per_call_threshold_cny, daily_threshold_cny, monthly_threshold_cny, updated_at) VALUES (1, ?, ?, ?, ?)",
+            (per_call_threshold_cny, daily_threshold_cny, monthly_threshold_cny, now),
         )
     conn.commit()
     conn.close()

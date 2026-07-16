@@ -64,6 +64,7 @@ class PriceUpdate(BaseModel):
 class BudgetUpdate(BaseModel):
     per_call_threshold_cny: Optional[float] = None
     daily_threshold_cny: Optional[float] = None
+    monthly_threshold_cny: Optional[float] = None
 
 
 # -----------------------------------------------------------------------------
@@ -128,46 +129,76 @@ def _query_period_summary(start: str, end: str) -> Dict[str, Any]:
 
 
 def _check_budget(strategy: Optional[str] = None) -> Dict[str, Any]:
-    """Return today's budget usage and alert level.
+    """Return daily and monthly budget usage and the highest alert level.
 
-    - strategy is reserved for future per-strategy thresholds; it does not
-      change the calculation today because the budget table only has a daily cap.
+    - blocked: any configured threshold has reached or exceeded 100%.
+    - warning: any configured threshold has reached or exceeded 80%.
+    - none: no threshold is configured or all usages are below 80%.
     """
     thresholds = get_budget_thresholds()
     daily_threshold = thresholds.get("daily_threshold_cny")
+    monthly_threshold = thresholds.get("monthly_threshold_cny")
+
+    bounds = _period_bounds()
     today_cost = 0.0
+    month_cost = 0.0
     try:
-        bounds = _period_bounds()["today"]
         conn = _get_conn()
         cursor = conn.cursor()
         cursor.execute(
             "SELECT COALESCE(SUM(estimated_cost_cny), 0) as cost FROM model_calls WHERE created_at >= ? AND created_at <= ?",
-            (bounds["start"], bounds["end"]),
+            (bounds["today"]["start"], bounds["today"]["end"]),
         )
-        row = cursor.fetchone()
+        today_cost = float(cursor.fetchone()["cost"])
+        cursor.execute(
+            "SELECT COALESCE(SUM(estimated_cost_cny), 0) as cost FROM model_calls WHERE created_at >= ? AND created_at <= ?",
+            (bounds["this_month"]["start"], bounds["this_month"]["end"]),
+        )
+        month_cost = float(cursor.fetchone()["cost"])
         conn.close()
-        today_cost = float(row["cost"]) if row else 0.0
     except Exception:
         today_cost = 0.0
+        month_cost = 0.0
 
-    usage_percent = None
+    daily_usage_percent = None
+    monthly_usage_percent = None
     alert_level = "none"
     reason = None
+    trigger_dimension = None
+
     if daily_threshold and daily_threshold > 0:
-        usage_percent = round((today_cost / daily_threshold) * 100, 4)
-        if usage_percent >= 100:
+        daily_usage_percent = round((today_cost / daily_threshold) * 100, 4)
+        if daily_usage_percent >= 100:
             alert_level = "blocked"
             reason = "今日预估成本已达到或超过日预算上限"
-        elif usage_percent >= 80:
+            trigger_dimension = "daily"
+        elif daily_usage_percent >= 80 and alert_level == "none":
             alert_level = "warning"
             reason = "今日预估成本接近日预算上限（>=80%）"
+            trigger_dimension = "daily"
+
+    if monthly_threshold and monthly_threshold > 0:
+        monthly_usage_percent = round((month_cost / monthly_threshold) * 100, 4)
+        if monthly_usage_percent >= 100:
+            alert_level = "blocked"
+            reason = "本月预估成本已达到或超过月预算上限"
+            trigger_dimension = "monthly"
+        elif monthly_usage_percent >= 80 and alert_level == "none":
+            alert_level = "warning"
+            reason = "本月预估成本接近月预算上限（>=80%）"
+            trigger_dimension = "monthly"
 
     return {
-        "usage_percent": usage_percent,
+        "daily_usage_percent": daily_usage_percent,
+        "monthly_usage_percent": monthly_usage_percent,
         "alert_level": alert_level,
         "reason": reason,
+        "trigger_dimension": trigger_dimension,
         "today_cost": round(today_cost, 8),
+        "month_cost": round(month_cost, 8),
         "daily_threshold_cny": daily_threshold,
+        "monthly_threshold_cny": monthly_threshold,
+        "per_call_threshold_cny": thresholds.get("per_call_threshold_cny"),
         "strategy": strategy,
     }
 
@@ -250,8 +281,26 @@ async def overview(
 
     data = dict(row) if row else {}
     thresholds = get_budget_thresholds()
-    daily_cost = data.get("total_cost") or 0.0
     per_call_cost = data.get("avg_cost") or 0.0
+
+    # Period summaries
+    periods = {}
+    daily_threshold = thresholds.get("daily_threshold_cny")
+    monthly_threshold = thresholds.get("monthly_threshold_cny")
+    for name, bounds in _period_bounds().items():
+        summary = _query_period_summary(bounds["start"], bounds["end"])
+        usage_percent = None
+        if name == "this_month" and monthly_threshold and monthly_threshold > 0:
+            usage_percent = round((summary["estimated_cost_cny"] / monthly_threshold) * 100, 4)
+        elif daily_threshold and daily_threshold > 0:
+            denominator = daily_threshold * bounds["days"]
+            if denominator:
+                usage_percent = round((summary["estimated_cost_cny"] / denominator) * 100, 4)
+        summary["budget_usage_percent"] = usage_percent
+        periods[name] = summary
+
+    daily_cost = periods["today"]["estimated_cost_cny"]
+    month_cost = periods["this_month"]["estimated_cost_cny"]
 
     alerts = []
     if thresholds.get("daily_threshold_cny") and daily_cost > thresholds["daily_threshold_cny"]:
@@ -260,25 +309,18 @@ async def overview(
             "threshold": thresholds["daily_threshold_cny"],
             "actual": round(daily_cost, 6),
         })
+    if thresholds.get("monthly_threshold_cny") and month_cost > thresholds["monthly_threshold_cny"]:
+        alerts.append({
+            "type": "monthly",
+            "threshold": thresholds["monthly_threshold_cny"],
+            "actual": round(month_cost, 6),
+        })
     if thresholds.get("per_call_threshold_cny") and per_call_cost > thresholds["per_call_threshold_cny"]:
         alerts.append({
             "type": "per_call",
             "threshold": thresholds["per_call_threshold_cny"],
             "actual": round(per_call_cost, 6),
         })
-
-    # Period summaries
-    periods = {}
-    daily_threshold = thresholds.get("daily_threshold_cny")
-    for name, bounds in _period_bounds().items():
-        summary = _query_period_summary(bounds["start"], bounds["end"])
-        usage_percent = None
-        if daily_threshold and daily_threshold > 0:
-            denominator = daily_threshold * bounds["days"]
-            if denominator:
-                usage_percent = round((summary["estimated_cost_cny"] / denominator) * 100, 4)
-        summary["budget_usage_percent"] = usage_percent
-        periods[name] = summary
 
     # Flash vs Pro breakdown
     by_model: Dict[str, Dict[str, Any]] = {}
@@ -699,6 +741,7 @@ async def update_budget(request: BudgetUpdate):
     budget = update_budget_thresholds(
         per_call_threshold_cny=request.per_call_threshold_cny,
         daily_threshold_cny=request.daily_threshold_cny,
+        monthly_threshold_cny=request.monthly_threshold_cny,
     )
     return {"budget": budget}
 

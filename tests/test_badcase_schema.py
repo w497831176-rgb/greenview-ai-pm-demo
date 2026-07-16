@@ -72,7 +72,7 @@ def test_enrich_badcase_exposes_stable_schema():
     assert bc["actions"][0]["status_before_label"] == "待分类"
     assert bc["actions"][0]["action_detail_parsed"]["category"] == "knowledge_gap"
     assert "retest_result" not in bc
-    assert bc["allowed_actions"] == allowed_actions("verifying")
+    assert bc["allowed_actions"] == effective_allowed_actions(raw)
     assert not bc["is_terminal"]
 
 
@@ -127,7 +127,7 @@ def test_allowed_actions_per_status():
         "review-draft",
         "transition",
     }
-    assert set(allowed_actions("verifying")) == {"reject", "transition", "verify-fail", "verify-pass"}
+    assert set(allowed_actions("verifying")) == {"reject", "retest", "transition", "verify-fail", "verify-pass"}
     assert allowed_actions("closed") == []
     assert allowed_actions("rejected") == []
 
@@ -163,21 +163,38 @@ def test_terminal_allowed_actions_are_empty():
 
 
 def test_effective_allowed_actions_hides_verify_pass_without_retest():
-    bc = {"status": "verifying", "retest_response": ""}
+    bc = {"status": "verifying", "retest_response": "", "last_applied_at": "2026-07-16 10:00:00"}
     actions = set(effective_allowed_actions(bc))
     assert "verify-pass" not in actions
-    assert "retest" not in actions
+    assert "retest" in actions
     assert "verify-fail" in actions
     assert "reject" in actions
 
 
-def test_effective_allowed_actions_shows_verify_pass_with_retest():
-    bc = {"status": "verifying", "retest_response": "已修复"}
+def test_effective_allowed_actions_shows_verify_pass_with_post_apply_retest():
+    bc = {
+        "status": "verifying",
+        "retest_response": "已修复",
+        "last_applied_at": "2026-07-16 10:00:00",
+        "last_retest_at": "2026-07-16 11:00:00",
+    }
     actions = set(effective_allowed_actions(bc))
     assert "verify-pass" in actions
-    assert "retest" not in actions
+    assert "retest" in actions
     assert "verify-fail" in actions
     assert "reject" in actions
+
+
+def test_effective_allowed_actions_hides_verify_pass_when_retest_is_before_apply():
+    bc = {
+        "status": "verifying",
+        "retest_response": "旧复测",
+        "last_applied_at": "2026-07-16 12:00:00",
+        "last_retest_at": "2026-07-16 10:00:00",
+    }
+    actions = set(effective_allowed_actions(bc))
+    assert "verify-pass" not in actions
+    assert "retest" in actions
 
 
 def test_effective_allowed_actions_for_non_verifying_unchanged():
@@ -268,7 +285,8 @@ if __name__ == "__main__":
     test_repair_path_for_category()
     test_terminal_allowed_actions_are_empty()
     test_effective_allowed_actions_hides_verify_pass_without_retest()
-    test_effective_allowed_actions_shows_verify_pass_with_retest()
+    test_effective_allowed_actions_shows_verify_pass_with_post_apply_retest()
+    test_effective_allowed_actions_hides_verify_pass_when_retest_is_before_apply()
     test_effective_allowed_actions_for_non_verifying_unchanged()
     test_draft_status_transitions_knowledge_and_skill()
     test_draft_status_transitions_capability_gap()
