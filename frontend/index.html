@@ -1242,20 +1242,21 @@
     }
 
     function renderMarkdownWithCitations(content, citations) {
-      if (!citations || citations.length === 0) return marked.parse(content || '');
+      const safeContent = content || '';
+      if (!citations || citations.length === 0) return marked.parse(safeContent);
       const renderer = new marked.Renderer();
-      const originalText = renderer.text.bind(renderer);
-      renderer.text = (text) => {
-        const replaced = text.replace(/【引用(\d+)】|\[引用(\d+)\]/g, (match, b1, b2) => {
+      renderer.text = (token) => {
+        const rawText = typeof token === 'string' ? token : (token && token.text ? token.text : '');
+        return String(rawText).replace(/【引用(\d+)】|\[引用(\d+)\]/g, (match, b1, b2) => {
           const idx = parseInt(b1 || b2, 10);
           const c = citations[idx - 1];
           if (!c || !c.doc_id) return match;
           const chunkIdx = typeof c.chunk_index === 'number' ? c.chunk_index : '';
-          return `<button type="button" class="inline-citation-btn px-1 py-0.5 mx-0.5 bg-brand-50 text-brand-700 rounded text-[11px] hover:bg-brand-100 transition-colors align-text-bottom" onclick="showCitationChunk(${c.doc_id}, '${chunkIdx}', '')">引用${idx}</button>`;
+          const snippet = escapeHtml((c.content || '').slice(0, 120).replace(/[\n\r]+/g, ' '));
+          return `<button type="button" class="inline-citation-btn px-1 py-0.5 mx-0.5 bg-brand-50 text-brand-700 rounded text-[11px] hover:bg-brand-100 transition-colors align-text-bottom" onclick="showCitationChunk(${c.doc_id}, '${chunkIdx}', '${snippet}')">引用${idx}</button>`;
         });
-        return originalText(replaced);
       };
-      return marked.parse(content || '', { renderer });
+      return marked.parse(safeContent, { renderer });
     }
 
     function renderCitations(citations, content = '') {
