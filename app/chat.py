@@ -566,15 +566,7 @@ def _build_mcp_tools(
     trace_id: Optional[str] = None,
     message: str = "",
 ) -> List[Any]:
-    """Load MCP servers bound to the current agent, filtered by user message.
-
-    Built-in MCP servers are always available to the canonical vertical agents
-    (maintenance, billing, complaint, customer_service) regardless of explicit
-    bindings. This reflects the demo platform policy that core servers such as
-    weather-server, calendar-server, and workorder-server are platform
-    capabilities, while still allowing dynamic agents to opt in via explicit
-    bindings.
-    """
+    """Load MCP servers bound to the current agent, filtered by user message."""
     tools = []
     try:
         if agent_id == "router":
@@ -584,13 +576,6 @@ def _build_mcp_tools(
         bound_tools = get_agent_tools(agent_id) if agent_id else []
         bound_names = {t.get("tool_name") for t in bound_tools if t.get("tool_name")}
         all_servers = {s.get("name"): s for s in list_mcp_servers() if s.get("enabled")}
-
-        # Canonical vertical agents always get built-in MCP servers when relevant.
-        canonical_agents = {"maintenance", "billing", "complaint", "customer_service"}
-        if agent_id in canonical_agents:
-            for name, server in all_servers.items():
-                if server.get("is_builtin"):
-                    bound_names.add(name)
 
         candidate_servers = [all_servers[name] for name in bound_names if name in all_servers]
         if not candidate_servers:
@@ -635,13 +620,7 @@ def _build_mcp_tools(
 
 
 def _format_mcp_context(agent_id: Optional[str] = None, message: str = "") -> str:
-    """Format MCP servers bound to the current agent, filtered by user message.
-
-    Mirrors _build_mcp_tools: built-in MCP servers are always surfaced to the
-    canonical vertical agents so the model knows it must call them for gated
-    intents even when explicit bindings have been cleared (e.g. during skill
-    isolation acceptance tests).
-    """
+    """Format MCP servers bound to the current agent, filtered by user message."""
     try:
         if agent_id == "router":
             return ""
@@ -649,18 +628,9 @@ def _format_mcp_context(agent_id: Optional[str] = None, message: str = "") -> st
 
         bound_tools = get_agent_tools(agent_id) if agent_id else []
         bound_names = {t.get("tool_name") for t in bound_tools if t.get("tool_name")}
-        all_servers = {s.get("name"): s for s in list_mcp_servers() if s.get("enabled")}
-
-        # Canonical vertical agents always see built-in MCP server context.
-        canonical_agents = {"maintenance", "billing", "complaint", "customer_service"}
-        if agent_id in canonical_agents:
-            for name, server in all_servers.items():
-                if server.get("is_builtin"):
-                    bound_names.add(name)
-
         servers = [
-            s for s in all_servers.values()
-            if s.get("name") in bound_names and _mcp_server_relevant(s.get("name", ""), message)
+            s for s in list_mcp_servers()
+            if s.get("enabled") and s.get("name") in bound_names and _mcp_server_relevant(s.get("name", ""), message)
         ]
         if not servers:
             return ""
@@ -680,147 +650,6 @@ def _format_mcp_context(agent_id: Optional[str] = None, message: str = "") -> st
         )
     except Exception:
         return ""
-
-
-async def _pre_invoke_relevant_mcp_tool(
-    message: str,
-    mcp_tools: List[Any],
-) -> Tuple[List[Dict[str, Any]], str]:
-    """Deterministically invoke MCP tools for known gated intents.
-
-    Some demo models do not reliably call tools even when tool_choice="required"
-    is set. For narrow, testable intents (weather, date/time, workorder progress)
-    we pre-invoke the bound MCP tool and inject its result into the agent
-    context. This guarantees the tool is actually exercised and the answer is
-    grounded in real tool output rather than model hallucination.
-
-    Returns (call_records, result_context_string).
-    """
-    if not mcp_tools:
-        return [], ""
-
-    lowered = message.lower()
-    call_records: List[Dict[str, Any]] = []
-    result_context = ""
-
-    # Weather intent.
-    weather_keywords = ["天气", "气温", "下雨", "晴天", "阴天", "多云", "下雪", "刮风", "温度"]
-    if any(k in lowered for k in weather_keywords):
-        known_cities = ["北京", "上海", "广州", "深圳", "杭州", "成都", "武汉", "西安"]
-        city = next((c for c in known_cities if c in message), "北京")
-        for tool in mcp_tools:
-            name = getattr(tool, "server_name", "").lower()
-            if "weather" not in name:
-                continue
-            functions = getattr(tool, "functions", None) or {}
-            fn = functions.get("get_current_weather")
-            if fn is None or not hasattr(fn, "entrypoint"):
-                continue
-            start = time.time()
-            try:
-                result = await fn.entrypoint(city=city)
-                summary = _summarize_tool_result(result)
-                call_records.append({
-                    "tool_name": "get_current_weather",
-                    "arguments": {"city": city},
-                    "status": "success",
-                    "result_summary": summary,
-                    "error_summary": None,
-                    "latency_ms": int((time.time() - start) * 1000),
-                })
-                result_context = f"[已调用 weather-server 工具获取天气：{summary}]"
-            except Exception as exc:
-                call_records.append({
-                    "tool_name": "get_current_weather",
-                    "arguments": {"city": city},
-                    "status": "failed",
-                    "result_summary": "",
-                    "error_summary": str(exc)[:300],
-                    "latency_ms": int((time.time() - start) * 1000),
-                })
-            break
-
-    # Date/time intent.
-    date_keywords = ["今天日期", "现在几点", "当前时间", "今天星期", "今天周几", "几点了", "什么日期", "现在时间", "今天几号"]
-    if any(k in lowered for k in date_keywords):
-        for tool in mcp_tools:
-            name = getattr(tool, "server_name", "").lower()
-            if "calendar" not in name:
-                continue
-            functions = getattr(tool, "functions", None) or {}
-            fn = functions.get("get_current_date")
-            if fn is None or not hasattr(fn, "entrypoint"):
-                continue
-            start = time.time()
-            try:
-                result = await fn.entrypoint()
-                summary = _summarize_tool_result(result)
-                call_records.append({
-                    "tool_name": "get_current_date",
-                    "arguments": {},
-                    "status": "success",
-                    "result_summary": summary,
-                    "error_summary": None,
-                    "latency_ms": int((time.time() - start) * 1000),
-                })
-                result_context = f"[已调用 calendar-server 工具获取日期：{summary}]"
-            except Exception as exc:
-                call_records.append({
-                    "tool_name": "get_current_date",
-                    "arguments": {},
-                    "status": "failed",
-                    "result_summary": "",
-                    "error_summary": str(exc)[:300],
-                    "latency_ms": int((time.time() - start) * 1000),
-                })
-            break
-
-    # Workorder progress intent.
-    workorder_keywords = ["工单进度", "查询工单", "我的工单", "工单状态", "查看工单"]
-    if any(k in lowered for k in workorder_keywords):
-        ids = re.findall(r"\b(WO-\d{8}-\d{3}|\d{5,})\b", message)
-        work_order_id = ids[0] if ids else None
-        for tool in mcp_tools:
-            name = getattr(tool, "server_name", "").lower()
-            if "workorder" not in name and "db-query" not in name:
-                continue
-            functions = getattr(tool, "functions", None) or {}
-            if work_order_id:
-                fn_name = "get_work_order_by_id"
-                args = {"work_order_id": work_order_id}
-            else:
-                fn_name = "count_work_orders"
-                args = {}
-            fn = functions.get(fn_name)
-            if fn is None or not hasattr(fn, "entrypoint"):
-                continue
-            start = time.time()
-            try:
-                result = await fn.entrypoint(**args)
-                summary = _summarize_tool_result(result)
-                # Prefix with "workorder_" so acceptance tests can identify the
-                # domain even though the underlying MCP tool name is generic.
-                call_records.append({
-                    "tool_name": f"workorder_{fn_name}",
-                    "arguments": args,
-                    "status": "success",
-                    "result_summary": summary,
-                    "error_summary": None,
-                    "latency_ms": int((time.time() - start) * 1000),
-                })
-                result_context = f"[已调用 workorder-server 工具查询工单：{summary}]"
-            except Exception as exc:
-                call_records.append({
-                    "tool_name": f"workorder_{fn_name}",
-                    "arguments": args,
-                    "status": "failed",
-                    "result_summary": "",
-                    "error_summary": str(exc)[:300],
-                    "latency_ms": int((time.time() - start) * 1000),
-                })
-            break
-
-    return call_records, result_context
 
 
 def _detect_handoff_intent(message: str) -> Optional[str]:
@@ -1130,18 +959,6 @@ async def _stream_agent_response(
                     await tool.connect()
                 except Exception:
                     pass
-            if hasattr(tool, "build_tools"):
-                try:
-                    await tool.build_tools()
-                except Exception:
-                    pass
-
-        # Pre-invoke MCP tools for narrow gated intents. This makes tool use
-        # deterministic for acceptance tests and grounds the answer in real
-        # tool output even when the model's native tool-calling is flaky.
-        pre_mcp_calls, pre_mcp_context = await _pre_invoke_relevant_mcp_tool(
-            message, mcp_tools
-        )
 
         # If no relevant knowledge was retrieved, record a badcase for the gap
         # and instruct the agent to admit the missing knowledge.
@@ -1201,18 +1018,12 @@ async def _stream_agent_response(
             f"当用户明确要求人工、表达强烈不满、或问题超出物业维修/收费/知识库范围时，"
             f"你必须主动提出转人工处理，不要强行回答。]"
             f"{knowledge_gap_note}"
-            f"{pre_mcp_context}"
         )
         contextual_message = f"{system_context_prefix}{rag_context}{skill_context}{mcp_context}\n{message}"
 
         full_content = ""
         token_count = 0
         tool_calls: List[Dict[str, Any]] = []
-        # Surface pre-invoked MCP tool calls to the client immediately.
-        for pre_call in pre_mcp_calls:
-            normalized = _normalize_tool_call(pre_call)
-            tool_calls.append(normalized)
-            yield f"event: tool_calls\ndata: {_safe_json_dumps({'tool_calls': [normalized], 'current_agent': current_agent})}\n\n"
         token_detail: Dict[str, Any] = {
             "input_tokens": 0,
             "output_tokens": 0,
