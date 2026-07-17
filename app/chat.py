@@ -1057,6 +1057,8 @@ async def _stream_agent_response(
     turn_selection_reason = "owner-facing default"
     vertical_latency_ms: Optional[int] = None
     router_latency_ms: Optional[int] = None
+    # Early confirmation returns must not leave final cleanup with an undefined local.
+    mcp_tools: List[Any] = []
 
     try:
         # Ensure session exists and check handoff state.
@@ -1111,11 +1113,8 @@ async def _stream_agent_response(
         # V1.4.3: work-order creation and confirmation must stay inside the
         # maintenance agent so the two-stage draft gate is enforced.
         needs_maintenance = (
-            _user_requests_work_order_creation(message)
-            or (
-                _user_confirms_work_order(message)
-                and _has_pending_work_order_draft(session_id)
-            )
+            _user_confirms_work_order(message)
+            and _has_pending_work_order_draft(session_id)
         )
         if needs_maintenance:
             target_agent_id = "maintenance"
@@ -1203,7 +1202,7 @@ async def _stream_agent_response(
             mcp_calls_for_done: List[Dict[str, Any]] = []
             citations_for_done: List[Dict[str, Any]] = []
             activated_skills_for_done: List[Dict[str, Any]] = []
-            vertical_latency_ms = int((time.time() - vertical_start) * 1000)
+            vertical_latency_ms = int((time.time() - trace_start) * 1000)
             yield f"event: delta\ndata: {_safe_json_dumps({'content': full_content, 'current_agent': current_agent, 'current_agent_id': current_agent_id})}\n\n"
             saved = save_chat_message(
                 session_id=session_id,
@@ -1217,7 +1216,7 @@ async def _stream_agent_response(
                 route_reason=intent_result.get("reason", ""),
                 current_agent=current_agent,
                 current_agent_id=current_agent_id,
-                tool_calls=None,
+                tool_calls=tool_calls_for_done,
                 model_id=runtime_model_id if 'runtime_model_id' in locals() else MODEL_ID,
                 thinking_enabled=USE_THINKING,
                 model_selection_reason="work_order_direct_gate",
