@@ -68,6 +68,12 @@ services:
       - SLACK_SIGNING_SECRET=${SLACK_SIGNING_SECRET:-}
     depends_on:
       - demo-os-db
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/docs', timeout=5)\" || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
     networks:
       - demo-os
     extra_hosts:
@@ -83,7 +89,8 @@ services:
     ports:
       - "18005:80"
     depends_on:
-      - demo-os-api
+      demo-os-api:
+        condition: service_healthy
     networks:
       - demo-os
 
