@@ -11,7 +11,6 @@ from agno.agent import Agent
 
 from app.settings import MODEL, agent_db
 from tools.knowledge import KnowledgeTools
-from tools.work_order import WorkOrderTools
 
 try:
     from tools.bing_search import BingSearchTools
@@ -39,10 +38,6 @@ def _base_tools() -> List[Any]:
     except ImportError:
         pass
     try:
-        base_tools.append(WorkOrderTools())
-    except ImportError:
-        pass
-    try:
         base_tools.append(KnowledgeTools())
     except ImportError:
         pass
@@ -59,12 +54,9 @@ INSTRUCTIONS = [
     "紧急安全问题（燃气泄漏、火灾、触电）立即建议拨打 119/120/燃气公司电话，并告知已转人工紧急处理。",
     "邻里纠纷、责任争议、费用争议直接转人工，不自行判定。",
     "当前页面默认业主是 3-2-1201 的王先生。如果用户没有明确提供房号，创建工单时默认使用房号 3-2-1201。",
-    "创建工单必须使用 create_work_order 工具，并且遵循后端强制的两阶段确认："
-    "第一次完整报修信息只形成【待确认工单草稿】，并明确回复'请核对以上信息，回复「确认创建」后我将为您生成正式工单'；"
-    "只有用户明确回复'确认创建'或'确认'后，再次调用 create_work_order 才会真正写入正式工单。"
-    "如果用户未确认，不得自行创建正式工单。",
-    "工单创建成功后，必须告知工单号和预计处理时间。",
-    "查询工单时调用 query_work_order 工具。",
+    "正式工单由服务端会话工作流控制器创建：模型只能收集和解释信息，绝不能凭语言声称“已创建”。"
+    "仅当系统返回真实工单号后，才可说明工单创建成功；未确认时必须明确它只是待确认草稿。",
+    "查询工单数量、待办或最近工单时，使用已绑定的 workorder-server MCP 工具，不要声称调用不存在的 query_work_order 工具。",
     "当业主问题涉及天气、暴雨、台风、气温、湿度、天气预报等气象信息时，必须调用已绑定的 weather-server MCP 工具的 get_current_weather 函数获取实时天气，禁止基于自身知识或网络搜索猜测。",
     "当业主查询工单数量、待办工单、工单统计或维修进度概览时，必须调用已绑定的 workorder-server MCP 工具的 count_work_orders 或 list_recent_work_orders 函数，禁止基于自身知识猜测。",
     "回复简洁专业，关键信息高亮，使用中文。",

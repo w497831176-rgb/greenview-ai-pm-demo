@@ -219,7 +219,7 @@
     // ==========================================
     const API_BASE = '';
     const DEFAULT_ROOM_ID = '3-2-1201';
-    const APP_VERSION = 'V1.4.3';
+    const APP_VERSION = 'V1.5.0';
 
     const STATE = {
       topTab: 'owner',
@@ -547,133 +547,36 @@
         const mcpCalls = data.mcp_calls || [];
         const messages = data.messages || [];
         const assistantMsg = messages.find(m => m.role === 'assistant') || {};
-        const citations = assistantMsg.citations || [];
         const currentAgent = assistantMsg.current_agent || trace.agent_name || '-';
         const currentAgentId = assistantMsg.current_agent_id || trace.agent_id || '-';
-        const activatedSkillsRaw = assistantMsg.activated_skills || [];
-        const activatedSkills = activatedSkillsRaw.map(s => (typeof s === 'object' && s !== null ? (s.name || JSON.stringify(s)) : String(s)));
-
-        const fmtTokensLocal = (v) => (v === null || v === undefined ? '不可得' : Number(v).toLocaleString());
-        const fmtCostLocal = (v) => (v === null || v === undefined ? '--' : '¥' + Number(v).toFixed(6));
-
-        const modelCallsHtml = modelCalls.length ? modelCalls.map(c => {
-          const norm = c.usage_normalized || {};
-          const usageUnavailable = norm.usage_split_unavailable || (!norm.uncached_input_tokens && !norm.cached_input_tokens && !norm.output_tokens);
-          return `
-          <div class="border border-slate-200 rounded-xl p-3 mb-2 text-sm">
-            <div class="flex items-center justify-between mb-1">
-              <span class="font-medium text-slate-900">${escapeHtml(c.stage || 'unknown')} · ${escapeHtml(c.model_id || '-')}</span>
-              <span class="text-xs ${c.status === 'success' ? 'text-green-600' : 'text-red-600'}">${c.status === 'success' ? '成功' : (c.status || '未知')}</span>
-            </div>
-            <div class="text-xs text-slate-500">usage_source: ${escapeHtml(c.usage_source || 'unknown')}</div>
-            <div class="text-xs text-slate-500 mt-1">tokens: 未缓存输入 ${fmtTokensLocal(norm.uncached_input_tokens)} / 缓存命中输入 ${fmtTokensLocal(norm.cached_input_tokens)} / 输出 ${fmtTokensLocal(norm.output_tokens)} / 总计 ${fmtTokensLocal(c.total_tokens)}</div>
-            <div class="text-xs text-slate-700 mt-1">cost: ${usageUnavailable ? 'usage_split_unavailable' : fmtCostLocal(c.estimated_cost_cny)}</div>
-            <div class="text-xs text-slate-500 mt-1">formula: ${escapeHtml(c.cost_formula || '-')}</div>
-            <div class="text-xs text-slate-500 mt-1">price_snapshot: ${escapeHtml(JSON.stringify(c.price_snapshot || {}))}</div>
-          </div>
-        `}).join('') : '<p class="text-sm text-slate-400">无模型调用记录</p>';
-
-        const mcpCallsHtml = mcpCalls.length ? mcpCalls.map(c => `
-          <div class="border border-slate-200 rounded-xl p-3 mb-2 text-sm">
-            <div class="flex items-center justify-between mb-1">
-              <span class="font-medium text-slate-900">${escapeHtml(c.server_name || 'unknown')} · ${escapeHtml(c.tool_name || '-')}</span>
-              <span class="text-xs ${c.status === 'success' ? 'text-green-600' : 'text-red-600'}">${c.status === 'success' ? '成功' : '失败'}</span>
-            </div>
-            <div class="text-xs text-slate-500">invocation_mode: ${escapeHtml(c.invocation_mode || 'model_native')}</div>
-            <div class="text-xs text-slate-500 mt-1">duration: ${c.latency_ms || 0}ms</div>
-            <div class="text-xs text-slate-500 mt-1">args: ${escapeHtml(JSON.stringify(c.arguments || c.args || {}))}</div>
-            <div class="text-xs text-slate-500 mt-1">result_summary: ${escapeHtml((c.result_summary || '').slice(0, 200))}</div>
-          </div>
-        `).join('') : '<p class="text-sm text-slate-400">无 MCP 调用记录</p>';
-
-        const citationsHtml = citations.length ? `
-          <ol class="text-xs text-slate-600 list-decimal list-inside space-y-1">
-            ${citations.map(c => `<li>doc_id: ${escapeHtml(c.doc_id || '-')}, chunk_index: ${typeof c.chunk_index === 'number' ? c.chunk_index : '-'}, title: 《${escapeHtml(c.doc_title || '未知文档')}》</li>`).join('')}
-          </ol>
-        ` : '<p class="text-sm text-slate-400">无 RAG 引用</p>';
-
-        const summary = {
-          trace_id: traceId,
-          current_agent: currentAgent,
-          current_agent_id: currentAgentId,
-          activated_skills: activatedSkills,
-          model_calls: modelCalls.map(c => ({
-            model_id: c.model_id,
-            stage: c.stage,
-            total_tokens: c.total_tokens,
-            usage_source: c.usage_source,
-            cost_formula: c.cost_formula,
-            cost_cny: c.estimated_cost_cny
-          })),
-          mcp_calls: mcpCalls.map(c => ({
-            server_name: c.server_name,
-            tool_name: c.tool_name,
-            invocation_mode: c.invocation_mode || 'model_native',
-            success: c.status === 'success',
-            duration_ms: c.latency_ms,
-            args: c.arguments || c.args
-          })),
-          rag_citations: citations.map(c => ({
-            doc_id: c.doc_id,
-            chunk_index: c.chunk_index,
-            doc_title: c.doc_title
-          }))
-        };
-        const summaryJson = JSON.stringify(summary, null, 2);
-        const summaryText = [
-          `Trace ID: ${traceId}`,
-          `当前 Agent: ${currentAgent} (agent_id: ${currentAgentId})`,
-          `激活 Skill: ${activatedSkills.join('、') || '无'}`,
-          '',
-          '模型调用:',
-          ...modelCalls.map(c => `- ${c.stage || 'unknown'} / ${c.model_id || '-'}: usage_source=${c.usage_source || 'unknown'}, total_tokens=${c.total_tokens || 0}, cost=${fmtCostLocal(c.estimated_cost_cny)}, formula=${c.cost_formula || '-'}`),
-          '',
-          'MCP 调用:',
-          ...mcpCalls.map(c => `- ${c.server_name || 'unknown'} / ${c.tool_name || '-'}: invocation_mode=${c.invocation_mode || 'model_native'}, success=${c.status === 'success'}, duration=${c.latency_ms || 0}ms, args=${JSON.stringify(c.arguments || c.args || {})}`),
-          '',
-          'RAG 引用:',
-          ...citations.map(c => `- doc_id=${c.doc_id || '-'}, chunk_index=${typeof c.chunk_index === 'number' ? c.chunk_index : '-'}, title=《${c.doc_title || '未知文档'}》`)
-        ].join('\n');
-
-        const html = `
-          <div class="space-y-5">
-            <div class="bg-slate-50 rounded-xl p-3 border border-slate-200 text-sm space-y-1">
-              <div><span class="text-slate-500">trace_id:</span> <span class="font-mono">${escapeHtml(traceId)}</span></div>
-              <div><span class="text-slate-500">当前 Agent:</span> ${escapeHtml(currentAgent)} <span class="text-xs text-slate-400">(agent_id: ${escapeHtml(currentAgentId)})</span></div>
-              <div><span class="text-slate-500">激活 Skill:</span> ${activatedSkills.length ? escapeHtml(activatedSkills.join('、')) : '无'}</div>
-            </div>
-            <div>
-              <h4 class="font-medium text-slate-900 mb-2">模型调用</h4>
-              ${modelCallsHtml}
-            </div>
-            <div>
-              <h4 class="font-medium text-slate-900 mb-2">MCP 调用</h4>
-              ${mcpCallsHtml}
-            </div>
-            <div>
-              <h4 class="font-medium text-slate-900 mb-2">RAG 引用</h4>
-              ${citationsHtml}
-            </div>
-            <div class="pt-2 border-t border-slate-200">
-              <button type="button" id="trace-copy-summary" class="w-full px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white rounded-xl text-sm transition-colors">复制本次 Trace 摘要</button>
-            </div>
-          </div>
-        `;
+        const skills = (assistantMsg.activated_skills || []).map(s => typeof s === 'object' ? (s.name || JSON.stringify(s)) : String(s));
+        const stageName = { router: '路由判定', vertical_agent: '业务 Agent 回答', darwin: 'Darwin 分析', retest: 'Badcase 复测' };
+        const sourceName = { provider_reported: '模型服务商实际返回', estimated_tokenization: '本地估算', unavailable: '本次不可得', not_applicable: '不适用' };
+        const money = value => value === null || value === undefined ? '--' : `¥${Number(value).toFixed(6)}`;
+        const priceText = snapshot => snapshot && snapshot.input_price_per_1m !== undefined
+          ? `单价：未缓存输入 ¥${snapshot.input_price_per_1m}/百万 · 缓存命中 ¥${snapshot.cached_input_price_per_1m}/百万 · 输出 ¥${snapshot.output_price_per_1m}/百万`
+          : '单价：未配置';
+        const modelCards = modelCalls.length ? modelCalls.map(call => {
+          const usage = call.usage_normalized || {};
+          const splitMissing = usage.usage_split_unavailable || (!usage.uncached_input_tokens && !usage.cached_input_tokens && !usage.output_tokens);
+          const usageLine = splitMissing
+            ? `总 Token：${call.total_tokens ?? '不可得'}；模型服务商未返回输入/缓存/输出拆分`
+            : `未缓存输入 ${usage.uncached_input_tokens || 0} · 缓存命中 ${usage.cached_input_tokens || 0} · 输出 ${usage.output_tokens || 0} · 总计 ${call.total_tokens ?? '不可得'}`;
+          const costLine = splitMissing ? '成本：不估算（避免在缺少缓存拆分时给出假精确金额）' : `估算成本：${money(call.estimated_cost_cny)}`;
+          const routeMode = call.stage === 'router' && call.context_breakdown ? call.context_breakdown.route_mode : '';
+          return `<div class="border border-slate-200 rounded-xl p-3 text-sm space-y-1"><div class="font-medium text-slate-900">${escapeHtml(stageName[call.stage] || call.stage || '模型调用')} · ${escapeHtml(call.model_id || '-')}</div><div class="text-xs text-slate-500">用量来源：${escapeHtml(sourceName[call.usage_source] || call.usage_source || '未知')}${routeMode ? ` · 路由方式：${escapeHtml(routeMode)}` : ''}</div><div class="text-xs text-slate-600">${escapeHtml(usageLine)}</div><div class="text-xs text-slate-700">${escapeHtml(costLine)}</div><div class="text-xs text-slate-500">${escapeHtml(priceText(call.price_snapshot || {}))}</div></div>`;
+        }).join('') : '<p class="text-sm text-slate-400">本轮没有模型调用；如为规则工作流，这是预期行为。</p>';
+        const workflowCalls = (assistantMsg.tool_calls || []).filter(call => (call.tool_name || call.name) === 'work_order_workflow');
+        const workflowHtml = workflowCalls.length ? workflowCalls.map(call => `<div class="border border-emerald-200 bg-emerald-50 rounded-xl p-3 text-sm"><div class="font-medium text-emerald-800">维修工单工作流：${escapeHtml((call.arguments || {}).action || '已处理')}</div><div class="text-xs text-emerald-700 mt-1">${escapeHtml(call.result_summary || '')}</div>${call.work_order_id ? `<div class="text-xs text-emerald-700 mt-1">真实工单号：${escapeHtml(call.work_order_id)}</div>` : ''}</div>`).join('') : '';
+        const mcpHtml = mcpCalls.length ? mcpCalls.map(call => `<div class="border border-slate-200 rounded-xl p-3 text-sm"><div class="font-medium text-slate-900">${escapeHtml(call.server_name || 'unknown')} · ${escapeHtml(call.tool_name || '-')}</div><div class="text-xs text-slate-500 mt-1">${call.invocation_mode === 'policy_preinvoke' ? '系统策略预调用' : 'Agent 自主调用'} · ${call.status === 'success' ? '成功' : '失败'}</div><div class="text-xs text-slate-500 mt-1">参数：${escapeHtml(JSON.stringify(call.arguments || call.args || {}))}</div><div class="text-xs text-slate-600 mt-1">结果摘要：${escapeHtml((call.result_summary || call.error_summary || '无').slice(0, 240))}</div></div>`).join('') : '<p class="text-sm text-slate-400">本轮未调用 MCP 工具。</p>';
+        const citations = assistantMsg.citations || [];
+        const usedCitations = citations.filter(c => c.used_in_answer === true);
+        const candidateCitations = citations.filter(c => c.used_in_answer !== true);
+        const citationList = items => items.length ? `<ol class="text-xs text-slate-600 list-decimal list-inside space-y-1">${items.map(c => `<li>《${escapeHtml(c.doc_title || '未知文档')}》 · 分片 ${escapeHtml(String(c.chunk_index ?? '-'))}</li>`).join('')}</ol>` : '<p class="text-sm text-slate-400">无</p>';
+        const summaryText = [`Trace ID：${traceId}`, `当前 Agent：${currentAgent} (${currentAgentId})`, `激活 Skill：${skills.join('、') || '无'}`, `模型调用：${modelCalls.length} 次`, `MCP 调用：${mcpCalls.length} 次`, `回答实际引用：${usedCitations.map(c => `《${c.doc_title}》分片${c.chunk_index}`).join('、') || '无'}`].join('\n');
+        const html = `<div class="space-y-5"><div class="bg-slate-50 rounded-xl p-3 border border-slate-200 text-sm space-y-1"><div><span class="text-slate-500">Trace：</span><span class="font-mono">${escapeHtml(traceId)}</span></div><div><span class="text-slate-500">当前 Agent：</span>${escapeHtml(currentAgent)} <span class="text-xs text-slate-400">(${escapeHtml(currentAgentId)})</span></div><div><span class="text-slate-500">激活 Skill：</span>${escapeHtml(skills.join('、') || '无')}</div></div>${workflowHtml ? `<div><h4 class="font-medium text-slate-900 mb-2">业务工作流</h4>${workflowHtml}</div>` : ''}<div><h4 class="font-medium text-slate-900 mb-2">模型调用与成本</h4><div class="space-y-2">${modelCards}</div></div><div><h4 class="font-medium text-slate-900 mb-2">MCP 工具证据</h4><div class="space-y-2">${mcpHtml}</div></div><div><h4 class="font-medium text-slate-900 mb-2">RAG 证据</h4><p class="text-xs text-slate-500 mb-1">回答实际引用</p>${citationList(usedCitations)}<details class="mt-3"><summary class="text-xs text-slate-500 cursor-pointer">仅检索到、未写入回答的候选（${candidateCitations.length}）</summary>${citationList(candidateCitations)}</details></div><button type="button" id="trace-copy-summary" class="w-full px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white rounded-xl text-sm transition-colors">复制可读摘要</button></div>`;
         openDrawer('Trace 详情', html);
-        setTimeout(() => {
-          const copyBtn = $('#trace-copy-summary');
-          if (copyBtn) {
-            copyBtn.addEventListener('click', async () => {
-              try {
-                const text = summaryText + '\n\n--- JSON ---\n' + summaryJson;
-                await navigator.clipboard.writeText(text);
-                showToast('Trace 摘要已复制', 'success');
-              } catch (e) {
-                showToast('复制失败', 'error');
-              }
-            });
-          }
-        }, 0);
+        setTimeout(() => { const button = $('#trace-copy-summary'); if (button) button.addEventListener('click', async () => { try { await navigator.clipboard.writeText(summaryText); showToast('Trace 摘要已复制', 'success'); } catch (_) { showToast('复制失败', 'error'); } }); }, 0);
       } catch (err) {
         showToast('加载 Trace 失败：' + (err && err.message ? err.message : err), 'error');
       }
@@ -1241,31 +1144,41 @@
       return parts.join(' · ');
     }
 
+    function tokenUsageLabel(tokenCount, usageSource) {
+      if (usageSource === 'not_applicable') return '规则工作流：未调用模型';
+      if (!tokenCount) return '本次模型 Token：不可得';
+      const prefix = usageSource === 'estimated_tokenization' ? '本地估算 Token' : '本次回答 Token';
+      return `${prefix}：${tokenCount}`;
+    }
+
+    function normalizeCitationMarkers(content) {
+      return String(content || '').replace(/【(?:参考)?引用\s*(\d+)】|\[(?:参考)?引用\s*(\d+)\]|[（(](?:参考)?引用\s*(\d+)[）)]/g, (_, a, b, c) => `【引用${a || b || c}】`);
+    }
+
     function getUsedCitationIndices(content, maxCount) {
       const used = new Set();
-      if (!content || !maxCount) return used;
-      const regex = /【引用(\d+)】|\[引用(\d+)\]/g;
-      let m;
-      while ((m = regex.exec(content)) !== null) {
-        const idx = parseInt(m[1] || m[2], 10);
-        if (idx >= 1 && idx <= maxCount) used.add(idx);
+      const normalized = normalizeCitationMarkers(content);
+      const regex = /【引用(\d+)】/g;
+      let match;
+      while ((match = regex.exec(normalized)) !== null) {
+        const index = parseInt(match[1], 10);
+        if (index >= 1 && index <= maxCount) used.add(index);
       }
       return used;
     }
 
     function renderMarkdownWithCitations(content, citations) {
-      const safeContent = content || '';
+      const safeContent = normalizeCitationMarkers(content);
       if (!citations || citations.length === 0) return marked.parse(safeContent);
       const renderer = new marked.Renderer();
       renderer.text = (token) => {
         const rawText = typeof token === 'string' ? token : (token && token.text ? token.text : '');
-        return String(rawText).replace(/【引用(\d+)】|\[引用(\d+)\]/g, (match, b1, b2) => {
-          const idx = parseInt(b1 || b2, 10);
-          const c = citations[idx - 1];
-          if (!c || !c.doc_id) return match;
-          const chunkIdx = typeof c.chunk_index === 'number' ? c.chunk_index : '';
-          const snippet = escapeHtml((c.content || '').slice(0, 120).replace(/[\n\r]+/g, ' '));
-          return `<button type="button" class="inline-citation-btn px-1 py-0.5 mx-0.5 bg-brand-50 text-brand-700 rounded text-[11px] hover:bg-brand-100 transition-colors align-text-bottom" onclick="showCitationChunk(${c.doc_id}, '${chunkIdx}', '${snippet}')">引用${idx}</button>`;
+        return String(rawText).replace(/【引用(\d+)】/g, (match, value) => {
+          const index = parseInt(value, 10);
+          const citation = citations[index - 1];
+          if (!citation || !citation.doc_id) return match;
+          const chunkIndex = typeof citation.chunk_index === 'number' ? citation.chunk_index : '';
+          return `<button type="button" class="inline-citation-btn px-1 py-0.5 mx-0.5 bg-brand-50 text-brand-700 rounded text-[11px] hover:bg-brand-100 transition-colors align-text-bottom" onclick="showCitationChunk(${Number(citation.doc_id)}, '${escapeHtml(String(chunkIndex))}')">引用${index}</button>`;
         });
       };
       return marked.parse(safeContent, { renderer });
@@ -1274,40 +1187,22 @@
     function renderCitations(citations, content = '') {
       if (!citations || citations.length === 0) return '';
       const usedSet = getUsedCitationIndices(content, citations.length);
-      const used = citations.filter((_, i) => usedSet.has(i + 1));
-      const candidates = citations.filter((_, i) => !usedSet.has(i + 1));
-
-      const renderItem = (c, i, isUsed) => {
-        const score = typeof c.score === 'number' ? c.score.toFixed(3) : '-';
-        const title = escapeHtml(c.doc_title || '未知文档');
-        const docId = c.doc_id || '';
-        const chunkIdx = typeof c.chunk_index === 'number' ? c.chunk_index : '';
-        const snippet = escapeHtml((c.content || '').slice(0, 120).replace(/[\n\r]+/g, ' '));
-        const clickable = docId ? 'cursor-pointer hover:text-brand-600 hover:underline' : '';
-        const attrs = docId
-          ? `data-doc-id="${docId}" data-chunk-index="${chunkIdx}" data-snippet="${snippet}" onclick="showCitationChunk(${docId}, '${chunkIdx}', this.dataset.snippet)"`
-          : '';
-        const chunkLabel = chunkIdx !== '' ? ` · 分片 ${chunkIdx}` : '';
-        return `<li class="mt-1 ${clickable}" ${attrs}>[${i + 1}] 《${title}》${chunkLabel}<span class="text-slate-400">（相关度 ${score}）</span></li>`;
+      const items = citations.map((citation, index) => ({ citation, index: index + 1 }));
+      const used = items.filter(item => usedSet.has(item.index) || item.citation.used_in_answer === true);
+      const candidates = items.filter(item => !usedSet.has(item.index) && item.citation.used_in_answer !== true);
+      const renderItem = (item) => {
+        const citation = item.citation;
+        const score = typeof citation.score === 'number' ? citation.score.toFixed(3) : '-';
+        const title = escapeHtml(citation.doc_title || '未知文档');
+        const docId = Number(citation.doc_id || 0);
+        const chunkIndex = typeof citation.chunk_index === 'number' ? citation.chunk_index : '';
+        const click = docId ? `class="mt-1 cursor-pointer hover:text-brand-600 hover:underline" onclick="showCitationChunk(${docId}, '${escapeHtml(String(chunkIndex))}')"` : 'class="mt-1"';
+        return `<li ${click}>[${item.index}] 《${title}》${chunkIndex !== '' ? ` · 分片 ${chunkIndex}` : ''}<span class="text-slate-400">（相关度 ${score}）</span></li>`;
       };
-
-      const usedItems = used.map((c, i) => renderItem(c, i, true)).join('');
-      const candidateItems = candidates.map((c, i) => renderItem(c, i, false)).join('');
-
       let html = '<div class="ai-message-citations mt-2 pt-2 border-t border-slate-100">';
-      if (usedItems) {
-        html += `<p class="text-[10px] text-slate-400 mb-1">引用来源</p><ol class="text-[10px] text-slate-500 list-decimal list-inside">${usedItems}</ol>`;
-      }
-      if (candidateItems) {
-        html += `
-          <details class="mt-2">
-            <summary class="text-[10px] text-slate-400 cursor-pointer hover:text-slate-600 select-none">本轮检索候选（${candidates.length} 条未在回答中引用）</summary>
-            <ol class="text-[10px] text-slate-500 list-decimal list-inside mt-1">${candidateItems}</ol>
-          </details>
-        `;
-      }
-      html += '</div>';
-      return html;
+      if (used.length) html += `<p class="text-[10px] text-slate-400 mb-1">回答中实际引用的证据</p><ol class="text-[10px] text-slate-500 list-decimal list-inside">${used.map(renderItem).join('')}</ol>`;
+      if (candidates.length) html += `<details class="mt-2"><summary class="text-[10px] text-slate-400 cursor-pointer hover:text-slate-600 select-none">本轮检索候选（${candidates.length} 条未在回答中引用）</summary><ol class="text-[10px] text-slate-500 list-decimal list-inside mt-1">${candidates.map(renderItem).join('')}</ol></details>`;
+      return html + '</div>';
     }
 
     async function showCitationChunk(docId, chunkIndex, snippet = '') {
@@ -1386,7 +1281,7 @@
           const tokensEl = footer.querySelector('.ai-message-tokens');
           if (tokensEl) {
             const detailText = formatTokenDetail(tokenDetail);
-            const mainText = tokenCount > 0 ? `消耗 ${tokenCount} tokens` : '消耗 - tokens';
+            const mainText = tokenUsageLabel(tokenCount, usageSource);
             tokensEl.innerHTML = detailText
               ? `<span class="cursor-help underline decoration-dotted" title="${escapeHtml(detailText)}">${mainText}</span>`
               : mainText;
@@ -1603,7 +1498,7 @@
       if (messageId) div.dataset.messageId = messageId;
       const time = formatTimeLabel(createdAt);
       const clean = stripThinking(content);
-      const tokenText = tokenCount > 0 ? `消耗 ${tokenCount} tokens` : '消耗 - tokens';
+      const tokenText = tokenUsageLabel(tokenCount, usageSource);
       const detailText = formatTokenDetail(tokenDetail);
       const tokenHtml = detailText
         ? `<span class="cursor-help underline decoration-dotted" title="${escapeHtml(detailText)}">${tokenText}</span>`

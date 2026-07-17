@@ -33,6 +33,7 @@ from agents.complaint import create_complaint_agent
 from agents.customer_service import create_customer_service_agent
 from agents.maintenance import create_maintenance_agent
 from agents.router import classify_intent
+from app.work_order_workflow import advance_work_order_workflow
 from tools.work_order import set_work_order_context
 from db.property_db import (
     activate_handoff,
@@ -486,6 +487,34 @@ def _build_skill_context(message: str, agent_id: Optional[str] = None) -> tuple:
         return "", [], None
 
 
+_CITATION_MARKER_RE = re.compile(
+    r"【(?:参考)?引用\s*(\d+)】|\[(?:参考)?引用\s*(\d+)\]|[（(](?:参考)?引用\s*(\d+)[）)]"
+)
+
+
+def _canonicalize_citation_markers(content: str) -> str:
+    """Normalize accepted citation variants to one clickable UI contract."""
+    if not content:
+        return content
+    return _CITATION_MARKER_RE.sub(
+        lambda match: f"【引用{next(group for group in match.groups() if group)}】",
+        content,
+    )
+
+
+def _annotate_citation_usage(content: str, citations: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Persist both retrieved candidates and whether each one supports the answer."""
+    normalized = _canonicalize_citation_markers(content)
+    used = {int(index) for index in re.findall(r"【引用(\d+)】", normalized)}
+    annotated: List[Dict[str, Any]] = []
+    for index, citation in enumerate(citations, 1):
+        item = dict(citation)
+        item["index"] = index
+        item["used_in_answer"] = index in used
+        annotated.append(item)
+    return annotated
+
+
 def _build_rag_context(message: str, top_k: Optional[int] = None, threshold: Optional[float] = None) -> tuple:
     """Run advanced RAG and format retrieved chunks as context.
 
@@ -601,6 +630,7 @@ def _build_mcp_tools(
     agent_id: Optional[str] = None,
     trace_id: Optional[str] = None,
     message: str = "",
+    excluded_servers: Optional[set] = None,
 ) -> List[Any]:
     """Load MCP servers bound to the current agent, filtered by user message."""
     tools = []
@@ -621,6 +651,8 @@ def _build_mcp_tools(
 
         for server in candidate_servers:
             name = server.get("name", "mcp-server")
+            if excluded_servers and name in excluded_servers:
+                continue
             if not _mcp_server_relevant(name, message):
                 continue
             command = server.get("command")
@@ -694,10 +726,31 @@ def _format_mcp_context(agent_id: Optional[str] = None, message: str = "") -> st
 # message explicitly requests that live capability. Results are injected into the
 # agent context and recorded in the trace as invocation_mode=policy_preinvoke.
 _READONLY_MCP_DEFAULT_TOOLS = {
-    "weather-server": ["get_current_weather"],
+    "weather-server": ["get_current_weather", "get_weather_advice"],
     "workorder-server": ["count_work_orders", "list_recent_work_orders"],
     "calendar-server": ["get_current_datetime"],
 }
+
+
+def _policy_mcp_args(server_name: str, tool_name: str, message: str) -> Optional[Dict[str, Any]]:
+    """Build explicit arguments for a policy pre-invocation, or skip it safely."""
+    cities = ("北京", "上海", "广州", "深圳", "杭州", "成都", "武汉", "西安")
+    if server_name == "weather-server":
+        city = next((item for item in cities if item in message), None)
+        return {"city": city} if city else None
+    if server_name == "workorder-server":
+        room_match = re.search(r"(\d{1,2})\s*[-#—]\s*(\d{1,2})\s*[-#—]\s*(\d{3,4})", message)
+        room = (
+            f"{room_match.group(1)}-{room_match.group(2)}-{room_match.group(3)}"
+            if room_match else (DEFAULT_ROOM_ID if any(word in message for word in ("我的", "我家", "本房号")) else None)
+        )
+        if tool_name == "list_recent_work_orders":
+            return {"room_id": room, "limit": 5}
+        if tool_name == "count_work_orders":
+            return {"status": "pending"} if any(word in message for word in ("待处理", "待派单", "未处理")) else {}
+    if server_name == "calendar-server":
+        return {}
+    return {}
 
 
 async def _preinvoke_readonly_mcp_tools(
@@ -773,6 +826,9 @@ async def _preinvoke_readonly_mcp_tools(
         for fn_name, fn in functions.items():
             if fn_name not in default_tools:
                 continue
+            arguments = _policy_mcp_args(server_name, fn_name, message)
+            if arguments is None:
+                continue
             entrypoint = getattr(fn, "entrypoint", None)
             if not entrypoint:
                 continue
@@ -781,8 +837,7 @@ async def _preinvoke_readonly_mcp_tools(
             result_summary = ""
             error_summary = None
             try:
-                # Most readonly tools accept no arguments; pass empty dict.
-                result = await entrypoint({})
+                result = await entrypoint(arguments)
                 result_summary = _summarize_tool_result(result)
                 if "Error from MCP tool" in result_summary:
                     status = "failed"
@@ -796,7 +851,7 @@ async def _preinvoke_readonly_mcp_tools(
                 call_records.append({
                     "server_name": server_name,
                     "tool_name": fn_name,
-                    "arguments": {},
+                    "arguments": arguments,
                     "status": status,
                     "result_summary": result_summary,
                     "error_summary": error_summary,
@@ -809,7 +864,7 @@ async def _preinvoke_readonly_mcp_tools(
                 # Audit via wrapper if available; otherwise skip (we already recorded above).
                 if hasattr(tool, "_record_audit"):
                     try:
-                        tool._record_audit(fn_name, {}, status, result_summary, error_summary, latency_ms)
+                        tool._record_audit(fn_name, arguments, status, result_summary, error_summary, latency_ms)
                     except Exception:
                         pass
 
@@ -1098,6 +1153,62 @@ async def _stream_agent_response(
             done_yielded = True
             return
 
+        # Repair work orders are a stateful command workflow, not a best-effort
+        # model tool call.  A pending draft pins follow-up turns to Maintenance;
+        # a formal work order is created exactly once only on explicit confirmation.
+        workflow = advance_work_order_workflow(session_id, message)
+        if workflow is not None:
+            current_agent_id = "maintenance"
+            _, current_agent = _select_agent(current_agent_id)
+            route_reason = workflow.get("route_reason") or "已进入维修工单流程。"
+            workflow_call = {
+                "tool_name": "work_order_workflow",
+                "arguments": {
+                    "action": workflow.get("action"),
+                    "missing_fields": workflow.get("missing_fields", []),
+                },
+                "status": "success",
+                "result_summary": workflow.get("reply", ""),
+                "work_order_id": workflow.get("work_order_id"),
+            }
+            update_chat_trace(
+                trace_id=trace_id,
+                intent="maintenance",
+                agent_name=current_agent,
+                agent_id=current_agent_id,
+                status="complete",
+            )
+            yield f"event: route\ndata: {json.dumps({'intent': 'maintenance', 'reason': route_reason, 'current_agent': current_agent, 'current_agent_id': current_agent_id, 'trace_id': trace_id})}\n\n"
+            reply = workflow.get("reply", "")
+            yield f"event: delta\ndata: {_safe_json_dumps({'content': reply, 'current_agent': current_agent, 'current_agent_id': current_agent_id})}\n\n"
+            yield f"event: tool_calls\ndata: {_safe_json_dumps({'tool_calls': [workflow_call], 'current_agent': current_agent, 'current_agent_id': current_agent_id})}\n\n"
+            saved = save_chat_message(
+                session_id=session_id,
+                role="assistant",
+                content=reply,
+                token_count=0,
+                token_detail={"input_tokens": 0, "output_tokens": 0, "reasoning_tokens": 0, "cached_tokens": 0, "total_tokens": 0},
+                citations=[],
+                activated_skills=[],
+                route_intent="maintenance",
+                route_reason=route_reason,
+                current_agent=current_agent,
+                current_agent_id=current_agent_id,
+                tool_calls=[workflow_call],
+                model_id=None,
+                thinking_enabled=False,
+                model_selection_reason="workflow_controller",
+                trace_id=trace_id,
+                status="success",
+                latency_ms=int((time.time() - trace_start) * 1000),
+                error_summary=None,
+                mcp_calls=None,
+                usage_source="not_applicable",
+            )
+            yield f"event: done\ndata: {_safe_json_dumps({'status': 'complete', 'token_count': 0, 'token_detail': {'input_tokens': 0, 'output_tokens': 0, 'reasoning_tokens': 0, 'cached_tokens': 0, 'total_tokens': 0}, 'message_id': saved.get('id') if saved else None, 'handoff': False, 'citations': [], 'activated_skills': [], 'current_agent': current_agent, 'current_agent_id': current_agent_id, 'route_intent': 'maintenance', 'route_reason': route_reason, 'tool_calls': [workflow_call], 'mcp_calls': [], 'auto_badcase_id': None, 'model_id': None, 'thinking_enabled': False, 'model_selection_reason': 'workflow_controller', 'trace_id': trace_id, 'usage_source': 'not_applicable'})}\n\n"
+            done_yielded = True
+            return
+
         # Load enabled vertical agents from the database for dynamic routing.
         vertical_agents = _get_vertical_agents()
 
@@ -1110,21 +1221,9 @@ async def _stream_agent_response(
         target_agent_id = intent_result.get("target_agent_id") or intent_result.get("intent") or "customer_service"
         intent = target_agent_id
 
-        # V1.4.3: work-order creation and confirmation must stay inside the
-        # maintenance agent so the two-stage draft gate is enforced.
-        needs_maintenance = (
-            _user_confirms_work_order(message)
-            and _has_pending_work_order_draft(session_id)
-        )
-        if needs_maintenance:
-            target_agent_id = "maintenance"
-            intent = "maintenance"
-            intent_result["reason"] = (
-                intent_result.get("reason", "") + "；强制路由到维修 Agent（工单创建/确认）"
-            )
-            # Work-order turns need deterministic tool calls; disable thinking
-            # so tool_choice="required" is accepted by the provider.
-            turn_model = build_model(MODEL_ID, use_thinking=False)
+        # Explicit repair creation and any repair follow-up were handled above
+        # by the session workflow controller.  Ordinary repair consultation still
+        # uses the normal Router -> vertical Agent path below.
 
         create_agent_fn, agent_name = _select_agent(target_agent_id)
         current_agent_id = _agent_id_for_intent(target_agent_id)
@@ -1177,81 +1276,12 @@ async def _stream_agent_response(
         if preinvoke_context:
             mcp_context = f"{mcp_context}{preinvoke_context}"
 
-        # V1.4.3: bind session_id and current message to WorkOrderTools so the
-        # backend can enforce draft + explicit confirmation gating.
-        set_work_order_context(session_id, message)
-
-        # V1.4.3: work-order creation/confirmation is handled deterministically
-        # by the backend gate. This avoids relying on the LLM to call a tool
-        # with tool_choice="required", which DeepSeek rejects in thinking mode.
-        if needs_maintenance:
-            from tools.work_order import WorkOrderTools
-            wo_tool = WorkOrderTools()
-            tool_result = wo_tool.create_work_order(issue_desc=message)
-            full_content = str(tool_result)
-            token_count = 0
-            token_detail = {
-                "input_tokens": 0,
-                "output_tokens": 0,
-                "reasoning_tokens": 0,
-                "cached_tokens": 0,
-                "total_tokens": 0,
-            }
-            usage_source = "tool_direct"
-            tool_calls_for_done: List[Dict[str, Any]] = []
-            mcp_calls_for_done: List[Dict[str, Any]] = []
-            citations_for_done: List[Dict[str, Any]] = []
-            activated_skills_for_done: List[Dict[str, Any]] = []
-            vertical_latency_ms = int((time.time() - trace_start) * 1000)
-            yield f"event: delta\ndata: {_safe_json_dumps({'content': full_content, 'current_agent': current_agent, 'current_agent_id': current_agent_id})}\n\n"
-            saved = save_chat_message(
-                session_id=session_id,
-                role="assistant",
-                content=full_content,
-                token_count=token_count,
-                token_detail=token_detail,
-                citations=citations_for_done,
-                activated_skills=activated_skills_for_done,
-                route_intent=intent,
-                route_reason=intent_result.get("reason", ""),
-                current_agent=current_agent,
-                current_agent_id=current_agent_id,
-                tool_calls=tool_calls_for_done,
-                model_id=runtime_model_id if 'runtime_model_id' in locals() else MODEL_ID,
-                thinking_enabled=USE_THINKING,
-                model_selection_reason="work_order_direct_gate",
-                trace_id=trace_id,
-                status="success",
-                latency_ms=vertical_latency_ms,
-                error_summary=None,
-                mcp_calls=None,
-                usage_source=usage_source,
-            )
-            done_payload = {
-                "status": "complete",
-                "token_count": token_count,
-                "token_detail": token_detail,
-                "message_id": saved.get("id") if saved else None,
-                "handoff": False,
-                "citations": citations_for_done,
-                "activated_skills": activated_skills_for_done,
-                "current_agent": current_agent,
-                "current_agent_id": current_agent_id,
-                "route_intent": intent,
-                "route_reason": intent_result.get("reason", ""),
-                "tool_calls": tool_calls_for_done,
-                "mcp_calls": mcp_calls_for_done,
-                "auto_badcase_id": None,
-                "model_id": runtime_model_id if 'runtime_model_id' in locals() else MODEL_ID,
-                "thinking_enabled": USE_THINKING,
-                "model_selection_reason": "work_order_direct_gate",
-                "trace_id": trace_id,
-                "usage_source": usage_source,
-            }
-            yield f"event: done\ndata: {_safe_json_dumps(done_payload)}\n\n"
-            return
-
-        mcp_tools = _build_mcp_tools(agent_id=current_agent_id, trace_id=trace_id, message=message)
+        # Formal work-order writes have already been guarded by the workflow controller.
+        # This model path is for consultation, RAG and read-only MCP only.
+        preinvoked_servers = {
+            call.get("server_name") for call in preinvoke_calls if call.get("status") == "success" and call.get("server_name")
+        }
+        mcp_tools = _build_mcp_tools(agent_id=current_agent_id, trace_id=trace_id, message=message, excluded_servers=preinvoked_servers)
         for tool in mcp_tools:
             if hasattr(tool, "connect"):
                 try:
@@ -1372,10 +1402,6 @@ async def _stream_agent_response(
             agent.tool_choice = "required"
         elif not mcp_tools:
             agent.tool_choice = "auto"
-        # V1.4.3: for work-order creation/confirmation, force a tool call so the
-        # two-stage draft gate in WorkOrderTools is actually exercised.
-        if current_agent_id == "maintenance" and needs_maintenance:
-            agent.tool_choice = "required"
         vertical_start = time.time()
 
         # Run agent in streaming mode.  We decouple Agno's async generator from
@@ -1509,6 +1535,11 @@ async def _stream_agent_response(
             token_detail["input_tokens"] = input_tokens
             token_detail["output_tokens"] = output_tokens
             token_detail["total_tokens"] = token_count
+
+        # Normalize model citation variants before persistence so citations are
+        # always clickable and retrieved candidates can be distinguished from evidence.
+        full_content = _canonicalize_citation_markers(full_content)
+        citations = _annotate_citation_usage(full_content, citations)
 
         # AI-initiated handoff: if the agent explicitly asks to transfer.
         ai_handoff = False

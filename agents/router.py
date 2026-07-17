@@ -93,6 +93,26 @@ async def _collect_response(generator) -> str:
         return ""
 
 
+def _fallback_reason(message: str, target_agent_id: str, vertical_agents: Optional[List[Dict[str, Any]]] = None) -> str:
+    """Business-readable explanation for deterministic route fallback."""
+    names = {item.get("agent_id"): item.get("name") for item in (vertical_agents or [])}
+    target_name = names.get(target_agent_id) or {
+        "maintenance": "维修 Agent",
+        "billing": "费用 Agent",
+        "complaint": "投诉 Agent",
+        "customer_service": "客服 Agent",
+    }.get(target_agent_id, target_agent_id)
+    keyword_groups = {
+        "maintenance": ("报修", "漏水", "维修", "工单", "电梯", "天气"),
+        "billing": ("缴费", "费用", "物业费", "收费", "账单"),
+        "complaint": ("投诉", "扰民", "纠纷", "赔偿", "不满意"),
+    }
+    matched = next((word for word in keyword_groups.get(target_agent_id, ()) if word in message), None)
+    if matched:
+        return f"用户提及“{matched}”，与{target_name}的服务范围匹配，由{target_name}处理。"
+    return f"根据问题内容与{target_name}的服务范围匹配，由{target_name}处理。"
+
+
 async def classify_intent(
     message: str,
     vertical_agents: Optional[List[Dict[str, Any]]] = None,
@@ -151,13 +171,13 @@ async def classify_intent(
             reason = parsed.get("reason", "")
         else:
             target = _keyword_intent(message, vertical_agents)
-            reason = "基于关键词回退分类"
-            route_mode = "invalid_output_fallback"
+            reason = _fallback_reason(message, target, vertical_agents)
+            route_mode = "rule_fallback"
 
         if target not in enabled_ids:
             target = _keyword_intent(message, vertical_agents)
-            reason = f"模型返回了未启用的 agent_id，已回退：{reason}"
-            route_mode = "invalid_output_fallback"
+            reason = _fallback_reason(message, target, vertical_agents)
+            route_mode = "rule_fallback"
 
         return {
             "target_agent_id": target,
@@ -171,9 +191,9 @@ async def classify_intent(
         traceback.print_exc()
         return {
             "target_agent_id": _keyword_intent(message, vertical_agents),
-            "reason": "路由异常，使用关键词回退",
+            "reason": _fallback_reason(message, _keyword_intent(message, vertical_agents), vertical_agents),
             "raw": raw_response,
-            "route_mode": "exception_fallback",
+            "route_mode": "rule_fallback",
             "metrics": metrics,
         }
 
