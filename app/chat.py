@@ -429,7 +429,10 @@ def _skill_matches_trigger(skill: Dict[str, Any], message: str) -> bool:
 def _build_skill_context(message: str, agent_id: Optional[str] = None) -> tuple:
     """Load enabled skills bound to the current agent, filter by trigger.
 
-    Returns (skill_context_string, activated_skill_names, skill_model_id).
+    Returns (skill_context_string, activated_skills, skill_model_id).
+
+    activated_skills is a list of dicts with at least {"name": ..., "id": ...}
+    so callers can distinguish metadata from plain strings.
 
     Only skills explicitly bound to the current agent are considered. The
     router agent is treated specially: it sees all enabled skills so that it
@@ -463,7 +466,7 @@ def _build_skill_context(message: str, agent_id: Optional[str] = None) -> tuple:
             # shown as "activated". Skills without a trigger behave as default
             # platform capabilities and stay in context but are not listed.
             if trigger and triggered:
-                activated.append(name)
+                activated.append({"name": name, "id": skill.get("id")})
                 # Owner-facing chat ignores any Skill model_id override.
                 if skill_model_id is None and skill.get("model_id"):
                     skill_model_id = None
@@ -911,8 +914,7 @@ async def _stream_agent_response(
             intent_result["reason"] = "天气查询属于维修/工单场景（含工具支持）"
 
         create_agent_fn, agent_name = _select_agent(target_agent_id)
-        current_agent = agent_name
-        current_agent_id = _agent_id_for_intent(target_agent_id)
+        current_agent = current_agent_id = _agent_id_for_intent(target_agent_id)
 
         # Record the router model call. Provider usage is unavailable for the router;
         # cost/price_snapshot must be null (not ¥0) to reflect that.
@@ -937,8 +939,8 @@ async def _stream_agent_response(
         # Build dynamic context and tools scoped to the current vertical agent.
         skill_context, activated_skills, skill_model_id = _build_skill_context(message, agent_id=current_agent_id)
         rag_context, citations = _build_rag_context(message)
-        mcp_context = _format_mcp_context(agent_id=current_agent_id)
-        mcp_tools = _build_mcp_tools(agent_id=current_agent_id, trace_id=trace_id)
+        mcp_context = _format_mcp_context(agent_id=current_agent_id, message=message)
+        mcp_tools = _build_mcp_tools(agent_id=current_agent_id, trace_id=trace_id, message=message)
 
         # If no relevant knowledge was retrieved, record a badcase for the gap
         # and instruct the agent to admit the missing knowledge.

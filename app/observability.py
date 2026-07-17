@@ -807,6 +807,15 @@ async def prices(enabled_only: bool = False):
     return {"prices": list_model_prices(enabled_only=enabled_only)}
 
 
+@router.get("/prices/{price_id}")
+async def get_price(price_id: int):
+    """Return a single model price entry."""
+    price = get_model_price(price_id)
+    if not price:
+        raise HTTPException(status_code=404, detail="Price not found")
+    return {"price": price}
+
+
 @router.post("/prices")
 async def create_price(request: PriceCreate):
     """Create a new model price entry."""

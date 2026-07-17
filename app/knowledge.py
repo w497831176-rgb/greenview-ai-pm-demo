@@ -288,8 +288,11 @@ async def create_knowledge_doc(request: KnowledgeDocCreate):
         chunk_overlap=request.chunk_overlap,
         split_strategy=request.split_strategy,
     )
-    if doc and doc.get("is_indexed"):
-        rag_indexer.index_document(doc["id"])
+    if doc:
+        try:
+            rag_indexer.index_document(doc["id"])
+        except Exception:
+            pass
         doc = db_get_knowledge_doc(doc["id"])
     return {"knowledge_doc": doc}
 
