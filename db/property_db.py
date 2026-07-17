@@ -480,11 +480,9 @@ def init_db():
         _seed_model_configs(cursor)
         conn.commit()
 
-    # V1.4.3: seed official model prices once if table is empty.
-    cursor.execute("SELECT COUNT(*) FROM model_prices")
-    if cursor.fetchone()[0] == 0:
-        _seed_model_prices(cursor)
-        conn.commit()
+    # V1.4.3: enforce official DeepSeek prices without deleting user-added rows.
+    _migrate_official_prices_v143(cursor)
+    conn.commit()
 
     # V1.4.3: one-time model config migration only (no longer overwrites user edits).
     _migrate_model_configs_v143(cursor)
@@ -1189,6 +1187,90 @@ def _seed_model_prices(cursor):
         """,
         prices,
     )
+
+
+def _migrate_official_prices_v143(cursor):
+    """One-time migration to enforce official DeepSeek V4 prices.
+
+    - Disables stale demo/gateway price rows for deepseek-v4-flash/pro.
+    - Inserts the official price row if no row with the exact same price
+      snapshot already exists.
+    - Leaves user-created price rows for other models untouched.
+    """
+    now = now_cn("%Y-%m-%d %H:%M")
+    if _migration_applied(cursor, "v143_official_prices"):
+        return
+
+    official = {
+        "deepseek-v4-flash": {
+            "input": 1.0,
+            "cached_input": 0.02,
+            "output": 2.0,
+            "reasoning": 0.0,
+        },
+        "deepseek-v4-pro": {
+            "input": 3.0,
+            "cached_input": 0.025,
+            "output": 6.0,
+            "reasoning": 0.0,
+        },
+    }
+
+    for model_id, price in official.items():
+        # Disable stale rows that do not match the official snapshot.
+        cursor.execute(
+            """
+            UPDATE model_prices
+            SET enabled = 0, updated_at = ?
+            WHERE model_id = ?
+              AND enabled = 1
+              AND (
+                COALESCE(input_price_per_1m, -1) != ?
+                OR COALESCE(cached_input_price_per_1m, -1) != ?
+                OR COALESCE(output_price_per_1m, -1) != ?
+                OR COALESCE(reasoning_price_per_1m, -1) != ?
+              )
+            """,
+            (now, model_id, price["input"], price["cached_input"], price["output"], price["reasoning"]),
+        )
+
+        # Insert official row only if an exact match is not already present.
+        cursor.execute(
+            """
+            SELECT 1 FROM model_prices
+            WHERE model_id = ?
+              AND input_price_per_1m = ?
+              AND cached_input_price_per_1m = ?
+              AND output_price_per_1m = ?
+              AND reasoning_price_per_1m = ?
+            LIMIT 1
+            """,
+            (model_id, price["input"], price["cached_input"], price["output"], price["reasoning"]),
+        )
+        if cursor.fetchone() is None:
+            cursor.execute(
+                """
+                INSERT INTO model_prices
+                (model_id, currency, effective_date, input_price_per_1m, cached_input_price_per_1m,
+                 output_price_per_1m, reasoning_price_per_1m, source_note, enabled, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    model_id,
+                    "CNY",
+                    "2026-07-17",
+                    price["input"],
+                    price["cached_input"],
+                    price["output"],
+                    price["reasoning"],
+                    "DeepSeek 官方价格表（2026-07-17 校准）",
+                    1,
+                    now,
+                    now,
+                ),
+            )
+
+    _mark_migration_applied(cursor, "v143_official_prices", now)
 
 
 def _migrate_model_configs_v143(cursor):
