@@ -142,6 +142,24 @@ def init_db():
         """
     )
 
+    # V1.5.2: immutable Skill configuration snapshots.  Skills are business
+    # capabilities and need an auditable release/rollback history instead of
+    # silently overwriting a prompt in place.
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS skill_versions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            skill_id INTEGER NOT NULL,
+            version TEXT NOT NULL,
+            snapshot_json TEXT NOT NULL,
+            change_summary TEXT,
+            created_by TEXT,
+            created_at TEXT,
+            UNIQUE(skill_id, version)
+        )
+        """
+    )
+
     cursor.execute(
         """
         CREATE TABLE IF NOT EXISTS mcp_servers (
@@ -523,6 +541,12 @@ def init_db():
 
     # V1.3.3 Badcase operational closure schema.
     _migrate_v1_3_3_badcase_closure(cursor)
+    conn.commit()
+
+    # V1.5.2: create a non-destructive baseline snapshot for existing Skills.
+    # It does not change instructions, bindings or enablement; it only makes
+    # current state traceable before the first governed edit.
+    _migrate_skill_governance_v152(cursor)
     conn.commit()
 
     conn.close()
@@ -2958,11 +2982,142 @@ def update_skill(
 def delete_skill(skill_id: int) -> bool:
     conn = _get_conn()
     cursor = conn.cursor()
+    cursor.execute("DELETE FROM skill_versions WHERE skill_id = ?", (skill_id,))
     cursor.execute("DELETE FROM skills WHERE id = ?", (skill_id,))
     deleted = cursor.rowcount > 0
     conn.commit()
     conn.close()
     return deleted
+
+
+def _skill_snapshot(skill: Dict[str, Any]) -> Dict[str, Any]:
+    """Return the persisted fields that define a Skill release."""
+    return {
+        "id": skill.get("id"),
+        "name": skill.get("name", ""),
+        "description": skill.get("description", ""),
+        "instructions": skill.get("instructions", ""),
+        "category": skill.get("category", ""),
+        "enabled": bool(skill.get("enabled")),
+        "trigger_condition": skill.get("trigger_condition", ""),
+        "skill_metadata": skill.get("skill_metadata") or {},
+        "storage_path": skill.get("storage_path", ""),
+        "model_id": skill.get("model_id"),
+    }
+
+
+def create_skill_version(
+    skill_id: int,
+    version: str,
+    change_summary: str = "",
+    created_by: str = "平台管理员",
+) -> Optional[Dict[str, Any]]:
+    """Persist one immutable Skill release snapshot if it does not exist."""
+    skill = get_skill(skill_id)
+    if not skill:
+        return None
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        INSERT OR IGNORE INTO skill_versions
+        (skill_id, version, snapshot_json, change_summary, created_by, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            skill_id,
+            version,
+            json.dumps(_skill_snapshot(skill), ensure_ascii=False),
+            change_summary,
+            created_by,
+            now_cn(),
+        ),
+    )
+    conn.commit()
+    conn.close()
+    return get_skill_version(skill_id, version)
+
+
+def get_skill_version(skill_id: int, version: str) -> Optional[Dict[str, Any]]:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT * FROM skill_versions WHERE skill_id = ? AND version = ?",
+        (skill_id, version),
+    )
+    row = cursor.fetchone()
+    conn.close()
+    if not row:
+        return None
+    result = dict(row)
+    try:
+        result["snapshot"] = json.loads(result.pop("snapshot_json") or "{}")
+    except Exception:
+        result["snapshot"] = {}
+    return result
+
+
+def list_skill_versions(skill_id: int) -> List[Dict[str, Any]]:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT * FROM skill_versions WHERE skill_id = ? ORDER BY id DESC",
+        (skill_id,),
+    )
+    rows = cursor.fetchall()
+    conn.close()
+    result = []
+    for row in rows:
+        item = dict(row)
+        try:
+            snapshot = json.loads(item.pop("snapshot_json") or "{}")
+        except Exception:
+            snapshot = {}
+        # The list is an audit index; detailed content is available only when
+        # the operator explicitly asks to restore a version.
+        item["snapshot_summary"] = {
+            "name": snapshot.get("name", ""),
+            "trigger_condition": snapshot.get("trigger_condition", ""),
+            "enabled": snapshot.get("enabled"),
+        }
+        result.append(item)
+    return result
+
+
+def _migrate_skill_governance_v152(cursor):
+    """Write only baseline audit records for legacy Skills, once."""
+    key = "v152_skill_version_baselines"
+    cursor.execute("SELECT 1 FROM migration_meta WHERE key = ?", (key,))
+    if cursor.fetchone():
+        return
+    cursor.execute("SELECT * FROM skills")
+    for row in cursor.fetchall():
+        skill = dict(row)
+        raw_metadata = skill.get("skill_metadata")
+        try:
+            metadata = json.loads(raw_metadata) if raw_metadata else {}
+        except Exception:
+            metadata = {}
+        version = str(metadata.get("version") or "legacy-1.0.0")
+        snapshot = {
+            "id": skill.get("id"),
+            "name": skill.get("name", ""),
+            "description": skill.get("description", ""),
+            "instructions": skill.get("instructions", ""),
+            "category": skill.get("category", ""),
+            "enabled": bool(skill.get("enabled")),
+            "trigger_condition": skill.get("trigger_condition", ""),
+            "skill_metadata": metadata,
+            "storage_path": skill.get("storage_path", ""),
+            "model_id": skill.get("model_id"),
+        }
+        cursor.execute(
+            """INSERT OR IGNORE INTO skill_versions
+               (skill_id, version, snapshot_json, change_summary, created_by, created_at)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (skill["id"], version, json.dumps(snapshot, ensure_ascii=False), "V1.5.2 治理基线", "系统迁移", now_cn()),
+        )
+    _mark_migration_applied(cursor, key, now_cn())
 
 
 # -----------------------------------------------------------------------------
