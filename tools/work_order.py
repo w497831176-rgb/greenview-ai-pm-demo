@@ -176,6 +176,7 @@ class WorkOrderTools(Toolkit):
                     contact_phone=existing_draft.get("contact_phone") or "",
                     appointment_time=existing_draft.get("appointment_time") or "",
                     status="pending",
+                    session_id=session_id,
                 )
                 delete_work_order_draft(session_id)
                 return (

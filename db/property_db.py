@@ -47,6 +47,7 @@ def init_db():
         """
         CREATE TABLE IF NOT EXISTS work_orders (
             id TEXT PRIMARY KEY,
+            session_id TEXT,
             room_id TEXT NOT NULL,
             contact_name TEXT,
             contact_phone TEXT,
@@ -1799,6 +1800,12 @@ def _migrate_v1_3_observability(cursor):
     except sqlite3.OperationalError:
         pass
 
+    # V1.4.3: add session_id to work_orders to link confirmed orders to their chat session.
+    try:
+        cursor.execute("ALTER TABLE work_orders ADD COLUMN session_id TEXT")
+    except sqlite3.OperationalError:
+        pass
+
     cursor.execute(
         """
         CREATE TABLE IF NOT EXISTS mcp_call_audits (
@@ -1947,6 +1954,7 @@ def create_work_order(
     contact_phone: str,
     appointment_time: str,
     status: str = "待派单",
+    session_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     now = now_cn("%Y-%m-%d %H:%M")
     conn = _get_conn()
@@ -1954,11 +1962,11 @@ def create_work_order(
     cursor.execute(
         """
         INSERT INTO work_orders
-        (id, room_id, contact_name, contact_phone, issue_type, issue_desc, urgency, status,
+        (id, session_id, room_id, contact_name, contact_phone, issue_type, issue_desc, urgency, status,
          appointment_time, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (work_order_id, room_id, contact_name, contact_phone, issue_type, issue_desc, urgency, status, appointment_time, now, now),
+        (work_order_id, session_id, room_id, contact_name, contact_phone, issue_type, issue_desc, urgency, status, appointment_time, now, now),
     )
     conn.commit()
     conn.close()

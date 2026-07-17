@@ -568,6 +568,35 @@ def _mcp_server_relevant(server_name: str, message: str) -> bool:
     return server_name.lower() in lowered
 
 
+def _user_requests_work_order_creation(message: str) -> bool:
+    """Detect an explicit request to create a new repair work order."""
+    lowered = message.lower()
+    creation_keywords = ["创建工单", "创建维修工单", "报修", "我要修", "帮我修", "提交工单"]
+    if any(k in lowered for k in creation_keywords):
+        return True
+    return "工单" in lowered and "创建" in lowered
+
+
+def _user_confirms_work_order(message: str) -> bool:
+    """Detect a confirmation reply for a pending work-order draft."""
+    if not message:
+        return False
+    lowered = message.strip().lower()
+    confirm_patterns = [r"^确认创建", r"^确认", r"^好的.*创建", r"^同意创建", r"^就.*创建", r"^创建.*"]
+    return any(re.search(p, lowered) for p in confirm_patterns)
+
+
+def _has_pending_work_order_draft(session_id: Optional[str]) -> bool:
+    """Return True if the session already has an unconfirmed work-order draft."""
+    if not session_id:
+        return False
+    try:
+        from db.property_db import get_work_order_draft
+        return bool(get_work_order_draft(session_id))
+    except Exception:
+        return False
+
+
 def _build_mcp_tools(
     agent_id: Optional[str] = None,
     trace_id: Optional[str] = None,
@@ -1079,6 +1108,22 @@ async def _stream_agent_response(
         target_agent_id = intent_result.get("target_agent_id") or intent_result.get("intent") or "customer_service"
         intent = target_agent_id
 
+        # V1.4.3: work-order creation and confirmation must stay inside the
+        # maintenance agent so the two-stage draft gate is enforced.
+        needs_maintenance = (
+            _user_requests_work_order_creation(message)
+            or (
+                _user_confirms_work_order(message)
+                and _has_pending_work_order_draft(session_id)
+            )
+        )
+        if needs_maintenance:
+            target_agent_id = "maintenance"
+            intent = "maintenance"
+            intent_result["route_reason"] = (
+                intent_result.get("route_reason", "") + "；强制路由到维修 Agent（工单创建/确认）"
+            )
+
         create_agent_fn, agent_name = _select_agent(target_agent_id)
         current_agent_id = _agent_id_for_intent(target_agent_id)
         current_agent = agent_name  # human-readable Chinese name for UI/Trace
@@ -1255,6 +1300,10 @@ async def _stream_agent_response(
             agent.tool_choice = "required"
         elif not mcp_tools:
             agent.tool_choice = "auto"
+        # V1.4.3: for work-order creation/confirmation, force a tool call so the
+        # two-stage draft gate in WorkOrderTools is actually exercised.
+        if current_agent_id == "maintenance" and needs_maintenance:
+            agent.tool_choice = "required"
         vertical_start = time.time()
 
         # Run agent in streaming mode.  We decouple Agno's async generator from
