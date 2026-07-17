@@ -30,7 +30,7 @@ services:
       # Enterprise skills (read-only)
       - /volume3/docker/volumes/agno-demo-os/skills:/app/enterprise/skills:ro
       # Property demo data persistence
-      - /volume1/docker/volumes/agno-demo-os/property-data:/app/data
+      - /volume3/docker/volumes/agno-demo-os/property-data:/app/data
     environment:
       - RUNTIME_ENV=dev
       - AGNO_DEBUG=True
