@@ -530,19 +530,19 @@ def _build_rag_context(message: str, top_k: Optional[int] = None, threshold: Opt
         effective_top_k = max(1, min(10, int(effective_top_k)))
         settings_payload = {
             "top_k": effective_top_k,
-            "keyword_weight": settings.get("keyword_weight", 0.5),
+            "keyword_weight": settings.get("keyword_weight", 0.3),
             "semantic_weight": settings.get("semantic_weight", 0.7),
             "rrf_k": settings.get("rrf_k", 60),
             "enable_rerank": settings.get("enable_rerank", False),
             "rerank_model": settings.get("rerank_model"),
             "score_threshold": threshold if threshold is not None else settings.get("score_threshold", 0.0),
-            "context_threshold": settings.get("context_threshold", 0.0),
+            "context_threshold": settings.get("context_threshold", 0.2),
         }
         result = rag_retrieval.advanced_search(message, settings=settings_payload)
         results = result.get("results", [])
         if not results:
             return "", []
-        parts = ["\n\n[相关知识库片段（回答时请引用出处，每条引用必须对应下方确切分片）："]
+        parts = ["\n\n[相关知识库证据（仅对确有证据支持的结论使用【引用n】；不得把未引用候选、常识或实时数据伪装成知识库结论。每个引用必须对应下方确切分片）："]
         citations = []
         for i, r in enumerate(results, 1):
             title = r.get("doc_title") or "未知文档"
@@ -557,6 +557,10 @@ def _build_rag_context(message: str, top_k: Optional[int] = None, threshold: Opt
                 "chunk_index": chunk_index,
                 "content": content,
                 "score": score,
+                "context_score": r.get("context_score"),
+                "retrieval_sources": r.get("retrieval_sources", []),
+                "retrieval_paths": r.get("retrieval_paths", []),
+                "evidence_status": r.get("evidence_status", "accepted"),
             })
         parts.append("]")
         return "\n".join(parts), citations

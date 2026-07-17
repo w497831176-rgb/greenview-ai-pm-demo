@@ -105,7 +105,8 @@ def init_db():
             is_indexed INTEGER DEFAULT 1,
             chunk_size INTEGER DEFAULT 512,
             chunk_overlap INTEGER DEFAULT 64,
-            split_strategy TEXT DEFAULT 'auto'
+            split_strategy TEXT DEFAULT 'auto',
+            source_type TEXT DEFAULT 'business'
         )
         """
     )
@@ -387,11 +388,30 @@ def init_db():
         ("chunk_size", "INTEGER DEFAULT 512"),
         ("chunk_overlap", "INTEGER DEFAULT 64"),
         ("split_strategy", "TEXT DEFAULT 'auto'"),
+        ("source_type", "TEXT DEFAULT 'business'"),
     ]:
         try:
             cursor.execute(f"ALTER TABLE knowledge_docs ADD COLUMN {col} {dtype}")
         except sqlite3.OperationalError:
             pass
+
+    # V1.5.1: keep historical acceptance fixtures for audit, but do not let
+    # them pollute owner-facing RAG. Content is retained; only retrieval scope
+    # is changed once for obviously named test documents.
+    cursor.execute("SELECT 1 FROM migration_meta WHERE key = ?", ("v151_isolate_demo_rag_docs",))
+    if not cursor.fetchone():
+        cursor.execute(
+            """UPDATE knowledge_docs
+               SET source_type = 'demo_test', is_indexed = 0
+               WHERE title LIKE 'DEMO_TEST_%'
+                  OR title LIKE 'BROWSER_%'
+                  OR title = '测试 badcase'
+                  OR title = '测试问题标准答案（验收用例）'"""
+        )
+        cursor.execute(
+            "INSERT INTO migration_meta (key, applied_at) VALUES (?, ?)",
+            ("v151_isolate_demo_rag_docs", now_cn()),
+        )
 
     # Migration: add Skill metadata columns to existing skills table.
     for col, dtype in [
@@ -2103,6 +2123,7 @@ def create_knowledge_doc(
     title: str,
     content: str,
     category: str,
+    source_type: str = "business",
     index_status: str = "pending",
     chunk_size: int = 512,
     chunk_overlap: int = 64,
@@ -2113,10 +2134,10 @@ def create_knowledge_doc(
     cursor.execute(
         """
         INSERT INTO knowledge_docs
-        (title, content, category, index_status, chunk_size, chunk_overlap, split_strategy)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        (title, content, category, source_type, is_indexed, index_status, chunk_size, chunk_overlap, split_strategy)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (title, content, category, index_status, chunk_size, chunk_overlap, split_strategy),
+        (title, content, category, source_type, 1 if source_type == "business" else 0, index_status, chunk_size, chunk_overlap, split_strategy),
     )
     doc_id = cursor.lastrowid
     conn.commit()
@@ -2147,6 +2168,7 @@ def update_knowledge_doc(
     title: str,
     content: str,
     category: str,
+    source_type: Optional[str] = None,
     index_status: Optional[str] = None,
     chunk_size: Optional[int] = None,
     chunk_overlap: Optional[int] = None,
@@ -2157,6 +2179,11 @@ def update_knowledge_doc(
 
     fields = ["title = ?", "content = ?", "category = ?"]
     params = [title, content, category]
+    if source_type is not None:
+        fields.append("source_type = ?")
+        params.append(source_type)
+        fields.append("is_indexed = ?")
+        params.append(1 if source_type == "business" else 0)
     if index_status is not None:
         fields.append("index_status = ?")
         params.append(index_status)
@@ -2218,6 +2245,8 @@ def search_knowledge(query: str, top_k: int = 3) -> List[Dict[str, Any]]:
     query_terms = [q for q in query.split() if q]
     scored = []
     for row in rows:
+        if not row.get("is_indexed"):
+            continue
         text = f"{row['title']} {row['content']}".lower()
         score = sum(1 for q in query_terms if q.lower() in text)
         if score > 0:
