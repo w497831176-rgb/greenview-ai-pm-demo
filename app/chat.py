@@ -26,7 +26,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from app.observability import _check_budget
-from app.settings import MODEL_ID, USE_THINKING
+from app.settings import MODEL_ID, USE_THINKING, build_model
 from app.utils.cost_utils import build_price_snapshot, compute_cost_cny, normalize_usage
 from agents.billing import create_billing_agent
 from agents.complaint import create_complaint_agent
@@ -1120,9 +1120,12 @@ async def _stream_agent_response(
         if needs_maintenance:
             target_agent_id = "maintenance"
             intent = "maintenance"
-            intent_result["route_reason"] = (
-                intent_result.get("route_reason", "") + "；强制路由到维修 Agent（工单创建/确认）"
+            intent_result["reason"] = (
+                intent_result.get("reason", "") + "；强制路由到维修 Agent（工单创建/确认）"
             )
+            # Work-order turns need deterministic tool calls; disable thinking
+            # so tool_choice="required" is accepted by the provider.
+            turn_model = build_model(MODEL_ID, use_thinking=False)
 
         create_agent_fn, agent_name = _select_agent(target_agent_id)
         current_agent_id = _agent_id_for_intent(target_agent_id)
