@@ -98,6 +98,7 @@ if MCPTools is not None:
             self.recorded_calls: List[Dict[str, Any]] = []
             self.trace_id: Optional[str] = None
             self.server_name: str = "unknown"
+            self.invocation_mode: str = kwargs.pop("invocation_mode", "model_native")
 
         async def build_tools(self) -> None:
             # Build tools in the current event loop. MCPTools uses asyncio stdio
@@ -128,6 +129,7 @@ if MCPTools is not None:
                 "result_summary": result_summary,
                 "error_summary": error_summary,
                 "latency_ms": latency_ms,
+                "invocation_mode": self.invocation_mode,
             }
             self.recorded_calls.append(call_record)
             try:
@@ -140,6 +142,7 @@ if MCPTools is not None:
                     result_summary=result_summary,
                     error_summary=error_summary,
                     latency_ms=latency_ms,
+                    invocation_mode=self.invocation_mode,
                 )
             except Exception:
                 # Audit failures must not break the chat flow.
@@ -609,6 +612,7 @@ def _build_mcp_tools(
                     name=name,
                     transport="stdio",
                     timeout_seconds=15,
+                    invocation_mode="model_native",
                 )
                 tool.trace_id = trace_id
                 tool.server_name = name
@@ -723,6 +727,7 @@ async def _preinvoke_readonly_mcp_tools(
                 name=server_name,
                 transport="stdio",
                 timeout_seconds=15,
+                invocation_mode="policy_preinvoke",
             )
             tool.trace_id = trace_id
             tool.server_name = server_name

@@ -1793,6 +1793,12 @@ def _migrate_v1_3_observability(cursor):
     except sqlite3.OperationalError:
         pass
 
+    # V1.4.3: add invocation_mode to mcp_call_audits for policy_preinvoke traceability.
+    try:
+        cursor.execute("ALTER TABLE mcp_call_audits ADD COLUMN invocation_mode TEXT")
+    except sqlite3.OperationalError:
+        pass
+
     cursor.execute(
         """
         CREATE TABLE IF NOT EXISTS mcp_call_audits (
@@ -1805,6 +1811,7 @@ def _migrate_v1_3_observability(cursor):
             result_summary TEXT,
             error_summary TEXT,
             latency_ms INTEGER,
+            invocation_mode TEXT,
             created_at TEXT
         )
         """
@@ -3547,6 +3554,7 @@ def record_mcp_call_audit(
     result_summary: Optional[str] = None,
     error_summary: Optional[str] = None,
     latency_ms: Optional[int] = None,
+    invocation_mode: Optional[str] = None,
 ) -> Dict[str, Any]:
     now = now_cn()
     conn = _get_conn()
@@ -3555,8 +3563,8 @@ def record_mcp_call_audit(
         """
         INSERT INTO mcp_call_audits (
             trace_id, server_name, tool_name, arguments, status, result_summary,
-            error_summary, latency_ms, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            error_summary, latency_ms, invocation_mode, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             trace_id,
@@ -3567,6 +3575,7 @@ def record_mcp_call_audit(
             result_summary,
             error_summary,
             latency_ms,
+            invocation_mode,
             now,
         ),
     )
