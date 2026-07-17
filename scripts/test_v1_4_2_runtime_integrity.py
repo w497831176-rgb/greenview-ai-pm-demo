@@ -329,6 +329,9 @@ def run(base_url: str) -> int:
 
         def agent_prompt_runtime():
             resp = chat_sse(c, f"{marker}，厨房漏水需要报修。")
+            print(f"  resp text len={len(resp['text'])}, events={len(resp['events'])}, done={resp['done']}", flush=True)
+            if not resp["text"].strip():
+                raise AssertionError(f"chat response text is empty; events={resp['events'][:5]}")
             first_line = resp["text"].strip().splitlines()[0]
             if marker not in first_line:
                 raise AssertionError(f"expected first line to contain {marker}, got: {first_line[:100]}")
@@ -339,7 +342,7 @@ def run(base_url: str) -> int:
 
         # Restore maintenance instructions.
         c.put("/api/agents/maintenance", {
-            "system_prompt": original_agent_instructions["maintenance"],
+            "system_prompt": original_agent_config["maintenance"]["system_prompt"],
             "available_skills": [],
             "available_mcp_tools": [],
         })

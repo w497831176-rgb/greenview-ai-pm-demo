@@ -665,9 +665,18 @@ def _get_vertical_agents() -> List[Dict[str, Any]]:
 
 
 def _select_agent(agent_id: str, tools: Optional[List[Any]] = None):
-    """Create the vertical agent for a target_agent_id using DB configuration."""
-    agent = _create_vertical_agent_for_id(agent_id, tools=tools)
-    return agent, agent.name or agent_id
+    """Return a factory that creates the vertical agent for target_agent_id.
+
+    A factory is returned (instead of an Agent instance) so the chat runtime
+    can instantiate the agent with the model selected for this turn.
+    """
+    from functools import partial
+
+    factory = partial(_create_vertical_agent_for_id, agent_id)
+    # Determine the display name without constructing the agent.
+    db_agent = get_agent_by_agent_id(agent_id)
+    agent_name = db_agent.get("name") if db_agent else agent_id
+    return factory, agent_name or agent_id
 
 
 def _agent_id_for_intent(intent: str) -> str:
@@ -676,7 +685,11 @@ def _agent_id_for_intent(intent: str) -> str:
     return intent if intent else "customer_service"
 
 
-def _create_vertical_agent_for_id(agent_id: str, tools: Optional[List[Any]] = None):
+def _create_vertical_agent_for_id(
+    agent_id: str,
+    tools: Optional[List[Any]] = None,
+    model: Optional[Any] = None,
+):
     """Create a vertical Agent instance from DB configuration, falling back to code defaults."""
     db_agent = get_agent_by_agent_id(agent_id)
     instructions = None
@@ -704,7 +717,7 @@ def _create_vertical_agent_for_id(agent_id: str, tools: Optional[List[Any]] = No
     }
     factory = factories.get(agent_id)
     if factory:
-        return factory(tools=tools, instructions=instructions, name=name, description=description)
+        return factory(tools=tools, instructions=instructions, name=name, description=description, model=model)
 
     # For dynamically created vertical agents without a dedicated factory, build a generic Agent.
     from agno.agent import Agent
@@ -722,7 +735,7 @@ def _create_vertical_agent_for_id(agent_id: str, tools: Optional[List[Any]] = No
         id=f"{agent_id}_agent",
         name=name or agent_id,
         description=description or "",
-        model=MODEL,
+        model=model or MODEL,
         db=agent_db,
         tools=base_tools,
         skills=None,
