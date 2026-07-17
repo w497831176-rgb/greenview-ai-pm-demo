@@ -12,10 +12,11 @@ from typing import Any, AsyncIterator, Dict, List, Optional
 from agno.agent import Agent
 
 from app.settings import MODEL, agent_db
+from db.property_db import get_agent_by_agent_id
 
 
 def _base_router_instructions(vertical_agents: List[Dict[str, Any]]) -> List[str]:
-    """Build router instructions from the current enabled vertical agents."""
+    """Build router instructions from DB Router config + current enabled vertical agents."""
     valid_targets = [
         {"agent_id": a.get("agent_id"), "name": a.get("name"), "description": a.get("description", "")}
         for a in vertical_agents
@@ -32,7 +33,11 @@ def _base_router_instructions(vertical_agents: List[Dict[str, Any]]) -> List[str
         f'- {t["agent_id"]}（{t["name"]}）：{t["description"] or "无描述"}'
         for t in valid_targets
     )
-    return [
+
+    router = get_agent_by_agent_id("router")
+    user_instructions = (router.get("instructions") or "").strip() if router else ""
+
+    base = [
         "你是YIAI物业的路由 Agent，负责识别业主意图并分发给合适的垂直 Agent。",
         f"你只能从以下启用的垂直 Agent 中选择目标，输出其 agent_id：\n{target_lines}",
         '输出格式必须严格为 JSON：{"target_agent_id": "<agent_id>", "reason": "<一句话理由>"}',
@@ -40,6 +45,9 @@ def _base_router_instructions(vertical_agents: List[Dict[str, Any]]) -> List[str
         "优先选择描述与用户问题关键词最匹配的垂直 Agent；若用户问题明确指向某个 Agent 的描述，必须选择该 Agent。",
         "如果无法判断，选择 customer_service 或其他最接近的垂直 Agent；不要编造不存在的 agent_id。",
     ]
+    if user_instructions:
+        base.insert(0, f"[路由策略：{user_instructions}]")
+    return base
 
 
 def create_router_agent(vertical_agents: Optional[List[Dict[str, Any]]] = None) -> Agent:
@@ -91,7 +99,10 @@ async def classify_intent(
     user_id: str = "web-user",
     session_id: str = "",
 ) -> Dict[str, Any]:
-    """Use the router agent to classify the user message intent."""
+    """Use the router agent to classify the user message intent.
+
+    Returns route_mode to distinguish true model success from fallback paths.
+    """
     vertical_agents = vertical_agents or []
     enabled_ids = {a.get("agent_id") for a in vertical_agents if a.get("enabled") and a.get("agent_id")}
     if not enabled_ids:
@@ -108,16 +119,30 @@ async def classify_intent(
         "可选目标：\n" + valid_lines + "\n\n"
         '输出格式：{"target_agent_id": "<agent_id>", "reason": "<简要理由>"}'
     )
+    route_mode = "model_success"
+    raw_response = ""
+    metrics: Dict[str, Any] = {}
     try:
         router_agent = create_router_agent(vertical_agents)
-        response = await _collect_response(
-            router_agent.arun(
-                prompt,
-                user_id=user_id,
-                session_id=session_id or f"router-{id(message)}",
-                stream=False,
-            )
+        response_obj = await router_agent.arun(
+            prompt,
+            user_id=user_id,
+            session_id=session_id or f"router-{id(message)}",
+            stream=False,
         )
+        response = await _collect_response(response_obj)
+        raw_response = response
+
+        # Collect provider metrics if available.
+        if hasattr(response_obj, "metrics") and response_obj.metrics:
+            m = response_obj.metrics
+            metrics = {
+                "input_tokens": getattr(m, "input_tokens", None),
+                "output_tokens": getattr(m, "output_tokens", None),
+                "total_tokens": getattr(m, "total_tokens", None),
+                "reasoning_tokens": getattr(m, "reasoning_tokens", None),
+                "cached_tokens": getattr(m, "cached_tokens", None),
+            }
 
         json_match = re.search(r"\{.*\}", response, re.DOTALL)
         if json_match:
@@ -127,18 +152,29 @@ async def classify_intent(
         else:
             target = _keyword_intent(message, vertical_agents)
             reason = "基于关键词回退分类"
+            route_mode = "invalid_output_fallback"
 
         if target not in enabled_ids:
             target = _keyword_intent(message, vertical_agents)
             reason = f"模型返回了未启用的 agent_id，已回退：{reason}"
-        return {"target_agent_id": target, "reason": reason, "raw": response}
+            route_mode = "invalid_output_fallback"
+
+        return {
+            "target_agent_id": target,
+            "reason": reason,
+            "raw": raw_response,
+            "route_mode": route_mode,
+            "metrics": metrics,
+        }
     except Exception:
         import traceback
         traceback.print_exc()
         return {
             "target_agent_id": _keyword_intent(message, vertical_agents),
             "reason": "路由异常，使用关键词回退",
-            "raw": "",
+            "raw": raw_response,
+            "route_mode": "exception_fallback",
+            "metrics": metrics,
         }
 
 

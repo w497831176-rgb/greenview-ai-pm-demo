@@ -219,7 +219,7 @@
     // ==========================================
     const API_BASE = '';
     const DEFAULT_ROOM_ID = '3-2-1201';
-    const APP_VERSION = 'V1.4.2.1';
+    const APP_VERSION = 'V1.4.3';
 
     const STATE = {
       topTab: 'owner',
@@ -514,7 +514,7 @@
       }, '提交');
     }
 
-    function renderAiMessageTags(skills, tools, agent, routeReason = '', routeIntent = '', modelId = '', thinkingEnabled = null, modelSelectionReason = '', traceId = '', mcpCalls = null, usageSource = '') {
+    function renderAiMessageTags(skills, tools, agent, routeReason = '', routeIntent = '', modelId = '', thinkingEnabled = null, modelSelectionReason = '', traceId = '', mcpCalls = null, usageSource = '', currentAgentId = '') {
       const tags = [];
       if (modelId) {
         const modelLabel = modelId === 'deepseek-v4-pro' ? 'Pro' : (modelId === 'deepseek-v4-flash' ? 'Flash' : modelId);
@@ -522,8 +522,8 @@
         tags.push(`<span class="px-1.5 py-0.5 bg-purple-50 text-purple-600 rounded text-[10px]" title="${escapeHtml(modelSelectionReason || '')}">模型：${escapeHtml(modelId)}${thinkingText}</span>`);
       }
       if (routeReason) tags.push(`<span class="px-1.5 py-0.5 bg-slate-100 text-slate-600 rounded text-[10px]" title="${escapeHtml(routeIntent || '')}">路由原因：${escapeHtml(routeReason)}</span>`);
-      if (agent) tags.push(`<span class="px-1.5 py-0.5 bg-indigo-50 text-indigo-600 rounded text-[10px]">当前处理 Agent：${escapeHtml(agent)}</span>`);
-      if (skills && skills.length) tags.push(`<span class="px-1.5 py-0.5 bg-brand-50 text-brand-600 rounded text-[10px]">已命中 Skill：${escapeHtml(skills.join('、'))}</span>`);
+      if (agent) tags.push(`<span class="px-1.5 py-0.5 bg-indigo-50 text-indigo-600 rounded text-[10px]" title="agent_id: ${escapeHtml(currentAgentId || '')}">当前处理 Agent：${escapeHtml(agent)}</span>`);
+      if (skills && skills.length) tags.push(`<span class="px-1.5 py-0.5 bg-brand-50 text-brand-600 rounded text-[10px]">已命中 Skill：${escapeHtml(skills.map(s => (typeof s === 'object' && s !== null ? (s.name || JSON.stringify(s)) : String(s))).join('、'))}</span>`);
       if (tools && tools.length) tags.push(`<span class="px-1.5 py-0.5 bg-gold-50 text-gold-600 rounded text-[10px]">已调用工具：${escapeHtml(tools.map(t => typeof t === 'string' ? t : (t.name || t.tool_name || JSON.stringify(t))).join('、'))}</span>`);
       if (mcpCalls && mcpCalls.length) {
         const okCount = mcpCalls.filter(c => c.status === 'success').length;
@@ -549,22 +549,29 @@
         const assistantMsg = messages.find(m => m.role === 'assistant') || {};
         const citations = assistantMsg.citations || [];
         const currentAgent = assistantMsg.current_agent || trace.agent_name || '-';
-        const activatedSkills = assistantMsg.activated_skills || [];
+        const currentAgentId = assistantMsg.current_agent_id || trace.agent_id || '-';
+        const activatedSkillsRaw = assistantMsg.activated_skills || [];
+        const activatedSkills = activatedSkillsRaw.map(s => (typeof s === 'object' && s !== null ? (s.name || JSON.stringify(s)) : String(s)));
 
-        const fmtTokensLocal = (v) => (v === null || v === undefined ? '-' : Number(v).toLocaleString());
+        const fmtTokensLocal = (v) => (v === null || v === undefined ? '不可得' : Number(v).toLocaleString());
         const fmtCostLocal = (v) => (v === null || v === undefined ? '--' : '¥' + Number(v).toFixed(6));
 
-        const modelCallsHtml = modelCalls.length ? modelCalls.map(c => `
+        const modelCallsHtml = modelCalls.length ? modelCalls.map(c => {
+          const norm = c.usage_normalized || {};
+          const usageUnavailable = norm.usage_split_unavailable || (!norm.uncached_input_tokens && !norm.cached_input_tokens && !norm.output_tokens);
+          return `
           <div class="border border-slate-200 rounded-xl p-3 mb-2 text-sm">
             <div class="flex items-center justify-between mb-1">
               <span class="font-medium text-slate-900">${escapeHtml(c.stage || 'unknown')} · ${escapeHtml(c.model_id || '-')}</span>
               <span class="text-xs ${c.status === 'success' ? 'text-green-600' : 'text-red-600'}">${c.status === 'success' ? '成功' : (c.status || '未知')}</span>
             </div>
-            <div class="text-xs text-slate-500">tokens: 输入 ${fmtTokensLocal(c.input_tokens)} / 输出 ${fmtTokensLocal(c.output_tokens)} / 推理 ${fmtTokensLocal(c.reasoning_tokens)} / 缓存 ${fmtTokensLocal(c.cached_tokens)} / 总计 ${fmtTokensLocal(c.total_tokens)}</div>
-            <div class="text-xs text-slate-700 mt-1">cost: ${fmtCostLocal(c.estimated_cost_cny)}</div>
-            <div class="text-xs text-slate-500 mt-1">formula: ${escapeHtml(c.formula || c.cost_formula || '-')}</div>
+            <div class="text-xs text-slate-500">usage_source: ${escapeHtml(c.usage_source || 'unknown')}</div>
+            <div class="text-xs text-slate-500 mt-1">tokens: 未缓存输入 ${fmtTokensLocal(norm.uncached_input_tokens)} / 缓存命中输入 ${fmtTokensLocal(norm.cached_input_tokens)} / 输出 ${fmtTokensLocal(norm.output_tokens)} / 总计 ${fmtTokensLocal(c.total_tokens)}</div>
+            <div class="text-xs text-slate-700 mt-1">cost: ${usageUnavailable ? 'usage_split_unavailable' : fmtCostLocal(c.estimated_cost_cny)}</div>
+            <div class="text-xs text-slate-500 mt-1">formula: ${escapeHtml(c.cost_formula || '-')}</div>
+            <div class="text-xs text-slate-500 mt-1">price_snapshot: ${escapeHtml(JSON.stringify(c.price_snapshot || {}))}</div>
           </div>
-        `).join('') : '<p class="text-sm text-slate-400">无模型调用记录</p>';
+        `}).join('') : '<p class="text-sm text-slate-400">无模型调用记录</p>';
 
         const mcpCallsHtml = mcpCalls.length ? mcpCalls.map(c => `
           <div class="border border-slate-200 rounded-xl p-3 mb-2 text-sm">
@@ -572,8 +579,10 @@
               <span class="font-medium text-slate-900">${escapeHtml(c.server_name || 'unknown')} · ${escapeHtml(c.tool_name || '-')}</span>
               <span class="text-xs ${c.status === 'success' ? 'text-green-600' : 'text-red-600'}">${c.status === 'success' ? '成功' : '失败'}</span>
             </div>
-            <div class="text-xs text-slate-500">duration: ${c.latency_ms || 0}ms</div>
+            <div class="text-xs text-slate-500">invocation_mode: ${escapeHtml(c.invocation_mode || 'model_native')}</div>
+            <div class="text-xs text-slate-500 mt-1">duration: ${c.latency_ms || 0}ms</div>
             <div class="text-xs text-slate-500 mt-1">args: ${escapeHtml(JSON.stringify(c.arguments || c.args || {}))}</div>
+            <div class="text-xs text-slate-500 mt-1">result_summary: ${escapeHtml((c.result_summary || '').slice(0, 200))}</div>
           </div>
         `).join('') : '<p class="text-sm text-slate-400">无 MCP 调用记录</p>';
 
@@ -586,17 +595,20 @@
         const summary = {
           trace_id: traceId,
           current_agent: currentAgent,
+          current_agent_id: currentAgentId,
           activated_skills: activatedSkills,
           model_calls: modelCalls.map(c => ({
             model_id: c.model_id,
             stage: c.stage,
             total_tokens: c.total_tokens,
-            cost_formula: c.formula || c.cost_formula,
+            usage_source: c.usage_source,
+            cost_formula: c.cost_formula,
             cost_cny: c.estimated_cost_cny
           })),
           mcp_calls: mcpCalls.map(c => ({
             server_name: c.server_name,
             tool_name: c.tool_name,
+            invocation_mode: c.invocation_mode || 'model_native',
             success: c.status === 'success',
             duration_ms: c.latency_ms,
             args: c.arguments || c.args
@@ -610,14 +622,14 @@
         const summaryJson = JSON.stringify(summary, null, 2);
         const summaryText = [
           `Trace ID: ${traceId}`,
-          `当前 Agent: ${currentAgent}`,
+          `当前 Agent: ${currentAgent} (agent_id: ${currentAgentId})`,
           `激活 Skill: ${activatedSkills.join('、') || '无'}`,
           '',
           '模型调用:',
-          ...modelCalls.map(c => `- ${c.stage || 'unknown'} / ${c.model_id || '-'}: tokens=${c.total_tokens || 0}, cost=${fmtCostLocal(c.estimated_cost_cny)}, formula=${c.formula || c.cost_formula || '-'}`),
+          ...modelCalls.map(c => `- ${c.stage || 'unknown'} / ${c.model_id || '-'}: usage_source=${c.usage_source || 'unknown'}, total_tokens=${c.total_tokens || 0}, cost=${fmtCostLocal(c.estimated_cost_cny)}, formula=${c.cost_formula || '-'}`),
           '',
           'MCP 调用:',
-          ...mcpCalls.map(c => `- ${c.server_name || 'unknown'} / ${c.tool_name || '-'}: success=${c.status === 'success'}, duration=${c.latency_ms || 0}ms, args=${JSON.stringify(c.arguments || c.args || {})}`),
+          ...mcpCalls.map(c => `- ${c.server_name || 'unknown'} / ${c.tool_name || '-'}: invocation_mode=${c.invocation_mode || 'model_native'}, success=${c.status === 'success'}, duration=${c.latency_ms || 0}ms, args=${JSON.stringify(c.arguments || c.args || {})}`),
           '',
           'RAG 引用:',
           ...citations.map(c => `- doc_id=${c.doc_id || '-'}, chunk_index=${typeof c.chunk_index === 'number' ? c.chunk_index : '-'}, title=《${c.doc_title || '未知文档'}》`)
@@ -627,7 +639,7 @@
           <div class="space-y-5">
             <div class="bg-slate-50 rounded-xl p-3 border border-slate-200 text-sm space-y-1">
               <div><span class="text-slate-500">trace_id:</span> <span class="font-mono">${escapeHtml(traceId)}</span></div>
-              <div><span class="text-slate-500">当前 Agent:</span> ${escapeHtml(currentAgent)}</div>
+              <div><span class="text-slate-500">当前 Agent:</span> ${escapeHtml(currentAgent)} <span class="text-xs text-slate-400">(agent_id: ${escapeHtml(currentAgentId)})</span></div>
               <div><span class="text-slate-500">激活 Skill:</span> ${activatedSkills.length ? escapeHtml(activatedSkills.join('、')) : '无'}</div>
             </div>
             <div>
@@ -643,7 +655,7 @@
               ${citationsHtml}
             </div>
             <div class="pt-2 border-t border-slate-200">
-              <button type="button" id="trace-copy-summary" class="w-full px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white rounded-xl text-sm transition-colors">复制 Trace 摘要</button>
+              <button type="button" id="trace-copy-summary" class="w-full px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white rounded-xl text-sm transition-colors">复制本次 Trace 摘要</button>
             </div>
           </div>
         `;
@@ -1356,7 +1368,7 @@
       return `<div class="flex flex-wrap items-center gap-1 mt-2"><span class="text-[10px] text-slate-400">已调用skill:</span>${tags}</div>`;
     }
 
-    function updateAiMessage(content, done = false, tokenCount = 0, messageId = null, tokenDetail = null, citations = null, activatedSkills = null, tools = null, agent = null, modelId = '', thinkingEnabled = null, modelSelectionReason = '', traceId = '', mcpCalls = null, usageSource = '') {
+    function updateAiMessage(content, done = false, tokenCount = 0, messageId = null, tokenDetail = null, citations = null, activatedSkills = null, tools = null, agent = null, modelId = '', thinkingEnabled = null, modelSelectionReason = '', traceId = '', mcpCalls = null, usageSource = '', currentAgentId = '') {
       const current = STATE.currentAiMessage;
       if (!current) return;
       const contentDiv = current.querySelector('.ai-message-content');
@@ -1386,7 +1398,11 @@
           const tagsEl = footer.querySelector('.ai-message-tags');
           if (tagsEl) {
             const route = STATE.currentRoute || {};
-            tagsEl.innerHTML = renderAiMessageTags(activatedSkills, tools, agent, route.reason || '', route.intent || '', modelId, thinkingEnabled, modelSelectionReason, traceId, mcpCalls, usageSource);
+            tagsEl.innerHTML = renderAiMessageTags(activatedSkills, tools, agent, route.reason || '', route.intent || '', modelId, thinkingEnabled, modelSelectionReason, traceId, mcpCalls, usageSource, currentAgentId || route.current_agent_id || '');
+          }
+          // Persist agent id on the message object so drawer can read it.
+          if (STATE.currentMessage) {
+            STATE.currentMessage.current_agent_id = currentAgentId || route.current_agent_id || '';
           }
           // Append citation footnotes below the footer row.
           const existingFootnotes = footer.parentElement.querySelector('.ai-message-footnotes');
@@ -1473,16 +1489,19 @@
               STATE.currentRoute = {
                 intent: data.intent || '',
                 reason: data.reason || '',
-                current_agent: data.current_agent || ''
+                current_agent: data.current_agent || '',
+                current_agent_id: data.current_agent_id || ''
               };
               const statusEl = placeholder.querySelector('.ai-message-route-status');
               if (statusEl) statusEl.textContent = `路由：${data.reason || data.intent || ''} → ${data.current_agent || ''}`;
             } else if (eventType === 'delta') {
               if (data.current_agent && STATE.currentRoute) STATE.currentRoute.current_agent = data.current_agent;
+              if (data.current_agent_id && STATE.currentRoute) STATE.currentRoute.current_agent_id = data.current_agent_id;
               accumulated += (data.content || '');
               updateAiMessage(accumulated);
             } else if (eventType === 'tool_calls') {
               if (data.current_agent && STATE.currentRoute) STATE.currentRoute.current_agent = data.current_agent;
+              if (data.current_agent_id && STATE.currentRoute) STATE.currentRoute.current_agent_id = data.current_agent_id;
               const toolNames = (data.tool_calls || []).map(t => typeof t === 'string' ? t : (t.name || t.tool_name || JSON.stringify(t))).join('、');
               const statusEl = placeholder.querySelector('.ai-message-tool-status');
               if (statusEl) statusEl.textContent = toolNames ? `调用工具：${toolNames}` : '';
@@ -1502,7 +1521,8 @@
                 data.model_selection_reason || '',
                 data.trace_id || STATE.currentTraceId || '',
                 data.mcp_calls || null,
-                data.usage_source || ''
+                data.usage_source || '',
+                data.current_agent_id || (STATE.currentRoute && STATE.currentRoute.current_agent_id) || ''
               );
               if (data.handoff) {
                 STATE.chatHandoff = true;
@@ -1563,7 +1583,8 @@
               msg.model_selection_reason,
               msg.trace_id,
               msg.mcp_calls,
-              msg.usage_source
+              msg.usage_source,
+              msg.current_agent_id
             );
           } else if (msg.role === 'staff') {
             appendStaffMessage(msg.content || '', msg.created_at);
@@ -1575,7 +1596,7 @@
       }
     }
 
-    function appendAiMessageFromHistory(content, createdAt, tokenCount, messageId, tokenDetail = null, citations = null, activatedSkills = null, tools = null, agent = null, routeReason = '', routeIntent = '', modelId = '', thinkingEnabled = null, modelSelectionReason = '', traceId = '', mcpCalls = null, usageSource = '') {
+    function appendAiMessageFromHistory(content, createdAt, tokenCount, messageId, tokenDetail = null, citations = null, activatedSkills = null, tools = null, agent = null, routeReason = '', routeIntent = '', modelId = '', thinkingEnabled = null, modelSelectionReason = '', traceId = '', mcpCalls = null, usageSource = '', currentAgentId = '') {
       const container = $('#chat-message-list');
       const div = document.createElement('div');
       div.className = 'flex gap-3 items-start fade-in';
@@ -1588,7 +1609,7 @@
         ? `<span class="cursor-help underline decoration-dotted" title="${escapeHtml(detailText)}">${tokenText}</span>`
         : tokenText;
       const footnotesHtml = renderCitations(citations, clean);
-      const tagsHtml = renderAiMessageTags(activatedSkills, tools, agent, routeReason, routeIntent, modelId, thinkingEnabled, modelSelectionReason, traceId, mcpCalls, usageSource);
+      const tagsHtml = renderAiMessageTags(activatedSkills, tools, agent, routeReason, routeIntent, modelId, thinkingEnabled, modelSelectionReason, traceId, mcpCalls, usageSource, currentAgentId);
       div.innerHTML = `
         <div class="w-9 h-9 rounded-full bg-gradient-to-br from-brand-500 to-brand-700 flex items-center justify-center text-white shrink-0 shadow-md">
           <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z"></path></svg>
@@ -1939,7 +1960,7 @@
         }
         if (msg.role === 'assistant') {
           const clean = stripThinking(msg.content || '');
-          const tags = renderAiMessageTags(msg.activated_skills, msg.tools, msg.agent);
+          const tags = renderAiMessageTags(msg.activated_skills, msg.tools, msg.agent, msg.route_reason, msg.route_intent, msg.model_id, msg.thinking_enabled, msg.model_selection_reason, msg.trace_id, msg.mcp_calls, msg.usage_source, msg.current_agent_id);
           const footnotes = renderCitations(msg.citations, clean);
           return `
             <div class="mb-3">
@@ -3679,14 +3700,14 @@
           const totalTokens = modelCalls.reduce((sum, c) => sum + (c.total_tokens || 0), 0);
           const callsHtml = modelCalls.map(c => {
             const formula = c.formula || (
-              `cost = input_tokens * input_price + output_tokens * output_price + reasoning_tokens * reasoning_price - cached_tokens * cached_discount`
+              `cost = uncached_input_tokens * input_price + cached_input_tokens * cached_input_price + output_tokens * output_price`
             );
             const formulaDetail = [
-              c.input_price_per_1m ? `输入价 ¥${c.input_price_per_1m}/M` : null,
-              c.output_price_per_1m ? `输出价 ¥${c.output_price_per_1m}/M` : null,
-              c.reasoning_price_per_1m ? `推理价 ¥${c.reasoning_price_per_1m}/M` : null,
-              c.cached_input_price_per_1m ? `缓存价 ¥${c.cached_input_price_per_1m}/M` : null
-            ].filter(Boolean).join(' · ') || '价格未配置';
+              c.input_price_per_1m ? `未缓存输入 ¥${c.input_price_per_1m}/M` : null,
+              c.cached_input_price_per_1m ? `缓存命中输入 ¥${c.cached_input_price_per_1m}/M` : null,
+              c.output_price_per_1m ? `输出 ¥${c.output_price_per_1m}/M` : null
+            ].filter(Boolean).join(' · ') || '单价已配置，但 Provider 未返回本次 usage';
+            const norm = c.usage_normalized || {};
             return `
             <div class="border border-slate-200 rounded-xl p-3 mb-2 text-sm">
               <div class="flex items-center justify-between mb-1">
@@ -3694,8 +3715,8 @@
                 <span class="text-xs">${statusBadgeSmall(c.status)} · ${sourceBadge(c.usage_source)}</span>
               </div>
               <div class="text-xs text-slate-500">耗时 ${c.latency_ms || 0}ms · 模型选择原因：${escapeHtml(c.model_selection_reason || '-')}</div>
-              <div class="text-xs text-slate-500 mt-1">Token: 输入 ${fmtTokens(c.input_tokens)} / 输出 ${fmtTokens(c.output_tokens)} / 推理 ${fmtTokens(c.reasoning_tokens)} / 缓存 ${fmtTokens(c.cached_tokens)} / 总计 ${fmtTokens(c.total_tokens)}</div>
-              <div class="text-xs text-slate-700 mt-1">估算成本：${fmtCost(c.estimated_cost_cny)}</div>
+              <div class="text-xs text-slate-500 mt-1">Token: 未缓存输入 ${fmtTokens(norm.uncached_input_tokens)} / 缓存命中输入 ${fmtTokens(norm.cached_input_tokens)} / 输出 ${fmtTokens(norm.output_tokens)} / 总计 ${fmtTokens(c.total_tokens)}</div>
+              <div class="text-xs text-slate-700 mt-1">估算成本：${norm.usage_split_unavailable ? 'usage_split_unavailable' : fmtCost(c.estimated_cost_cny)}</div>
               <details class="mt-2">
                 <summary class="text-xs text-brand-600 cursor-pointer hover:text-brand-700">成本计算公式</summary>
                 <div class="mt-1 p-2 bg-slate-50 rounded-lg border border-slate-200">
@@ -3712,6 +3733,7 @@
                 <span class="font-medium text-slate-900">[${escapeHtml(c.server_name)}] ${escapeHtml(c.tool_name)}</span>
                 <span class="text-xs">${statusBadgeSmall(c.status)} · ${c.latency_ms || 0}ms</span>
               </div>
+              <div class="text-xs text-slate-500">invocation_mode: ${escapeHtml(c.invocation_mode || 'model_native')}</div>
               <div class="text-xs text-slate-500">参数：${escapeHtml(JSON.stringify(c.arguments || {}))}</div>
               ${c.result_summary ? `<div class="text-xs text-slate-600 mt-1 bg-slate-50 rounded p-1.5">结果摘要：${escapeHtml(c.result_summary)}</div>` : ''}
               ${c.error_summary ? `<div class="text-xs text-red-600 mt-1">错误：${escapeHtml(c.error_summary)}</div>` : ''}
@@ -3760,7 +3782,6 @@
             <td class="py-2">${p.input_price_per_1m ?? '-'}</td>
             <td class="py-2">${p.cached_input_price_per_1m ?? '-'}</td>
             <td class="py-2">${p.output_price_per_1m ?? '-'}</td>
-            <td class="py-2">${p.reasoning_price_per_1m ?? '-'}</td>
             <td class="py-2">${escapeHtml(p.source_note || '-')}</td>
             <td class="py-2">${p.enabled ? '<span class="text-green-600">启用</span>' : '<span class="text-slate-400">禁用</span>'}</td>
             <td class="py-2"><button type="button" data-price-id="${p.id}" class="cg-edit-price px-2 py-1 bg-slate-100 text-slate-600 rounded-lg text-xs hover:bg-slate-200">编辑</button></td>
@@ -3774,8 +3795,8 @@
             </div>
             <div class="overflow-x-auto">
               <table class="w-full text-sm">
-                <thead><tr class="text-left text-slate-500 text-xs border-b border-slate-100"><th class="pb-2">模型</th><th class="pb-2">货币</th><th class="pb-2">生效日期</th><th class="pb-2">输入/百万</th><th class="pb-2">缓存输入/百万</th><th class="pb-2">输出/百万</th><th class="pb-2">推理/百万</th><th class="pb-2">来源备注</th><th class="pb-2">启用</th><th class="pb-2">操作</th></tr></thead>
-                <tbody>${rows || '<tr><td colspan="10" class="py-4 text-center text-sm text-slate-400">暂无价格配置</td></tr>'}</tbody>
+                <thead><tr class="text-left text-slate-500 text-xs border-b border-slate-100"><th class="pb-2">模型</th><th class="pb-2">货币</th><th class="pb-2">生效日期</th><th class="pb-2">未缓存输入/百万</th><th class="pb-2">缓存命中输入/百万</th><th class="pb-2">输出/百万</th><th class="pb-2">来源备注</th><th class="pb-2">启用</th><th class="pb-2">操作</th></tr></thead>
+                <tbody>${rows || '<tr><td colspan="9" class="py-4 text-center text-sm text-slate-400">暂无价格配置</td></tr>'}</tbody>
               </table>
             </div>
           </div>
@@ -3787,11 +3808,10 @@
           <div class="space-y-3">
             ${formInput('模型', 'price-model', price ? price.model_id : '', '例如 deepseek-v4-flash')}
             ${formInput('生效日期', 'price-effective', price ? price.effective_date : '', 'YYYY-MM-DD')}
-            ${formInput('输入 Token 单价（每百万 CNY）', 'price-input', price ? (price.input_price_per_1m ?? '') : '', '', 'number')}
-            ${formInput('缓存输入 Token 单价', 'price-cached', price ? (price.cached_input_price_per_1m ?? '') : '', '', 'number')}
+            ${formInput('未缓存输入 Token 单价（每百万 CNY）', 'price-input', price ? (price.input_price_per_1m ?? '') : '', '', 'number')}
+            ${formInput('缓存命中输入 Token 单价', 'price-cached', price ? (price.cached_input_price_per_1m ?? '') : '', '', 'number')}
             ${formInput('输出 Token 单价', 'price-output', price ? (price.output_price_per_1m ?? '') : '', '', 'number')}
-            ${formInput('推理 Token 单价', 'price-reasoning', price ? (price.reasoning_price_per_1m ?? '') : '', '', 'number')}
-            ${formInput('价格来源备注', 'price-note', price ? (price.source_note || '') : '', '例如 自购 Gateway 账单')}
+            ${formInput('价格来源备注', 'price-note', price ? (price.source_note || '') : 'DeepSeek 官方价格表（2026-07-17 校准）')}
             ${formSwitch('启用', 'price-enabled', price ? price.enabled : true)}
           </div>
         `;
@@ -3802,7 +3822,7 @@
             input_price_per_1m: $('#price-input').value === '' ? null : parseFloat($('#price-input').value),
             cached_input_price_per_1m: $('#price-cached').value === '' ? null : parseFloat($('#price-cached').value),
             output_price_per_1m: $('#price-output').value === '' ? null : parseFloat($('#price-output').value),
-            reasoning_price_per_1m: $('#price-reasoning').value === '' ? null : parseFloat($('#price-reasoning').value),
+            reasoning_price_per_1m: 0,
             source_note: $('#price-note').value.trim() || null,
             enabled: $('#price-enabled').checked,
           };
@@ -4275,7 +4295,7 @@
                         </td>
                         <td class="px-4 py-3">
                           <div class="flex gap-2">
-                            <button data-id="${a.id}" class="agent-edit-btn text-xs px-3 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg transition-colors">${isSeededRouter ? '查看' : '编辑'}</button>
+                            <button data-id="${a.id}" class="agent-edit-btn text-xs px-3 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg transition-colors">${isSeededRouter ? '编辑路由策略' : '编辑'}</button>
                             ${isSeededRouter ? '' : `<button data-id="${a.id}" class="agent-delete-btn text-xs px-3 py-1.5 border border-red-200 hover:bg-red-50 text-red-600 rounded-lg transition-colors">删除</button>`}
                           </div>
                         </td>
@@ -4318,7 +4338,8 @@
       async function openAgentModal(agent = null) {
         const isEdit = !!agent;
         const isSeededRouter = isEdit && agent.agent_id === 'router' && agent.is_router;
-        const title = isEdit ? (isSeededRouter ? 'Agent 详情' : '编辑 Agent') : '新增 Agent';
+        const title = isEdit ? (isSeededRouter ? '编辑路由策略' : '编辑 Agent') : '新增 Agent';
+        const selectedSkillNames = (agent && agent.available_skills || []).map(s => (typeof s === 'object' && s !== null ? (s.name || '') : String(s))).filter(Boolean);
         let skills = [];
         let mcpTools = [];
         try {
@@ -4357,7 +4378,7 @@
                     </div>
                     <p class="text-xs text-slate-500 mb-1.5">${escapeHtml(m.description || '-')}</p>
                     <div class="text-xs text-slate-600 space-y-0.5">
-                      <div><span class="text-slate-400">绑定 Skill：</span>${(m.available_skills || []).length ? escapeHtml((m.available_skills || []).join('、')) : '无'}</div>
+                      <div><span class="text-slate-400">绑定 Skill：</span>${(m.available_skills || []).length ? escapeHtml((m.available_skills || []).map(s => (typeof s === 'object' && s !== null ? (s.name || '') : String(s))).filter(Boolean).join('、')) : '无'}</div>
                       <div><span class="text-slate-400">绑定 MCP：</span>${(m.available_mcp_tools || []).length ? escapeHtml((m.available_mcp_tools || []).join('、')) : '无'}</div>
                     </div>
                   </div>
@@ -4377,26 +4398,31 @@
                 <div class="flex justify-between mb-1"><span class="text-slate-500">类型</span><span class="text-xs px-2 py-0.5 rounded-full bg-indigo-50 text-indigo-600">路由</span></div>
                 <div class="flex justify-between mb-1"><span class="text-slate-500">状态</span><span>${agent.enabled ? '启用' : '禁用'}</span></div>
               </div>
-              <div>
-                <label class="block text-sm font-medium text-slate-700 mb-1">描述</label>
-                <p class="text-slate-600 whitespace-pre-line">${escapeHtml(agent.description || '-')}</p>
-              </div>
-              <div>
-                <label class="block text-sm font-medium text-slate-700 mb-1">System Prompt</label>
-                <div class="bg-slate-50 rounded-xl p-3 border border-slate-200 text-slate-700 whitespace-pre-line text-xs leading-relaxed">${escapeHtml(agent.system_prompt || '-')}</div>
-              </div>
-              <div>
-                <label class="block text-sm font-medium text-slate-700 mb-1">绑定 Skill</label>
-                <p class="text-slate-600">${(agent.available_skills || []).length ? escapeHtml((agent.available_skills || []).join('、')) : '无'}</p>
-              </div>
-              <div>
-                <label class="block text-sm font-medium text-slate-700 mb-1">绑定 MCP Server</label>
-                <p class="text-slate-600">${(agent.available_mcp_tools || []).length ? escapeHtml((agent.available_mcp_tools || []).join('、')) : '无'}</p>
-              </div>
+              ${formInput('名称', 'agent-name', agent ? agent.name : '', '路由 Agent 名称')}
+              ${formInput('描述', 'agent-description', agent ? agent.description : '', '简短描述路由 Agent 职责')}
+              ${formTextarea('System Prompt', 'agent-system-prompt', agent ? agent.system_prompt : '', '定义路由 Agent 的系统提示词；运行时会自动附加当前启用垂直 Agent 清单与 JSON 输出契约', 5)}
               ${routerMembersHtml}
             </div>
           `;
-          openModal(title, body, null, '关闭');
+          openModal(title, body, async () => {
+            const payload = {
+              name: $('#agent-name').value.trim(),
+              description: $('#agent-description').value.trim(),
+              system_prompt: $('#agent-system-prompt').value.trim(),
+            };
+            if (!payload.name || !payload.system_prompt) {
+              showToast('名称和 System Prompt 不能为空', 'error');
+              return;
+            }
+            try {
+              await apiPut(`/api/agents/${agent.id}`, payload);
+              showToast('路由策略已更新');
+              closeModal();
+              await loadAgents();
+            } catch (err) {
+              showToast('保存失败，请重试', 'error');
+            }
+          });
           return;
         }
 
@@ -4404,8 +4430,7 @@
           ${formInput('名称', 'agent-name', agent ? agent.name : '', '如：维修报修 Agent')}
           ${formInput('描述', 'agent-description', agent ? agent.description : '', '简短描述 Agent 职责')}
           ${formTextarea('System Prompt', 'agent-system-prompt', agent ? agent.system_prompt : '', '定义该 Agent 的系统提示词', 5)}
-          ${isEdit ? formSwitch('路由 Agent (is_router)', 'agent-is-router', agent ? agent.is_router : false) : ''}
-          ${formCheckboxGroup('可用 Skill', 'agent-skills', skills, agent ? agent.available_skills : [])}
+          ${formCheckboxGroup('可用 Skill', 'agent-skills', skills, agent ? selectedSkillNames : [])}
           ${formCheckboxGroup('可用 MCP Server（展开查看可调用工具）', 'agent-mcp-tools', mcpTools, agent ? agent.available_mcp_tools : [])}
         `;
         openModal(title, body, async () => {
@@ -4417,9 +4442,6 @@
             available_mcp_tools: Array.from(document.querySelectorAll('input[name="agent-mcp-tools"]:checked')).map(cb => cb.value),
             enabled: true
           };
-          if (isEdit) {
-            payload.is_router = $('#agent-is-router') ? $('#agent-is-router').checked : agent.is_router;
-          }
           if (!payload.name || !payload.system_prompt) {
             showToast('名称和 System Prompt 不能为空', 'error');
             return;

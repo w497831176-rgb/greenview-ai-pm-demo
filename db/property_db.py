@@ -64,6 +64,34 @@ def init_db():
         """
     )
 
+    # V1.4.3: per-session work order drafts pending explicit user confirmation.
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS work_order_drafts (
+            session_id TEXT PRIMARY KEY,
+            room_id TEXT NOT NULL,
+            issue_type TEXT,
+            issue_desc TEXT,
+            urgency TEXT,
+            contact_name TEXT,
+            contact_phone TEXT,
+            appointment_time TEXT,
+            created_at TEXT,
+            updated_at TEXT
+        )
+        """
+    )
+
+    # Migration bookkeeping: ensures one-time migrations are not re-run.
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS migration_meta (
+            key TEXT PRIMARY KEY,
+            applied_at TEXT
+        )
+        """
+    )
+
     cursor.execute(
         """
         CREATE TABLE IF NOT EXISTS knowledge_docs (
@@ -271,11 +299,17 @@ def init_db():
             route_intent TEXT,
             route_reason TEXT,
             current_agent TEXT,
+            current_agent_id TEXT,
             tool_calls TEXT,
             created_at TEXT
         )
         """
     )
+    # V1.4.3: add current_agent_id column to existing chat_messages.
+    try:
+        cursor.execute("ALTER TABLE chat_messages ADD COLUMN current_agent_id TEXT")
+    except sqlite3.OperationalError:
+        pass
 
     cursor.execute(
         """
@@ -446,16 +480,22 @@ def init_db():
         _seed_model_configs(cursor)
         conn.commit()
 
-    # Always repair existing catalog so runtime policy stays in sync.
-    _migrate_model_configs(cursor)
+    # V1.4.3: seed official model prices once if table is empty.
+    cursor.execute("SELECT COUNT(*) FROM model_prices")
+    if cursor.fetchone()[0] == 0:
+        _seed_model_prices(cursor)
+        conn.commit()
+
+    # V1.4.3: one-time model config migration only (no longer overwrites user edits).
+    _migrate_model_configs_v143(cursor)
     conn.commit()
 
-    # Clean up agents, bindings, and rebrand runtime demo data.
-    _migrate_runtime_contract(cursor)
+    # V1.4.3: one-time agent runtime contract migration only.
+    _migrate_runtime_contract_v143(cursor)
     conn.commit()
 
-    # Clean up demo/test MCP servers and ensure canonical demo servers/bindings.
-    _migrate_mcp_hygiene(cursor)
+    # V1.4.3: one-time MCP hygiene migration only.
+    _migrate_mcp_hygiene_v143(cursor)
     conn.commit()
 
     # V1.3 observability & cost governance schema.
@@ -1109,11 +1149,95 @@ def _seed_model_configs(cursor):
     )
 
 
-def _migrate_model_configs(cursor):
-    """Idempotently align SQLite model catalog with runtime policy.
+def _seed_model_prices(cursor):
+    """Seed official DeepSeek prices (CNY per 1M tokens) as of 2026-07-17."""
+    now = now_cn("%Y-%m-%d %H:%M")
+    prices = [
+        (
+            "deepseek-v4-flash",
+            "CNY",
+            "2026-07-17",
+            1.0,
+            0.02,
+            2.0,
+            0.0,
+            "DeepSeek 官方价格表（2026-07-17 校准）",
+            1,
+            now,
+            now,
+        ),
+        (
+            "deepseek-v4-pro",
+            "CNY",
+            "2026-07-17",
+            3.0,
+            0.025,
+            6.0,
+            0.0,
+            "DeepSeek 官方价格表（2026-07-17 校准）",
+            1,
+            now,
+            now,
+        ),
+    ]
+    cursor.executemany(
+        """
+        INSERT INTO model_prices
+        (model_id, currency, effective_date, input_price_per_1m, cached_input_price_per_1m,
+         output_price_per_1m, reasoning_price_per_1m, source_note, enabled, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        prices,
+    )
 
-    Flash is the single default; Pro is enabled but not default; both use
-    thinking. This runs after seeding so existing deployments are repaired.
+
+def _migrate_model_configs_v143(cursor):
+    """One-time migration for model catalog. Existing rows are left untouched."""
+    now = now_cn("%Y-%m-%d %H:%M")
+    if _migration_applied(cursor, "v143_model_configs"):
+        return
+    # Only INSERT missing rows; never UPDATE user-edited configurations.
+    defaults = [
+        ("deepseek-v4-flash", "DeepSeek V4 Flash", json.dumps({"use_thinking": True}), 1, 1, "常规文本 Router 与垂直 Agent 主力模型"),
+        ("deepseek-v4-pro", "DeepSeek V4 Pro", json.dumps({"use_thinking": True}), 0, 1, "后台 A/B 与 Darwin 深度复盘模型"),
+    ]
+    for model_id, name, params, is_default, enabled, description in defaults:
+        cursor.execute(
+            """
+            INSERT OR IGNORE INTO model_configs
+            (model_id, name, provider, api_key, base_url, model_params, is_default, enabled, description, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (model_id, name, "deepseek", None, "https://api.deepseek.com", params, is_default, enabled, description, now, now),
+        )
+    # If exactly one default exists, leave it; otherwise enforce Flash as the sole default only on first migration.
+    cursor.execute("SELECT COUNT(*) FROM model_configs WHERE is_default = 1")
+    if cursor.fetchone()[0] == 0:
+        cursor.execute(
+            "UPDATE model_configs SET is_default = 1 WHERE model_id = ?",
+            ("deepseek-v4-flash",),
+        )
+    _mark_migration_applied(cursor, "v143_model_configs", now)
+
+
+def _migration_applied(cursor, key: str) -> bool:
+    cursor.execute("SELECT 1 FROM migration_meta WHERE key = ?", (key,))
+    return cursor.fetchone() is not None
+
+
+def _mark_migration_applied(cursor, key: str, applied_at: Optional[str] = None):
+    if applied_at is None:
+        applied_at = now_cn("%Y-%m-%d %H:%M")
+    cursor.execute(
+        "INSERT OR REPLACE INTO migration_meta (key, applied_at) VALUES (?, ?)",
+        (key, applied_at),
+    )
+
+
+def _migrate_model_configs_legacy(cursor):
+    """DEPRECATED: one-time old behavior preserved only for external callers.
+
+    init_db now uses _migrate_model_configs_v143 which never overwrites user edits.
     """
     now = now_cn("%Y-%m-%d %H:%M")
     updates = [
@@ -1154,13 +1278,51 @@ def _migrate_model_configs(cursor):
     )
 
 
-def _migrate_runtime_contract(cursor):
-    """Idempotently clean up agents, bindings, and rebrand runtime demo data.
+def _migrate_runtime_contract_v143(cursor):
+    """One-time runtime contract migration for V1.4.3.
 
-    - Adds is_router column to agents.
-    - Deduplicates agents by canonical agent_id, migrates bindings, removes temp/test agents.
-    - Ensures exactly the five canonical demo agents exist.
-    - Replaces "绿景" / "绿景智服" with "YIAI物业" in user-facing text fields.
+    - Adds is_router column to agents if missing.
+    - Inserts missing canonical agents without overwriting existing rows.
+    - Does NOT update name/description/instructions/category/enabled of existing agents.
+    - Does NOT delete user-created agents or perform rebranding.
+    """
+    now = now_cn("%Y-%m-%d %H:%M")
+    if _migration_applied(cursor, "v143_runtime_contract"):
+        return
+
+    # Schema: add is_router column if missing.
+    cursor.execute("PRAGMA table_info(agents)")
+    columns = {row[1] for row in cursor.fetchall()}
+    if "is_router" not in columns:
+        cursor.execute("ALTER TABLE agents ADD COLUMN is_router INTEGER DEFAULT 0")
+        cursor.execute("UPDATE agents SET is_router = 1 WHERE category IN ('router', 'orchestration')")
+        cursor.execute("UPDATE agents SET is_router = 0 WHERE category NOT IN ('router', 'orchestration') OR category IS NULL")
+
+    # Insert missing canonical agents only; never UPDATE existing rows.
+    canonical = [
+        ("router", "router", "路由 Agent", "负责识别业主意图并路由到对应垂直 Agent。", "你是物业智能客服路由助手，负责判断业主消息属于维修、费用、投诉还是一般客服咨询，并简洁输出意图分类。"),
+        ("maintenance", "vertical", "维修 Agent", "处理报修、维修进度、上门预约。", "你是物业维修助手，负责记录业主报修内容、判断紧急程度、创建维修工单。"),
+        ("billing", "vertical", "费用 Agent", "处理物业费、停车费、缴费查询。", "你是物业费用助手，负责解释收费标准、查询账单、引导缴费流程。"),
+        ("complaint", "vertical", "投诉 Agent", "处理业主投诉、邻里纠纷、责任争议。", "你是物业投诉处理助手，负责安抚业主情绪、记录投诉要点、协调人工跟进。不要自行判定责任。"),
+        ("customer_service", "vertical", "客服 Agent", "处理一般咨询、小区规定、服务承诺。", "你是物业客服助手，负责解答小区服务、联系方式、一般规定等咨询。"),
+    ]
+    for agent_id, category, name, description, instructions in canonical:
+        cursor.execute(
+            """
+            INSERT OR IGNORE INTO agents
+            (agent_id, name, description, instructions, category, is_router, enabled, model_id, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (agent_id, name, description, instructions, category, 1 if category == "router" else 0, 1, None, now, now),
+        )
+
+    _mark_migration_applied(cursor, "v143_runtime_contract", now)
+
+
+def _migrate_runtime_contract(cursor):
+    """DEPRECATED: old runtime contract migration preserved for external callers.
+
+    init_db now uses _migrate_runtime_contract_v143 which never overwrites user edits.
     """
     now = now_cn("%Y-%m-%d %H:%M")
 
@@ -1306,12 +1468,58 @@ def _migrate_runtime_contract(cursor):
             pass
 
 
-def _migrate_mcp_hygiene(cursor):
-    """Clean up demo/test MCP servers and ensure canonical demo servers exist.
+def _migrate_mcp_hygiene_v143(cursor):
+    """One-time MCP hygiene migration for V1.4.3.
 
-    Demo rule: keep only real, discoverable MCP servers.  Test Server rows and
-    any server that fails discovery (currently time-server) are removed.
-    Canonical demo servers: weather-server, workorder-server, calendar-server.
+    - Ensures canonical demo MCP server rows exist via INSERT OR IGNORE.
+    - Does NOT update command/args/description/enabled of existing servers.
+    - Does NOT delete user-created MCP servers or bindings.
+    - Does NOT force agent-tool bindings on maintenance/customer_service.
+    """
+    import json
+
+    now = now_cn("%Y-%m-%d %H:%M")
+    if _migration_applied(cursor, "v143_mcp_hygiene"):
+        return
+
+    canonical_servers = [
+        {
+            "name": "weather-server",
+            "command": "python",
+            "args": ["/app/tools/weather_mcp_server.py"],
+            "description": "天气查询 MCP Server，提供实时天气与天气建议工具。",
+        },
+        {
+            "name": "workorder-server",
+            "command": "python",
+            "args": ["/app/tools/db_query_mcp_server.py"],
+            "description": "工单查询 MCP Server，提供维修工单数量与待办列表只读查询。",
+        },
+        {
+            "name": "calendar-server",
+            "command": "python",
+            "args": ["/app/tools/calendar_mcp_server.py"],
+            "description": "日历 MCP Server，提供当前日期与预约时间相关工具。",
+        },
+    ]
+
+    for server in canonical_servers:
+        cursor.execute(
+            """
+            INSERT OR IGNORE INTO mcp_servers (name, command, args, env, description, enabled, is_builtin, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, 1, 1, ?, ?)
+            """,
+            (server["name"], server["command"], json.dumps(server["args"]), "{}", server["description"], now, now),
+        )
+
+    cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_mcp_servers_name ON mcp_servers(name)")
+    _mark_migration_applied(cursor, "v143_mcp_hygiene", now)
+
+
+def _migrate_mcp_hygiene(cursor):
+    """DEPRECATED: old MCP hygiene migration preserved for external callers.
+
+    init_db now uses _migrate_mcp_hygiene_v143 which never overwrites user edits.
     """
     import json
 
@@ -1451,12 +1659,18 @@ def _migrate_v1_3_observability(cursor):
             user_message TEXT,
             intent TEXT,
             agent_name TEXT,
+            agent_id TEXT,
             status TEXT,
             created_at TEXT,
             updated_at TEXT
         )
         """
     )
+    # V1.4.3: add agent_id column to existing chat_traces.
+    try:
+        cursor.execute("ALTER TABLE chat_traces ADD COLUMN agent_id TEXT")
+    except sqlite3.OperationalError:
+        pass
 
     cursor.execute(
         """
@@ -1488,6 +1702,12 @@ def _migrate_v1_3_observability(cursor):
     # V1.4.2: add context_breakdown column to existing databases.
     try:
         cursor.execute("ALTER TABLE model_calls ADD COLUMN context_breakdown TEXT")
+    except sqlite3.OperationalError:
+        pass
+
+    # V1.4.3: add usage_normalized column to store uncached/cached/output split.
+    try:
+        cursor.execute("ALTER TABLE model_calls ADD COLUMN usage_normalized TEXT")
     except sqlite3.OperationalError:
         pass
 
@@ -1654,6 +1874,62 @@ def create_work_order(
     conn.commit()
     conn.close()
     return get_work_order(work_order_id)
+
+
+# ---------------------------------------------------------------------------
+# Work order drafts (V1.4.3): pending explicit user confirmation per session.
+# ---------------------------------------------------------------------------
+def save_work_order_draft(
+    session_id: str,
+    room_id: str,
+    issue_type: str,
+    issue_desc: str,
+    urgency: str,
+    contact_name: str,
+    contact_phone: str,
+    appointment_time: str,
+) -> Dict[str, Any]:
+    """Upsert a work-order draft for the session. Does not create a real work order."""
+    now = now_cn("%Y-%m-%d %H:%M")
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        INSERT INTO work_order_drafts
+        (session_id, room_id, issue_type, issue_desc, urgency, contact_name, contact_phone, appointment_time, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(session_id) DO UPDATE SET
+            room_id = excluded.room_id,
+            issue_type = excluded.issue_type,
+            issue_desc = excluded.issue_desc,
+            urgency = excluded.urgency,
+            contact_name = excluded.contact_name,
+            contact_phone = excluded.contact_phone,
+            appointment_time = excluded.appointment_time,
+            updated_at = excluded.updated_at
+        """,
+        (session_id, room_id, issue_type, issue_desc, urgency, contact_name, contact_phone, appointment_time, now, now),
+    )
+    conn.commit()
+    conn.close()
+    return get_work_order_draft(session_id)
+
+
+def get_work_order_draft(session_id: str) -> Optional[Dict[str, Any]]:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM work_order_drafts WHERE session_id = ?", (session_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def delete_work_order_draft(session_id: str) -> None:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM work_order_drafts WHERE session_id = ?", (session_id,))
+    conn.commit()
+    conn.close()
 
 
 def get_work_order(work_order_id: str) -> Optional[Dict[str, Any]]:
@@ -2691,6 +2967,7 @@ def save_chat_message(
     route_intent: Optional[str] = None,
     route_reason: Optional[str] = None,
     current_agent: Optional[str] = None,
+    current_agent_id: Optional[str] = None,
     tool_calls: Optional[List[Dict[str, Any]]] = None,
     model_id: Optional[str] = None,
     thinking_enabled: Optional[bool] = None,
@@ -2709,9 +2986,9 @@ def save_chat_message(
         """
         INSERT INTO chat_messages (
             session_id, role, content, token_count, token_detail, citations, activated_skills,
-            route_intent, route_reason, current_agent, tool_calls, model_id, thinking_enabled,
+            route_intent, route_reason, current_agent, current_agent_id, tool_calls, model_id, thinking_enabled,
             model_selection_reason, trace_id, status, latency_ms, error_summary, mcp_calls, usage_source, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             session_id,
@@ -2724,6 +3001,7 @@ def save_chat_message(
             route_intent,
             route_reason,
             current_agent,
+            current_agent_id,
             json.dumps(tool_calls) if tool_calls else None,
             model_id,
             1 if thinking_enabled else 0,
@@ -3015,6 +3293,7 @@ def update_chat_trace(
     trace_id: str,
     intent: Optional[str] = None,
     agent_name: Optional[str] = None,
+    agent_id: Optional[str] = None,
     status: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     now = now_cn()
@@ -3028,6 +3307,9 @@ def update_chat_trace(
     if agent_name is not None:
         fields.append("agent_name = ?")
         params.append(agent_name)
+    if agent_id is not None:
+        fields.append("agent_id = ?")
+        params.append(agent_id)
     if status is not None:
         fields.append("status = ?")
         params.append(status)
@@ -3094,6 +3376,7 @@ def record_model_call(
     price_snapshot: Optional[Dict[str, Any]] = None,
     estimated_cost_cny: Optional[float] = None,
     context_breakdown: Optional[Dict[str, Any]] = None,
+    usage_normalized: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     now = now_cn()
     conn = _get_conn()
@@ -3103,8 +3386,8 @@ def record_model_call(
         INSERT INTO model_calls (
             trace_id, stage, model_id, status, latency_ms, input_tokens, output_tokens,
             reasoning_tokens, cached_tokens, total_tokens, usage_source, model_selection_reason,
-            error_summary, price_snapshot, estimated_cost_cny, context_breakdown, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            error_summary, price_snapshot, estimated_cost_cny, context_breakdown, usage_normalized, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             trace_id,
@@ -3123,6 +3406,7 @@ def record_model_call(
             json.dumps(price_snapshot, ensure_ascii=False) if price_snapshot else None,
             estimated_cost_cny,
             json.dumps(context_breakdown, ensure_ascii=False) if context_breakdown else None,
+            json.dumps(usage_normalized, ensure_ascii=False) if usage_normalized else None,
             now,
         ),
     )
