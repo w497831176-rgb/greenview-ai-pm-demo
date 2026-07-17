@@ -5,27 +5,12 @@ Complaint Vertical Agent
 Handles owner complaints, disputes, and escalation.
 """
 
-from pathlib import Path
 from typing import Any, List, Optional
 
 from agno.agent import Agent
 
 from app.settings import MODEL, agent_db
 from tools.knowledge import KnowledgeTools
-
-try:
-    from agno.skills import LocalSkills, Skills
-
-    skill_loaders = []
-    local_skills_path = Path(__file__).parent / "property" / "skills"
-    enterprise_skills_path = Path("/app/enterprise/skills")
-    if local_skills_path.exists():
-        skill_loaders.append(LocalSkills(str(local_skills_path)))
-    if enterprise_skills_path.exists():
-        skill_loaders.append(LocalSkills(str(enterprise_skills_path)))
-    skills = Skills(loaders=skill_loaders) if skill_loaders else None
-except ImportError:
-    skills = None
 
 
 def _base_tools() -> List[Any]:
@@ -48,19 +33,25 @@ INSTRUCTIONS = [
 ]
 
 
-def create_complaint_agent(tools: Optional[List[Any]] = None, model: Optional[Any] = None) -> Agent:
+def create_complaint_agent(
+    tools: Optional[List[Any]] = None,
+    model: Optional[Any] = None,
+    instructions: Optional[List[str]] = None,
+    name: Optional[str] = None,
+    description: Optional[str] = None,
+) -> Agent:
     agent_tools = _base_tools()
     if tools:
         agent_tools.extend(tools)
     return Agent(
         id="complaint_agent",
-        name="投诉 Agent",
-        description="处理业主投诉、邻里纠纷、责任争议。",
+        name=name or "投诉 Agent",
+        description=description or "处理业主投诉、邻里纠纷、责任争议。",
         model=model or MODEL,
         db=agent_db,
         tools=agent_tools,
-        skills=skills,
-        instructions=INSTRUCTIONS,
+        skills=None,
+        instructions=(INSTRUCTIONS.copy() + (instructions or [])),
         add_datetime_to_context=True,
         add_history_to_context=True,
         read_chat_history=True,

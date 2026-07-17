@@ -46,7 +46,16 @@ def index_document(doc_id: int, force: bool = False) -> bool:
             return True
 
         embeddings = rag_embeddings.embed_texts(chunks)
-        rag_store.add_chunks(doc_id, chunks, embeddings)
+        # Ensure every chunk has a non-empty embedding; otherwise fall back to
+        # deterministic hashes so retrieval still works.
+        fallback = rag_embeddings._embed_fallback
+        fixed_embeddings = []
+        for idx, emb in enumerate(embeddings):
+            if emb and len(emb) == rag_embeddings.VECTOR_DIM:
+                fixed_embeddings.append(emb)
+            else:
+                fixed_embeddings.append(fallback(chunks[idx]))
+        rag_store.add_chunks(doc_id, chunks, fixed_embeddings)
         db.set_knowledge_doc_indexed(doc_id, "indexed", len(chunks))
         return True
     except Exception:

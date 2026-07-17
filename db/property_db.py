@@ -1477,6 +1477,7 @@ def _migrate_v1_3_observability(cursor):
             error_summary TEXT,
             price_snapshot TEXT,
             estimated_cost_cny REAL,
+            context_breakdown TEXT,
             created_at TEXT
         )
         """
@@ -1484,6 +1485,11 @@ def _migrate_v1_3_observability(cursor):
     cursor.execute(
         "CREATE INDEX IF NOT EXISTS idx_model_calls_trace_id ON model_calls(trace_id)"
     )
+    # V1.4.2: add context_breakdown column to existing databases.
+    try:
+        cursor.execute("ALTER TABLE model_calls ADD COLUMN context_breakdown TEXT")
+    except sqlite3.OperationalError:
+        pass
 
     cursor.execute(
         """
@@ -3087,6 +3093,7 @@ def record_model_call(
     error_summary: Optional[str] = None,
     price_snapshot: Optional[Dict[str, Any]] = None,
     estimated_cost_cny: Optional[float] = None,
+    context_breakdown: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     now = now_cn()
     conn = _get_conn()
@@ -3096,8 +3103,8 @@ def record_model_call(
         INSERT INTO model_calls (
             trace_id, stage, model_id, status, latency_ms, input_tokens, output_tokens,
             reasoning_tokens, cached_tokens, total_tokens, usage_source, model_selection_reason,
-            error_summary, price_snapshot, estimated_cost_cny, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            error_summary, price_snapshot, estimated_cost_cny, context_breakdown, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             trace_id,
@@ -3115,6 +3122,7 @@ def record_model_call(
             error_summary,
             json.dumps(price_snapshot, ensure_ascii=False) if price_snapshot else None,
             estimated_cost_cny,
+            json.dumps(context_breakdown, ensure_ascii=False) if context_breakdown else None,
             now,
         ),
     )
@@ -3133,11 +3141,12 @@ def get_model_call(call_id: int) -> Optional[Dict[str, Any]]:
     if not row:
         return None
     msg = dict(row)
-    if msg.get("price_snapshot"):
-        try:
-            msg["price_snapshot"] = json.loads(msg["price_snapshot"])
-        except Exception:
-            pass
+    for json_col in ("price_snapshot", "context_breakdown"):
+        if msg.get(json_col):
+            try:
+                msg[json_col] = json.loads(msg[json_col])
+            except Exception:
+                pass
     return msg
 
 
@@ -3153,11 +3162,12 @@ def get_model_calls_for_trace(trace_id: str) -> List[Dict[str, Any]]:
     calls = []
     for r in rows:
         msg = dict(r)
-        if msg.get("price_snapshot"):
-            try:
-                msg["price_snapshot"] = json.loads(msg["price_snapshot"])
-            except Exception:
-                pass
+        for json_col in ("price_snapshot", "context_breakdown"):
+            if msg.get(json_col):
+                try:
+                    msg[json_col] = json.loads(msg[json_col])
+                except Exception:
+                    pass
         calls.append(msg)
     return calls
 
