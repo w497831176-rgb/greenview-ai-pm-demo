@@ -1182,6 +1182,76 @@ async def _stream_agent_response(
         # backend can enforce draft + explicit confirmation gating.
         set_work_order_context(session_id, message)
 
+        # V1.4.3: work-order creation/confirmation is handled deterministically
+        # by the backend gate. This avoids relying on the LLM to call a tool
+        # with tool_choice="required", which DeepSeek rejects in thinking mode.
+        if needs_maintenance:
+            from tools.work_order import WorkOrderTools
+            wo_tool = WorkOrderTools()
+            tool_result = wo_tool.create_work_order(issue_desc=message)
+            full_content = str(tool_result)
+            token_count = 0
+            token_detail = {
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "reasoning_tokens": 0,
+                "cached_tokens": 0,
+                "total_tokens": 0,
+            }
+            usage_source = "tool_direct"
+            tool_calls_for_done: List[Dict[str, Any]] = []
+            mcp_calls_for_done: List[Dict[str, Any]] = []
+            citations_for_done: List[Dict[str, Any]] = []
+            activated_skills_for_done: List[Dict[str, Any]] = []
+            vertical_latency_ms = int((time.time() - vertical_start) * 1000)
+            yield f"event: delta\ndata: {_safe_json_dumps({'content': full_content, 'current_agent': current_agent, 'current_agent_id': current_agent_id})}\n\n"
+            saved = save_chat_message(
+                session_id=session_id,
+                role="assistant",
+                content=full_content,
+                token_count=token_count,
+                token_detail=token_detail,
+                citations=citations_for_done,
+                activated_skills=activated_skills_for_done,
+                route_intent=intent,
+                route_reason=intent_result.get("reason", ""),
+                current_agent=current_agent,
+                current_agent_id=current_agent_id,
+                tool_calls=None,
+                model_id=runtime_model_id if 'runtime_model_id' in locals() else MODEL_ID,
+                thinking_enabled=USE_THINKING,
+                model_selection_reason="work_order_direct_gate",
+                trace_id=trace_id,
+                status="success",
+                latency_ms=vertical_latency_ms,
+                error_summary=None,
+                mcp_calls=None,
+                usage_source=usage_source,
+            )
+            done_payload = {
+                "status": "complete",
+                "token_count": token_count,
+                "token_detail": token_detail,
+                "message_id": saved.get("id") if saved else None,
+                "handoff": False,
+                "citations": citations_for_done,
+                "activated_skills": activated_skills_for_done,
+                "current_agent": current_agent,
+                "current_agent_id": current_agent_id,
+                "route_intent": intent,
+                "route_reason": intent_result.get("reason", ""),
+                "tool_calls": tool_calls_for_done,
+                "mcp_calls": mcp_calls_for_done,
+                "auto_badcase_id": None,
+                "model_id": runtime_model_id if 'runtime_model_id' in locals() else MODEL_ID,
+                "thinking_enabled": USE_THINKING,
+                "model_selection_reason": "work_order_direct_gate",
+                "trace_id": trace_id,
+                "usage_source": usage_source,
+            }
+            yield f"event: done\ndata: {_safe_json_dumps(done_payload)}\n\n"
+            return
+
         mcp_tools = _build_mcp_tools(agent_id=current_agent_id, trace_id=trace_id, message=message)
         for tool in mcp_tools:
             if hasattr(tool, "connect"):
