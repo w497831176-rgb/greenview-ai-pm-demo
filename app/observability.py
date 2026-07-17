@@ -385,6 +385,21 @@ async def overview(
 # -----------------------------------------------------------------------------
 
 
+def _normalize_end(end: Optional[str]) -> Optional[str]:
+    """Expand a bare YYYY-MM-DD end date to the last second of that day."""
+    if not end:
+        return end
+    # If already has time component, leave as-is.
+    if len(end) > 10 or " " in end or "T" in end:
+        return end
+    try:
+        from datetime import datetime
+        datetime.strptime(end, "%Y-%m-%d")
+        return f"{end} 23:59:59"
+    except ValueError:
+        return end
+
+
 @router.get("/traces")
 async def traces(
     session_id: Optional[str] = Query(None),
@@ -398,54 +413,157 @@ async def traces(
     limit: int = Query(100, ge=1, le=500),
     offset: int = Query(0, ge=0),
 ):
-    """List chat traces with optional filters."""
+    """List chat traces aggregated with their model calls.
+
+    Each returned trace includes:
+    - models: list of models actually invoked for this trace
+    - total_tokens: sum of model_calls.total_tokens
+    - estimated_cost_cny: sum of estimated_cost_cny (null if any call lacks a price)
+    - price_missing: true when at least one model call had no configured price
+    - no_model_calls: true when the trace has no model call records
+    """
+    effective_end = _normalize_end(end)
+
+    # Build model-call aggregation with its own filters.
+    m_conditions = ["1=1"]
+    m_params: List[Any] = []
+    if model_id:
+        m_conditions.append("model_id = ?")
+        m_params.append(model_id)
+    if stage:
+        m_conditions.append("stage = ?")
+        m_params.append(stage)
+    if start:
+        m_conditions.append("created_at >= ?")
+        m_params.append(start)
+    if effective_end:
+        m_conditions.append("created_at <= ?")
+        m_params.append(effective_end)
+    m_where = " AND ".join(m_conditions)
+
+    # Build chat-trace filters.
+    t_conditions = ["1=1"]
+    t_params: List[Any] = []
+    if trace_id:
+        t_conditions.append("trace_id = ?")
+        t_params.append(trace_id)
+    if session_id:
+        t_conditions.append("session_id = ?")
+        t_params.append(session_id)
+    if intent:
+        t_conditions.append("intent = ?")
+        t_params.append(intent)
+    if agent:
+        t_conditions.append("agent_name = ?")
+        t_params.append(agent)
+    if start:
+        t_conditions.append("created_at >= ?")
+        t_params.append(start)
+    if effective_end:
+        t_conditions.append("created_at <= ?")
+        t_params.append(effective_end)
+    t_where = " AND ".join(t_conditions)
+
     conn = _get_conn()
     cursor = conn.cursor()
-    conditions = ["1=1"]
-    params = []
-    if trace_id:
-        conditions.append("trace_id = ?")
-        params.append(trace_id)
-    if session_id:
-        conditions.append("session_id = ?")
-        params.append(session_id)
-    if intent:
-        conditions.append("intent = ?")
-        params.append(intent)
-    if agent:
-        conditions.append("agent_name = ?")
-        params.append(agent)
-    if start:
-        conditions.append("created_at >= ?")
-        params.append(start)
-    if end:
-        conditions.append("created_at <= ?")
-        params.append(end)
 
-    where = " AND ".join(conditions)
+    # Aggregate model calls per trace.
     cursor.execute(
         f"""
-        SELECT * FROM chat_traces WHERE {where}
-        UNION
         SELECT
-            m.trace_id,
-            NULL as session_id,
-            NULL as user_message,
-            NULL as intent,
-            NULL as agent_name,
-            MAX(m.status) as status,
-            MAX(m.created_at) as created_at,
-            MAX(m.created_at) as updated_at
-        FROM model_calls m
-        WHERE m.trace_id NOT IN (SELECT trace_id FROM chat_traces)
-        GROUP BY m.trace_id
-        ORDER BY created_at DESC LIMIT ? OFFSET ?
+            trace_id,
+            GROUP_CONCAT(DISTINCT model_id) as model_ids,
+            COALESCE(SUM(total_tokens), 0) as total_tokens,
+            SUM(estimated_cost_cny) as estimated_cost_cny,
+            SUM(CASE WHEN estimated_cost_cny IS NULL THEN 1 ELSE 0 END) as unknown_cost_calls,
+            COUNT(*) as call_count
+        FROM model_calls
+        WHERE {m_where}
+        GROUP BY trace_id
         """,
-        params + [limit, offset],
+        m_params,
     )
-    rows = cursor.fetchall()
+    agg_rows = {r["trace_id"]: dict(r) for r in cursor.fetchall()}
+
+    # Main query: chat traces joined with aggregated model-call metrics.
+    cursor.execute(
+        f"""
+        SELECT
+            t.trace_id,
+            t.session_id,
+            t.user_message,
+            t.intent,
+            t.agent_name,
+            t.status,
+            t.created_at,
+            t.updated_at
+        FROM chat_traces t
+        WHERE {t_where}
+        ORDER BY t.created_at DESC
+        LIMIT ? OFFSET ?
+        """,
+        t_params + [limit, offset],
+    )
+    trace_rows = cursor.fetchall()
+
+    # Also include traces that only exist in model_calls when no chat-trace
+    # filters other than start/end/model/stage are requested.
+    if not any([trace_id, session_id, intent, agent]):
+        cursor.execute(
+            f"""
+            SELECT
+                m.trace_id,
+                NULL as session_id,
+                NULL as user_message,
+                NULL as intent,
+                NULL as agent_name,
+                MAX(m.status) as status,
+                MAX(m.created_at) as created_at,
+                MAX(m.created_at) as updated_at
+            FROM model_calls m
+            WHERE {m_where}
+              AND m.trace_id NOT IN (SELECT trace_id FROM chat_traces)
+            GROUP BY m.trace_id
+            ORDER BY created_at DESC
+            LIMIT ? OFFSET ?
+            """,
+            m_params + [limit, offset],
+        )
+        trace_rows.extend(cursor.fetchall())
+
     conn.close()
-    return {"traces": [dict(r) for r in rows]}
+
+    results = []
+    for row in trace_rows:
+        trace = dict(row)
+        agg = agg_rows.get(trace["trace_id"], {})
+        model_ids_str = agg.get("model_ids") or ""
+        model_ids = [m for m in model_ids_str.split(",") if m]
+        call_count = agg.get("call_count") or 0
+        total_tokens = agg.get("total_tokens") or 0
+        estimated_cost_cny = agg.get("estimated_cost_cny")
+        unknown_cost_calls = agg.get("unknown_cost_calls") or 0
+        price_missing = unknown_cost_calls > 0 or (call_count == 0)
+
+        # Build a concise model summary.
+        if not model_ids:
+            model_summary = "尚无模型调用记录"
+        elif len(model_ids) == 1:
+            display = _model_display_name(model_ids[0])
+            model_summary = display
+        else:
+            display = _model_display_name(model_ids[0])
+            model_summary = f"{display}（router + vertical）"
+
+        trace["models"] = model_ids
+        trace["model_summary"] = model_summary
+        trace["total_tokens"] = total_tokens if call_count else None
+        trace["estimated_cost_cny"] = estimated_cost_cny
+        trace["price_missing"] = price_missing
+        trace["no_model_calls"] = call_count == 0
+        results.append(trace)
+
+    return {"traces": results, "start": start, "end": effective_end}
 
 
 def _build_cost_formula(call: Dict[str, Any]) -> str:
@@ -532,22 +650,22 @@ async def trace_detail(trace_id: str):
 
     model_calls = [_enrich_model_call(c, session_id) for c in raw_calls]
 
-    # Summarize context composition from the assistant message for this trace.
-    assistant_msg = next((m for m in trace_messages if m.get("role") == "assistant"), None)
+    # Summarize context composition from the vertical model call if available.
+    # Router calls have no usage and no context_breakdown.
     context_breakdown = {}
-    if assistant_msg:
-        token_detail = assistant_msg.get("token_detail") or {}
+    vertical_call = next((c for c in model_calls if c.get("stage") == "vertical_agent"), None)
+    if vertical_call and vertical_call.get("context_breakdown"):
+        context_breakdown = vertical_call["context_breakdown"]
+    elif vertical_call:
         context_breakdown = {
-            "system_prompt_tokens": 0,
-            "history_tokens": 0,
-            "skill_tokens": 0,
-            "rag_tokens": 0,
-            "tool_result_tokens": 0,
-            "user_message_tokens": 0,
-            "note": "本地估算构成，非 Provider 原始账单",
+            "system_prompt_tokens": None,
+            "history_tokens": None,
+            "skill_tokens": None,
+            "rag_tokens": None,
+            "tool_result_tokens": None,
+            "user_message_tokens": None,
+            "note": "本地上下文估算，不等于 Provider 原始账单",
         }
-        # We do not have exact per-category token counts; the UI will show the
-        # estimate with an honest note.
 
     return {
         "trace": trace,

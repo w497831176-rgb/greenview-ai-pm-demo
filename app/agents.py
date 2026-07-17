@@ -102,7 +102,33 @@ def _serialize_agent(agent: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]
     agent["available_mcp_tools"] = [
         t.get("tool_name") for t in agent["tools"] if t.get("tool_name")
     ]
+    if agent.get("is_router"):
+        agent["members"] = _get_router_members()
     return agent
+
+
+def _get_router_members() -> List[Dict[str, Any]]:
+    """Return enabled vertical agents as router routing candidates."""
+    members = []
+    for a in db_list_agents(category="vertical"):
+        if not a.get("enabled"):
+            continue
+        aid = a.get("agent_id")
+        skills = [db_get_skill(int(s)).get("name") or str(s) for s in get_agent_skills(aid)]
+        tools = [t.get("tool_name") for t in get_agent_tools(aid) if t.get("tool_name")]
+        members.append({
+            "agent_id": aid,
+            "name": a.get("name"),
+            "description": a.get("description") or "",
+            "enabled": a.get("enabled"),
+            "skills": skills,
+            "mcp_tools": tools,
+        })
+    return members
+
+
+def _is_router(agent: Dict[str, Any]) -> bool:
+    return agent.get("category") in ("router", "orchestration")
 
 
 @router.get("")
@@ -121,16 +147,17 @@ async def get_agent(agent_id: str):
 
 @router.post("")
 async def create_agent(request: AgentCreate):
-    """Create a new agent."""
+    """Create a new agent. Only vertical agents can be created."""
     agent_id = (request.agent_id or request.name).strip()
     if get_agent_by_agent_id(agent_id):
         raise HTTPException(status_code=409, detail="agent_id already exists")
 
+    # Router is singleton and seeded; users cannot create a second router.
+    if request.is_router or (request.category in ("router", "orchestration")):
+        raise HTTPException(status_code=400, detail="router agent cannot be created")
+
     instructions = request.system_prompt if request.system_prompt is not None else request.instructions
-    category = request.category
-    if request.is_router is not None:
-        category = "router" if request.is_router else "vertical"
-    category = "router" if category in ("router", "orchestration") else "vertical"
+    category = "vertical"
     agent = db_create_agent(
         agent_id=agent_id,
         name=request.name,
@@ -163,6 +190,8 @@ async def update_agent(agent_id: str, request: AgentUpdate):
     empty array explicitly clears them.
     """
     agent = _resolve_agent(agent_id)
+    if _is_router(agent):
+        raise HTTPException(status_code=400, detail="router agent cannot be updated")
 
     # Pydantic V2 / V1 compatible way to know which fields were sent.
     fields_set = getattr(request, "model_fields_set", getattr(request, "__fields_set__", set()))
@@ -181,14 +210,8 @@ async def update_agent(agent_id: str, request: AgentUpdate):
     else:
         instructions = agent.get("instructions")
 
-    # 3. Category / is_router alias: is_router wins if sent.
-    if "is_router" in fields_set:
-        category = "router" if request.is_router else "vertical"
-    elif "category" in fields_set:
-        category = "router" if request.category in ("router", "orchestration") else "vertical"
-    else:
-        category = agent.get("category")
-        category = "router" if category in ("router", "orchestration") else "vertical"
+    # 3. Category: vertical agents must stay vertical.
+    category = "vertical"
 
     updated = db_update_agent(
         agent_row_id=agent["id"],
@@ -226,6 +249,8 @@ async def update_agent(agent_id: str, request: AgentUpdate):
 async def delete_agent(agent_id: str):
     """Delete an agent."""
     agent = _resolve_agent(agent_id)
+    if _is_router(agent):
+        raise HTTPException(status_code=400, detail="router agent cannot be deleted")
     deleted = db_delete_agent(agent["id"])
     return {"ok": deleted}
 
@@ -234,6 +259,8 @@ async def delete_agent(agent_id: str):
 async def toggle_agent(agent_id: str, request: AgentToggleRequest):
     """Enable or disable an agent."""
     agent = _resolve_agent(agent_id)
+    if _is_router(agent):
+        raise HTTPException(status_code=400, detail="router agent cannot be disabled")
     updated = db_update_agent(agent["id"], enabled=request.enabled)
     return {"agent": _serialize_agent(updated)}
 

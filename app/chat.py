@@ -31,7 +31,6 @@ from agents.billing import create_billing_agent
 from agents.complaint import create_complaint_agent
 from agents.customer_service import create_customer_service_agent
 from agents.maintenance import create_maintenance_agent
-from agents.property import create_property_agent
 from agents.router import classify_intent
 from db.property_db import (
     activate_handoff,
@@ -40,6 +39,9 @@ from db.property_db import (
     create_chat_session,
     create_chat_trace,
     ensure_chat_session,
+    get_agent_by_agent_id,
+    get_agent_skills,
+    get_agent_tools,
     get_budget_thresholds,
     get_chat_message,
     get_chat_session,
@@ -48,6 +50,7 @@ from db.property_db import (
     get_previous_user_message,
     is_handoff_active,
     is_handoff_requested,
+    list_agents,
     list_chat_messages,
     list_handoff_sessions,
     list_mcp_servers,
@@ -237,13 +240,65 @@ except Exception:
     _tiktoken_encoding = None
 
 
-def _estimate_tokens(text: str) -> int:
+def _estimate_tokens(text: str) -> Optional[int]:
+    """Estimate token count for a text string.
+
+    Returns None when tiktoken is unavailable so the UI can show "不可得"
+    instead of 0.
+    """
     if _tiktoken_encoding is None:
-        return 0
+        return None
     try:
-        return len(_tiktoken_encoding.encode(text))
+        return len(_tiktoken_encoding.encode(text or ""))
     except Exception:
-        return 0
+        return None
+
+
+def _estimate_context_breakdown(
+    system_prompt: Optional[List[str]] = None,
+    history_messages: Optional[List[Dict[str, Any]]] = None,
+    skill_context: str = "",
+    rag_context: str = "",
+    tool_results: Optional[List[str]] = None,
+    user_message: str = "",
+    system_context_prefix: str = "",
+) -> Dict[str, Any]:
+    """Build an honest local estimate of the prompt context composition.
+
+    Any component that cannot be estimated is returned as null, which the
+    frontend renders as "不可得". The total is not forced to match provider
+    usage; a note makes this explicit.
+    """
+    breakdown: Dict[str, Any] = {
+        "system_prompt_tokens": None,
+        "history_tokens": None,
+        "skill_tokens": None,
+        "rag_tokens": None,
+        "tool_result_tokens": None,
+        "user_message_tokens": None,
+        "note": "本地上下文估算，不等于 Provider 原始账单",
+    }
+
+    if system_prompt:
+        breakdown["system_prompt_tokens"] = _estimate_tokens("\n".join(str(p) for p in system_prompt))
+
+    if history_messages:
+        history_text = "\n".join(
+            f"{m.get('role', 'user')}: {m.get('content', '')}" for m in history_messages
+        )
+        breakdown["history_tokens"] = _estimate_tokens(history_text)
+
+    breakdown["skill_tokens"] = _estimate_tokens(skill_context)
+    breakdown["rag_tokens"] = _estimate_tokens(rag_context)
+
+    if tool_results:
+        breakdown["tool_result_tokens"] = _estimate_tokens("\n".join(tool_results))
+
+    # User-facing message includes the explicit system context prefix we prepend
+    # to the question so the model knows the current owner / room defaults.
+    breakdown["user_message_tokens"] = _estimate_tokens(f"{system_context_prefix}\n{user_message}".strip())
+
+    return breakdown
 
 
 def _is_pro_model(model_id: Optional[str]) -> bool:
@@ -478,41 +533,62 @@ def _build_rag_context(message: str, top_k: Optional[int] = None, threshold: Opt
         return "", []
 
 
+def _mcp_server_relevant(server_name: str, message: str) -> bool:
+    """Return True only when the user message explicitly needs live external data.
+
+    Knowledge-base questions must not trigger MCP tools. Each server is gated
+    by narrow intent keywords so that, for example, a repair request does not
+    accidentally call a work-order query tool.
+    """
+    lowered = message.lower()
+    relevance = {
+        "weather-server": ["天气", "气温", "下雨", "晴天", "阴天", "多云", "下雪", "刮风", "温度"],
+        # Work-order server is for querying existing work orders / progress, not
+        # for creating a new repair request (which is handled by the vertical
+        # agent's own instructions and knowledge base).
+        "workorder-server": ["工单进度", "查询工单", "我的工单", "工单状态", "查看工单"],
+        # Calendar server is for explicit date/time/appointment questions.
+        "calendar-server": ["今天日期", "现在几点", "当前时间", "今天星期", "今天周几", "预约", "几点了", "什么日期", "现在时间"],
+    }
+    for key, keywords in relevance.items():
+        if server_name == key or key in server_name:
+            return any(k in lowered for k in keywords)
+    # Unknown servers: attach only if explicitly mentioned by name.
+    return server_name.lower() in lowered
+
+
 def _build_mcp_tools(
     agent_id: Optional[str] = None,
     trace_id: Optional[str] = None,
+    message: str = "",
 ) -> List[Any]:
-    """Load MCP servers bound to the current agent and return MCPTools instances."""
+    """Load MCP servers bound to the current agent, filtered by user message."""
     tools = []
     try:
-        is_router = agent_id == "router"
-        if is_router:
-            candidate_servers = [s for s in list_mcp_servers() if s.get("enabled")]
-        else:
-            from db.property_db import get_agent_tools, list_mcp_servers
+        if agent_id == "router":
+            return tools
+        from db.property_db import get_agent_tools, list_mcp_servers
 
-            bound_tools = get_agent_tools(agent_id) if agent_id else []
-            bound_names = {t.get("tool_name") for t in bound_tools if t.get("tool_name")}
-            all_servers = {s.get("name"): s for s in list_mcp_servers() if s.get("enabled")}
-            candidate_servers = [all_servers[name] for name in bound_names if name in all_servers]
+        bound_tools = get_agent_tools(agent_id) if agent_id else []
+        bound_names = {t.get("tool_name") for t in bound_tools if t.get("tool_name")}
+        all_servers = {s.get("name"): s for s in list_mcp_servers() if s.get("enabled")}
+        candidate_servers = [all_servers[name] for name in bound_names if name in all_servers]
         if not candidate_servers:
             return tools
         if ObservableMCPTools is None:
             return tools
 
         for server in candidate_servers:
+            name = server.get("name", "mcp-server")
+            if not _mcp_server_relevant(name, message):
+                continue
             command = server.get("command")
             args = server.get("args") or []
             env = server.get("env") or {}
-            name = server.get("name", "mcp-server")
             if not command:
                 continue
-            # Merge current process env so PATH and other vars are available.
             merged_env = {**dict(os.environ), **env}
             try:
-                # Agno MCPTools stdio transport expects the full command as a single
-                # string (it uses shlex.split internally); passing args separately is
-                # not supported by the Toolkit constructor.
                 import shlex
 
                 full_command = command
@@ -529,7 +605,6 @@ def _build_mcp_tools(
                 tool.server_name = name
                 tools.append(tool)
             except Exception:
-                # If a single MCP server fails to initialize, log and continue.
                 import traceback
                 traceback.print_exc()
                 continue
@@ -539,18 +614,19 @@ def _build_mcp_tools(
     return tools
 
 
-def _format_mcp_context(agent_id: Optional[str] = None) -> str:
-    """Format MCP servers bound to the current agent for the agent prompt."""
+def _format_mcp_context(agent_id: Optional[str] = None, message: str = "") -> str:
+    """Format MCP servers bound to the current agent, filtered by user message."""
     try:
-        is_router = agent_id == "router"
-        if is_router:
-            servers = [s for s in list_mcp_servers() if s.get("enabled")]
-        else:
-            from db.property_db import get_agent_tools, list_mcp_servers
+        if agent_id == "router":
+            return ""
+        from db.property_db import get_agent_tools, list_mcp_servers
 
-            bound_tools = get_agent_tools(agent_id) if agent_id else []
-            bound_names = {t.get("tool_name") for t in bound_tools if t.get("tool_name")}
-            servers = [s for s in list_mcp_servers() if s.get("enabled") and s.get("name") in bound_names]
+        bound_tools = get_agent_tools(agent_id) if agent_id else []
+        bound_names = {t.get("tool_name") for t in bound_tools if t.get("tool_name")}
+        servers = [
+            s for s in list_mcp_servers()
+            if s.get("enabled") and s.get("name") in bound_names and _mcp_server_relevant(s.get("name", ""), message)
+        ]
         if not servers:
             return ""
         parts = []
@@ -580,29 +656,83 @@ def _detect_handoff_intent(message: str) -> Optional[str]:
     return None
 
 
-def _select_agent(intent: str, tools: Optional[List[Any]] = None):
-    """Return the vertical agent factory and display name for a classified intent."""
-    agents = {
-        "billing": (create_billing_agent, "费用 Agent"),
-        "complaint": (create_complaint_agent, "投诉 Agent"),
-        "customer_service": (create_customer_service_agent, "客服 Agent"),
-        "maintenance": (create_maintenance_agent, "维修 Agent"),
-    }
-    if intent in agents:
-        return agents[intent]
-    # Default to the original property agent for backward compatibility.
-    return create_property_agent, "物业 Agent"
+def _get_vertical_agents() -> List[Dict[str, Any]]:
+    """Load enabled vertical agents from the database (cached per call)."""
+    try:
+        return [dict(a) for a in list_agents(category="vertical")]
+    except Exception:
+        return []
+
+
+def _select_agent(agent_id: str, tools: Optional[List[Any]] = None):
+    """Create the vertical agent for a target_agent_id using DB configuration."""
+    agent = _create_vertical_agent_for_id(agent_id, tools=tools)
+    return agent, agent.name or agent_id
 
 
 def _agent_id_for_intent(intent: str) -> str:
     """Return the canonical agent_id used for Skill/MCP binding lookups."""
-    return {
-        "maintenance": "maintenance",
-        "billing": "billing",
-        "complaint": "complaint",
-        "customer_service": "customer_service",
-        "other": "customer_service",
-    }.get(intent, "customer_service")
+    # Intent is already an agent_id when using the dynamic router.
+    return intent if intent else "customer_service"
+
+
+def _create_vertical_agent_for_id(agent_id: str, tools: Optional[List[Any]] = None):
+    """Create a vertical Agent instance from DB configuration, falling back to code defaults."""
+    db_agent = get_agent_by_agent_id(agent_id)
+    instructions = None
+    name = None
+    description = None
+    if db_agent:
+        raw_instructions = db_agent.get("instructions") or ""
+        if raw_instructions.strip():
+            # Allow either newline-separated or list JSON.
+            try:
+                parsed = json.loads(raw_instructions)
+                if isinstance(parsed, list):
+                    instructions = [str(x) for x in parsed]
+            except Exception:
+                instructions = [line.strip() for line in raw_instructions.split("\n") if line.strip()]
+        name = db_agent.get("name")
+        description = db_agent.get("description")
+
+    # Map canonical agent IDs to their factory functions so we keep base tools.
+    factories = {
+        "maintenance": create_maintenance_agent,
+        "billing": create_billing_agent,
+        "complaint": create_complaint_agent,
+        "customer_service": create_customer_service_agent,
+    }
+    factory = factories.get(agent_id)
+    if factory:
+        return factory(tools=tools, instructions=instructions, name=name, description=description)
+
+    # For dynamically created vertical agents without a dedicated factory, build a generic Agent.
+    from agno.agent import Agent
+    from app.settings import MODEL, agent_db
+    from tools.knowledge import KnowledgeTools
+
+    base_tools = []
+    try:
+        base_tools.append(KnowledgeTools())
+    except Exception:
+        pass
+    if tools:
+        base_tools.extend(tools)
+    return Agent(
+        id=f"{agent_id}_agent",
+        name=name or agent_id,
+        description=description or "",
+        model=MODEL,
+        db=agent_db,
+        tools=base_tools,
+        skills=None,
+        instructions=instructions or ["你是YIAI物业的专属 Agent，请基于知识库与绑定工具回答业主问题。"],
+        add_datetime_to_context=True,
+        add_history_to_context=True,
+        read_chat_history=True,
+        num_history_runs=5,
+        markdown=True,
+    )
 
 
 def _extract_tool_calls(chunk: Any) -> List[Dict[str, Any]]:
@@ -747,39 +877,43 @@ async def _stream_agent_response(
             done_yielded = True
             return
 
+        # Load enabled vertical agents from the database for dynamic routing.
+        vertical_agents = _get_vertical_agents()
+
         # Classify intent and dispatch to the appropriate vertical agent.
         router_start = time.time()
-        intent_result = await classify_intent(message, user_id=user_id, session_id=session_id)
+        intent_result = await classify_intent(
+            message, vertical_agents=vertical_agents, user_id=user_id, session_id=session_id
+        )
         router_latency_ms = int((time.time() - router_start) * 1000)
-        intent = intent_result.get("intent", "other")
+        target_agent_id = intent_result.get("target_agent_id") or intent_result.get("intent") or "customer_service"
+        intent = target_agent_id
 
         # Weather queries (even for unsupported cities) must be dispatched to the
         # maintenance agent, which owns the weather MCP tools.
-        if intent in {"other", "customer_service"} and any(k in message for k in ("天气", "气温", "下雨")):
+        if target_agent_id in {"other", "customer_service"} and any(k in message for k in ("天气", "气温", "下雨")):
+            target_agent_id = "maintenance"
             intent = "maintenance"
-            intent_result["intent"] = intent
+            intent_result["target_agent_id"] = target_agent_id
             intent_result["reason"] = "天气查询属于维修/工单场景（含工具支持）"
 
-        create_agent_fn, agent_name = _select_agent(intent)
+        create_agent_fn, agent_name = _select_agent(target_agent_id)
         current_agent = agent_name
-        current_agent_id = _agent_id_for_intent(intent)
+        current_agent_id = _agent_id_for_intent(target_agent_id)
 
-        # Record the router model call (metrics are not returned by the non-streaming router).
+        # Record the router model call. Provider usage is unavailable for the router;
+        # cost/price_snapshot must be null (not ¥0) to reflect that.
         try:
-            router_cost, router_price = _calculate_cost(
-                MODEL_ID,
-                {"input_tokens": 0, "output_tokens": 0, "reasoning_tokens": 0, "cached_tokens": 0},
-            )
             record_model_call(
                 trace_id=trace_id,
                 stage="router",
                 model_id=MODEL_ID,
-                model_selection_reason="owner-facing default",
+                model_selection_reason=f"router selected {current_agent_id}",
                 latency_ms=router_latency_ms,
                 usage_source="unavailable",
                 status="success",
-                estimated_cost_cny=router_cost,
-                price_snapshot=router_price,
+                estimated_cost_cny=None,
+                price_snapshot=None,
             )
         except Exception:
             pass
@@ -845,16 +979,14 @@ async def _stream_agent_response(
             if not citations
             else ""
         )
-        contextual_message = (
+        system_context_prefix = (
             f"[系统上下文：当前业主是 {DEFAULT_ROOM_ID} 的{DEFAULT_OWNER_NAME}，"
             f"如果用户没有提供房号，创建工单时默认使用 {DEFAULT_ROOM_ID}。"
             f"当用户明确要求人工、表达强烈不满、或问题超出物业维修/收费/知识库范围时，"
             f"你必须主动提出转人工处理，不要强行回答。]"
             f"{knowledge_gap_note}"
-            f"{rag_context}"
-            f"{skill_context}"
-            f"{mcp_context}\n{message}"
         )
+        contextual_message = f"{system_context_prefix}{rag_context}{skill_context}{mcp_context}\n{message}"
 
         full_content = ""
         token_count = 0
@@ -987,12 +1119,12 @@ async def _stream_agent_response(
         if token_detail["total_tokens"]:
             token_count = token_detail["total_tokens"]
         elif token_detail["input_tokens"] or token_detail["output_tokens"]:
-            token_count = token_detail["input_tokens"] + token_detail["output_tokens"]
+            token_count = (token_detail["input_tokens"] or 0) + (token_detail["output_tokens"] or 0)
 
         # Fall back to tiktoken estimate if the model did not report metrics.
         if not token_count and full_content:
-            output_tokens = _estimate_tokens(full_content)
-            input_tokens = _estimate_tokens(contextual_message)
+            output_tokens = _estimate_tokens(full_content) or 0
+            input_tokens = _estimate_tokens(contextual_message) or 0
             token_count = input_tokens + output_tokens
             token_detail["input_tokens"] = input_tokens
             token_detail["output_tokens"] = output_tokens
@@ -1014,6 +1146,34 @@ async def _stream_agent_response(
         )
         turn_model_id = runtime_model_id
         turn_selection_reason = model_selection_reason
+
+        # Build an honest local estimate of the prompt context composition.
+        # Tool-result summaries are only available after the MCP wrappers have
+        # recorded their calls.
+        tool_result_summaries = []
+        for toolkit in mcp_tools:
+            if hasattr(toolkit, "recorded_calls") and toolkit.recorded_calls:
+                for call in toolkit.recorded_calls:
+                    summary = call.get("result_summary") or call.get("error_summary") or ""
+                    if summary:
+                        tool_result_summaries.append(summary)
+        try:
+            history_messages = list_chat_messages(session_id)
+        except Exception:
+            history_messages = []
+        try:
+            agent_instructions = getattr(agent, "instructions", None) or []
+        except Exception:
+            agent_instructions = []
+        context_breakdown = _estimate_context_breakdown(
+            system_prompt=agent_instructions,
+            history_messages=history_messages,
+            skill_context=skill_context,
+            rag_context=rag_context,
+            tool_results=tool_result_summaries or None,
+            user_message=message,
+            system_context_prefix=system_context_prefix,
+        )
 
         # Record the vertical agent model call.
         try:
@@ -1038,6 +1198,7 @@ async def _stream_agent_response(
                 status="success",
                 estimated_cost_cny=vertical_cost,
                 price_snapshot=vertical_price,
+                context_breakdown=context_breakdown,
             )
         except Exception:
             pass

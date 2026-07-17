@@ -17,8 +17,19 @@ import rag_store
 
 
 def _tokenize(text: str) -> List[str]:
-    """Tokenize Chinese/English text into searchable terms."""
+    """Tokenize Chinese/English/number text into searchable terms.
+
+    The tokenizer splits on non-alphanumeric/CJK characters, and also inserts
+    boundaries between Chinese characters and alphanumeric runs so queries like
+    "17号充电区" match documents containing "17 号集中充电区".
+    """
     text = text.lower()
+    # Insert spaces between Chinese chars and alphanumeric runs.
+    text = re.sub(
+        r"(?<=[\u4e00-\u9fa5])(?=[a-z0-9])|(?<=[a-z0-9])(?=[\u4e00-\u9fa5])",
+        " ",
+        text,
+    )
     text = re.sub(r"[^\u4e00-\u9fa5a-z0-9]", " ", text)
     tokens = []
     for word in text.split():
