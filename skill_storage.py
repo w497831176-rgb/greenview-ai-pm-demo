@@ -68,6 +68,20 @@ def write_skill_md(skill_id: int, metadata: Dict[str, Any], body: str):
     skill_md.write_text(f"---\n{yaml_text}---\n\n{body}\n", encoding="utf-8")
 
 
+def write_skill_revision(skill_id: int, version: str, metadata: Dict[str, Any], body: str):
+    """Keep a file-level snapshot alongside the database audit record.
+
+    Runtime always reads the root ``SKILL.md``.  Revision files are immutable
+    operator evidence and are never auto-injected into a chat context.
+    """
+    revision_dir = ensure_skill_dir(skill_id) / "revisions" / str(version)
+    revision_dir.mkdir(parents=True, exist_ok=True)
+    yaml_text = yaml.safe_dump(metadata, allow_unicode=True, sort_keys=False)
+    (revision_dir / "SKILL.md").write_text(
+        f"---\n{yaml_text}---\n\n{body}\n", encoding="utf-8"
+    )
+
+
 def list_skill_files(skill_id: int) -> List[Dict[str, str]]:
     d = _skill_dir(skill_id)
     if not d.exists():

@@ -39,7 +39,9 @@ from app.badcase_schema import (
 )
 from app.observability import _check_budget
 from app.settings import MODEL, MODEL_ID, build_model
+from app.skill_runtime import canonical_metadata, next_patch_version
 from app.utils.cost_utils import build_price_snapshot, compute_cost_cny
+import skill_storage
 
 _BUDGET_BLOCKED_DETAIL = "预算已达上限，Darwin/AI 分类等 Pro/额外评估操作被阻止，请联系管理员调整预算或等待次日刷新"
 from db.property_db import (
@@ -49,6 +51,7 @@ from db.property_db import (
     create_knowledge_doc as db_create_knowledge_doc,
     create_knowledge_draft as db_create_knowledge_draft,
     create_skill as db_create_skill,
+    create_skill_version,
     create_skill_prompt_draft as db_create_skill_prompt_draft,
     delete_badcase as db_delete_badcase,
     delete_knowledge_doc as db_delete_knowledge_doc,
@@ -754,11 +757,26 @@ async def _apply_skill_prompt_draft(
     instructions = draft.get("prompt_content") or ""
     trigger_condition = draft.get("trigger_keywords") or ""
 
+    def governed_metadata(source_skill: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        metadata = canonical_metadata(
+            {
+                "trigger_condition": trigger_condition,
+                "skill_metadata": (source_skill or {}).get("skill_metadata") or {},
+            },
+            (source_skill or {}).get("skill_metadata") or {},
+        )
+        metadata["positive_triggers"] = metadata.get("positive_triggers") or [
+            item.strip() for item in re.split(r"[,，、；;｜|\\/]+", trigger_condition) if item.strip()
+        ]
+        metadata["version"] = next_patch_version(str(metadata.get("version") or "legacy-1.0.0")) if source_skill else "1.0.0"
+        return metadata
+
     # Create or update the formal Skill.
     skill_id = draft.get("skill_id")
     existing_skill = get_skill(skill_id) if skill_id else None
     try:
         if existing_skill:
+            metadata = governed_metadata(existing_skill)
             skill = db_update_skill(
                 skill_id=existing_skill["id"],
                 name=skill_name,
@@ -767,13 +785,14 @@ async def _apply_skill_prompt_draft(
                 category=existing_skill.get("category") or "skill_prompt",
                 enabled=existing_skill.get("enabled", True),
                 trigger_condition=trigger_condition,
-                skill_metadata=existing_skill.get("skill_metadata"),
+                skill_metadata=metadata,
                 storage_path=existing_skill.get("storage_path", ""),
                 model_id=existing_skill.get("model_id"),
             )
         else:
             existing_by_name = get_skill_by_name(skill_name)
             if existing_by_name:
+                metadata = governed_metadata(existing_by_name)
                 skill = db_update_skill(
                     skill_id=existing_by_name["id"],
                     name=skill_name,
@@ -782,11 +801,12 @@ async def _apply_skill_prompt_draft(
                     category=existing_by_name.get("category") or "skill_prompt",
                     enabled=existing_by_name.get("enabled", True),
                     trigger_condition=trigger_condition,
-                    skill_metadata=existing_by_name.get("skill_metadata"),
+                    skill_metadata=metadata,
                     storage_path=existing_by_name.get("storage_path", ""),
                     model_id=existing_by_name.get("model_id"),
                 )
             else:
+                metadata = governed_metadata(None)
                 skill = db_create_skill(
                     name=skill_name,
                     description=description,
@@ -794,6 +814,7 @@ async def _apply_skill_prompt_draft(
                     category="skill_prompt",
                     enabled=True,
                     trigger_condition=trigger_condition,
+                    skill_metadata=metadata,
                 )
     except Exception as exc:
         logger.exception("failed to create/update formal skill from draft")
@@ -803,6 +824,10 @@ async def _apply_skill_prompt_draft(
         raise HTTPException(status_code=500, detail="Skill 创建/更新后未返回有效记录")
 
     skill_id = skill["id"]
+    metadata = skill.get("skill_metadata") or {}
+    skill_storage.write_skill_md(skill_id, metadata, skill.get("instructions") or "")
+    skill_storage.write_skill_revision(skill_id, str(metadata.get("version") or "legacy-1.0.0"), metadata, skill.get("instructions") or "")
+    create_skill_version(skill_id, str(metadata.get("version") or "legacy-1.0.0"), "从 Badcase 审核草稿应用")
 
     # Bind the skill to the target agent, preserving existing bindings.
     before_skill_ids = get_agent_skills(target_agent_id)

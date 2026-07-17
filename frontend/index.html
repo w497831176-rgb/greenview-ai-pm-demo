@@ -219,7 +219,7 @@
     // ==========================================
     const API_BASE = '';
     const DEFAULT_ROOM_ID = '3-2-1201';
-    const APP_VERSION = 'V1.5.1';
+    const APP_VERSION = 'V1.5.2';
 
     const STATE = {
       topTab: 'owner',
@@ -4626,11 +4626,18 @@
                   <div class="flex items-center gap-2 mb-2">
                     <h3 class="font-semibold text-slate-900">${escapeHtml(skill.name)}</h3>
                     <span class="text-xs px-2 py-0.5 bg-slate-100 text-slate-600 rounded-full">${escapeHtml(skill.category || '未分类')}</span>
+                    <span class="text-xs px-2 py-0.5 bg-brand-50 text-brand-700 rounded-full">v${escapeHtml((skill.runtime_contract || {}).version || 'legacy-1.0.0')}</span>
                   </div>
                   <p class="text-sm text-slate-600 mb-3">${escapeHtml(skill.description)}</p>
+                  <div class="text-xs text-slate-500 mb-3 space-y-1">
+                    <p>正向触发：${escapeHtml(((skill.runtime_contract || {}).positive_triggers || []).join('、') || '未配置')}</p>
+                    ${((skill.runtime_contract || {}).negative_triggers || []).length ? `<p>不触发：${escapeHtml((skill.runtime_contract || {}).negative_triggers.join('、'))}</p>` : ''}
+                    <p>优先级 ${(skill.runtime_contract || {}).priority ?? 50} · ${((skill.runtime_contract || {}).legacy_mode) ? '旧版 Prompt 模式，建议补齐治理字段' : '治理契约已配置'}</p>
+                  </div>
                   <div class="text-xs text-slate-500 bg-slate-50 rounded-lg p-2 line-clamp-3 whitespace-pre-line">${escapeHtml(skill.instructions)}</div>
                   <div class="mt-4 pt-4 border-t border-slate-100 flex flex-wrap gap-2">
                     <button data-id="${skill.id}" class="skill-edit-btn text-xs px-3 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg transition-colors">编辑</button>
+                    <button data-id="${skill.id}" class="skill-versions-btn text-xs px-3 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg transition-colors">版本</button>
                     <button data-id="${skill.id}" class="skill-files-btn text-xs px-3 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg transition-colors">文件</button>
                     <button data-id="${skill.id}" class="skill-test-btn text-xs px-3 py-1.5 bg-brand-50 hover:bg-brand-100 text-brand-700 rounded-lg transition-colors">测试</button>
                     <button data-id="${skill.id}" class="skill-export-btn text-xs px-3 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg transition-colors">导出</button>
@@ -4649,6 +4656,9 @@
       function bindSkillActions() {
         $$('.skill-edit-btn').forEach(btn => {
           btn.addEventListener('click', () => editSkill(Number(btn.dataset.id)));
+        });
+        $$('.skill-versions-btn').forEach(btn => {
+          btn.addEventListener('click', () => showSkillVersions(Number(btn.dataset.id)));
         });
         $$('.skill-delete-btn').forEach(btn => {
           btn.addEventListener('click', () => deleteSkill(Number(btn.dataset.id)));
@@ -4674,7 +4684,10 @@
                 description: skill.description,
                 instructions: skill.instructions,
                 category: skill.category,
-                enabled: enabled
+                enabled: enabled,
+                trigger_condition: skill.trigger_condition || '',
+                skill_metadata: skill.skill_metadata || {},
+                model_id: skill.model_id || null
               });
               showToast(enabled ? 'Skill 已启用' : 'Skill 已禁用');
               await loadSkills();
@@ -4689,22 +4702,51 @@
       function openSkillModal(skill = null) {
         const isEdit = !!skill;
         const title = isEdit ? '编辑 Skill' : '新增 Skill';
+        const meta = (skill && skill.skill_metadata) || {};
+        const asTerms = value => Array.isArray(value) ? value.join('、') : (value || '');
         const body = `
           ${formInput('名称', 'skill-name', skill ? skill.name : '', '如：维修工单处理')}
           ${formInput('分类', 'skill-category', skill ? skill.category : '', '如：业务技能、系统技能')}
           ${formInput('描述', 'skill-description', skill ? skill.description : '', '简短描述 Skill 用途')}
           ${formSwitch('启用', 'skill-enabled', skill ? skill.enabled : true)}
-          ${formInput('触发条件', 'skill-trigger', skill ? (skill.trigger_condition || '') : '', '如：用户提到“孩子托管”')}
+          <div class="rounded-xl border border-brand-100 bg-brand-50/50 p-3 text-xs text-slate-600">Skill 是“可重复、可验收的业务方法”，不是默认塞入的一段 Prompt。只有同时满足 <b>Agent 已绑定 + 正向触发命中 + 未命中负向条件 + 未被高优先级冲突项排除</b> 时，才会注入本轮对话。</div>
+          ${formInput('正向触发', 'skill-trigger', skill ? (skill.trigger_condition || asTerms(meta.positive_triggers)) : '', '逗号分隔，如：报修、漏水、查询工单')}
+          ${formInput('负向触发', 'skill-negative-trigger', asTerms(meta.negative_triggers), '命中后禁止注入，如：仅咨询价格、不需报修')}
+          <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+            ${formInput('优先级（0-100）', 'skill-priority', String(meta.priority ?? 50), '数字越大越优先')}
+            ${formInput('冲突组（可选）', 'skill-conflict-group', meta.conflict_group || '', '同组只保留最高优先级 Skill')}
+          </div>
+          <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+            ${formSwitch('允许同冲突组叠加', 'skill-composable', !!meta.composable)}
+            ${formSwitch('默认注入（谨慎）', 'skill-always-on', !!meta.always_on)}
+          </div>
+          ${formInput('工具提示（可选）', 'skill-tool-hints', asTerms(meta.tool_hints), '仅提示 SOP；真实工具权限仍由 Agent MCP 绑定决定')}
+          ${formTextarea('输入契约（可选）', 'skill-input-contract', meta.input_contract || '', '此 Skill 需要哪些信息；信息缺失时如何追问', 3)}
+          ${formTextarea('输出契约（可选）', 'skill-output-contract', meta.output_contract || '', '输出必须包含什么；哪些动作必须等待用户确认', 3)}
           ${formTextarea('指令 (Instructions)', 'skill-instructions', skill ? skill.instructions : '', '定义 Skill 的系统提示词与行为约束', 6)}
         `;
         openModal(title, body, async () => {
+          const splitTerms = value => value.split(/[，、,;；|]+/).map(item => item.trim()).filter(Boolean);
+          const existingMetadata = meta || {};
           const payload = {
             name: $('#skill-name').value.trim(),
             category: $('#skill-category').value.trim() || '未分类',
             description: $('#skill-description').value.trim(),
             instructions: $('#skill-instructions').value.trim(),
             trigger_condition: $('#skill-trigger').value.trim(),
-            enabled: $('#skill-enabled').checked
+            enabled: $('#skill-enabled').checked,
+            skill_metadata: {
+              ...existingMetadata,
+              positive_triggers: splitTerms($('#skill-trigger').value),
+              negative_triggers: splitTerms($('#skill-negative-trigger').value),
+              priority: Number($('#skill-priority').value || 50),
+              conflict_group: $('#skill-conflict-group').value.trim(),
+              composable: $('#skill-composable').checked,
+              always_on: $('#skill-always-on').checked,
+              tool_hints: splitTerms($('#skill-tool-hints').value),
+              input_contract: $('#skill-input-contract').value.trim(),
+              output_contract: $('#skill-output-contract').value.trim()
+            }
           };
           if (!payload.name) {
             showToast('Skill 名称不能为空', 'error');
@@ -4747,8 +4789,18 @@
       }
 
       async function testSkill(skillId) {
+        let agents = [];
+        try { agents = (await apiGet('/api/agents')).agents || []; } catch (_) { /* binding check remains optional */ }
         const body = `
           ${formTextarea('测试问题', 'skill-test-query', '', '输入一个会触发该 Skill 的问题', 3)}
+          <div>
+            <label class="block text-sm font-medium text-slate-700 mb-1">目标 Agent（建议选择，用于验证绑定与冲突）</label>
+            <select id="skill-test-agent" class="w-full px-3 py-2 bg-white border border-slate-200 rounded-xl text-sm">
+              <option value="">仅诊断触发条件</option>
+              ${agents.filter(agent => agent.enabled).map(agent => `<option value="${escapeHtml(agent.agent_id)}">${escapeHtml(agent.name)}（${escapeHtml(agent.agent_id)}）</option>`).join('')}
+            </select>
+          </div>
+          <p class="text-xs text-slate-500">这是确定性运行时诊断，不调用模型、不消耗 Token；它会告诉你该 Skill 是否真的会在该 Agent 的下一轮对话中注入。</p>
         `;
         openModal('测试 Skill', body, async () => {
           const query = $('#skill-test-query').value.trim();
@@ -4757,19 +4809,52 @@
             return;
           }
           try {
-            const data = await apiPost(`/api/skills/${skillId}/test`, { message: query });
+            const data = await apiPost(`/api/skills/${skillId}/test`, { message: query, agent_id: $('#skill-test-agent').value || null });
             closeModal();
+            const decision = data.decision || {};
+            const selected = data.will_inject;
+            const statusClass = selected ? 'bg-emerald-50 border-emerald-200 text-emerald-800' : 'bg-amber-50 border-amber-200 text-amber-800';
             const html = `
               <div class="space-y-3">
                 <div class="bg-slate-50 rounded-xl p-3 border border-slate-200"><p class="text-[10px] text-slate-400 mb-1">测试问题</p><p class="text-sm text-slate-800">${escapeHtml(query)}</p></div>
-                <div class="bg-brand-50 rounded-xl p-3 border border-brand-100"><p class="text-[10px] text-brand-500 mb-1">组合后的指令</p><pre class="text-xs text-slate-700 whitespace-pre-wrap">${escapeHtml(data.instructions_preview || data.instructions || '')}</pre></div>
+                <div class="${statusClass} rounded-xl p-3 border"><p class="font-medium text-sm">${selected ? '会在下一轮对话中注入' : '不会注入'}</p><p class="text-xs mt-1">${escapeHtml(decision.match_reason || '')}</p><p class="text-xs mt-1">Agent 绑定：${escapeHtml(data.binding || 'not_checked')}；候选选择：${(data.selected_skill_ids || []).join('、') || '无'}</p></div>
+                <div class="bg-slate-50 rounded-xl p-3 border border-slate-200 text-xs text-slate-600"><p><b>权限边界：</b>${escapeHtml(data.authority_note || '')}</p><p class="mt-1"><b>版本：</b>${escapeHtml(((decision.contract || {}).version) || 'legacy-1.0.0')}；优先级：${escapeHtml(String((decision.contract || {}).priority ?? 50))}</p></div>
+                <div class="bg-brand-50 rounded-xl p-3 border border-brand-100"><p class="text-[10px] text-brand-500 mb-1">${selected ? '将被注入的指令预览' : '未注入原因'}</p><pre class="text-xs text-slate-700 whitespace-pre-wrap">${escapeHtml(data.instructions_preview || '')}</pre></div>
               </div>
             `;
-            openModal('测试结果', html, null, '关闭');
+            openModal('运行时诊断结果', html, null, '关闭');
           } catch (err) {
             showToast('测试失败', 'error');
           }
         }, '运行测试');
+      }
+
+      async function showSkillVersions(skillId) {
+        try {
+          const data = await apiGet(`/api/skills/${skillId}/versions`);
+          const versions = data.versions || [];
+          const body = `
+            <div class="space-y-3 max-h-[60vh] overflow-y-auto">
+              <div class="rounded-xl bg-brand-50 border border-brand-100 p-3 text-xs text-slate-600">版本是 Skill 的业务方法审计记录。回滚会生成一个新的版本，不会篡改历史版本；回滚后请用“测试”确认命中与绑定。</div>
+              ${versions.length ? versions.map(version => `
+                <div class="rounded-xl border border-slate-200 p-3">
+                  <div class="flex items-start justify-between gap-3"><div><p class="font-medium text-sm text-slate-800">v${escapeHtml(version.version)}</p><p class="text-xs text-slate-500 mt-1">${escapeHtml(version.change_summary || '历史快照')} · ${escapeHtml(version.created_at || '')}</p><p class="text-xs text-slate-500 mt-1">触发：${escapeHtml((version.snapshot_summary || {}).trigger_condition || '未配置')}</p></div><button data-version="${escapeHtml(version.version)}" class="skill-version-rollback text-xs px-3 py-1.5 border border-amber-300 text-amber-700 rounded-lg hover:bg-amber-50">回滚到此版</button></div>
+                </div>`).join('') : '<p class="text-sm text-slate-500">暂无版本记录</p>'}
+            </div>`;
+          openModal('Skill 版本与回滚', body, null, '关闭');
+          $$('.skill-version-rollback').forEach(button => button.addEventListener('click', async () => {
+            const version = button.dataset.version;
+            if (!confirm(`确认回滚到 v${version}？系统会保留当前版本，并创建新的回滚版本。`)) return;
+            try {
+              await apiPost(`/api/skills/${skillId}/versions/${encodeURIComponent(version)}/rollback`, {});
+              showToast('已回滚，请重新运行 Skill 诊断');
+              closeModal();
+              await loadSkills();
+            } catch (err) { showToast('回滚失败：' + err.message, 'error'); }
+          }));
+        } catch (err) {
+          showToast('加载版本失败', 'error');
+        }
       }
 
       async function exportSkill(skillId) {

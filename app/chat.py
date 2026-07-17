@@ -27,6 +27,7 @@ from pydantic import BaseModel
 
 from app.observability import _check_budget
 from app.settings import MODEL_ID, USE_THINKING, build_model
+from app.skill_runtime import activation_evidence, select_skills, skill_contract
 from app.utils.cost_utils import build_price_snapshot, compute_cost_cny, normalize_usage
 from agents.billing import create_billing_agent
 from agents.complaint import create_complaint_agent
@@ -350,89 +351,28 @@ def _summarize_tool_result(result: Any, max_len: int = 300) -> str:
         return ""
 
 
-def _skill_matches_trigger(skill: Dict[str, Any], message: str) -> bool:
-    """Return True when a skill's trigger condition matches the user message.
-
-    A skill with no trigger_condition is considered globally active.
-
-    Trigger conditions are expected to be comma/、 separated keywords or short
-    phrases (e.g. "报修、查询工单、维修进度").  We clean stop words, split
-    into keywords, and match with a combination of substring containment and
-    character-bigram Jaccard similarity.  This handles both normal word order
-    ("宠物托管") and reversed/colloquial expressions ("托管宠物").
-    """
-    trigger = (skill.get("trigger_condition") or "").strip()
-    if not trigger:
-        return True
-
-    # Stop words commonly used in trigger descriptions but not meaningful for matching.
-    stop_words = {"用户", "提到", "说到", "询问", "问题", "关于", "相关", "的", "时", "如果", "当", "要", "等"}
-
-    def _clean(text: str) -> str:
-        text = text.lower().strip()
-        for sw in stop_words:
-            text = text.replace(sw, "")
-        return text
-
-    def _bigrams(text: str):
-        chars = [c for c in text if c.strip()]
-        return set(chars[i] + chars[i + 1] for i in range(len(chars) - 1)) if len(chars) >= 2 else set(chars)
-
-    cleaned_trigger = _clean(trigger)
-    cleaned_message = _clean(message)
-
-    # Split trigger into keywords by common separators.
-    raw_keywords = [k.strip() for k in re.split(r"[,，、；;｜|\\/]+", cleaned_trigger) if k.strip()]
-    # If splitting produced nothing, treat the whole trigger as one keyword.
-    keywords = raw_keywords if raw_keywords else [cleaned_trigger]
-
-    msg_bg = _bigrams(cleaned_message)
-
-    for keyword in keywords:
-        if len(keyword) < 2:
-            continue
-        # Exact substring match after cleaning (handles "报修" in "帮我报修...").
-        if keyword in cleaned_message:
-            return True
-        # Bigram Jaccard similarity for reversed/variant expressions.
-        key_bg = _bigrams(keyword)
-        if not key_bg or not msg_bg:
-            continue
-        overlap = len(key_bg & msg_bg)
-        union = len(key_bg | msg_bg)
-        if union > 0 and overlap / union >= 0.45:
-            return True
-
-    return False
-
-
 def _build_skill_context(message: str, agent_id: Optional[str] = None) -> tuple:
-    """Load enabled skills bound to the current agent, filter by trigger.
+    """Build governed Skill context and explain every runtime selection.
 
-    Returns (skill_context_string, activated_skills, skill_model_id).
-
-    activated_skills is a list of dicts with at least {"name": ..., "id": ...}
-    so callers can distinguish metadata from plain strings.
-
-    Only skills explicitly bound to the current agent are considered. The
-    router agent is treated specially: it sees all enabled skills so that it
-    can reason about available capabilities when classifying intent.
+    Bound Skills are evaluated by one deterministic policy: positive/negative
+    triggers, priority and optional conflict groups.  A missing trigger no
+    longer silently injects legacy instructions; an operator must explicitly
+    set ``always_on`` for that exceptional case.
     """
     try:
         is_router = agent_id == "router"
         if is_router:
-            # Router only sees a lightweight summary of enabled skills to avoid
-            # polluting intent classification and wasting tokens.
             candidate_skills = [s for s in list_skills() if s.get("enabled")]
             if not candidate_skills:
                 return "", [], None
             summary_lines = []
             for skill in candidate_skills:
                 name = skill.get("name", "")
-                trigger = skill.get("trigger_condition", "")
+                contract = skill_contract(skill)
                 if not name:
                     continue
-                line = f"- {name}" + (f"（触发：{trigger}）" if trigger else "")
+                trigger = "、".join(contract["positive_triggers"])
+                line = f"- {name}" + (f"（适用：{trigger}）" if trigger else "（未配置触发，不作为默认能力）")
                 summary_lines.append(line)
             if not summary_lines:
                 return "", [], None
@@ -452,37 +392,33 @@ def _build_skill_context(message: str, agent_id: Optional[str] = None) -> tuple:
         candidate_skills = [s for s in candidate_skills if s and s.get("enabled")]
         if not candidate_skills:
             return "", [], None
-        parts = []
-        activated = []
-        skill_model_id = None
-        for skill in candidate_skills:
+        selected, _decisions = select_skills(candidate_skills, message)
+        if not selected:
+            return "", [], None
+        by_id = {skill.get("id"): skill for skill in candidate_skills}
+        parts, activated = [], []
+        for decision in selected:
+            skill = by_id.get(decision.get("skill_id"))
+            if not skill:
+                continue
             name = skill.get("name", "")
             instructions = skill_storage.build_instructions(skill.get("id"), skill)
-            trigger = skill.get("trigger_condition", "")
             if not name or not instructions:
                 continue
-            triggered = _skill_matches_trigger(skill, message)
-            # Only skills with an explicit trigger condition that matches are
-            # shown as "activated". Skills without a trigger behave as default
-            # platform capabilities and stay in context but are not listed.
-            if trigger and triggered:
-                activated.append({"name": name, "id": skill.get("id")})
-                # Owner-facing chat ignores any Skill model_id override.
-                if skill_model_id is None and skill.get("model_id"):
-                    skill_model_id = None
-            if trigger and not triggered:
-                continue
-            header = f"【Skill：{name}】"
-            if trigger:
-                header += f"（触发条件：{trigger}）"
+            contract = decision["contract"]
+            header = (
+                f"【Skill：{name}｜版本 {contract['version']}｜{decision['match_reason']}】\n"
+                "权限边界：Skill 提供业务 SOP，不新增工具权限；仅可使用当前 Agent 已绑定的 MCP 工具。"
+            )
             parts.append(f"{header}\n{instructions}")
+            activated.append(activation_evidence(decision, len(instructions)))
         if not parts:
             return "", [], None
         return (
-            "\n\n[已启用的平台 Skill（当用户问题命中 Skill 名称或相关场景时，必须按对应 Skill 的指令回答）：\n"
+            "\n\n[已命中的平台 Skill（仅以下经过触发与冲突策略选择的能力可注入；必须遵守其 SOP 和边界）：\n"
             + "\n".join(parts)
             + "]"
-        ), activated, skill_model_id
+        ), activated, None
     except Exception:
         return "", [], None
 
