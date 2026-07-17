@@ -27,11 +27,13 @@ from pydantic import BaseModel
 
 from app.observability import _check_budget
 from app.settings import MODEL_ID, USE_THINKING
+from app.utils.cost_utils import build_price_snapshot, compute_cost_cny, normalize_usage
 from agents.billing import create_billing_agent
 from agents.complaint import create_complaint_agent
 from agents.customer_service import create_customer_service_agent
 from agents.maintenance import create_maintenance_agent
 from agents.router import classify_intent
+from tools.work_order import set_work_order_context
 from db.property_db import (
     activate_handoff,
     add_badcase_action,
@@ -311,48 +313,21 @@ DEFAULT_ROOM_ID = "3-2-1201"
 DEFAULT_OWNER_NAME = "王先生"
 
 
-def _build_price_snapshot(model_id: str) -> Optional[Dict[str, Any]]:
+def _get_price_snapshot(model_id: str) -> Optional[Dict[str, Any]]:
+    """Return a serializable price snapshot for a model_id."""
     price = get_enabled_price_for_model(model_id)
-    if not price:
-        return None
-    return {
-        "model_id": price.get("model_id"),
-        "currency": price.get("currency"),
-        "effective_date": price.get("effective_date"),
-        "input_price_per_1m": price.get("input_price_per_1m"),
-        "cached_input_price_per_1m": price.get("cached_input_price_per_1m"),
-        "output_price_per_1m": price.get("output_price_per_1m"),
-        "reasoning_price_per_1m": price.get("reasoning_price_per_1m"),
-        "source_note": price.get("source_note"),
-    }
+    return build_price_snapshot(price)
 
 
 def _calculate_cost(model_id: str, usage: Dict[str, Optional[int]]) -> tuple:
     """Return (cost_cny, price_snapshot) for a model call.
 
-    Cost is always an estimate based on the configured price table at the time
-    of the call. If no price is configured, return (None, None).
+    Uses the centralized cost helper. If the provider did not return a usable
+    cached/uncached split, cost is None but the price snapshot is still returned.
     """
-    snapshot = _build_price_snapshot(model_id)
-    if not snapshot:
-        return None, None
-
-    input_tk = usage.get("input_tokens") or 0
-    output_tk = usage.get("output_tokens") or 0
-    reasoning_tk = usage.get("reasoning_tokens") or 0
-    cached_tk = usage.get("cached_tokens") or 0
-
-    cost = 0.0
-    if snapshot.get("input_price_per_1m") is not None:
-        cost += (input_tk - cached_tk) * (snapshot["input_price_per_1m"] / 1_000_000)
-    if snapshot.get("cached_input_price_per_1m") is not None:
-        cost += cached_tk * (snapshot["cached_input_price_per_1m"] / 1_000_000)
-    if snapshot.get("output_price_per_1m") is not None:
-        cost += output_tk * (snapshot["output_price_per_1m"] / 1_000_000)
-    if snapshot.get("reasoning_price_per_1m") is not None:
-        cost += reasoning_tk * (snapshot["reasoning_price_per_1m"] / 1_000_000)
-
-    return round(cost, 8), snapshot
+    snapshot = _get_price_snapshot(model_id)
+    cost, _status = compute_cost_cny(snapshot, usage)
+    return cost, snapshot
 
 
 def _summarize_tool_result(result: Any, max_len: int = 300) -> str:
@@ -442,15 +417,35 @@ def _build_skill_context(message: str, agent_id: Optional[str] = None) -> tuple:
     try:
         is_router = agent_id == "router"
         if is_router:
+            # Router only sees a lightweight summary of enabled skills to avoid
+            # polluting intent classification and wasting tokens.
             candidate_skills = [s for s in list_skills() if s.get("enabled")]
-        else:
-            from db.property_db import get_agent_skills, get_skill
+            if not candidate_skills:
+                return "", [], None
+            summary_lines = []
+            for skill in candidate_skills:
+                name = skill.get("name", "")
+                trigger = skill.get("trigger_condition", "")
+                if not name:
+                    continue
+                line = f"- {name}" + (f"（触发：{trigger}）" if trigger else "")
+                summary_lines.append(line)
+            if not summary_lines:
+                return "", [], None
+            context = (
+                "\n\n[可用 Skill 清单（仅用于路由参考，不要注入完整 Skill 指令）：\n"
+                + "\n".join(summary_lines)
+                + "]"
+            )
+            return context, [], None
 
-            bound_skill_ids = get_agent_skills(agent_id) if agent_id else []
-            candidate_skills = [
-                get_skill(int(skill_id)) for skill_id in bound_skill_ids
-            ]
-            candidate_skills = [s for s in candidate_skills if s and s.get("enabled")]
+        from db.property_db import get_agent_skills, get_skill
+
+        bound_skill_ids = get_agent_skills(agent_id) if agent_id else []
+        candidate_skills = [
+            get_skill(int(skill_id)) for skill_id in bound_skill_ids
+        ]
+        candidate_skills = [s for s in candidate_skills if s and s.get("enabled")]
         if not candidate_skills:
             return "", [], None
         parts = []
@@ -546,13 +541,22 @@ def _mcp_server_relevant(server_name: str, message: str) -> bool:
     """
     lowered = message.lower()
     relevance = {
-        "weather-server": ["天气", "气温", "下雨", "晴天", "阴天", "多云", "下雪", "刮风", "温度"],
+        "weather-server": [
+            "天气", "气温", "下雨", "雨天", "暴雨", "降雨", "湿度", "天气变化",
+            "晴天", "阴天", "多云", "下雪", "刮风", "温度",
+        ],
         # Work-order server is for querying existing work orders / progress, not
-        # for creating a new repair request (which is handled by the vertical
-        # agent's own instructions and knowledge base).
-        "workorder-server": ["工单进度", "查询工单", "我的工单", "工单状态", "查看工单"],
+        # for creating a new repair request.
+        "workorder-server": [
+            "工单进度", "查询工单", "我的工单", "工单状态", "查看工单",
+            "最近工单", "待处理工单", "工单数量", "多少工单", "维修进度",
+            "查询房号工单", "工单统计",
+        ],
         # Calendar server is for explicit date/time/appointment questions.
-        "calendar-server": ["今天日期", "现在几点", "当前时间", "今天星期", "今天周几", "今天几号", "预约", "几点了", "什么日期", "现在时间"],
+        "calendar-server": [
+            "今天日期", "现在几点", "当前时间", "今天星期", "今天周几", "今天几号",
+            "预约", "几点了", "什么日期", "现在时间", "日期加减", "几号", "星期几",
+        ],
     }
     for key, keywords in relevance.items():
         if server_name == key or key in server_name:
@@ -652,12 +656,165 @@ def _format_mcp_context(agent_id: Optional[str] = None, message: str = "") -> st
         return ""
 
 
+# V1.4.3: narrow policy pre-invocation for the three formal readonly MCP servers.
+# Only runs when the current agent is explicitly bound to the server and the user
+# message explicitly requests that live capability. Results are injected into the
+# agent context and recorded in the trace as invocation_mode=policy_preinvoke.
+_READONLY_MCP_DEFAULT_TOOLS = {
+    "weather-server": ["get_current_weather"],
+    "workorder-server": ["count_work_orders", "list_recent_work_orders"],
+    "calendar-server": ["get_current_datetime"],
+}
+
+
+async def _preinvoke_readonly_mcp_tools(
+    agent_id: Optional[str],
+    message: str,
+    trace_id: Optional[str],
+) -> Tuple[str, List[Dict[str, Any]]]:
+    """Pre-invoke bound readonly MCP servers when the user explicitly needs them.
+
+    Returns (context_string, call_records). The context string tells the agent
+    the real results so it does not need to call the same tools again.
+    """
+    if not agent_id or agent_id == "router" or ObservableMCPTools is None:
+        return "", []
+
+    try:
+        from db.property_db import get_agent_tools, list_mcp_servers
+
+        bound_tools = get_agent_tools(agent_id) or []
+        bound_names = {t.get("tool_name") for t in bound_tools if t.get("tool_name")}
+        servers = {
+            s.get("name"): s
+            for s in list_mcp_servers()
+            if s.get("enabled") and s.get("name") in bound_names and _mcp_server_relevant(s.get("name", ""), message)
+        }
+    except Exception:
+        return "", []
+
+    if not servers:
+        return "", []
+
+    context_parts: List[str] = []
+    call_records: List[Dict[str, Any]] = []
+
+    for server_name, server in servers.items():
+        default_tools = _READONLY_MCP_DEFAULT_TOOLS.get(server_name, [])
+        if not default_tools:
+            continue
+
+        command = server.get("command")
+        args = server.get("args") or []
+        env = server.get("env") or {}
+        if not command:
+            continue
+
+        import shlex
+
+        merged_env = {**dict(os.environ), **env}
+        full_command = shlex.join([command] + list(args))
+
+        tool: Any = None
+        try:
+            tool = ObservableMCPTools(
+                command=full_command,
+                env=merged_env,
+                name=server_name,
+                transport="stdio",
+                timeout_seconds=15,
+            )
+            tool.trace_id = trace_id
+            tool.server_name = server_name
+            await tool.build_tools()
+        except Exception:
+            if tool and hasattr(tool, "close"):
+                try:
+                    await tool.close()
+                except Exception:
+                    pass
+            continue
+
+        functions = getattr(tool, "functions", None) or {}
+        for fn_name, fn in functions.items():
+            if fn_name not in default_tools:
+                continue
+            entrypoint = getattr(fn, "entrypoint", None)
+            if not entrypoint:
+                continue
+            start = time.time()
+            status = "success"
+            result_summary = ""
+            error_summary = None
+            try:
+                # Most readonly tools accept no arguments; pass empty dict.
+                result = await entrypoint({})
+                result_summary = _summarize_tool_result(result)
+                if "Error from MCP tool" in result_summary:
+                    status = "failed"
+                    error_summary = result_summary[:300]
+            except Exception as exc:
+                status = "failed"
+                error_summary = str(exc)[:300]
+                result_summary = error_summary
+            finally:
+                latency_ms = int((time.time() - start) * 1000)
+                call_records.append({
+                    "server_name": server_name,
+                    "tool_name": fn_name,
+                    "arguments": {},
+                    "status": status,
+                    "result_summary": result_summary,
+                    "error_summary": error_summary,
+                    "latency_ms": latency_ms,
+                    "invocation_mode": "policy_preinvoke",
+                })
+                context_parts.append(
+                    f"[{server_name}:{fn_name}] 策略预执行结果：{result_summary}"
+                )
+                # Audit via wrapper if available; otherwise skip (we already recorded above).
+                if hasattr(tool, "_record_audit"):
+                    try:
+                        tool._record_audit(fn_name, {}, status, result_summary, error_summary, latency_ms)
+                    except Exception:
+                        pass
+
+        if hasattr(tool, "close"):
+            try:
+                await tool.close()
+            except Exception:
+                pass
+
+    if not context_parts:
+        return "", []
+
+    context_str = (
+        "\n\n[以下 MCP 工具已由系统策略预先真实调用，结果已注入上下文；"
+        "你在后续回答中不要再次重复调用这些工具：\n"
+        + "\n".join(context_parts)
+        + "]"
+    )
+    return context_str, call_records
+
+
 def _detect_handoff_intent(message: str) -> Optional[str]:
-    """Detect whether the owner explicitly asks for human support."""
-    triggers = ["人工", "客服", "找物业", "找管家", "我要人"]
+    """Detect explicit handoff requests only.
+
+    Ordinary mentions of customer service / property management should not
+    trigger automatic human takeover.
+    """
     lowered = message.lower()
-    if any(t in lowered for t in triggers):
-        return "业主主动要求人工服务"
+    explicit_triggers = [
+        "转人工",
+        "人工客服",
+        "找人工",
+        "人工处理",
+        "我要人工",
+        "人工介入",
+        "接人工",
+    ]
+    if any(t in lowered for t in explicit_triggers):
+        return "业主明确要求人工服务"
     return None
 
 
@@ -917,41 +1074,61 @@ async def _stream_agent_response(
         target_agent_id = intent_result.get("target_agent_id") or intent_result.get("intent") or "customer_service"
         intent = target_agent_id
 
-        # Weather queries (even for unsupported cities) must be dispatched to the
-        # maintenance agent, which owns the weather MCP tools.
-        if target_agent_id in {"other", "customer_service"} and any(k in message for k in ("天气", "气温", "下雨")):
-            target_agent_id = "maintenance"
-            intent = "maintenance"
-            intent_result["target_agent_id"] = target_agent_id
-            intent_result["reason"] = "天气查询属于维修/工单场景（含工具支持）"
-
         create_agent_fn, agent_name = _select_agent(target_agent_id)
-        current_agent = current_agent_id = _agent_id_for_intent(target_agent_id)
+        current_agent_id = _agent_id_for_intent(target_agent_id)
+        current_agent = agent_name  # human-readable Chinese name for UI/Trace
 
-        # Record the router model call. Provider usage is unavailable for the router;
-        # cost/price_snapshot must be null (not ¥0) to reflect that.
+        # Record the router model call. Preserve the configured price snapshot so the
+        # UI can show "单价已配置，但 Provider 未返回本次 Router usage".
         try:
+            router_price = _get_price_snapshot(MODEL_ID)
+            router_metrics = intent_result.get("metrics") or {}
+            has_router_usage = bool(router_metrics.get("total_tokens"))
             record_model_call(
                 trace_id=trace_id,
                 stage="router",
                 model_id=MODEL_ID,
-                model_selection_reason=f"router selected {current_agent_id}",
+                model_selection_reason=f"router selected {current_agent_id} ({current_agent})",
                 latency_ms=router_latency_ms,
-                usage_source="unavailable",
+                input_tokens=router_metrics.get("input_tokens"),
+                output_tokens=router_metrics.get("output_tokens"),
+                reasoning_tokens=router_metrics.get("reasoning_tokens"),
+                cached_tokens=router_metrics.get("cached_tokens"),
+                total_tokens=router_metrics.get("total_tokens"),
+                usage_source="provider_reported" if has_router_usage else "unavailable",
                 status="success",
                 estimated_cost_cny=None,
-                price_snapshot=None,
+                price_snapshot=router_price,
+                context_breakdown={
+                    "route_mode": intent_result.get("route_mode", "unknown"),
+                    "reason": intent_result.get("reason", ""),
+                },
+                usage_normalized=normalize_usage(router_metrics) if has_router_usage else None,
             )
         except Exception:
             pass
 
         # Yield routing event so the UI can show which agent is handling the request.
-        yield f"event: route\ndata: {json.dumps({'intent': intent, 'reason': intent_result.get('reason', ''), 'current_agent': current_agent, 'trace_id': trace_id})}\n\n"
+        yield f"event: route\ndata: {json.dumps({'intent': intent, 'reason': intent_result.get('reason', ''), 'current_agent': current_agent, 'current_agent_id': current_agent_id, 'trace_id': trace_id})}\n\n"
 
         # Build dynamic context and tools scoped to the current vertical agent.
         skill_context, activated_skills, skill_model_id = _build_skill_context(message, agent_id=current_agent_id)
         rag_context, citations = _build_rag_context(message)
         mcp_context = _format_mcp_context(agent_id=current_agent_id, message=message)
+        # V1.4.3: narrow policy pre-invocation for readonly MCP servers. Real
+        # tool results are injected into context and recorded as policy_preinvoke.
+        preinvoke_context, preinvoke_calls = await _preinvoke_readonly_mcp_tools(
+            agent_id=current_agent_id,
+            message=message,
+            trace_id=trace_id,
+        )
+        if preinvoke_context:
+            mcp_context = f"{mcp_context}{preinvoke_context}"
+
+        # V1.4.3: bind session_id and current message to WorkOrderTools so the
+        # backend can enforce draft + explicit confirmation gating.
+        set_work_order_context(session_id, message)
+
         mcp_tools = _build_mcp_tools(agent_id=current_agent_id, trace_id=trace_id, message=message)
         for tool in mcp_tools:
             if hasattr(tool, "connect"):
@@ -1066,9 +1243,13 @@ async def _stream_agent_response(
 
         # Create a fresh agent instance with dynamic MCP tools.
         agent = create_agent_fn(tools=mcp_tools, model=turn_model, mcp_context=mcp_context)
-        # When MCP tools are admitted for this turn, require the model to call at
-        # least one of them so that gated tool use is exercised deterministically.
-        agent.tool_choice = "required" if mcp_tools else "auto"
+        # V1.4.3: never force tool_choice="required" when thinking is enabled,
+        # because DeepSeek's thinking mode rejects that value. Leave tool_choice
+        # unset for the provider default.
+        if mcp_tools and not USE_THINKING:
+            agent.tool_choice = "required"
+        elif not mcp_tools:
+            agent.tool_choice = "auto"
         vertical_start = time.time()
 
         # Run agent in streaming mode.  We decouple Agno's async generator from
@@ -1165,10 +1346,10 @@ async def _stream_agent_response(
                     break
                 if kind == "delta":
                     full_content += payload
-                    yield f"event: delta\ndata: {json.dumps({'content': payload, 'current_agent': current_agent})}\n\n"
+                    yield f"event: delta\ndata: {json.dumps({'content': payload, 'current_agent': current_agent, 'current_agent_id': current_agent_id})}\n\n"
                 elif kind == "tool_calls":
                     tool_calls.extend(payload)
-                    yield f"event: tool_calls\ndata: {_safe_json_dumps({'tool_calls': payload, 'current_agent': current_agent})}\n\n"
+                    yield f"event: tool_calls\ndata: {_safe_json_dumps({'tool_calls': payload, 'current_agent': current_agent, 'current_agent_id': current_agent_id})}\n\n"
         finally:
             if not producer_task.done():
                 producer_task.cancel()
@@ -1186,7 +1367,7 @@ async def _stream_agent_response(
                     normalized = _normalize_tool_call(call)
                     if normalized not in tool_calls:
                         tool_calls.append(normalized)
-                        yield f"event: tool_calls\ndata: {_safe_json_dumps({'tool_calls': [normalized], 'current_agent': current_agent})}\n\n"
+                        yield f"event: tool_calls\ndata: {_safe_json_dumps({'tool_calls': [normalized], 'current_agent': current_agent, 'current_agent_id': current_agent_id})}\n\n"
 
         # Derive token_count from total_tokens or input+output when possible.
         if token_detail["total_tokens"]:
@@ -1272,6 +1453,7 @@ async def _stream_agent_response(
                 estimated_cost_cny=vertical_cost,
                 price_snapshot=vertical_price,
                 context_breakdown=context_breakdown,
+                usage_normalized=normalize_usage(token_detail),
             )
         except Exception:
             pass
@@ -1282,6 +1464,7 @@ async def _stream_agent_response(
                 trace_id=trace_id,
                 intent=intent,
                 agent_name=current_agent,
+                agent_id=current_agent_id,
                 status="failed" if error_yielded else "complete",
             )
         except Exception:
@@ -1289,6 +1472,19 @@ async def _stream_agent_response(
 
         # Build MCP audit list for the done event and persistence.
         mcp_calls_for_done: List[Dict[str, Any]] = []
+        # Pre-invoked calls first (policy_preinvoke).
+        for call in preinvoke_calls:
+            mcp_calls_for_done.append({
+                "server_name": call.get("server_name", "unknown"),
+                "tool_name": call.get("tool_name", ""),
+                "arguments": call.get("arguments", {}),
+                "status": call.get("status", "success"),
+                "result_summary": call.get("result_summary", ""),
+                "error_summary": call.get("error_summary"),
+                "latency_ms": call.get("latency_ms"),
+                "invocation_mode": call.get("invocation_mode", "policy_preinvoke"),
+            })
+        # Model-native calls recorded by ObservableMCPTools wrappers.
         for toolkit in mcp_tools:
             if hasattr(toolkit, "recorded_calls") and toolkit.recorded_calls:
                 for call in toolkit.recorded_calls:
@@ -1300,6 +1496,7 @@ async def _stream_agent_response(
                         "result_summary": call.get("result_summary", ""),
                         "error_summary": call.get("error_summary"),
                         "latency_ms": call.get("latency_ms"),
+                        "invocation_mode": "model_native",
                     })
 
         # Persist the assistant message synchronously. SQLite writes against the
@@ -1317,6 +1514,7 @@ async def _stream_agent_response(
             route_intent=intent,
             route_reason=intent_result.get("reason", ""),
             current_agent=current_agent,
+            current_agent_id=current_agent_id,
             tool_calls=tool_calls or None,
             model_id=runtime_model_id,
             thinking_enabled=USE_THINKING,
@@ -1362,6 +1560,7 @@ async def _stream_agent_response(
             'citations': citations,
             'activated_skills': activated_skills,
             'current_agent': current_agent,
+            'current_agent_id': current_agent_id,
             'route_intent': intent,
             'route_reason': intent_result.get("reason", ""),
             'tool_calls': tool_calls,

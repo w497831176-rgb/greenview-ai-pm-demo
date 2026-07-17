@@ -18,6 +18,7 @@ from pydantic import BaseModel, Field
 
 from app.observability import _check_budget
 from app.settings import build_model
+from app.utils.cost_utils import build_price_snapshot, compute_cost_cny
 from db.property_db import (
     create_model_config as db_create_model_config,
     delete_model_config as db_delete_model_config,
@@ -200,39 +201,14 @@ async def ab_test_models(request: AbTestRequest):
             pass
         raise HTTPException(status_code=403, detail=_BUDGET_BLOCKED_DETAIL)
 
-    def _build_price_snapshot(model_id: str) -> Optional[Dict[str, Any]]:
+    def _get_price_snapshot(model_id: str) -> Optional[Dict[str, Any]]:
         price = get_enabled_price_for_model(model_id)
-        if not price:
-            return None
-        return {
-            "model_id": price.get("model_id"),
-            "currency": price.get("currency"),
-            "effective_date": price.get("effective_date"),
-            "input_price_per_1m": price.get("input_price_per_1m"),
-            "cached_input_price_per_1m": price.get("cached_input_price_per_1m"),
-            "output_price_per_1m": price.get("output_price_per_1m"),
-            "reasoning_price_per_1m": price.get("reasoning_price_per_1m"),
-            "source_note": price.get("source_note"),
-        }
+        return build_price_snapshot(price)
 
     def _calculate_cost(model_id: str, usage: Dict[str, Optional[int]]) -> tuple:
-        snapshot = _build_price_snapshot(model_id)
-        if not snapshot:
-            return None, None
-        input_tk = usage.get("input_tokens") or 0
-        output_tk = usage.get("output_tokens") or 0
-        reasoning_tk = usage.get("reasoning_tokens") or 0
-        cached_tk = usage.get("cached_tokens") or 0
-        cost = 0.0
-        if snapshot.get("input_price_per_1m") is not None:
-            cost += (input_tk - cached_tk) * (snapshot["input_price_per_1m"] / 1_000_000)
-        if snapshot.get("cached_input_price_per_1m") is not None:
-            cost += cached_tk * (snapshot["cached_input_price_per_1m"] / 1_000_000)
-        if snapshot.get("output_price_per_1m") is not None:
-            cost += output_tk * (snapshot["output_price_per_1m"] / 1_000_000)
-        if snapshot.get("reasoning_price_per_1m") is not None:
-            cost += reasoning_tk * (snapshot["reasoning_price_per_1m"] / 1_000_000)
-        return round(cost, 8), snapshot
+        snapshot = _get_price_snapshot(model_id)
+        cost, _status = compute_cost_cny(snapshot, usage)
+        return cost, snapshot
 
     async def _collect_response(generator) -> tuple:
         response = ""

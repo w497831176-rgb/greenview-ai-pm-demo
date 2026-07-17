@@ -570,22 +570,32 @@ def _build_cost_formula(call: Dict[str, Any]) -> str:
     """Build a human-readable cost formula from the recorded price snapshot."""
     snapshot = call.get("price_snapshot") or {}
     if not snapshot:
-        return "价格未配置，无法估算成本"
+        return "单价已配置，但 Provider 未返回本次 usage，无法估算本次成本"
+
+    usage_source = call.get("usage_source")
+    if usage_source == "unavailable":
+        return "单价已配置，但 Provider 未返回本次 usage，无法估算本次成本"
 
     terms = []
     input_p = snapshot.get("input_price_per_1m")
     cached_p = snapshot.get("cached_input_price_per_1m")
     output_p = snapshot.get("output_price_per_1m")
-    reasoning_p = snapshot.get("reasoning_price_per_1m")
 
-    if input_p is not None:
-        terms.append(f"(input_tokens - cached_tokens) * {input_p} / 1_000_000")
-    if cached_p is not None:
-        terms.append(f"cached_tokens * {cached_p} / 1_000_000")
-    if output_p is not None:
-        terms.append(f"output_tokens * {output_p} / 1_000_000")
-    if reasoning_p is not None:
-        terms.append(f"reasoning_tokens * {reasoning_p} / 1_000_000")
+    # V1.4.3: normalized usage fields are preferred over legacy raw fields.
+    normalized = call.get("usage_normalized") or {}
+    if normalized.get("usage_split_unavailable"):
+        return "usage_split_unavailable：Provider 未拆分缓存/未缓存输入，成本 --"
+
+    uncached = normalized.get("uncached_input_tokens")
+    cached = normalized.get("cached_input_tokens")
+    output = normalized.get("output_tokens")
+
+    if uncached is not None and input_p is not None:
+        terms.append(f"uncached_input_tokens({uncached}) * {input_p} / 1_000_000")
+    if cached is not None and cached_p is not None:
+        terms.append(f"cached_input_tokens({cached}) * {cached_p} / 1_000_000")
+    if output is not None and output_p is not None:
+        terms.append(f"output_tokens({output}) * {output_p} / 1_000_000")
 
     if not terms:
         return "价格快照中无有效单价，无法估算成本"
@@ -594,10 +604,21 @@ def _build_cost_formula(call: Dict[str, Any]) -> str:
 
 def _enrich_model_call(call: Dict[str, Any], session_id: Optional[str]) -> Dict[str, Any]:
     """Add display name, session linkage, badcase linkage, and cost formula."""
+    import json
+
     enriched = dict(call)
     model_id = enriched.get("model_id")
     enriched["model_name"] = _model_display_name(model_id)
     enriched["session_id"] = session_id
+
+    # Parse normalized usage JSON if stored as string.
+    usage_norm = enriched.get("usage_normalized")
+    if isinstance(usage_norm, str):
+        try:
+            usage_norm = json.loads(usage_norm)
+        except Exception:
+            usage_norm = None
+    enriched["usage_normalized"] = usage_norm or {}
 
     stage = enriched.get("stage") or ""
     if stage in ("darwin", "badcase_classify", "retest"):
