@@ -219,40 +219,43 @@ def _rrf_fusion(
     keyword_weight: float = 0.3,
     semantic_weight: float = 0.7,
 ) -> List[Dict[str, Any]]:
-    """Reciprocal Rank Fusion between keyword and semantic chunk rankings.
+    """Fuse exact evidence chunks and preserve why each candidate survived.
 
-    Fusion key is (doc_id, chunk_index) so each chunk is an independent
-    candidate and citations stay chunk-accurate.
+    A result is keyed by (doc_id, chunk_index). Unlike document-level fusion,
+    this keeps a clickable citation tied to the exact supporting text. The
+    returned provenance is retained for the debug page and Trace.
     """
     scores: Dict[tuple, float] = {}
     details: Dict[tuple, Dict[str, Any]] = {}
 
-    for rank, r in enumerate(keyword_results, start=1):
-        key = (r.get("doc_id"), r.get("chunk_index"))
-        scores[key] = scores.get(key, 0.0) + keyword_weight * (1.0 / (k + rank))
-        details[key] = r
+    def add(result: Dict[str, Any], rank: int, channel: str, weight: float) -> None:
+        key = (result.get("doc_id"), result.get("chunk_index"))
+        scores[key] = scores.get(key, 0.0) + weight * (1.0 / (k + rank))
+        item = details.get(key)
+        if item is None:
+            item = dict(result)
+            item["retrieval_sources"] = []
+            details[key] = item
+        if channel not in item["retrieval_sources"]:
+            item["retrieval_sources"].append(channel)
+        item[f"{channel}_rank"] = rank
+        item[f"{channel}_score"] = result.get("score")
 
-    for rank, r in enumerate(semantic_results, start=1):
-        key = (r.get("doc_id"), r.get("chunk_index"))
-        scores[key] = scores.get(key, 0.0) + semantic_weight * (1.0 / (k + rank))
-        details[key] = r
+    for rank, result in enumerate(keyword_results, start=1):
+        add(result, rank, "keyword", keyword_weight)
+    for rank, result in enumerate(semantic_results, start=1):
+        add(result, rank, "semantic", semantic_weight)
 
-    ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
     results = []
-    for key, score in ranked:
-        r = dict(details[key])
-        r["rrf_score"] = round(score, 4)
-        r["source"] = "fusion"
-        results.append(r)
+    for key, score in sorted(scores.items(), key=lambda item: item[1], reverse=True):
+        item = dict(details[key])
+        item["rrf_score"] = round(score, 6)
+        item["source"] = "fusion"
+        results.append(item)
     return results
 
-
 def _rerank_results(query: str, results: List[Dict[str, Any]], model_name: Optional[str] = None) -> List[Dict[str, Any]]:
-    """Optional cross-encoder reranking.
-
-    If a cross-encoder model is available locally, use it; otherwise fall back
-    to a lightweight lexical overlap score so the pipeline still works offline.
-    """
+    """Optionally rerank and explicitly disclose any offline fallback."""
     if not results:
         return results
 
@@ -260,28 +263,27 @@ def _rerank_results(query: str, results: List[Dict[str, Any]], model_name: Optio
     if model_name:
         try:
             from sentence_transformers import CrossEncoder
-
             cross_encoder = CrossEncoder(model_name)
         except Exception:
             cross_encoder = None
 
     if cross_encoder is not None:
-        pairs = [[query, r.get("content", "")] for r in results]
+        pairs = [[query, result.get("content", "")] for result in results]
         scores = cross_encoder.predict(pairs)
-        for r, score in zip(results, scores):
-            r["rerank_score"] = round(float(score), 4)
-        results.sort(key=lambda x: x.get("rerank_score", 0), reverse=True)
+        for result, score in zip(results, scores):
+            result["rerank_score"] = round(float(score), 4)
+            result["rerank_mode"] = "cross_encoder"
+        results.sort(key=lambda item: item.get("rerank_score", 0), reverse=True)
         return results
 
-    # Fallback: token overlap reranker.
     query_tokens = set(_tokenize(query))
-    for r in results:
-        content_tokens = set(_tokenize(r.get("content", "")))
+    for result in results:
+        content_tokens = set(_tokenize(result.get("content", "")))
         overlap = len(query_tokens & content_tokens)
-        r["rerank_score"] = round(overlap / max(len(query_tokens), 1), 4)
-    results.sort(key=lambda x: x.get("rerank_score", 0), reverse=True)
+        result["rerank_score"] = round(overlap / max(len(query_tokens), 1), 4)
+        result["rerank_mode"] = "lexical_fallback"
+    results.sort(key=lambda item: item.get("rerank_score", 0), reverse=True)
     return results
-
 
 def _extract_quoted_titles(query: str) -> List[str]:
     """Extract document titles wrapped in 《》 from the user query."""
@@ -319,55 +321,96 @@ def _extract_sub_queries(query: str) -> List[str]:
     return unique
 
 
+DEFAULT_RETRIEVAL_SETTINGS = {
+    "top_k": 5,
+    "keyword_weight": 0.3,
+    "semantic_weight": 0.7,
+    "rrf_k": 60,
+    "enable_rerank": False,
+    "rerank_model": None,
+    "score_threshold": 0.0,
+    "context_threshold": 0.2,
+}
+
+
+def normalize_retrieval_settings(settings: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Clamp and normalise the shared retrieval settings contract.
+
+    The owner chat, search API and debug console call this helper so the values
+    in the platform console are not silently replaced by different defaults.
+    """
+    result = dict(DEFAULT_RETRIEVAL_SETTINGS)
+    result.update(settings or {})
+    try:
+        result["top_k"] = max(1, min(10, int(result["top_k"])))
+    except (TypeError, ValueError):
+        result["top_k"] = DEFAULT_RETRIEVAL_SETTINGS["top_k"]
+    try:
+        result["rrf_k"] = max(1, min(1000, int(result["rrf_k"])))
+    except (TypeError, ValueError):
+        result["rrf_k"] = DEFAULT_RETRIEVAL_SETTINGS["rrf_k"]
+    for key in ("keyword_weight", "semantic_weight"):
+        try:
+            result[key] = max(0.0, float(result[key]))
+        except (TypeError, ValueError):
+            result[key] = DEFAULT_RETRIEVAL_SETTINGS[key]
+    weight_sum = result["keyword_weight"] + result["semantic_weight"]
+    if weight_sum <= 0:
+        result["keyword_weight"] = DEFAULT_RETRIEVAL_SETTINGS["keyword_weight"]
+        result["semantic_weight"] = DEFAULT_RETRIEVAL_SETTINGS["semantic_weight"]
+    else:
+        result["keyword_weight"] = round(result["keyword_weight"] / weight_sum, 4)
+        result["semantic_weight"] = round(result["semantic_weight"] / weight_sum, 4)
+    for key in ("score_threshold", "context_threshold"):
+        try:
+            result[key] = max(0.0, min(1.0, float(result[key])))
+        except (TypeError, ValueError):
+            result[key] = DEFAULT_RETRIEVAL_SETTINGS[key]
+    result["enable_rerank"] = bool(result.get("enable_rerank"))
+    return result
+
+
 def _single_query_search(
     query: str,
     settings: Dict[str, Any],
 ) -> List[Dict[str, Any]]:
-    """Run keyword + semantic + RRF + rerank + context filter for one query.
-
-    The context filter is applied against this specific query so that a short
-    sub-question ("家里漏水了怎么办？") is not penalised by tokens from the
-    broader composite prompt.
-    """
-    top_k = settings.get("top_k", 5)
-    keyword_weight = settings.get("keyword_weight", 0.3)
-    semantic_weight = settings.get("semantic_weight", 0.7)
-    rrf_k = settings.get("rrf_k", 60)
-    enable_rerank = settings.get("enable_rerank", False)
-    rerank_model = settings.get("rerank_model")
-    score_threshold = settings.get("score_threshold", 0.0)
-    context_threshold = settings.get("context_threshold", 0.2)
-
+    """Run hybrid retrieval and the same evidence gate used in production."""
+    settings = normalize_retrieval_settings(settings)
+    top_k = settings["top_k"]
     keyword_results = _keyword_search(query, top_k=top_k * 2)
-    semantic_results = _semantic_search(query, top_k=top_k * 2, threshold=score_threshold)
-    semantic_results = [r for r in semantic_results if r.get("is_indexed")]
-
+    semantic_results = _semantic_search(
+        query, top_k=top_k * 2, threshold=settings["score_threshold"]
+    )
+    semantic_results = [result for result in semantic_results if result.get("is_indexed")]
     fused = _rrf_fusion(
         keyword_results,
         semantic_results,
-        k=rrf_k,
-        keyword_weight=keyword_weight,
-        semantic_weight=semantic_weight,
+        k=settings["rrf_k"],
+        keyword_weight=settings["keyword_weight"],
+        semantic_weight=settings["semantic_weight"],
     )
-
-    if enable_rerank:
-        fused = _rerank_results(query, fused, model_name=rerank_model)
+    if settings["enable_rerank"]:
+        fused = _rerank_results(query, fused, model_name=settings["rerank_model"])
 
     grounded = []
-    for r in fused:
-        if enable_rerank:
-            ctx_score = r.get("rerank_score", 0.0)
-            r["score"] = round(ctx_score, 4)
+    for result in fused:
+        if settings["enable_rerank"]:
+            context_score = result.get("rerank_score", 0.0)
+            result["score"] = round(context_score, 4)
         else:
-            ctx_text = f"{r.get('title', '')} {r.get('content', '')}"
-            ctx_score = _context_relevance_score(query, ctx_text)
-            r["score"] = round(ctx_score, 4)
-        r["context_score"] = round(ctx_score, 4)
-        if ctx_score >= context_threshold:
-            grounded.append(r)
-
+            context_score = _context_relevance_score(
+                query, f"{result.get('title', '')} {result.get('content', '')}"
+            )
+            result["score"] = round(context_score, 4)
+        result["context_score"] = round(context_score, 4)
+        result["evidence_status"] = (
+            "accepted"
+            if context_score >= settings["context_threshold"]
+            else "filtered_low_relevance"
+        )
+        if result["evidence_status"] == "accepted":
+            grounded.append(result)
     return grounded[:top_k]
-
 
 def _title_boosted_results(
     query: str,
@@ -424,49 +467,54 @@ def advanced_search(
     query: str,
     settings: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Run composite-aware advanced RAG.
-
-    In addition to the full user query, the pipeline:
-      1. Searches for any document titles explicitly cited in 《》.
-      2. Searches focused sub-questions (sentences ending with ？/?).
-      3. Merges and deduplicates candidates by exact chunk.
-
-    Only when none of the retrieval paths produce evidence does the caller see
-    an empty result set (and may create an auto knowledge badcase).
-    """
-    settings = settings or {}
-    top_k = settings.get("top_k", 5)
-
+    """Run composite-aware advanced RAG and retain evidence provenance."""
+    settings = normalize_retrieval_settings(settings)
+    top_k = settings["top_k"]
     merged: Dict[tuple, Dict[str, Any]] = {}
 
-    def _add_results(results: List[Dict[str, Any]]) -> None:
-        for r in results:
-            key = (r.get("doc_id"), r.get("chunk_index"))
-            existing = merged.get(key)
-            if existing is None or r.get("score", 0) > existing.get("score", 0):
-                merged[key] = r
+    def add_results(results: List[Dict[str, Any]], path: str) -> None:
+        for result in results:
+            item = dict(result)
+            item["retrieval_paths"] = list(
+                dict.fromkeys(item.get("retrieval_paths", []) + [path])
+            )
+            key = (item.get("doc_id"), item.get("chunk_index"))
+            current = merged.get(key)
+            if current is None:
+                merged[key] = item
+                continue
+            paths = list(
+                dict.fromkeys(current.get("retrieval_paths", []) + item["retrieval_paths"])
+            )
+            sources = list(
+                dict.fromkeys(current.get("retrieval_sources", []) + item.get("retrieval_sources", []))
+            )
+            if item.get("score", 0) > current.get("score", 0):
+                item["retrieval_paths"] = paths
+                if sources:
+                    item["retrieval_sources"] = sources
+                merged[key] = item
+            else:
+                current["retrieval_paths"] = paths
+                if sources:
+                    current["retrieval_sources"] = sources
 
-    # Primary retrieval path: the full user query.
-    original_results = _single_query_search(query, settings)
-    _add_results(original_results)
-
-    # Secondary path: exact titles cited in 《》 (e.g. 《常见维修问题 FAQ》).
+    add_results(_single_query_search(query, settings), "full_query")
     for title in _extract_quoted_titles(query):
-        _add_results(_title_boosted_results(query, title, settings))
-
-    # Tertiary path: focused sub-questions inside the composite prompt.
+        add_results(_title_boosted_results(query, title, settings), "quoted_title")
     for sub_query in _extract_sub_queries(query):
-        if sub_query == query:
-            continue
-        _add_results(_single_query_search(sub_query, settings))
+        if sub_query != query:
+            add_results(_single_query_search(sub_query, settings), "sub_query")
 
-    results = sorted(merged.values(), key=lambda x: x.get("score", 0), reverse=True)[:top_k]
-
-    # Keep simple diagnostics based on the original query so callers can still
-    # compare the raw full-query pipeline against the composite result set.
+    results = sorted(merged.values(), key=lambda item: item.get("score", 0), reverse=True)[:top_k]
     keyword_results = _keyword_search(query, top_k=top_k * 2)
-    semantic_results = [r for r in _semantic_search(query, top_k=top_k * 2, threshold=settings.get("score_threshold", 0.0)) if r.get("is_indexed")]
-
+    semantic_results = [
+        result
+        for result in _semantic_search(
+            query, top_k=top_k * 2, threshold=settings["score_threshold"]
+        )
+        if result.get("is_indexed")
+    ]
     return {
         "query": query,
         "mode": "advanced",
@@ -475,8 +523,13 @@ def advanced_search(
         "semantic_count": len(semantic_results),
         "count": len(results),
         "results": results,
+        "embedding_runtime": rag_embeddings.get_runtime_info(),
+        "evidence_policy": {
+            "score_threshold": settings["score_threshold"],
+            "context_threshold": settings["context_threshold"],
+            "top_k": settings["top_k"],
+        },
     }
-
 
 def debug_search(
     query: str,
@@ -490,76 +543,50 @@ def debug_search(
     context_threshold: Optional[float] = None,
     expected_doc_title: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Debug endpoint exposing each retrieval stage."""
-    score_threshold = score_threshold or 0.0
-    context_threshold = context_threshold if context_threshold is not None else 0.2
-    settings = {
-        "top_k": top_k,
-        "keyword_weight": keyword_weight,
-        "semantic_weight": semantic_weight,
-        "rrf_k": rrf_k,
-        "enable_rerank": enable_rerank,
-        "rerank_model": rerank_model,
-        "score_threshold": score_threshold,
-        "context_threshold": context_threshold,
-    }
-    keyword_results = _keyword_search(query, top_k=top_k * 2)
-    semantic_results = _semantic_search(query, top_k=top_k * 2, threshold=score_threshold)
-    # Expose unfiltered semantic candidates in debug, but flag those that would
-    # be removed by the business-index gate.
-    semantic_results_debug = []
-    for r in semantic_results:
-        r_debug = dict(r)
-        r_debug["_filtered_not_indexed"] = not r.get("is_indexed")
-        semantic_results_debug.append(r_debug)
-    semantic_results_indexed = [r for r in semantic_results if r.get("is_indexed")]
-
-    fused = _rrf_fusion(
-        keyword_results,
-        semantic_results_indexed,
-        k=rrf_k,
-        keyword_weight=keyword_weight,
-        semantic_weight=semantic_weight,
-    )
-    if enable_rerank:
-        fused = _rerank_results(query, fused, model_name=rerank_model)
-
-    # Apply the same grounded-evidence filter used in production.
-    grounded = []
-    for r in fused:
-        if enable_rerank:
-            ctx_score = r.get("rerank_score", 0.0)
-        else:
-            ctx_text = f"{r.get('title', '')} {r.get('content', '')}"
-            ctx_score = _context_relevance_score(query, ctx_text)
-        r["context_score"] = ctx_score
-        if ctx_score >= context_threshold:
-            grounded.append(r)
-
-    # The original-query stages are exposed for diagnostics, but the final
-    # production result set comes from the composite-aware advanced_search so
-    # that title/sub-question evidence is preserved.
+    """Expose every retrieval stage without making candidates look like evidence."""
+    settings = normalize_retrieval_settings({
+        "top_k": top_k, "keyword_weight": keyword_weight, "semantic_weight": semantic_weight,
+        "rrf_k": rrf_k, "enable_rerank": enable_rerank, "rerank_model": rerank_model,
+        "score_threshold": 0.0 if score_threshold is None else score_threshold,
+        "context_threshold": 0.2 if context_threshold is None else context_threshold,
+    })
+    keyword_results = _keyword_search(query, top_k=settings["top_k"] * 2)
+    semantic_results = _semantic_search(query, top_k=settings["top_k"] * 2, threshold=settings["score_threshold"])
+    semantic_debug = []
+    for result in semantic_results:
+        item = dict(result)
+        item["_filtered_not_indexed"] = not item.get("is_indexed")
+        semantic_debug.append(item)
+    semantic_indexed = [result for result in semantic_results if result.get("is_indexed")]
+    fused = _rrf_fusion(keyword_results, semantic_indexed, k=settings["rrf_k"],
+                         keyword_weight=settings["keyword_weight"], semantic_weight=settings["semantic_weight"])
+    reranked_results: List[Dict[str, Any]] = []
+    if settings["enable_rerank"]:
+        fused = _rerank_results(query, fused, model_name=settings["rerank_model"])
+        reranked_results = [dict(result) for result in fused]
+    primary_accepted = []
+    for result in fused:
+        context_score = result.get("rerank_score", 0.0) if settings["enable_rerank"] else _context_relevance_score(
+            query, f"{result.get('title', '')} {result.get('content', '')}")
+        result["context_score"] = round(context_score, 4)
+        result["evidence_status"] = "accepted" if context_score >= settings["context_threshold"] else "filtered_low_relevance"
+        if result["evidence_status"] == "accepted":
+            primary_accepted.append(result)
     composite = advanced_search(query, settings=settings)
     results = composite.get("results", [])
-
-    titles = [r.get("title") for r in results]
-    top1_hit = bool(expected_doc_title and titles and titles[0] == expected_doc_title)
-    top3_hit = bool(expected_doc_title and expected_doc_title in titles)
-
+    titles = [result.get("title") for result in results]
     return {
-        "query": query,
-        "settings": settings,
-        "keyword_results": keyword_results,
-        "semantic_results": semantic_results_debug,
-        "fused_results": fused,
-        "results": results,
-        "count": len(results),
+        "query": query, "settings": settings, "keyword_results": keyword_results,
+        "semantic_results": semantic_debug, "fused_results": fused,
+        "reranked_results": reranked_results, "results": results, "count": len(results),
         "expected_doc_title": expected_doc_title,
-        "top1_hit": top1_hit,
-        "top3_hit": top3_hit,
-        "composite_debug": {
-            "quoted_titles": _extract_quoted_titles(query),
-            "sub_queries": _extract_sub_queries(query),
-            "merged_count": composite.get("count", 0),
-        },
+        "top1_hit": bool(expected_doc_title and titles and titles[0] == expected_doc_title),
+        "top3_hit": bool(expected_doc_title and expected_doc_title in titles),
+        "embedding_runtime": rag_embeddings.get_runtime_info(),
+        "filter_summary": {"context_threshold": settings["context_threshold"],
+                            "accepted_from_primary_fusion": len(primary_accepted),
+                            "final_composite_evidence": len(results)},
+        "composite_debug": {"quoted_titles": _extract_quoted_titles(query),
+                            "sub_queries": _extract_sub_queries(query),
+                            "merged_count": composite.get("count", 0)},
     }

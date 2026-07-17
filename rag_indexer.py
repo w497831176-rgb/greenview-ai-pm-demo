@@ -16,6 +16,9 @@ def index_document(doc_id: int, force: bool = False) -> bool:
     doc = db.get_knowledge_doc(doc_id)
     if not doc:
         return False
+    # Disabled/test documents retain history but never become owner-facing evidence.
+    if not doc.get("is_indexed"):
+        return True
 
     db.set_knowledge_doc_indexed(doc_id, "indexing", 0)
 
@@ -101,7 +104,7 @@ def semantic_search(query: str, top_k: int = 3, threshold: Optional[float] = Non
             continue
         seen_doc_ids.add(doc_id)
         doc = db.get_knowledge_doc(doc_id)
-        if not doc:
+        if not doc or not doc.get("is_indexed"):
             continue
         enriched.append({
             # Document-level fields for card rendering.

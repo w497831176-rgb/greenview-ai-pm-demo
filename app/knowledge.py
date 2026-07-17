@@ -30,9 +30,23 @@ from db.property_db import (
     update_knowledge_draft as db_update_knowledge_draft,
     update_retrieval_settings as db_update_retrieval_settings,
 )
+import rag_embeddings
 import rag_indexer
 import rag_retrieval
 import rag_store
+
+
+VALID_KNOWLEDGE_SOURCE_TYPES = {"business", "demo_test"}
+
+
+def _validate_source_type(source_type: str) -> str:
+    if source_type not in VALID_KNOWLEDGE_SOURCE_TYPES:
+        raise HTTPException(status_code=422, detail="source_type must be business or demo_test")
+    return source_type
+
+
+def _retrieval_settings_response(settings):
+    return {"retrieval_settings": settings, "embedding_runtime": rag_embeddings.get_runtime_info()}
 
 router = APIRouter(prefix="/api/knowledge", tags=["knowledge"])
 
@@ -44,6 +58,7 @@ class KnowledgeDocCreate(BaseModel):
     title: str
     content: str
     category: str = "未分类"
+    source_type: str = "business"
     chunk_size: int = 512
     chunk_overlap: int = 64
     split_strategy: str = "auto"
@@ -53,6 +68,7 @@ class KnowledgeDocUpdate(BaseModel):
     title: str
     content: str
     category: str = "未分类"
+    source_type: str = "business"
     chunk_size: int = 512
     chunk_overlap: int = 64
     split_strategy: str = "auto"
@@ -119,7 +135,7 @@ async def get_retrieval_settings_top():
     settings = db_get_retrieval_settings("default")
     if not settings:
         settings = db_update_retrieval_settings("default")
-    return {"retrieval_settings": settings}
+    return _retrieval_settings_response(settings)
 
 
 @retrieval_router.post("/settings")
@@ -136,7 +152,7 @@ async def update_retrieval_settings_top(request: RetrievalSettingsUpdate):
         score_threshold=request.score_threshold,
         context_threshold=request.context_threshold,
     )
-    return {"retrieval_settings": settings}
+    return _retrieval_settings_response(settings)
 
 
 @retrieval_router.post("/debug")
@@ -163,7 +179,7 @@ async def get_retrieval_settings():
     settings = db_get_retrieval_settings("default")
     if not settings:
         settings = db_update_retrieval_settings("default")
-    return {"retrieval_settings": settings}
+    return _retrieval_settings_response(settings)
 
 
 @router.post("/retrieval/settings")
@@ -180,7 +196,7 @@ async def update_retrieval_settings(request: RetrievalSettingsUpdate):
         score_threshold=request.score_threshold,
         context_threshold=request.context_threshold,
     )
-    return {"retrieval_settings": settings}
+    return _retrieval_settings_response(settings)
 
 
 @router.post("/retrieval/debug")
@@ -207,7 +223,7 @@ async def get_retrieval_settings_alias():
     settings = db_get_retrieval_settings("default")
     if not settings:
         settings = db_update_retrieval_settings("default")
-    return {"retrieval_settings": settings}
+    return _retrieval_settings_response(settings)
 
 
 @router.post("/retrieval-settings")
@@ -224,7 +240,7 @@ async def update_retrieval_settings_alias(request: RetrievalSettingsUpdate):
         score_threshold=request.score_threshold,
         context_threshold=request.context_threshold,
     )
-    return {"retrieval_settings": settings}
+    return _retrieval_settings_response(settings)
 
 
 @router.post("/retrieval-debug")
@@ -278,17 +294,19 @@ async def get_knowledge_doc(doc_id: int):
 
 @router.post("/docs")
 async def create_knowledge_doc(request: KnowledgeDocCreate):
-    """Create a new knowledge document and trigger indexing."""
+    """Create a document and index only owner-facing business evidence."""
+    source_type = _validate_source_type(request.source_type)
     doc = db_create_knowledge_doc(
         title=request.title,
         content=request.content,
         category=request.category,
+        source_type=source_type,
         index_status="pending",
         chunk_size=request.chunk_size,
         chunk_overlap=request.chunk_overlap,
         split_strategy=request.split_strategy,
     )
-    if doc:
+    if doc and doc.get("is_indexed"):
         rag_indexer.index_document(doc["id"])
         doc = db_get_knowledge_doc(doc["id"])
         # Retry once if the document has content but no SQLite chunks were recorded.
@@ -313,11 +331,13 @@ async def update_knowledge_doc(doc_id: int, request: KnowledgeDocUpdate):
     if not old_doc:
         raise HTTPException(status_code=404, detail="not found")
 
+    source_type = _validate_source_type(request.source_type)
     doc = db_update_knowledge_doc(
         doc_id=doc_id,
         title=request.title,
         content=request.content,
         category=request.category,
+        source_type=source_type,
         chunk_size=request.chunk_size,
         chunk_overlap=request.chunk_overlap,
         split_strategy=request.split_strategy,

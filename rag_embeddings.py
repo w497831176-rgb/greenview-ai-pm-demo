@@ -155,3 +155,19 @@ def embed_text(text: str) -> List[float]:
 def embed_texts(texts: List[str]) -> List[List[float]]:
     """Embed a batch of texts."""
     return [embed_text(t) for t in texts]
+
+
+def get_runtime_info() -> dict:
+    """Return an honest, serialisable description of the semantic channel."""
+    fallback = _should_use_fallback()
+    return {
+        "model_name": MODEL_NAME,
+        "mode": "deterministic_ngram_fallback" if fallback else "local_transformer",
+        "label": "确定性 n-gram 向量降级" if fallback else "本地 Transformer 向量模型",
+        "is_semantic_model": not fallback,
+        "note": (
+            "当前未缓存本地 Transformer，语义通道使用确定性 n-gram 向量；"
+            "可演示混合检索流程，但不应表述为已启用预训练语义模型。"
+            if fallback else "向量通道使用本地缓存的 Transformer 模型，不调用聊天模型。"
+        ),
+    }

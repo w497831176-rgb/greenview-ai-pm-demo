@@ -219,7 +219,7 @@
     // ==========================================
     const API_BASE = '';
     const DEFAULT_ROOM_ID = '3-2-1201';
-    const APP_VERSION = 'V1.5.0';
+    const APP_VERSION = 'V1.5.1';
 
     const STATE = {
       topTab: 'owner',
@@ -1193,11 +1193,16 @@
       const renderItem = (item) => {
         const citation = item.citation;
         const score = typeof citation.score === 'number' ? citation.score.toFixed(3) : '-';
+        const provenance = [
+          citation.retrieval_sources?.length ? `召回：${citation.retrieval_sources.join('+')}` : '',
+          citation.retrieval_paths?.length ? `路径：${citation.retrieval_paths.join('+')}` : '',
+          citation.context_score != null ? `证据相关度：${Number(citation.context_score).toFixed(3)}` : ''
+        ].filter(Boolean).join(' · ');
         const title = escapeHtml(citation.doc_title || '未知文档');
         const docId = Number(citation.doc_id || 0);
         const chunkIndex = typeof citation.chunk_index === 'number' ? citation.chunk_index : '';
         const click = docId ? `class="mt-1 cursor-pointer hover:text-brand-600 hover:underline" onclick="showCitationChunk(${docId}, '${escapeHtml(String(chunkIndex))}')"` : 'class="mt-1"';
-        return `<li ${click}>[${item.index}] 《${title}》${chunkIndex !== '' ? ` · 分片 ${chunkIndex}` : ''}<span class="text-slate-400">（相关度 ${score}）</span></li>`;
+        return `<li ${click}>[${item.index}] 《${title}》${chunkIndex !== '' ? ` · 分片 ${chunkIndex}` : ''}<span class="text-slate-400">（相关度 ${score}）</span>${provenance ? `<span class="block text-[9px] text-slate-400">${escapeHtml(provenance)}</span>` : ''}</li>`;
       };
       let html = '<div class="ai-message-citations mt-2 pt-2 border-t border-slate-100">';
       if (used.length) html += `<p class="text-[10px] text-slate-400 mb-1">回答中实际引用的证据</p><ol class="text-[10px] text-slate-500 list-decimal list-inside">${used.map(renderItem).join('')}</ol>`;
@@ -1984,8 +1989,8 @@
       }
 
       function indexStatusBadge(doc) {
-        if (!doc.is_indexed) return `<span class="text-xs px-2 py-1 bg-slate-100 text-slate-500 rounded-full">未索引</span>`;
-        return `<span class="text-xs px-2 py-1 bg-brand-50 text-brand-600 rounded-full">已索引 · ${doc.chunk_count || 0} 分片</span>`;
+        if (!doc.is_indexed) return `<span class="text-xs px-2 py-1 bg-slate-100 text-slate-500 rounded-full">验收隔离 · 不参与业主检索</span>`;
+        return `<span class="text-xs px-2 py-1 bg-brand-50 text-brand-600 rounded-full">业主可检索 · ${doc.chunk_count || 0} 分片</span>`;
       }
 
       async function loadDocs(query) {
@@ -2015,7 +2020,7 @@
                     <span class="text-xs px-2 py-1 bg-slate-100 text-slate-600 rounded-full">${escapeHtml(doc.category || '未分类')}</span>
                   </div>
                   <p class="text-sm text-slate-600 line-clamp-4 whitespace-pre-line">${escapeHtml(doc.content)}</p>
-                  <div class="mt-3 flex items-center gap-2">${indexStatusBadge(doc)}</div>
+                  <div class="mt-3 flex items-center gap-2 flex-wrap">${indexStatusBadge(doc)}<span class="text-[10px] text-slate-400">分片：${escapeHtml(doc.split_strategy || 'auto')} / ${escapeHtml(String(doc.chunk_size || 512))} 字</span></div>
                   <div class="mt-4 pt-4 border-t border-slate-100 flex flex-wrap gap-2">
                     <button data-id="${doc.id}" class="knowledge-edit-btn text-xs px-3 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg transition-colors">编辑</button>
                     <button data-id="${doc.id}" class="knowledge-chunks-btn text-xs px-3 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg transition-colors">查看分片</button>
@@ -2075,9 +2080,10 @@
               <div class="bg-blue-50 rounded-2xl border border-blue-100 p-5">
                 <h3 class="text-sm font-semibold text-blue-900 mb-2">当前 RAG 技术方案</h3>
                 <div class="text-sm text-blue-800 space-y-1">
-                  <p><strong>数据接入：</strong>粘贴知识文本 → 自动切分 → 关键词索引 + 向量索引</p>
-                  <p><strong>检索：</strong>关键词检索（BM25）+ 语义检索（向量）→ 加权 RRF 融合 → 可选重排序 → 相关性过滤</p>
-                  <p><strong>生成：</strong>最终证据分片注入当前 Agent → 回答携带文档/分片引用 → 点击可查看原文证据</p>
+                  <p><strong>数据治理：</strong>业务知识参与业主检索；验收/测试文档可隔离保留，不污染回答证据。</p>
+                  <p><strong>数据接入：</strong>粘贴知识文本 → 章节/规则项优先切分 → 关键词索引 + 向量索引。</p>
+                  <p><strong>检索：</strong>BM25 + 向量召回 → 加权 RRF 融合 → 可选重排序 → 证据相关性过滤。</p>
+                  <p><strong>生成：</strong>最终证据分片注入当前 Agent → 回答仅对实际使用内容标注引用 → 点击可查看原文分片。</p>
                 </div>
                 <div class="mt-3 grid grid-cols-2 gap-2 text-xs text-slate-700">
                   <div class="bg-white/70 rounded-lg p-2"><span class="text-slate-500">Top-K：</span>${currentTopK}</div>
@@ -2086,7 +2092,8 @@
                   <div class="bg-white/70 rounded-lg p-2"><span class="text-slate-500">RRF K：</span>${s.rrf_k != null ? s.rrf_k : '60'}</div>
                   <div class="bg-white/70 rounded-lg p-2"><span class="text-slate-500">重排序：</span>${!!s.enable_rerank ? (s.rerank_model || '已启用') : '未启用'}</div>
                   <div class="bg-white/70 rounded-lg p-2"><span class="text-slate-500">相似度阈值：</span>${s.score_threshold != null ? s.score_threshold : '无'}</div>
-                  <div class="bg-white/70 rounded-lg p-2"><span class="text-slate-500">context_threshold：</span>${s.context_threshold != null ? s.context_threshold : '0.2'}</div>
+                  <div class="bg-white/70 rounded-lg p-2"><span class="text-slate-500">证据相关性阈值：</span>${s.context_threshold != null ? s.context_threshold : '0.2'}</div>
+                  <div class="bg-white/70 rounded-lg p-2 col-span-2"><span class="text-slate-500">当前向量通道：</span>${escapeHtml((data.embedding_runtime || {}).label || '加载中')}<span class="block mt-1 text-[10px]">${escapeHtml((data.embedding_runtime || {}).note || '')}</span></div>
                 </div>
               </div>
               <div class="bg-white rounded-2xl shadow-soft border border-slate-200 p-5">
@@ -2098,7 +2105,7 @@
                   ${formSwitch('启用重排序', 'rs-enable-rerank', !!s.enable_rerank)}
                   ${formInput('重排序模型', 'rs-rerank-model', s.rerank_model || '', '如：cross-encoder/ms-marco-MiniLM-L-6-v2')}
                   ${formInput('相似度阈值（可选）', 'rs-score-threshold', s.score_threshold != null ? String(s.score_threshold) : '', '如：0.5', 'number')}
-                  ${formInput('context_threshold（0-1）', 'rs-context-threshold', s.context_threshold != null ? String(s.context_threshold) : '0.2', '如：0.2', 'number')}
+                  ${formInput('证据相关性阈值（0-1）', 'rs-context-threshold', s.context_threshold != null ? String(s.context_threshold) : '0.2', '如：0.2；越高越严格', 'number')}
                   <div class="pt-2">
                     <button type="submit" class="px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white rounded-xl text-sm transition-colors">保存设置</button>
                   </div>
@@ -2139,12 +2146,21 @@
                 const docId = r.doc_id || r.id || '';
                 const docTitle = r.doc_title || r.title || '未知文档';
                 const chunkIdx = r.chunk_index != null ? r.chunk_index : '';
+                const evidenceMeta = [
+                  r.retrieval_sources?.length ? `召回：${r.retrieval_sources.join('+')}` : '',
+                  r.retrieval_paths?.length ? `路径：${r.retrieval_paths.join('+')}` : '',
+                  r.rrf_score != null ? `RRF：${Number(r.rrf_score).toFixed(4)}` : '',
+                  r.context_score != null ? `证据相关度：${Number(r.context_score).toFixed(3)}` : '',
+                  r.rerank_mode === 'lexical_fallback' ? '重排：本地词项降级' : (r.rerank_mode === 'cross_encoder' ? '重排：Cross-Encoder' : ''),
+                  r.evidence_status === 'filtered_low_relevance' ? '已被证据阈值过滤' : ''
+                ].filter(Boolean).join(' · ');
                 return `
                 <div class="bg-slate-50 rounded-xl p-3 border border-slate-200">
                   <div class="flex items-center justify-between mb-1">
                     <span class="text-xs font-semibold text-slate-500">#${i + 1} ${escapeHtml(docTitle)}</span>
                     <span class="text-xs font-mono text-slate-600">score ${typeof r.score === 'number' ? r.score.toFixed(3) : '-'}</span>
                   </div>
+                  <p class="text-[10px] text-slate-400 mb-2">${escapeHtml(evidenceMeta || '原始候选')}</p>
                   <p class="text-xs text-slate-700 mb-2 max-h-20 overflow-hidden">${escapeHtml((r.content || '').slice(0, 180))}${(r.content || '').length > 180 ? '...' : ''}</p>
                   <button class="debug-view-chunk text-xs text-brand-600 hover:text-brand-700 underline" data-doc-id="${docId}" data-chunk-index="${chunkIdx}">查看分片</button>
                 </div>
@@ -2224,17 +2240,20 @@
       function openKnowledgeModal(doc = null) {
         const isEdit = !!doc;
         const title = isEdit ? '编辑知识文档' : '新增知识文档';
-        const addNote = isEdit ? '' : `<div class="bg-blue-50 text-blue-800 text-xs rounded-lg p-2 mb-3 border border-blue-100 space-y-1"><p>保存后系统将自动进行文本切分、关键词索引与向量索引；无需手动选择 RAG 方案。当前仅支持文本粘贴，不支持 PDF/Word 上传。</p><p>系统按长度与语义边界自动切分；短文本可能只生成 1 个分片，属于正常结果。</p></div>`;
+        const addNote = isEdit ? '' : `<div class="bg-blue-50 text-blue-800 text-xs rounded-lg p-2 mb-3 border border-blue-100 space-y-1"><p>保存后系统将自动进行结构化文本切分、关键词索引与向量索引；无需手动选择 RAG 方案。当前仅支持文本粘贴，不支持 PDF/Word 上传。</p><p>章节、FAQ、编号规则会尽量保持为可引用证据单元；短而完整的规则可能只有 1 个分片，属于正常结果。</p></div>`;
+        const sourceType = doc?.source_type || 'business';
         const body = `
           ${addNote}
           ${formInput('标题', 'kd-title', doc ? doc.title : '', '请输入文档标题')}
           ${formInput('分类', 'kd-category', doc ? doc.category : '', '如：服务承诺、收费标准、FAQ')}
+          <div><label class="block text-sm font-medium text-slate-700 mb-1.5">文档用途</label><select id="kd-source-type" class="w-full px-3 py-2.5 border border-slate-200 rounded-xl text-sm focus:outline-none focus:border-brand-400"><option value="business" ${sourceType === 'business' ? 'selected' : ''}>业务知识（参与业主 RAG）</option><option value="demo_test" ${sourceType === 'demo_test' ? 'selected' : ''}>验收/测试材料（隔离，不参与业主 RAG）</option></select></div>
           ${formTextarea('内容', 'kd-content', doc ? doc.content : '', '请输入知识库内容，支持多行文本', 8)}
         `;
         openModal(title, body, async () => {
           const payload = {
             title: $('#kd-title').value.trim(),
             category: $('#kd-category').value.trim() || '未分类',
+            source_type: $('#kd-source-type').value,
             content: $('#kd-content').value.trim()
           };
           if (!payload.title || !payload.content) {
