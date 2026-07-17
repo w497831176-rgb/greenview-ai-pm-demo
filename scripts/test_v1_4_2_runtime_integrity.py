@@ -79,7 +79,7 @@ def chat_sse(
     message: str,
     session_id: Optional[str] = None,
     enable_rag: bool = True,
-    timeout: int = 240,
+    timeout: int = 120,
 ) -> Dict[str, Any]:
     payload = {"message": message, "stream": True, "enable_rag": enable_rag}
     if session_id:
@@ -137,6 +137,11 @@ def find_agent(agents: List[Dict[str, Any]], agent_id: str) -> Optional[Dict[str
 
 
 def run(base_url: str) -> int:
+    import sys
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except Exception:
+        pass
     c = AcceptanceClient(base_url)
     passed = 0
     failed = 0
@@ -165,14 +170,16 @@ def run(base_url: str) -> int:
         nonlocal passed, failed
         try:
             fn()
-            print(f"  PASS  {name}")
+            print(f"  PASS  {name}", flush=True)
             passed += 1
         except Exception as exc:
-            print(f"  FAIL  {name}: {exc}")
+            import traceback
+            print(f"  FAIL  {name}: {exc}", flush=True)
+            traceback.print_exc()
             failed += 1
 
     def cleanup():
-        print("\n[Cleanup]")
+        print("\n[Cleanup]", flush=True)
         # Delete dynamic agent first to unbind skills/tools.
         if dynamic_agent_id:
             try:
@@ -180,7 +187,7 @@ def run(base_url: str) -> int:
                 if status not in (200, 204, 404):
                     record_residual("agent", dynamic_agent_id, status, text)
                 else:
-                    print(f"  deleted dynamic agent {dynamic_agent_id}")
+                    print(f"  deleted dynamic agent {dynamic_agent_id}", flush=True)
             except Exception as exc:
                 record_residual("agent", dynamic_agent_id, error=str(exc))
 
@@ -192,7 +199,7 @@ def run(base_url: str) -> int:
                     "available_skills": cfg["available_skills"],
                     "available_mcp_tools": cfg["available_mcp_tools"],
                 })
-                print(f"  restored bindings for {agent_id}")
+                print(f"  restored bindings for {agent_id}", flush=True)
             except Exception as exc:
                 record_residual("agent_bindings", agent_id, error=str(exc))
 
@@ -204,7 +211,7 @@ def run(base_url: str) -> int:
                     "available_skills": cfg["available_skills"],
                     "available_mcp_tools": cfg["available_mcp_tools"],
                 })
-                print(f"  restored config for {agent_id}")
+                print(f"  restored config for {agent_id}", flush=True)
             except Exception as exc:
                 record_residual("agent_config", agent_id, error=str(exc))
 
@@ -214,7 +221,7 @@ def run(base_url: str) -> int:
                 if status not in (200, 204, 404):
                     record_residual("knowledge_doc", doc_id, status, text)
                 else:
-                    print(f"  deleted knowledge doc #{doc_id}")
+                    print(f"  deleted knowledge doc #{doc_id}", flush=True)
             except Exception as exc:
                 record_residual("knowledge_doc", doc_id, error=str(exc))
 
@@ -224,7 +231,7 @@ def run(base_url: str) -> int:
                 if status not in (200, 204, 404):
                     record_residual("skill", skill_id, status, text)
                 else:
-                    print(f"  deleted skill #{skill_id}")
+                    print(f"  deleted skill #{skill_id}", flush=True)
             except Exception as exc:
                 record_residual("skill", skill_id, error=str(exc))
 
@@ -242,12 +249,12 @@ def run(base_url: str) -> int:
                 if status not in (200, 204, 404):
                     record_residual("price", price_id, status, text)
                 else:
-                    print(f"  deleted price #{price_id}")
+                    print(f"  deleted price #{price_id}", flush=True)
             except Exception as exc:
                 record_residual("price", price_id, error=str(exc))
 
     try:
-        print("\n[Agent Management Preconditions]")
+        print("\n[Agent Management Preconditions]", flush=True)
 
         agents = c.get("/api/agents").get("agents", [])
         router = find_agent(agents, "router")
@@ -255,7 +262,7 @@ def run(base_url: str) -> int:
             raise AssertionError("router agent must exist")
         if not router.get("is_router"):
             raise AssertionError("router agent must be marked as router")
-        print(f"  router exists, members={len(router.get('members', []))}")
+        print(f"  router exists, members={len(router.get('members', []))}", flush=True)
 
         maintenance = find_agent(agents, "maintenance")
         if not maintenance:
@@ -311,14 +318,14 @@ def run(base_url: str) -> int:
         )
 
         # --- Agent Prompt runtime ---
-        print("\n[Agent Prompt Runtime]")
+        print("\n[Agent Prompt Runtime]", flush=True)
         marker = "ACPT_AGENT_MAINT_0717"
         c.put("/api/agents/maintenance", {
             "system_prompt": f"{marker}\n你是YIAI物业维修 Agent。业主报修时，第一行必须精确输出'{marker}'，然后给出维修建议。",
             "available_skills": [],
             "available_mcp_tools": [],
         })
-        print(f"  injected marker into maintenance agent instructions")
+        print(f"  injected marker into maintenance agent instructions", flush=True)
 
         def agent_prompt_runtime():
             resp = chat_sse(c, f"{marker}，厨房漏水需要报修。")
@@ -336,10 +343,10 @@ def run(base_url: str) -> int:
             "available_skills": [],
             "available_mcp_tools": [],
         })
-        print("  restored maintenance instructions")
+        print("  restored maintenance instructions", flush=True)
 
         # --- Skill isolation ---
-        print("\n[Skill Isolation]")
+        print("\n[Skill Isolation]", flush=True)
         skill_marker = f"{TEST_PREFIX}BILL_0717"
         skill_name = f"{TEST_PREFIX}费用探针"
         skill_payload = {
@@ -352,7 +359,7 @@ def run(base_url: str) -> int:
         }
         skill = c.post("/api/skills", skill_payload).get("skill")
         created_skill_ids.append(skill["id"])
-        print(f"  created skill #{skill['id']} {skill_name}")
+        print(f"  created skill #{skill['id']} {skill_name}", flush=True)
 
         # Bind only to billing agent.
         c.put(f"/api/agents/billing", {
@@ -371,7 +378,7 @@ def run(base_url: str) -> int:
             "available_skills": [],
             "available_mcp_tools": [],
         })
-        print("  bound test skill only to billing agent")
+        print("  bound test skill only to billing agent", flush=True)
 
         def skill_isolated_billing():
             resp = chat_sse(c, "我要查询本月的物业费账单。")
@@ -397,7 +404,7 @@ def run(base_url: str) -> int:
         })
 
         # --- Dynamic vertical agent ---
-        print("\n[Dynamic Vertical Agent]")
+        print("\n[Dynamic Vertical Agent]", flush=True)
         dynamic_agent_id = f"{TEST_PREFIX}Vert"
         dynamic_marker = f"{TEST_PREFIX}DYNAMIC_MARKER"
 
@@ -410,7 +417,7 @@ def run(base_url: str) -> int:
                 "category": "vertical",
                 "enabled": True,
             })
-            print(f"  created dynamic agent {dynamic_agent_id}")
+            print(f"  created dynamic agent {dynamic_agent_id}", flush=True)
 
         check("Create dynamic vertical agent", create_dynamic_agent)
 
@@ -425,7 +432,7 @@ def run(base_url: str) -> int:
         check("Router routes to dynamic vertical agent", dynamic_agent_routed)
 
         # --- RAG keyword + semantic hit ---
-        print("\n[RAG Keyword and Semantic Retrieval]")
+        print("\n[RAG Keyword and Semantic Retrieval]", flush=True)
         doc_title = f"{TEST_PREFIX}电动车充电管理规定"
         doc_body = (
             "小区电动车管理规定："
@@ -435,7 +442,7 @@ def run(base_url: str) -> int:
         )
         doc = c.post("/api/knowledge/docs", {"title": doc_title, "content": doc_body}).get("knowledge_doc")
         created_doc_ids.append(doc["id"])
-        print(f"  created knowledge doc #{doc['id']}")
+        print(f"  created knowledge doc #{doc['id']}", flush=True)
 
         # Wait a moment for indexing.
         time.sleep(2)
@@ -472,7 +479,7 @@ def run(base_url: str) -> int:
         check("Chat answer cites correct doc_id/chunk_index", rag_chat_citation)
 
         # --- MCP gating ---
-        print("\n[MCP Gating]")
+        print("\n[MCP Gating]", flush=True)
 
         def mcp_no_calendar_for_rag():
             resp = chat_sse(c, "楼道飞线充电允许吗")
@@ -513,7 +520,7 @@ def run(base_url: str) -> int:
         check("Workorder progress question triggers workorder tool", mcp_workorder_called)
 
         # --- Cost governance ---
-        print("\n[Cost Governance]")
+        print("\n[Cost Governance]", flush=True)
 
         # Ensure a model price exists so cost is computable.
         price_payload = {
@@ -528,12 +535,12 @@ def run(base_url: str) -> int:
         }
         price = c.post("/api/observability/prices", price_payload).get("price")
         created_price_ids.append(price["id"])
-        print(f"  created price #{price['id']}")
+        print(f"  created price #{price['id']}", flush=True)
 
         # Also test that 0 price is preserved.
         fetched_price = c.get(f"/api/observability/prices/{price['id']}").get("price")
         if fetched_price.get("input_price_per_1m") != 0.0:
-            print(f"  WARNING: zero price input was not preserved: {fetched_price.get('input_price_per_1m')}")
+            print(f"  WARNING: zero price input was not preserved: {fetched_price.get('input_price_per_1m')}", flush=True)
 
         def cost_trace_has_model_and_tokens():
             resp = chat_sse(c, "厨房漏水需要报修。")
@@ -601,15 +608,15 @@ def run(base_url: str) -> int:
     finally:
         cleanup()
 
-    print("\n[Residuals]")
+    print("\n[Residuals]", flush=True)
     if residuals:
-        print(f"  {len(residuals)} residuals found:")
+        print(f"  {len(residuals)} residuals found:", flush=True)
         for r in residuals:
-            print(f"    {r}")
+            print(f"    {r}", flush=True)
     else:
-        print("  none")
+        print("  none", flush=True)
 
-    print(f"\nResults: {passed} passed, {failed} failed, {len(residuals)} residuals")
+    print(f"\nResults: {passed} passed, {failed} failed, {len(residuals)} residuals", flush=True)
     if failed or residuals:
         return 1
     return 0
