@@ -76,13 +76,16 @@ def _build_keyword_index() -> Dict[int, Dict[str, int]]:
     return index
 
 
-def _keyword_search(query: str, top_k: int = 10) -> List[Dict[str, Any]]:
+def _keyword_search(query: str, top_k: int = 10, threshold: Optional[float] = None) -> List[Dict[str, Any]]:
     """BM25-style keyword search over knowledge chunks.
 
     Documents are first matched by their full title+content TF index, then
     expanded into their indexed chunks so every result points to an exact
     chunk.  This keeps citations chunk-accurate instead of falling back to
     the document's first chunk.
+
+    ``threshold`` is accepted for API compatibility but currently ignored;
+    keyword matches always require a positive score.
     """
     query_tokens = _tokenize(query)
     if not query_tokens:

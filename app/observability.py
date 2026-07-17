@@ -475,7 +475,7 @@ async def traces(
             GROUP_CONCAT(DISTINCT model_id) as model_ids,
             COALESCE(SUM(total_tokens), 0) as total_tokens,
             SUM(estimated_cost_cny) as estimated_cost_cny,
-            SUM(CASE WHEN estimated_cost_cny IS NULL THEN 1 ELSE 0 END) as unknown_cost_calls,
+            SUM(CASE WHEN estimated_cost_cny IS NULL AND stage != 'router' THEN 1 ELSE 0 END) as unknown_cost_calls,
             COUNT(*) as call_count
         FROM model_calls
         WHERE {m_where}

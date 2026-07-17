@@ -37,6 +37,7 @@ def _base_router_instructions(vertical_agents: List[Dict[str, Any]]) -> List[str
         f"你只能从以下启用的垂直 Agent 中选择目标，输出其 agent_id：\n{target_lines}",
         '输出格式必须严格为 JSON：{"target_agent_id": "<agent_id>", "reason": "<一句话理由>"}',
         "如果用户问题同时涉及多个 Agent，选择最核心、最紧急的意图对应的 Agent。",
+        "优先选择描述与用户问题关键词最匹配的垂直 Agent；若用户问题明确指向某个 Agent 的描述，必须选择该 Agent。",
         "如果无法判断，选择 customer_service 或其他最接近的垂直 Agent；不要编造不存在的 agent_id。",
     ]
 
@@ -100,9 +101,12 @@ async def classify_intent(
         for a in vertical_agents if a.get("enabled") and a.get("agent_id")
     ) or "- maintenance（维修 Agent）\n- billing（费用 Agent）\n- complaint（投诉 Agent）\n- customer_service（客服 Agent）"
     prompt = (
-        "请判断以下业主问题的意图，并从当前启用的垂直 Agent 中选择一个目标。只输出 JSON，不要添加其他解释。\n\n"
+        "请判断以下业主问题的意图，并从当前启用的垂直 Agent 中选择一个目标。只输出 JSON，不要添加其他解释。\n"
+        "选择规则：优先选择描述与用户问题关键词最匹配的垂直 Agent；"
+        "如果某个 Agent 的描述明确包含用户问题的主题词，则必须选择该 Agent。\n\n"
         f"用户问题：{message}\n\n"
-        "可选目标：\n" + valid_lines
+        "可选目标：\n" + valid_lines + "\n\n"
+        '输出格式：{"target_agent_id": "<agent_id>", "reason": "<简要理由>"}'
     )
     try:
         router_agent = create_router_agent(vertical_agents)
@@ -141,6 +145,16 @@ async def classify_intent(
 def _keyword_intent(message: str, vertical_agents: Optional[List[Dict[str, Any]]] = None) -> str:
     """Fallback keyword-based intent classification."""
     lowered = message.lower()
+    # Prefer vertical agents whose description keywords directly appear in the message.
+    if vertical_agents:
+        for agent in vertical_agents:
+            if not agent.get("enabled") or not agent.get("agent_id"):
+                continue
+            desc = (agent.get("description") or "").lower()
+            # Use 2+ character descriptive keywords from the description.
+            desc_keywords = {w for w in re.findall(r"[\u4e00-\u9fa5]{2,}|\b[a-z_]{3,}\b", desc)}
+            if any(k in lowered for k in desc_keywords):
+                return agent["agent_id"]
     # Canonical category keywords preserved for backward compatibility.
     maintenance_keywords = ["报修", "漏水", "跳闸", "灯不亮", "门锁", "窗户", "电梯", "下水道", "维修", "工单", "师傅", "上门", "天气", "气温", "下雨"]
     billing_keywords = ["收费", "缴费", "多少钱", "费用", "物业费", "停车费", "账单", "价格", "收费标准"]

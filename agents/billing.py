@@ -55,7 +55,7 @@ def create_billing_agent(
         db=agent_db,
         tools=agent_tools,
         skills=None,
-        instructions=instructions if instructions is not None else INSTRUCTIONS,
+        instructions=(INSTRUCTIONS.copy() + (instructions or [])),
         add_datetime_to_context=True,
         add_history_to_context=True,
         read_chat_history=True,

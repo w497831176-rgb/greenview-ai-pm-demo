@@ -78,6 +78,9 @@ def create_maintenance_agent(
     agent_tools = _base_tools()
     if tools:
         agent_tools.extend(tools)
+    final_instructions = INSTRUCTIONS.copy()
+    if instructions:
+        final_instructions.extend(instructions)
     return Agent(
         id="maintenance_agent",
         name=name or "维修 Agent",
@@ -86,7 +89,7 @@ def create_maintenance_agent(
         db=agent_db,
         tools=agent_tools,
         skills=None,
-        instructions=instructions if instructions is not None else INSTRUCTIONS,
+        instructions=final_instructions,
         add_datetime_to_context=True,
         add_history_to_context=True,
         read_chat_history=True,

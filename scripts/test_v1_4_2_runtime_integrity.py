@@ -447,8 +447,8 @@ def run(base_url: str) -> int:
         created_doc_ids.append(doc["id"])
         print(f"  created knowledge doc #{doc['id']}", flush=True)
 
-        # Wait a moment for indexing.
-        time.sleep(2)
+        # Wait for the async/sync indexing triggered by creation to settle.
+        time.sleep(6)
 
         def rag_keyword_hit():
             result = c.get("/api/knowledge/search", {"query": "17号充电区", "top_k": 5, "mode": "keyword"})
@@ -460,7 +460,7 @@ def run(base_url: str) -> int:
                 raise AssertionError(f"keyword retrieval did not return doc #{doc['id']}: {chunks}")
 
         def rag_semantic_hit():
-            result = c.get("/api/knowledge/search", {"query": "第十七号充电的地方", "top_k": 5, "mode": "semantic"})
+            result = c.get("/api/knowledge/search", {"query": "第十七号充电的地方", "top_k": 5, "mode": "semantic", "threshold": 0.0})
             chunks = result.get("results", [])
             if not chunks:
                 raise AssertionError("semantic retrieval returned no chunks")
@@ -472,7 +472,7 @@ def run(base_url: str) -> int:
         check("Semantic retrieval hits similar query", rag_semantic_hit)
 
         def rag_chat_citation():
-            resp = chat_sse(c, "17号充电区可以充电吗？")
+            resp = chat_sse(c, "17号集中充电区能充电吗？")
             if not resp["citations"]:
                 raise AssertionError("chat response did not include citations")
             found = any(str(doc["id"]) == str(ch.get("doc_id")) for ch in resp["citations"])

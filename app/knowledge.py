@@ -289,11 +289,20 @@ async def create_knowledge_doc(request: KnowledgeDocCreate):
         split_strategy=request.split_strategy,
     )
     if doc:
-        try:
-            rag_indexer.index_document(doc["id"])
-        except Exception:
-            pass
+        rag_indexer.index_document(doc["id"])
         doc = db_get_knowledge_doc(doc["id"])
+        # Retry once if the document has content but no SQLite chunks were recorded.
+        if doc and doc.get("content", "").strip() and not doc.get("chunk_count"):
+            rag_indexer.reindex_document(doc["id"])
+            doc = db_get_knowledge_doc(doc["id"])
+        # Final safety check: if content exists but PG chunks are missing, fail loudly.
+        if doc and doc.get("content", "").strip():
+            chunks = rag_store.list_chunks_for_doc(doc["id"])
+            if not chunks:
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"indexing failed: no chunks persisted for doc {doc['id']}",
+                )
     return {"knowledge_doc": doc}
 
 
@@ -372,6 +381,8 @@ async def search_docs(
     """Search knowledge documents by keyword, semantic similarity, or advanced RAG fusion."""
     if mode == "semantic":
         results = rag_indexer.semantic_search(query, top_k=top_k, threshold=threshold)
+    elif mode == "keyword":
+        results = rag_retrieval._keyword_search(query, top_k=top_k, threshold=threshold)
     elif mode == "advanced":
         settings = db_get_retrieval_settings("default") or {}
         results = rag_retrieval.advanced_search(
