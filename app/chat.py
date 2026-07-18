@@ -925,11 +925,24 @@ async def _preinvoke_readonly_mcp_tools(
             )
             tool.trace_id = trace_id
             tool.server_name = server_name
-            await tool.build_tools()
-        except Exception:
+            await asyncio.wait_for(tool.build_tools(), timeout=8)
+        except Exception as exc:
+            # A failed discovery is still evidence.  Do not silently fall back
+            # to a second model-native connection that can hold the chat stream
+            # open until the reverse-proxy timeout.
+            call_records.append({
+                "server_name": server_name,
+                "tool_name": "discovery",
+                "arguments": {},
+                "status": "upstream_error",
+                "result_summary": str(exc)[:300],
+                "error_summary": str(exc)[:300],
+                "latency_ms": None,
+                "invocation_mode": "policy_preinvoke",
+            })
             if tool and hasattr(tool, "close"):
                 try:
-                    await tool.close()
+                    await asyncio.wait_for(tool.close(), timeout=3)
                 except Exception:
                     pass
             continue
@@ -949,7 +962,7 @@ async def _preinvoke_readonly_mcp_tools(
             result_summary = ""
             error_summary = None
             try:
-                result = await entrypoint(arguments)
+                result = await asyncio.wait_for(entrypoint(arguments), timeout=8)
                 result_summary = _summarize_tool_result(result)
                 status = extract_tool_outcome(result_summary)
                 if status in {"timeout", "upstream_error"}:
@@ -983,7 +996,7 @@ async def _preinvoke_readonly_mcp_tools(
 
         if hasattr(tool, "close"):
             try:
-                await tool.close()
+                await asyncio.wait_for(tool.close(), timeout=3)
             except Exception:
                 pass
 
@@ -1663,11 +1676,16 @@ async def _stream_agent_response(
 
         # Formal work-order writes have already been guarded by the workflow controller.
         # This model path is for consultation, RAG and read-only MCP only.
-        # Keep the allowlisted server connected after a policy pre-invocation.
-        # A compound request may need another function from the same Server
-        # (for example current date plus date arithmetic).  Context tells the
-        # Agent not to repeat facts that are already available.
-        preinvoked_servers: set = set()
+        # A successful (or auditable failed) policy read is already injected in
+        # context.  Do not start the same builtin stdio server a second time for
+        # model-native tools: that duplicate discovery was serial and could use
+        # up the whole reverse-proxy timeout before the vertical answer began.
+        # User-added dynamic MCP servers remain model-native and extensible.
+        preinvoked_servers = {
+            str(call.get("server_name"))
+            for call in preinvoke_calls
+            if call.get("server_name") and is_builtin_policy_server(str(call.get("server_name")))
+        }
         mcp_tools = _build_mcp_tools(agent_id=current_agent_id, trace_id=trace_id, message=message, excluded_servers=preinvoked_servers)
         for tool in mcp_tools:
             if hasattr(tool, "connect"):
