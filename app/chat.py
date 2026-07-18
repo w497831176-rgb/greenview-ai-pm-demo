@@ -28,6 +28,7 @@ from pydantic import BaseModel
 from app.observability import _check_budget
 from app.handoff_policy import HANDOFF_STATUS_LABELS, evaluate_handoff_policy, handoff_policy_summary
 from app.mcp_policy import allowed_tools_for_agent, extract_tool_outcome, outcome_instruction
+from app.multimodal import get_analysis_context, normalise_analysis_ids
 from app.settings import MODEL_ID, USE_THINKING, build_model
 from app.skill_runtime import activation_evidence, select_skills, skill_contract
 from app.utils.cost_utils import build_price_snapshot, compute_cost_cny, normalize_usage
@@ -1166,6 +1167,7 @@ class ChatRequest(BaseModel):
     message: str
     session_id: Optional[str] = None
     user_id: Optional[str] = None
+    image_analysis_ids: List[str] = []
 
 
 class FeedbackRequest(BaseModel):
@@ -1223,6 +1225,7 @@ async def _stream_agent_response(
     message: str,
     session_id: str,
     user_id: str,
+    image_analysis_ids: Optional[List[str]] = None,
 ) -> AsyncIterator[str]:
     """Run the agent with streaming and yield SSE events."""
 
@@ -1249,6 +1252,14 @@ async def _stream_agent_response(
 
         # Persist the user message before invoking the agent.
         save_chat_message(session_id=session_id, role="user", content=message, trace_id=trace_id)
+
+        # Kimi is invoked by the dedicated image endpoint before this text chain.
+        # Only its compact structured output is injected here; the Flash router
+        # and vertical Agent never receive raw image bytes or get to treat OCR as
+        # a system instruction.  A missing/invalid id simply contributes no
+        # image context, rather than inventing visual evidence.
+        image_context = get_analysis_context(normalise_analysis_ids(image_analysis_ids))
+        message_for_agent = f"{message}{image_context}"
 
         # Human collaboration is controlled by deterministic policy, not by a
         # model sentence.  It makes the accountability boundary explainable and
@@ -1369,7 +1380,7 @@ async def _stream_agent_response(
         # Classify intent and dispatch to the appropriate vertical agent.
         router_start = time.time()
         intent_result = await classify_intent(
-            message, vertical_agents=vertical_agents, user_id=user_id, session_id=session_id
+            message_for_agent, vertical_agents=vertical_agents, user_id=user_id, session_id=session_id
         )
         router_latency_ms = int((time.time() - router_start) * 1000)
         target_agent_id = intent_result.get("target_agent_id") or intent_result.get("intent") or "customer_service"
@@ -1418,7 +1429,7 @@ async def _stream_agent_response(
 
         # Build dynamic context and tools scoped to the current vertical agent.
         skill_context, activated_skills, skill_model_id = _build_skill_context(message, agent_id=current_agent_id)
-        rag_context, citations = _build_rag_context(message)
+        rag_context, citations = _build_rag_context(message_for_agent)
         mcp_context = _format_mcp_context(agent_id=current_agent_id, message=message)
         # V1.4.3: narrow policy pre-invocation for readonly MCP servers. Real
         # tool results are injected into context and recorded as policy_preinvoke.
@@ -1504,7 +1515,7 @@ async def _stream_agent_response(
             f"你必须主动提出转人工处理，不要强行回答。]"
             f"{knowledge_gap_note}"
         )
-        contextual_message = f"{system_context_prefix}{rag_context}{skill_context}{mcp_context}\n{message}"
+        contextual_message = f"{system_context_prefix}{rag_context}{skill_context}{mcp_context}\n{message_for_agent}"
 
         full_content = ""
         token_count = 0
@@ -1922,7 +1933,7 @@ async def chat_stream(request: ChatRequest):
     user_id = request.user_id or "web-user"
 
     return StreamingResponse(
-        _stream_agent_response(request.message, session_id, user_id),
+        _stream_agent_response(request.message, session_id, user_id, request.image_analysis_ids),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
@@ -1944,7 +1955,7 @@ async def chat_stream_get(
     user_id = user_id or "web-user"
 
     return StreamingResponse(
-        _stream_agent_response(message, session_id, user_id),
+        _stream_agent_response(message, session_id, user_id, None),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
