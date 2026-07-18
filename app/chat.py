@@ -1092,7 +1092,7 @@ def _build_handoff_package(
     for citation in evidence.get("citations") or []:
         verified.append({"type": "rag", "name": citation.get("doc_title"), "chunk_index": citation.get("chunk_index")})
     return {
-        "version": "v1.5.7",
+        "version": "v1.5.8",
         "generated_at": now_cn(),
         "session_id": session_id,
         "owner_request": {
@@ -1587,11 +1587,13 @@ async def _stream_agent_response(
         current_agent_id = _agent_id_for_intent(target_agent_id)
         current_agent = agent_name  # human-readable Chinese name for UI/Trace
 
+        router_token_count = 0
         # Record the router model call. Preserve the configured price snapshot so the
         # UI can show "单价已配置，但 Provider 未返回本次 Router usage".
         try:
             router_price = _get_price_snapshot(MODEL_ID)
             router_metrics = intent_result.get("metrics") or {}
+            router_token_count = int(router_metrics.get("total_tokens") or 0)
             has_router_usage = bool(router_metrics.get("total_tokens"))
             record_model_call(
                 trace_id=trace_id,
@@ -1897,6 +1899,10 @@ async def _stream_agent_response(
             token_detail["output_tokens"] = output_tokens
             token_detail["total_tokens"] = token_count
 
+        # Router and vertical Agent are separate model calls. Keep the business
+        # answer's token count readable, while exposing the actual full-turn total.
+        round_token_count = token_count + router_token_count
+
         # Normalize model citation variants before persistence so citations are
         # always clickable and retrieved candidates can be distinguished from evidence.
         full_content = _canonicalize_citation_markers(full_content)
@@ -2025,6 +2031,7 @@ async def _stream_agent_response(
             role="assistant",
             content=full_content,
             token_count=token_count,
+            round_token_count=round_token_count,
             token_detail=token_detail,
             citations=citations,
             activated_skills=activated_skills,
@@ -2071,6 +2078,8 @@ async def _stream_agent_response(
         done_payload = {
             'status': 'complete',
             'token_count': token_count,
+            'round_token_count': round_token_count,
+            'router_token_count': router_token_count,
             'token_detail': token_detail,
             'message_id': saved.get('id'),
             'handoff': ai_handoff,

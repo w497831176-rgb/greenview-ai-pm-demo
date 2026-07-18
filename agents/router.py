@@ -203,7 +203,7 @@ def _capability_fallback(message: str, vertical_agents: Optional[List[Dict[str, 
     """
     agents = [dict(agent) for agent in (vertical_agents or []) if agent.get("enabled") and agent.get("agent_id")]
     if not agents:
-        return "customer_service", "能力回退：没有可用垂直 Agent，降级到客服。", []
+        return "customer_service", "能力匹配路由：没有可用垂直 Agent，由客服承接通用咨询。", []
 
     lowered = (message or "").lower()
     scored: List[Dict[str, Any]] = []
@@ -233,7 +233,7 @@ def _capability_fallback(message: str, vertical_agents: Optional[List[Dict[str, 
         customer = next((item for item in scored if item["agent_id"] == "customer_service"), winner)
         return (
             customer["agent_id"],
-            f"能力回退：未命中特定能力，转由{customer['name']}承接通用咨询。",
+            f"能力匹配路由：未命中特定业务能力，转由{customer['name']}承接通用咨询。",
             scored,
         )
     # Explain the winning business capability, not the first textual match.
@@ -245,7 +245,7 @@ def _capability_fallback(message: str, vertical_agents: Optional[List[Dict[str, 
     )
     return (
         winner["agent_id"],
-        f"能力回退：命中“{strongest['term']}”（{strongest['source']}），与{winner['name']}的已配置能力匹配。",
+        f"能力匹配路由：命中“{strongest['term']}”（{strongest['source']}），与{winner['name']}的已配置能力匹配。",
         scored,
     )
 
