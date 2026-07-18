@@ -127,6 +127,18 @@ _ROUTING_STOP_TERMS = {
     "系统", "平台", "能力", "帮助", "提供", "进行", "通过", "以及", "一般", "工作",
 }
 
+# These words describe the orchestration mechanism rather than a business
+# capability.  They must never influence dynamic routing: a user asking
+# "which Agent handles this" would otherwise match every Agent whose display
+# name ends with "Agent" and make the fallback explanation meaningless.
+_ROUTING_GENERIC_TERMS = {
+    "agent", "agents", "assistant", "assistants", "skill", "skills",
+    "tool", "tools", "mcp", "server", "servers",
+    "智能体", "助手", "服务", "咨询", "问题", "处理", "能力", "系统",
+    "平台", "管理", "用户", "业主", "哪个", "什么", "如何", "请问",
+    "相关", "当前", "需要", "可以", "一个", "进行", "提供",
+}
+
 
 _CANONICAL_FALLBACK_TERMS = {
     "maintenance": ("报修", "漏水", "维修", "工单", "电梯", "下水道", "上门", "师傅"),
@@ -160,7 +172,7 @@ def _routing_terms(agent: Dict[str, Any]) -> List[tuple[str, str]]:
     for source, text in sources:
         for phrase in re.findall(r"[\u4e00-\u9fff]{2,16}|[a-zA-Z][a-zA-Z0-9_-]{2,}", text or ""):
             phrase = phrase.strip().lower()
-            if phrase in _ROUTING_STOP_TERMS or phrase in seen:
+            if phrase in _ROUTING_STOP_TERMS or phrase in _ROUTING_GENERIC_TERMS or phrase in seen:
                 continue
             seen.add(phrase)
             terms.append((phrase, source))
@@ -170,7 +182,11 @@ def _routing_terms(agent: Dict[str, Any]) -> List[tuple[str, str]]:
                 for size in (2, 3, 4):
                     for start in range(0, len(phrase) - size + 1):
                         window = phrase[start : start + size]
-                        if window not in _ROUTING_STOP_TERMS and window not in seen:
+                        if (
+                            window not in _ROUTING_STOP_TERMS
+                            and window not in _ROUTING_GENERIC_TERMS
+                            and window not in seen
+                        ):
                             seen.add(window)
                             terms.append((window, source))
     return terms
@@ -220,7 +236,13 @@ def _capability_fallback(message: str, vertical_agents: Optional[List[Dict[str, 
             f"能力回退：未命中特定能力，转由{customer['name']}承接通用咨询。",
             scored,
         )
-    strongest = winner["matches"][0]
+    # Explain the winning business capability, not the first textual match.
+    # Agent display names are deliberately low-signal; Skill triggers and
+    # service-scope terms should be visible in the user-facing route reason.
+    strongest = max(
+        winner["matches"],
+        key=lambda item: (item["weight"], len(item["term"])),
+    )
     return (
         winner["agent_id"],
         f"能力回退：命中“{strongest['term']}”（{strongest['source']}），与{winner['name']}的已配置能力匹配。",
