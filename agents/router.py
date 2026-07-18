@@ -16,7 +16,10 @@ from app.settings import MODEL, agent_db
 from db.property_db import get_agent_by_agent_id
 
 
-def _base_router_instructions(vertical_agents: List[Dict[str, Any]]) -> List[str]:
+def _base_router_instructions(
+    vertical_agents: List[Dict[str, Any]],
+    published_instructions: Optional[str] = None,
+) -> List[str]:
     """Build router instructions from DB Router config + current enabled vertical agents."""
     valid_targets = []
     for agent in vertical_agents:
@@ -44,8 +47,11 @@ def _base_router_instructions(vertical_agents: List[Dict[str, Any]]) -> List[str
         for t in valid_targets
     )
 
-    router = get_agent_by_agent_id("router")
-    user_instructions = (router.get("instructions") or "").strip() if router else ""
+    if published_instructions is None:
+        router = get_agent_by_agent_id("router")
+        user_instructions = (router.get("instructions") or "").strip() if router else ""
+    else:
+        user_instructions = published_instructions.strip()
 
     base = [
         "你是YIAI物业的路由 Agent，负责识别业主意图并分发给合适的垂直 Agent。",
@@ -60,18 +66,25 @@ def _base_router_instructions(vertical_agents: List[Dict[str, Any]]) -> List[str
     return base
 
 
-def create_router_agent(vertical_agents: Optional[List[Dict[str, Any]]] = None) -> Agent:
+def create_router_agent(
+    vertical_agents: Optional[List[Dict[str, Any]]] = None,
+    published_instructions: Optional[str] = None,
+    model: Any = None,
+) -> Agent:
     return Agent(
         id="router_agent",
         name="路由 Agent",
         description="识别业主意图并分发给垂直 Agent。",
-        model=MODEL,
+        model=model or MODEL,
         db=agent_db,
-        instructions=_base_router_instructions(vertical_agents or []),
+        instructions=_base_router_instructions(
+            vertical_agents or [],
+            published_instructions=published_instructions,
+        ),
         add_datetime_to_context=True,
         add_history_to_context=True,
         read_chat_history=True,
-        num_history_runs=1,
+        num_history_runs=3,
         markdown=False,
     )
 
@@ -259,6 +272,8 @@ async def classify_intent(
     vertical_agents: Optional[List[Dict[str, Any]]] = None,
     user_id: str = "web-user",
     session_id: str = "",
+    published_instructions: Optional[str] = None,
+    model: Any = None,
 ) -> Dict[str, Any]:
     """Use the router agent to classify the user message intent.
 
@@ -293,7 +308,11 @@ async def classify_intent(
     raw_response = ""
     metrics: Dict[str, Any] = {}
     try:
-        router_agent = create_router_agent(vertical_agents)
+        router_agent = create_router_agent(
+            vertical_agents,
+            published_instructions=published_instructions,
+            model=model,
+        )
         response_obj = await router_agent.arun(
             prompt,
             user_id=user_id,
@@ -306,12 +325,13 @@ async def classify_intent(
         # Collect provider metrics if available.
         if hasattr(response_obj, "metrics") and response_obj.metrics:
             m = response_obj.metrics
+            value = lambda key: m.get(key) if isinstance(m, dict) else getattr(m, key, None)
             metrics = {
-                "input_tokens": getattr(m, "input_tokens", None),
-                "output_tokens": getattr(m, "output_tokens", None),
-                "total_tokens": getattr(m, "total_tokens", None),
-                "reasoning_tokens": getattr(m, "reasoning_tokens", None),
-                "cached_tokens": getattr(m, "cached_tokens", None),
+                "input_tokens": value("input_tokens"),
+                "output_tokens": value("output_tokens"),
+                "total_tokens": value("total_tokens"),
+                "reasoning_tokens": value("reasoning_tokens"),
+                "cached_tokens": value("cached_tokens"),
             }
 
         json_match = re.search(r"\{.*\}", response, re.DOTALL)

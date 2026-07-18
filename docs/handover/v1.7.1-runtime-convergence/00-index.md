@@ -24,7 +24,12 @@
 5. [05-deployment-data-and-safety-boundaries.md](05-deployment-data-and-safety-boundaries.md)：NAS、数据卷、Git 与部署边界。
 6. [06-manual-demo-and-acceptance-matrix.md](06-manual-demo-and-acceptance-matrix.md)：用户如何手点、接手者如何低成本验收。
 7. [07-new-coding-session-bootstrap.md](07-new-coding-session-bootstrap.md)：可直接复制给新会话的完整提示词。
-8. [08-v1.8-enterprise-runtime-architecture-contract.md](08-v1.8-enterprise-runtime-architecture-contract.md)：V1.8 经企业级架构复核后的静态权威契约；后续实现不得只凭聊天上下文偏离。
+8. [08-v1.8-enterprise-runtime-architecture-contract.md](08-v1.8-enterprise-runtime-architecture-contract.md)：V1.8 当前批准的 Living Architecture；它允许通过 ADR 和版本治理持续修订，但实现不得无记录地偏离。
+
+V1.8 实施接续时还必须读取：
+
+- [ADR-0002｜显式发布、会话快照与组合验收](../../adr/0002-runtime-release-session-snapshot-and-composite-workflow.md)；
+- [V1.8.0 发布记录](../../releases/v1.8.0.md)，其中严格区分工作区实现、契约验证、真实模型验证、人工 UI 验收和 NAS 部署。
 
 ## 绝对优先级
 

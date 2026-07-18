@@ -7,12 +7,14 @@ once only after an explicit confirmation.
 """
 
 import re
-import time
 from typing import Any, Dict, List, Optional
 
+from app.runtime.action_gateway import ActionGateway
 from db.property_db import (
-    create_work_order,
     delete_work_order_draft,
+    get_action_receipt_by_idempotency_key,
+    get_latest_action_proposal,
+    get_pending_action_proposal,
     get_work_order_draft,
     save_work_order_draft,
 )
@@ -20,6 +22,8 @@ from db.property_db import (
 
 DEFAULT_ROOM_ID = "3-2-1201"
 DEFAULT_OWNER_NAME = "王先生"
+ACTION_TYPE = "work_order.create"
+action_gateway = ActionGateway()
 
 
 def _room_id(text: str) -> str:
@@ -66,15 +70,6 @@ def _appointment(text: str, urgency: str) -> str:
     return ""
 
 
-def _labelled_value(text: str, *labels: str) -> str:
-    """Read a single value from the owner-chat's labelled field format."""
-    for label in labels:
-        match = re.search(rf"(?:^|\n)\s*(?:✅\s*)?{re.escape(label)}[：:]\s*([^\n]+)", text or "")
-        if match:
-            return match.group(1).strip()
-    return ""
-
-
 def _issue_type(text: str) -> str:
     if any(word in text for word in ("水", "漏", "渗", "滴", "管", "下水道", "马桶", "龙头", "水槽")):
         return "水电"
@@ -85,18 +80,6 @@ def _issue_type(text: str) -> str:
     if any(word in text for word in ("门", "窗", "玻璃", "锁")):
         return "门窗"
     return "其他"
-
-
-def _looks_like_structured_work_order_payload(text: str) -> bool:
-    """Recognise an owner supplying a complete, labelled repair payload.
-
-    This starts only a draft, never a real order. It covers the common UX path
-    where the assistant asks for fields and the owner pastes them back without
-    repeating “please create a work order”.
-    """
-    labels = ("房号", "问题描述", "紧急程度", "联系电话", "预约上门", "预约时间")
-    field_count = sum(1 for label in labels if label in (text or ""))
-    return bool(_phone(text) and field_count >= 2)
 
 
 def is_explicit_work_order_request(message: str) -> bool:
@@ -116,7 +99,7 @@ def is_explicit_work_order_request(message: str) -> bool:
         r"(?:创建|提交)(?:一张|一个)?(?:维修)?工单",
         r"(?:请|帮我)安排(?:师傅|维修|上门)",
     )
-    return any(re.search(pattern, compact, flags=re.IGNORECASE) for pattern in affirmative_patterns) or _looks_like_structured_work_order_payload(text)
+    return any(re.search(pattern, compact, flags=re.IGNORECASE) for pattern in affirmative_patterns)
 
 
 def _has_creation_negation(text: str) -> bool:
@@ -132,12 +115,22 @@ def _has_creation_negation(text: str) -> bool:
 
 
 def is_cancel_request(message: str) -> bool:
-    return any(word in (message or "") for word in ("取消报修", "取消工单草稿", "不报修了", "先不用报修"))
+    normalized = (message or "").strip()
+    return any(word in normalized for word in (
+        "取消报修",
+        "取消工单草稿",
+        "不报修了",
+        "先不用报修",
+        "拒绝创建",
+        "拒绝提交",
+        "不创建了",
+        "不提交了",
+    )) or normalized in {"拒绝", "取消", "不提交", "不创建"}
 
 
 def is_confirmation(message: str) -> bool:
     normalized = (message or "").strip().lower()
-    return bool(re.search(r"^(?:确认(?:创建|提交|报修|工单)?|同意(?:创建|提交|报修|工单)?|好的.*(?:创建|提交)|就.*(?:创建|提交)|(?:创建|提交).*)$", normalized))
+    return bool(re.search(r"^(确认创建|确认提交|确认|同意创建|好的.*创建|就.*创建|创建.*)$", normalized))
 
 
 def _is_draft_follow_up(message: str) -> bool:
@@ -203,7 +196,12 @@ def _result(action: str, reply: str, draft: Optional[Dict[str, Any]], **extra: A
     return payload
 
 
-def advance_work_order_workflow(session_id: str, message: str) -> Optional[Dict[str, Any]]:
+def advance_work_order_workflow(
+    session_id: str,
+    message: str,
+    trace_id: Optional[str] = None,
+    release_id: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
     """Advance a repair draft without relying on a model tool call.
 
     Returns ``None`` for ordinary chat.  Every non-None result is authoritative
@@ -211,16 +209,37 @@ def advance_work_order_workflow(session_id: str, message: str) -> Optional[Dict[
     work order.
     """
     existing = get_work_order_draft(session_id)
+    pending = get_pending_action_proposal(session_id, ACTION_TYPE)
 
-    if existing and is_cancel_request(message):
+    if (existing or pending) and is_cancel_request(message):
+        if pending:
+            action_gateway.reject(
+                pending["proposal_id"],
+                actor=f"owner:{session_id}",
+                comment="用户取消待确认工单",
+            )
         delete_work_order_draft(session_id)
         return _result(
-            "cancelled",
+            "rejected",
             "已取消本次待确认的报修草稿，未创建正式工单。需要时您可以重新告诉我报修问题。",
             {},
+            proposal_id=(pending or {}).get("proposal_id"),
         )
 
     if not existing:
+        if is_confirmation(message):
+            latest = get_latest_action_proposal(session_id, ACTION_TYPE)
+            if latest and latest.get("status") == "committed":
+                receipt = get_action_receipt_by_idempotency_key(latest["idempotency_key"]) or {}
+                actual_id = receipt.get("resource_id")
+                return _result(
+                    "idempotent_replay",
+                    f"该工单已提交成功，工单号：{actual_id}。本次重复确认未再次写库。",
+                    {},
+                    proposal_id=latest.get("proposal_id"),
+                    receipt=receipt,
+                    work_order_id=actual_id,
+                )
         if not is_explicit_work_order_request(message):
             return None
     elif not _is_draft_follow_up(message):
@@ -236,32 +255,51 @@ def advance_work_order_workflow(session_id: str, message: str) -> Optional[Dict[
                 "暂不能创建正式工单，因为还缺少：" + "、".join(missing) + "。请补充后再确认创建。",
                 existing,
             )
-        work_order_id = f"WO-{time.strftime('%Y%m%d')}-{int(time.time() * 1000) % 1000000:06d}"
-        created = create_work_order(
-            work_order_id=work_order_id,
-            room_id=existing["room_id"],
-            issue_type=existing["issue_type"],
-            issue_desc=existing["issue_desc"],
-            urgency=existing["urgency"],
-            contact_name=existing.get("contact_name") or DEFAULT_OWNER_NAME,
-            contact_phone=existing["contact_phone"],
-            appointment_time=existing["appointment_time"],
-            status="pending",
+        proposal = action_gateway.propose(
             session_id=session_id,
+            action_type=ACTION_TYPE,
+            payload={
+                "room_id": existing["room_id"],
+                "issue_type": existing["issue_type"],
+                "issue_desc": existing["issue_desc"],
+                "urgency": existing["urgency"],
+                "contact_name": existing.get("contact_name") or DEFAULT_OWNER_NAME,
+                "contact_phone": existing["contact_phone"],
+                "appointment_time": existing["appointment_time"],
+            },
+            trace_id=trace_id,
+            release_id=release_id,
         )
+        if proposal.status == "pending_confirmation":
+            proposal = action_gateway.approve(
+                proposal.proposal_id,
+                actor=f"owner:{session_id}",
+                comment="用户明确确认创建维修工单",
+            )
+        receipt = action_gateway.execute(proposal.proposal_id)
+        if not receipt.may_claim_success:
+            return _result(
+                "failed",
+                "工单提交未成功，后端没有返回已提交 Receipt；草稿仍保留，请稍后重试或转人工。",
+                existing,
+                proposal_id=proposal.proposal_id,
+                receipt=receipt.model_dump(mode="json"),
+                error_summary=receipt.error_summary,
+            )
         delete_work_order_draft(session_id)
-        actual_id = (created or {}).get("id") or work_order_id
+        actual_id = receipt.resource_id
         return _result(
-            "created",
+            "committed",
             f"正式维修工单已创建成功，工单号：{actual_id}。维修人员将按“{existing['appointment_time']}”安排处理，请保持电话畅通。",
             existing,
             work_order_id=actual_id,
+            proposal_id=proposal.proposal_id,
+            receipt=receipt.model_dump(mode="json"),
         )
 
     base = dict(existing or {})
-    issue_desc = _labelled_value(message, "问题描述", "报修内容", "故障描述") or base.get("issue_desc") or message.strip()
-    urgency = _labelled_value(message, "紧急程度") or _urgency(message) or base.get("urgency") or ""
-    appointment = _labelled_value(message, "预约上门时间", "预约时间") or _appointment(message, urgency) or base.get("appointment_time") or ""
+    issue_desc = base.get("issue_desc") or message.strip()
+    urgency = _urgency(message) or base.get("urgency") or ""
     draft = {
         "room_id": _room_id(message) or base.get("room_id") or DEFAULT_ROOM_ID,
         "issue_type": base.get("issue_type") or _issue_type(issue_desc),
@@ -269,7 +307,7 @@ def advance_work_order_workflow(session_id: str, message: str) -> Optional[Dict[
         "urgency": urgency,
         "contact_name": _contact_name(message) or base.get("contact_name") or DEFAULT_OWNER_NAME,
         "contact_phone": _phone(message) or base.get("contact_phone") or "",
-        "appointment_time": appointment,
+        "appointment_time": _appointment(message, urgency) or base.get("appointment_time") or "",
     }
     save_work_order_draft(session_id=session_id, **draft)
     missing = _missing(draft)
@@ -285,10 +323,18 @@ def advance_work_order_workflow(session_id: str, message: str) -> Optional[Dict[
             + ("其余信息收齐后，我会请您确认创建。" if len(missing) > len(ask_now) else ""),
             draft,
         )
+    proposal = action_gateway.propose(
+        session_id=session_id,
+        action_type=ACTION_TYPE,
+        payload=draft,
+        trace_id=trace_id,
+        release_id=release_id,
+    )
     return _result(
         "awaiting_confirmation",
         "维修工单草稿已完整，尚未创建正式工单。请核对：\n\n"
         + _summary(draft)
         + "\n\n如信息无误，请回复“确认创建”。",
         draft,
+        proposal_id=proposal.proposal_id,
     )

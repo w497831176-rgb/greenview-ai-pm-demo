@@ -15,6 +15,7 @@ from db.property_db import (
     delete_agent as db_delete_agent,
     get_agent as db_get_agent,
     get_agent_by_agent_id,
+    get_agent_knowledge_bindings,
     get_agent_skills,
     get_agent_tools,
     get_skill as db_get_skill,
@@ -22,6 +23,7 @@ from db.property_db import (
     list_agents as db_list_agents,
     set_agent_skills,
     set_agent_tools,
+    set_agent_knowledge_bindings,
     update_agent as db_update_agent,
 )
 
@@ -42,6 +44,7 @@ class AgentCreate(BaseModel):
     available_skills: Optional[List[str]] = []  # frontend sends skill names
     tool_names: Optional[List[str]] = []
     available_mcp_tools: Optional[List[str]] = []  # frontend alias for tool_names
+    knowledge_doc_ids: Optional[List[int]] = None
 
 
 class AgentUpdate(BaseModel):
@@ -57,6 +60,7 @@ class AgentUpdate(BaseModel):
     available_skills: Optional[List[str]] = None
     tool_names: Optional[List[str]] = None
     available_mcp_tools: Optional[List[str]] = None
+    knowledge_doc_ids: Optional[List[int]] = None
 
 
 class AgentToggleRequest(BaseModel):
@@ -102,12 +106,21 @@ def _serialize_agent(agent: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]
     agent["available_mcp_tools"] = [
         t.get("tool_name") for t in agent["tools"] if t.get("tool_name")
     ]
+    agent["knowledge_doc_ids"] = get_agent_knowledge_bindings(agent["agent_id"])
+    agent["knowledge_scope_mode"] = (
+        "legacy_all_published"
+        if agent["knowledge_doc_ids"] is None
+        else "explicit"
+    )
     agent["runtime_registration"] = {
         "router_candidate": bool(agent.get("enabled")) and not agent["is_router"],
-        "effective_on": "next_owner_message" if bool(agent.get("enabled")) and not agent["is_router"] else None,
+        "effective_on": "next_published_release_new_session" if bool(agent.get("enabled")) and not agent["is_router"] else None,
         "skill_binding_count": len(agent["skill_ids"]),
         "mcp_server_binding_count": len(agent["available_mcp_tools"]),
-        "note": "启用的垂直 Agent 会在下一条业主消息进入路由候选池；无需重启服务。",
+        "note": (
+            "配置保存后仍是 Draft；在“V1.8 运行时发布”校验并发布后，"
+            "该 Agent 才会进入下一新会话的路由候选池。"
+        ),
     }
     if agent.get("is_router"):
         agent["members"] = _get_router_members()
@@ -185,6 +198,8 @@ async def create_agent(request: AgentCreate):
     if tool_names:
         tools = [{"tool_name": name} for name in tool_names]
         set_agent_tools(agent_id, tools)
+    if request.knowledge_doc_ids is not None:
+        set_agent_knowledge_bindings(agent_id, request.knowledge_doc_ids)
     return {"agent": _serialize_agent(agent)}
 
 
@@ -221,7 +236,7 @@ async def update_agent(agent_id: str, request: AgentUpdate):
     # 3. Router-only restrictions.
     if is_router:
         # Router cannot change category, enabled, model, skills or tools.
-        if any(f in fields_set for f in ("category", "is_router", "enabled", "model_id", "skill_ids", "available_skills", "tool_names", "available_mcp_tools")):
+        if any(f in fields_set for f in ("category", "is_router", "enabled", "model_id", "skill_ids", "available_skills", "tool_names", "available_mcp_tools", "knowledge_doc_ids")):
             raise HTTPException(status_code=400, detail="router agent can only edit name/description/system_prompt")
         category = agent.get("category")
         enabled = agent.get("enabled")
@@ -270,6 +285,10 @@ async def update_agent(agent_id: str, request: AgentUpdate):
     if tool_names is not None:
         tools = [{"tool_name": name} for name in tool_names]
         set_agent_tools(agent["agent_id"], tools)
+    if "knowledge_doc_ids" in fields_set:
+        set_agent_knowledge_bindings(
+            agent["agent_id"], request.knowledge_doc_ids or []
+        )
 
     return {"agent": _serialize_agent(updated)}
 

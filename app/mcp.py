@@ -20,6 +20,7 @@ from db.property_db import (
     delete_mcp_server as db_delete_mcp_server,
     delete_mcp_tools_for_server,
     get_mcp_server as db_get_mcp_server,
+    get_mcp_tool,
     list_mcp_servers as db_list_mcp_servers,
     list_mcp_tools,
     save_mcp_tool,
@@ -68,6 +69,10 @@ class McpServerUpdate(BaseModel):
 
 class McpServerToggle(BaseModel):
     enabled: bool
+
+
+class McpToolPolicyUpdate(BaseModel):
+    effect: str
 
 
 @router.get("")
@@ -145,6 +150,35 @@ async def get_mcp_server_tools(server_id: str):
     return {"mcp_server": server, "tools": tools, "count": len(tools)}
 
 
+@router.put("/{server_id}/tools/{tool_id}/policy")
+async def update_mcp_tool_policy(
+    server_id: str,
+    tool_id: int,
+    request: McpToolPolicyUpdate,
+):
+    server = _resolve_server(server_id)
+    tool = get_mcp_tool(tool_id)
+    if not tool or int(tool.get("server_id") or 0) != int(server["id"]):
+        raise HTTPException(status_code=404, detail="mcp tool not found")
+    effect = request.effect.strip().lower()
+    if effect not in {"read", "create", "update", "delete", "unknown"}:
+        raise HTTPException(status_code=400, detail="invalid tool effect")
+    metadata = dict(tool.get("tool_metadata") or {})
+    metadata["effect"] = effect
+    metadata["effect_source"] = "operator_declared"
+    updated = save_mcp_tool(
+        server_id=int(server["id"]),
+        name=str(tool["name"]),
+        description=str(tool.get("description") or ""),
+        input_schema=tool.get("input_schema") or {},
+        tool_metadata=metadata,
+    )
+    return {
+        "mcp_tool": updated,
+        "runtime_effective_on": "after_runtime_release_publish",
+    }
+
+
 @router.post("/{server_id}/discover")
 async def discover_mcp_server_tools(server_id: str):
     """Discover tools from a running MCP server and cache them."""
@@ -178,6 +212,10 @@ async def discover_server_tools(server: Dict[str, Any]) -> List[Dict[str, Any]]:
     params = StdioServerParameters(command=command, args=resolved_args, env=merged_env)
 
     discovered: List[Dict[str, Any]] = []
+    existing_by_name = {
+        str(item.get("name") or ""): item
+        for item in list_mcp_tools(server_id=server_id)
+    }
     try:
         async with stdio_client(params) as (read, write):
             async with ClientSession(read, write) as session:
@@ -188,7 +226,10 @@ async def discover_server_tools(server: Dict[str, Any]) -> List[Dict[str, Any]]:
                     name = getattr(tool, "name", "")
                     description = getattr(tool, "description", "") or ""
                     input_schema = getattr(tool, "inputSchema", {}) or {}
-                    tool_metadata = {"source": "discovered"}
+                prior_metadata = (
+                    existing_by_name.get(str(name), {}).get("tool_metadata") or {}
+                )
+                tool_metadata = {**prior_metadata, "source": "discovered"}
                     save_mcp_tool(
                         server_id=server_id,
                         name=name,

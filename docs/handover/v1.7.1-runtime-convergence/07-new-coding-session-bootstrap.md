@@ -1,6 +1,6 @@
 # 07｜新 AI Coding 会话完整启动提示词
 
-将以下内容整体复制到新会话。随后再把 `00-index.md`～`08-v1.8-enterprise-runtime-architecture-contract.md` 一并提供，或让其从 Git 分支读取。`08` 是 V1.8 后续实现的顶层权威契约。
+将以下内容整体复制到新会话。随后再把 `00-index.md`～`08-v1.8-enterprise-runtime-architecture-contract.md`、`docs/adr/0002-runtime-release-session-snapshot-and-composite-workflow.md` 和 `docs/releases/v1.8.0.md` 一并提供，或让其从 Git 分支读取。`08` 是 V1.8 当前批准的 Living Architecture；允许提出有依据的修订，但不得让实现静默漂移。发布记录必须用于区分“工作区已实现”和“已验证/已部署”。
 
 ```text
 你现在接手 YIAI物业：一个用于 AI 产品经理面试的可运行 AI 技术栈演示项目。
@@ -25,7 +25,7 @@ git fetch origin docs/v1.7.1-runtime-convergence-handover
 git show origin/docs/v1.7.1-runtime-convergence-handover:docs/handover/v1.7.1-runtime-convergence/00-index.md
 ```
 
-再依次读取同目录 `01` 至 `08` 全部文档，其中 `08-v1.8-enterprise-runtime-architecture-contract.md` 是后续实现不得绕过的顶层权威契约。不要把文档分支 checkout 到 NAS 正在运行的 main 工作目录。
+再依次读取同目录 `01` 至 `08` 全部文档，其中 `08-v1.8-enterprise-runtime-architecture-contract.md` 是当前批准、可受控修订的 Living Architecture。若需要改变它，先说明证据和影响、记录 ADR、更新文档版本与验收契约；不要让代码静默偏离。不要把文档分支 checkout 到 NAS 正在运行的 main 工作目录。
 
 【项目目的】
 这不是要建设生产物业系统。它是我面试企业级 AI 产品经理时，用来证明自己对 AI 技术栈“知其然也知其所以然”的演示项目。
