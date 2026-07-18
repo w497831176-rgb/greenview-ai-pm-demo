@@ -1,6 +1,6 @@
 # 07｜新 AI Coding 会话完整启动提示词
 
-将以下内容整体复制到新会话。随后再把 `00-index.md`～`06-manual-demo-and-acceptance-matrix.md` 一并提供，或让其从 Git 分支读取。
+将以下内容整体复制到新会话。随后再把 `00-index.md`～`08-v1.8-enterprise-runtime-architecture-contract.md` 一并提供，或让其从 Git 分支读取。`08` 是 V1.8 后续实现的顶层权威契约。
 
 ```text
 你现在接手 YIAI物业：一个用于 AI 产品经理面试的可运行 AI 技术栈演示项目。
@@ -25,7 +25,7 @@ git fetch origin docs/v1.7.1-runtime-convergence-handover
 git show origin/docs/v1.7.1-runtime-convergence-handover:docs/handover/v1.7.1-runtime-convergence/00-index.md
 ```
 
-再依次读取同目录 `01` 至 `06` 全部文档。不要把文档分支 checkout 到 NAS 正在运行的 main 工作目录。
+再依次读取同目录 `01` 至 `08` 全部文档，其中 `08-v1.8-enterprise-runtime-architecture-contract.md` 是后续实现不得绕过的顶层权威契约。不要把文档分支 checkout 到 NAS 正在运行的 main 工作目录。
 
 【项目目的】
 这不是要建设生产物业系统。它是我面试企业级 AI 产品经理时，用来证明自己对 AI 技术栈“知其然也知其所以然”的演示项目。
