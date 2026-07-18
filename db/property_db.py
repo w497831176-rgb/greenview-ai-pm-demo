@@ -315,6 +315,7 @@ def init_db():
             role TEXT NOT NULL,
             content TEXT,
             token_count INTEGER DEFAULT 0,
+            round_token_count INTEGER DEFAULT 0,
             token_detail TEXT,
             citations TEXT,
             activated_skills TEXT,
@@ -403,6 +404,13 @@ def init_db():
             cursor.execute(f"ALTER TABLE chat_sessions ADD COLUMN {col} {dtype}")
         except sqlite3.OperationalError:
             pass
+
+    # Migration: persist the full turn total separately from the vertical answer.
+    # A turn can contain both a Router and a vertical Agent model call.
+    try:
+        cursor.execute("ALTER TABLE chat_messages ADD COLUMN round_token_count INTEGER DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass
 
     # Migration: add token_detail column to existing chat_messages table.
     try:
@@ -3283,6 +3291,7 @@ def save_chat_message(
     role: str,
     content: str,
     token_count: int = 0,
+    round_token_count: Optional[int] = None,
     token_detail: Optional[Dict[str, Any]] = None,
     citations: Optional[List[Dict[str, Any]]] = None,
     activated_skills: Optional[List[str]] = None,
@@ -3307,16 +3316,17 @@ def save_chat_message(
     cursor.execute(
         """
         INSERT INTO chat_messages (
-            session_id, role, content, token_count, token_detail, citations, activated_skills,
+            session_id, role, content, token_count, round_token_count, token_detail, citations, activated_skills,
             route_intent, route_reason, current_agent, current_agent_id, tool_calls, model_id, thinking_enabled,
             model_selection_reason, trace_id, status, latency_ms, error_summary, mcp_calls, usage_source, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             session_id,
             role,
             content,
             token_count,
+            round_token_count if round_token_count is not None else token_count,
             json.dumps(token_detail) if token_detail else None,
             json.dumps(citations) if citations else None,
             json.dumps(activated_skills) if activated_skills else None,

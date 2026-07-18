@@ -3,6 +3,8 @@
 Run inside demo-os-api.  It never opens an SSE stream or calls a provider.
 """
 
+from pathlib import Path
+
 from agents.router import _capability_fallback
 from app.chat import _unique_rag_results
 from app.mcp_policy import allowed_tools_for_agent
@@ -23,6 +25,17 @@ def agent(agent_id, name, description, *, enabled=True, skills=None, mcp=None):
 
 
 def main():
+    root = Path(__file__).resolve().parents[1]
+    frontend_source = (root / "frontend" / "index.html").read_text(encoding="utf-8")
+    chat_source = (root / "app" / "chat.py").read_text(encoding="utf-8")
+    db_source = (root / "db" / "property_db.py").read_text(encoding="utf-8")
+    assert "const APP_VERSION = 'V1.5.8'" in frontend_source
+    assert "业务回答 Token" in frontend_source
+    assert "本轮累计 Token" in frontend_source
+    assert "Skill（业务规则）" in frontend_source
+    assert "动态能力匹配" in frontend_source
+    assert "round_token_count" in chat_source and "round_token_count" in db_source
+
     maintenance = agent("maintenance", "维修 Agent", "处理报修、漏水和维修工单")
     customer = agent("customer_service", "客服 Agent", "处理一般物业咨询")
     children = agent(
@@ -45,6 +58,8 @@ def main():
 
     target, reason, scores = _capability_fallback("孩子放学后想参加亲子课程和托管", registry)
     assert target == "children_education", (target, reason, scores)
+    assert reason.startswith("能力匹配路由："), reason
+    assert "能力回退" not in reason, reason
     assert all(
         match["term"] != "agent"
         for score in scores
@@ -80,7 +95,7 @@ def main():
         {"doc_id": 2, "chunk_index": 1, "content": "second"},
     ])
     assert len(deduped) == 2, deduped
-    print("V1.5.6 dynamic capability contract checks passed")
+    print("V1.5.8 dynamic capability and explainability contract checks passed")
 
 
 if __name__ == "__main__":

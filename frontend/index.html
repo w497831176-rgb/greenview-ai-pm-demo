@@ -219,7 +219,7 @@
     // ==========================================
     const API_BASE = '';
     const DEFAULT_ROOM_ID = '3-2-1201';
-    const APP_VERSION = 'V1.5.7';
+    const APP_VERSION = 'V1.5.8';
 
     const STATE = {
       topTab: 'owner',
@@ -523,7 +523,7 @@
       }
       if (routeReason) tags.push(`<span class="px-1.5 py-0.5 bg-slate-100 text-slate-600 rounded text-[10px]" title="${escapeHtml(routeIntent || '')}">路由原因：${escapeHtml(routeReason)}</span>`);
       if (agent) tags.push(`<span class="px-1.5 py-0.5 bg-indigo-50 text-indigo-600 rounded text-[10px]" title="agent_id: ${escapeHtml(currentAgentId || '')}">当前处理 Agent：${escapeHtml(agent)}</span>`);
-      if (skills && skills.length) tags.push(`<span class="px-1.5 py-0.5 bg-brand-50 text-brand-600 rounded text-[10px]">已命中 Skill：${escapeHtml(skills.map(s => (typeof s === 'object' && s !== null ? (s.name || JSON.stringify(s)) : String(s))).join('、'))}</span>`);
+      if (skills && skills.length) tags.push(`<span class="px-1.5 py-0.5 bg-brand-50 text-brand-600 rounded text-[10px]" title="Skill 提供可复用的业务规则与执行方法；它不是知识库引用。">已命中 Skill（业务规则）：${escapeHtml(skills.map(s => (typeof s === 'object' && s !== null ? (s.name || JSON.stringify(s)) : String(s))).join('、'))}</span>`);
       if (tools && tools.length) tags.push(`<span class="px-1.5 py-0.5 bg-gold-50 text-gold-600 rounded text-[10px]">已调用工具：${escapeHtml(tools.map(t => typeof t === 'string' ? t : (t.name || t.tool_name || JSON.stringify(t))).join('、'))}</span>`);
       if (mcpCalls && mcpCalls.length) {
         const okCount = mcpCalls.filter(c => c.status === 'success').length;
@@ -565,7 +565,12 @@
             : `未缓存输入 ${usage.uncached_input_tokens || 0} · 缓存命中 ${usage.cached_input_tokens || 0} · 输出 ${usage.output_tokens || 0} · 总计 ${call.total_tokens ?? '不可得'}`;
           const costLine = splitMissing ? '成本：不估算（避免在缺少缓存拆分时给出假精确金额）' : `估算成本：${money(call.estimated_cost_cny)}`;
           const routeMode = call.stage === 'router' && call.context_breakdown ? call.context_breakdown.route_mode : '';
-          return `<div class="border border-slate-200 rounded-xl p-3 text-sm space-y-1"><div class="font-medium text-slate-900">${escapeHtml(stageName[call.stage] || call.stage || '模型调用')} · ${escapeHtml(call.model_id || '-')}</div><div class="text-xs text-slate-500">用量来源：${escapeHtml(sourceName[call.usage_source] || call.usage_source || '未知')}${routeMode ? ` · 路由方式：${escapeHtml(routeMode)}` : ''}</div><div class="text-xs text-slate-600">${escapeHtml(usageLine)}</div><div class="text-xs text-slate-700">${escapeHtml(costLine)}</div><div class="text-xs text-slate-500">${escapeHtml(priceText(call.price_snapshot || {}))}</div></div>`;
+          const routeModeLabel = {
+            model_success: 'Router 模型判定',
+            capability_fallback: '动态能力匹配',
+            capability_policy_override: '能力策略校正',
+          }[routeMode] || routeMode;
+          return `<div class="border border-slate-200 rounded-xl p-3 text-sm space-y-1"><div class="font-medium text-slate-900">${escapeHtml(stageName[call.stage] || call.stage || '模型调用')} · ${escapeHtml(call.model_id || '-')}</div><div class="text-xs text-slate-500">用量来源：${escapeHtml(sourceName[call.usage_source] || call.usage_source || '未知')}${routeModeLabel ? ` · 路由方式：${escapeHtml(routeModeLabel)}` : ''}</div><div class="text-xs text-slate-600">${escapeHtml(usageLine)}</div><div class="text-xs text-slate-700">${escapeHtml(costLine)}</div><div class="text-xs text-slate-500">${escapeHtml(priceText(call.price_snapshot || {}))}</div></div>`;
         }).join('') : '<p class="text-sm text-slate-400">本轮没有模型调用；如为规则工作流，这是预期行为。</p>';
         const workflowCalls = (assistantMsg.tool_calls || []).filter(call => (call.tool_name || call.name) === 'work_order_workflow');
         const workflowHtml = workflowCalls.length ? workflowCalls.map(call => `<div class="border border-emerald-200 bg-emerald-50 rounded-xl p-3 text-sm"><div class="font-medium text-emerald-800">维修工单工作流：${escapeHtml((call.arguments || {}).action || '已处理')}</div><div class="text-xs text-emerald-700 mt-1">${escapeHtml(call.result_summary || '')}</div>${call.work_order_id ? `<div class="text-xs text-emerald-700 mt-1">真实工单号：${escapeHtml(call.work_order_id)}</div>` : ''}</div>`).join('') : '';
@@ -1232,9 +1237,28 @@
 
     function tokenUsageLabel(tokenCount, usageSource) {
       if (usageSource === 'not_applicable') return '规则工作流：未调用模型';
-      if (!tokenCount) return '本次模型 Token：不可得';
-      const prefix = usageSource === 'estimated_tokenization' ? '本地估算 Token' : '本次回答 Token';
+      if (!tokenCount) return '业务回答 Token：不可得';
+      const prefix = usageSource === 'estimated_tokenization' ? '本地估算业务回答 Token' : '业务回答 Token';
       return `${prefix}：${tokenCount}`;
+    }
+
+    function roundTokenLabel(roundTokenCount, answerTokenCount) {
+      const total = Number(roundTokenCount || 0);
+      const answer = Number(answerTokenCount || 0);
+      if (!total || total <= answer) return '';
+      return `本轮累计 Token：${total}`;
+    }
+
+    function renderTokenUsage(tokenCount, roundTokenCount, tokenDetail, usageSource) {
+      const mainText = tokenUsageLabel(tokenCount, usageSource);
+      const roundText = roundTokenLabel(roundTokenCount, tokenCount);
+      const detailParts = [formatTokenDetail(tokenDetail)];
+      if (roundText) detailParts.push(`其中路由 Token：${Number(roundTokenCount) - Number(tokenCount || 0)}`);
+      const detailText = detailParts.filter(Boolean).join(' · ');
+      const label = roundText ? `${mainText} · ${roundText}` : mainText;
+      return detailText
+        ? `<span class="cursor-help underline decoration-dotted" title="${escapeHtml(detailText)}">${label}</span>`
+        : label;
     }
 
     function normalizeCitationMarkers(content) {
@@ -1367,7 +1391,7 @@
       return `<div class="flex flex-wrap items-center gap-1 mt-2"><span class="text-[10px] text-slate-400">已调用skill:</span>${tags}</div>`;
     }
 
-    function updateAiMessage(content, done = false, tokenCount = 0, messageId = null, tokenDetail = null, citations = null, activatedSkills = null, tools = null, agent = null, modelId = '', thinkingEnabled = null, modelSelectionReason = '', traceId = '', mcpCalls = null, usageSource = '', currentAgentId = '') {
+    function updateAiMessage(content, done = false, tokenCount = 0, roundTokenCount = 0, messageId = null, tokenDetail = null, citations = null, activatedSkills = null, tools = null, agent = null, modelId = '', thinkingEnabled = null, modelSelectionReason = '', traceId = '', mcpCalls = null, usageSource = '', currentAgentId = '') {
       const current = STATE.currentAiMessage;
       if (!current) return;
       const contentDiv = current.querySelector('.ai-message-content');
@@ -1384,11 +1408,7 @@
           footer.classList.remove('hidden');
           const tokensEl = footer.querySelector('.ai-message-tokens');
           if (tokensEl) {
-            const detailText = formatTokenDetail(tokenDetail);
-            const mainText = tokenUsageLabel(tokenCount, usageSource);
-            tokensEl.innerHTML = detailText
-              ? `<span class="cursor-help underline decoration-dotted" title="${escapeHtml(detailText)}">${mainText}</span>`
-              : mainText;
+            tokensEl.innerHTML = renderTokenUsage(tokenCount, roundTokenCount, tokenDetail, usageSource);
           }
           const upBtn = footer.querySelector('.thumb-up-btn');
           const downBtn = footer.querySelector('.thumb-down-btn');
@@ -1532,6 +1552,7 @@
                 accumulated,
                 true,
                 data.token_count || 0,
+                data.round_token_count || data.token_count || 0,
                 data.message_id || null,
                 data.token_detail || null,
                 data.citations || null,
@@ -1593,6 +1614,7 @@
               msg.content || '',
               msg.created_at,
               msg.token_count,
+              msg.round_token_count || msg.token_count,
               msg.id,
               msg.token_detail,
               msg.citations,
@@ -1619,18 +1641,14 @@
       }
     }
 
-    function appendAiMessageFromHistory(content, createdAt, tokenCount, messageId, tokenDetail = null, citations = null, activatedSkills = null, tools = null, agent = null, routeReason = '', routeIntent = '', modelId = '', thinkingEnabled = null, modelSelectionReason = '', traceId = '', mcpCalls = null, usageSource = '', currentAgentId = '') {
+    function appendAiMessageFromHistory(content, createdAt, tokenCount, roundTokenCount, messageId, tokenDetail = null, citations = null, activatedSkills = null, tools = null, agent = null, routeReason = '', routeIntent = '', modelId = '', thinkingEnabled = null, modelSelectionReason = '', traceId = '', mcpCalls = null, usageSource = '', currentAgentId = '') {
       const container = $('#chat-message-list');
       const div = document.createElement('div');
       div.className = 'flex gap-3 items-start fade-in';
       if (messageId) div.dataset.messageId = messageId;
       const time = formatTimeLabel(createdAt);
       const clean = stripThinking(content);
-      const tokenText = tokenUsageLabel(tokenCount, usageSource);
-      const detailText = formatTokenDetail(tokenDetail);
-      const tokenHtml = detailText
-        ? `<span class="cursor-help underline decoration-dotted" title="${escapeHtml(detailText)}">${tokenText}</span>`
-        : tokenText;
+      const tokenHtml = renderTokenUsage(tokenCount, roundTokenCount, tokenDetail, usageSource);
       const footnotesHtml = renderCitations(citations, clean);
       const tagsHtml = renderAiMessageTags(activatedSkills, tools, agent, routeReason, routeIntent, modelId, thinkingEnabled, modelSelectionReason, traceId, mcpCalls, usageSource, currentAgentId);
       div.innerHTML = `
