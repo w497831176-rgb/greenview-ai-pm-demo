@@ -547,15 +547,16 @@ def _apply_explicit_document_coverage(
     # model or silently lowering the evidence threshold.
     for doc in named_docs:
         doc_id = doc.get("id")
-        if doc_id in existing_ids:
-            continue
         try:
-            focused = rag_retrieval.advanced_search(
-                f"{doc.get('title', '')}\n{message}", settings=settings
-            ).get("results", [])
-            matched = next((item for item in focused if item.get("doc_id") == doc_id), None)
-            if matched:
-                selected.insert(0, matched)
+            focused = rag_retrieval._title_boosted_results(
+                message, str(doc.get("title") or ""), settings
+            )
+            if focused:
+                # Explicit source requests deserve source-local, substantive
+                # evidence instead of whichever mixed-query chunk happened to
+                # rank first. Keep two focused chunks for multi-part questions.
+                selected = [item for item in selected if item.get("doc_id") != doc_id]
+                selected.extend(focused[:2])
                 existing_ids.add(doc_id)
         except Exception:
             continue

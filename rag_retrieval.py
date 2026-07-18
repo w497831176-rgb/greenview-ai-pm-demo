@@ -70,9 +70,36 @@ def _is_structural_chunk(content: str, doc_title: str = "") -> bool:
     title_normalized = re.sub(r"[^\u4e00-\u9fa5a-z0-9]", "", (doc_title or "").lower())
     if not normalized:
         return True
-    if title_normalized and normalized == title_normalized:
+    if title_normalized and (
+        normalized == title_normalized
+        or (normalized.endswith(title_normalized) and len(normalized) - len(title_normalized) <= 8)
+        or (title_normalized.endswith(normalized) and len(title_normalized) - len(normalized) <= 8)
+    ):
         return True
     return bool(re.fullmatch(r"第[0-9一二三四五六七八九十百]+[章节].{0,24}|[总附]则", normalized))
+
+
+def _explicit_evidence_priority(query: str, content: str) -> float:
+    """Rank supporting chunks for an explicitly named source.
+
+    It is a transparent property-domain evidence policy, not a document-name
+    rule: owner symptoms and service-time intents must outrank a generic
+    complaint or title sentence when the owner asks for repair guidance.
+    """
+    q = query or ""
+    text = content or ""
+    score = _context_relevance_score(q, text)
+    water_query = any(term in q for term in ("漏水", "滴水", "渗水"))
+    water_evidence = any(term in text for term in ("漏水", "滴水", "渗水", "水管", "水阀"))
+    timing_query = any(term in q for term in ("时效", "响应", "多久", "到场", "上门", "紧急"))
+    timing_evidence = any(term in text for term in ("紧急维修", "一般维修", "到场", "上门", "派单", "受理"))
+    if water_query and water_evidence:
+        score += 0.30
+    if timing_query and timing_evidence:
+        score += 0.18
+    if "投诉" in text and not any(term in q for term in ("投诉", "纠纷", "12345")):
+        score -= 0.50
+    return round(max(0.0, min(1.0, score)), 4)
 
 
 def _build_keyword_index() -> Dict[int, Dict[str, int]]:
@@ -310,34 +337,33 @@ def _extract_quoted_titles(query: str) -> List[str]:
 
 
 def _extract_sub_queries(query: str) -> List[str]:
-    """Split a long composite query into candidate sub-questions.
+    """Extract only independently retrievable evidence sub-questions.
 
-    Keeps whole lines and sentence-level segments ending with ？ or ? so that
-    focused sub-questions (e.g. "家里漏水了怎么办？") can be retrieved
-    independently.  Short fragments are ignored.
+    Composite owner requests often include operational steps plus one or more
+    explicitly grounded questions.  We retain the full query, and add numbered
+    fragments only when they name a document or ask for knowledge evidence.
+    This improves cited-chunk precision without multiplying every tool/query
+    step into an expensive embedding search.
     """
-    segments = []
+    segments: List[str] = []
     for line in query.splitlines():
         line = line.strip()
         if not line:
             continue
-        # Split on Chinese or ASCII question marks while keeping the marker.
-        parts = re.split(r'(?<=[？?])', line)
-        for part in parts:
+        if len(line) >= 5:
+            segments.append(line)
+        for part in re.split(r"(?:^|[\n：；;])\s*\d{1,2}[.、]\s*", line):
+            part = part.strip()
+            if len(part) < 5 or part == line:
+                continue
+            if "《" in part or "知识库" in part or "依据" in part:
+                segments.append(part)
+        for part in re.split(r'(?<=[？?])', line):
             part = part.strip()
             if len(part) >= 5:
                 segments.append(part)
-        # If the line had no question mark, keep it as a standalone sub-query.
-        if not re.search(r'[？?]', line) and len(line) >= 5:
-            segments.append(line)
-    # Deduplicate while preserving order.
     seen = set()
-    unique = []
-    for s in segments:
-        if s not in seen:
-            seen.add(s)
-            unique.append(s)
-    return unique
+    return [segment for segment in segments if not (segment in seen or seen.add(segment))]
 
 
 DEFAULT_RETRIEVAL_SETTINGS = {
@@ -461,8 +487,7 @@ def _title_boosted_results(
             content = c.get("content", "")
             if _is_structural_chunk(content, doc_title):
                 continue
-            ctx_text = f"{doc_title} {content}"
-            ctx_score = _context_relevance_score(query, ctx_text)
+            ctx_score = _explicit_evidence_priority(query, content)
             if ctx_score < context_threshold:
                 continue
             candidates.append({
