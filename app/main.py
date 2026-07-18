@@ -17,6 +17,7 @@ from agno.os.config import AuthorizationConfig
 from agents.property import property_agent
 from app.agents import router as agents_router
 from app.badcases import router as badcases_router
+from app.evaluations import router as evaluations_router
 from app.chat import router as chat_router
 from app.knowledge import retrieval_router, router as knowledge_router
 from app.mcp_contracts import router as mcp_contracts_router
@@ -94,6 +95,7 @@ app.include_router(models_compat_router)
 app.include_router(model_configs_router)
 app.include_router(agents_router)
 app.include_router(observability_router)
+app.include_router(evaluations_router)
 # Badcase endpoints under both /api/badcases and /api/knowledge/badcases (frontend).
 app.include_router(badcases_router, prefix="/api/badcases")
 app.include_router(badcases_router, prefix="/api/knowledge/badcases")

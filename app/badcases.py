@@ -2,8 +2,12 @@
 Badcase Closed-Loop API
 =======================
 
-Implements the full badcase lifecycle:
-    pending -> classified -> fixing -> verifying -> closed/rejected
+Implements the quality-operations lifecycle:
+    pending -> classified -> investigating -> fixing -> verifying
+    -> released (operator observation) -> closed
+
+Rejected, duplicate and accepted-limitation are retained as explicit terminal
+outcomes rather than silently deleting uncomfortable evidence.
 
 Supports automatic classification, knowledge extraction, Darwin skill
 optimization, model switch retry, and verification.
@@ -23,6 +27,7 @@ from pydantic import BaseModel
 logger = logging.getLogger(__name__)
 
 from app.badcase_schema import (
+    ROOT_CAUSE_DOMAINS,
     VALID_CATEGORIES,
     VALID_STATUSES,
     _enrich_badcase,
@@ -60,6 +65,7 @@ from db.property_db import (
     get_capability_gap_draft as db_get_capability_gap_draft,
     get_chat_message,
     get_enabled_price_for_model,
+    get_evaluation_case,
     get_knowledge_draft as db_get_knowledge_draft,
     get_skill,
     get_skill_by_name,
@@ -68,6 +74,7 @@ from db.property_db import (
     list_badcase_actions,
     list_badcases as db_list_badcases,
     list_capability_gap_drafts as db_list_capability_gap_drafts,
+    list_evaluation_runs,
     list_knowledge_drafts as db_list_knowledge_drafts,
     list_skill_prompt_drafts as db_list_skill_prompt_drafts,
     list_skills,
@@ -97,24 +104,43 @@ class BadcaseCreate(BaseModel):
     ai_response: Optional[str] = None
     feedback_reason: Optional[str] = None
     priority: str = "medium"
+    symptom: Optional[str] = None
+    expected_behavior: Optional[str] = None
+    actual_behavior: Optional[str] = None
+    root_cause_domain: Optional[str] = None
+    secondary_root_cause_domains: List[str] = []
+    impact_scope: Optional[str] = None
+    owner: Optional[str] = None
+    linked_evaluation_case_id: Optional[int] = None
+    linked_evaluation_run_id: Optional[int] = None
 
 
 class BadcaseUpdate(BaseModel):
     title: Optional[str] = None
     description: Optional[str] = None
     category: Optional[str] = None
+    # Status is intentionally not a free-form edit.  State changes must use a
+    # lifecycle action so Trace / audit / verification evidence remain intact.
     status: Optional[str] = None
     evidence: Optional[str] = None
     root_cause: Optional[str] = None
     fix_plan: Optional[str] = None
     rejected_reason: Optional[str] = None
     priority: Optional[str] = None
+    symptom: Optional[str] = None
+    expected_behavior: Optional[str] = None
+    actual_behavior: Optional[str] = None
+    root_cause_domain: Optional[str] = None
+    secondary_root_cause_domains: Optional[List[str]] = None
+    impact_scope: Optional[str] = None
+    owner: Optional[str] = None
 
 
 class ClassifyRequest(BaseModel):
     auto: bool = True
     category: Optional[str] = None
     reason: str = ""
+    root_cause_domain: Optional[str] = None
 
 
 class ExtractKnowledgeRequest(BaseModel):
@@ -136,6 +162,21 @@ class SwitchModelRetryRequest(BaseModel):
 class VerifyRequest(BaseModel):
     passed: bool = True
     note: str = ""
+    verification_evidence: str = ""
+
+
+class CloseReleaseRequest(BaseModel):
+    observation_note: str = ""
+
+
+class DuplicateRequest(BaseModel):
+    primary_badcase_id: int
+    note: str = ""
+
+
+class AcceptLimitationRequest(BaseModel):
+    reason: str
+    alternative_path: str = ""
 
 
 class RejectRequest(BaseModel):
@@ -222,6 +263,13 @@ def _attach_drafts(case: Dict[str, Any]) -> Dict[str, Any]:
     case["knowledge_drafts"] = [d for d in db_list_knowledge_drafts() if d.get("badcase_id") == case_id]
     case["skill_prompt_drafts"] = db_list_skill_prompt_drafts(badcase_id=case_id)
     case["capability_gap_drafts"] = db_list_capability_gap_drafts(badcase_id=case_id)
+    evaluation_case_id = case.get("linked_evaluation_case_id")
+    case["linked_evaluation_case"] = get_evaluation_case(evaluation_case_id) if evaluation_case_id else None
+    runs = list_evaluation_runs(limit=50)
+    case["linked_evaluation_runs"] = [
+        run for run in runs
+        if run.get("badcase_id") == case_id or run.get("id") == case.get("linked_evaluation_run_id")
+    ]
     return case
 
 
@@ -379,6 +427,15 @@ async def create_badcase(request: BadcaseCreate):
         ai_response=request.ai_response,
         feedback_reason=request.feedback_reason,
         priority=request.priority,
+        symptom=request.symptom,
+        expected_behavior=request.expected_behavior,
+        actual_behavior=request.actual_behavior,
+        root_cause_domain=request.root_cause_domain or "unknown",
+        secondary_root_cause_domains=json.dumps(request.secondary_root_cause_domains, ensure_ascii=False),
+        impact_scope=request.impact_scope,
+        owner=request.owner,
+        linked_evaluation_case_id=request.linked_evaluation_case_id,
+        linked_evaluation_run_id=request.linked_evaluation_run_id,
     )
     return {"badcase": _enrich_badcase(case)}
 
@@ -389,6 +446,13 @@ async def update_badcase(case_id: int, request: BadcaseUpdate):
     case = db_get_badcase(case_id)
     if not case:
         raise HTTPException(status_code=404, detail="not found")
+    if request.status is not None and request.status != case.get("status"):
+        raise HTTPException(
+            status_code=400,
+            detail="状态必须通过分类、归因、验证、发布观察、关闭等生命周期操作变更，不能直接编辑",
+        )
+    if request.root_cause_domain and request.root_cause_domain not in ROOT_CAUSE_DOMAINS:
+        raise HTTPException(status_code=400, detail=f"invalid root_cause_domain: {request.root_cause_domain}")
     updated = db_update_badcase(
         case_id=case_id,
         title=request.title,
@@ -400,6 +464,16 @@ async def update_badcase(case_id: int, request: BadcaseUpdate):
         fix_plan=request.fix_plan,
         rejected_reason=request.rejected_reason,
         priority=request.priority,
+        symptom=request.symptom,
+        expected_behavior=request.expected_behavior,
+        actual_behavior=request.actual_behavior,
+        root_cause_domain=request.root_cause_domain,
+        secondary_root_cause_domains=(
+            json.dumps(request.secondary_root_cause_domains, ensure_ascii=False)
+            if request.secondary_root_cause_domains is not None else None
+        ),
+        impact_scope=request.impact_scope,
+        owner=request.owner,
     )
     if updated:
         _record_action(
@@ -482,6 +556,8 @@ async def classify_badcase(case_id: int, request: ClassifyRequest = ClassifyRequ
             f"上下文：{json.dumps(context_obj, ensure_ascii=False)[:800]}\n\n"
             "输出字段：suggested_category, root_cause_hypothesis, repair_path_suggestion, priority。"
             "repair_path_suggestion 应从 knowledge、skill_prompt、mcp_capability、ops_only 中选择。"
+            "另输出 root_cause_domain，只能是 routing、knowledge_rag、model_instruction、tool_mcp、"
+            "authority_safety、human_collaboration、ux、external_dependency、unknown。"
         )
         try:
             raw, usage = await _llm_generate(prompt, model_id=model_id)
@@ -499,6 +575,9 @@ async def classify_badcase(case_id: int, request: ClassifyRequest = ClassifyRequ
             category = "other"
         if priority not in ("high", "medium", "low"):
             priority = "medium"
+        root_cause_domain = parsed.get("root_cause_domain", "unknown")
+        if root_cause_domain not in ROOT_CAUSE_DOMAINS:
+            root_cause_domain = "unknown"
     else:
         category = request.category or "other"
         reason = request.reason
@@ -506,6 +585,9 @@ async def classify_badcase(case_id: int, request: ClassifyRequest = ClassifyRequ
         priority = "medium"
         if category not in VALID_CATEGORIES:
             raise HTTPException(status_code=400, detail=f"invalid category: {category}")
+        root_cause_domain = request.root_cause_domain or "unknown"
+        if root_cause_domain not in ROOT_CAUSE_DOMAINS:
+            raise HTTPException(status_code=400, detail=f"invalid root_cause_domain: {root_cause_domain}")
 
     if request.auto:
         latency_ms = int((time.time() - start) * 1000)
@@ -541,6 +623,7 @@ async def classify_badcase(case_id: int, request: ClassifyRequest = ClassifyRequ
         root_cause=reason,
         fix_plan=repair_path,
         priority=priority,
+        root_cause_domain=root_cause_domain,
     )
     _record_action(
         case_id,
@@ -550,6 +633,7 @@ async def classify_badcase(case_id: int, request: ClassifyRequest = ClassifyRequ
             "reason": reason,
             "repair_path_suggestion": repair_path,
             "priority": priority,
+            "root_cause_domain": root_cause_domain,
             "raw": raw if request.auto else None,
             "classify_trace_id": classify_trace_id,
         },
@@ -562,6 +646,7 @@ async def classify_badcase(case_id: int, request: ClassifyRequest = ClassifyRequ
         "root_cause_hypothesis": reason,
         "repair_path_suggestion": repair_path,
         "priority": priority,
+        "root_cause_domain": root_cause_domain,
     }
 
 
@@ -1126,8 +1211,8 @@ async def darwin_fix(case_id: int, request: DarwinFixRequest = DarwinFixRequest(
     case = db_get_badcase(case_id)
     if not case:
         raise HTTPException(status_code=404, detail="not found")
-    if case["status"] != "classified":
-        raise HTTPException(status_code=400, detail=f"Darwin analysis requires status=classified, got {case['status']}")
+    if case["status"] not in {"classified", "investigating"}:
+        raise HTTPException(status_code=400, detail=f"Darwin analysis requires status=classified/investigating, got {case['status']}")
 
     context = case.get("context_json") or ""
     if isinstance(context, str) and context:
@@ -1158,6 +1243,7 @@ async def darwin_fix(case_id: int, request: DarwinFixRequest = DarwinFixRequest(
         "{\n"
         '  "phenomenon_impact": "<问题现象与业务影响>",\n'
         '  "root_cause_hypothesis": "<根因假设>",\n'
+        '  "root_cause_domain": "<routing|knowledge_rag|model_instruction|tool_mcp|authority_safety|human_collaboration|ux|external_dependency|unknown>",\n'
         '  "evidence_uncertainties": "<证据与不确定性>",\n'
         '  "repair_path_suggestion": "<建议修复路径：knowledge|skill_prompt|mcp_capability|ops_only>",\n'
         '  "recommended_category": "<推荐分类>",\n'
@@ -1251,6 +1337,9 @@ async def darwin_fix(case_id: int, request: DarwinFixRequest = DarwinFixRequest(
     # Ensure required keys exist.
     analysis_obj.setdefault("phenomenon_impact", "")
     analysis_obj.setdefault("root_cause_hypothesis", analysis_obj.get("root_cause", ""))
+    analysis_obj.setdefault("root_cause_domain", "unknown")
+    if analysis_obj.get("root_cause_domain") not in ROOT_CAUSE_DOMAINS:
+        analysis_obj["root_cause_domain"] = "unknown"
     analysis_obj.setdefault("evidence_uncertainties", "")
     analysis_obj.setdefault("repair_path_suggestion", repair_path_for_category(case.get("category", "other")))
     analysis_obj.setdefault("recommended_category", case.get("category", "other"))
@@ -1336,6 +1425,7 @@ async def darwin_fix(case_id: int, request: DarwinFixRequest = DarwinFixRequest(
     updated = db_update_badcase(
         case_id,
         root_cause=analysis_obj.get("root_cause_hypothesis", case.get("root_cause")),
+        root_cause_domain=analysis_obj.get("root_cause_domain", case.get("root_cause_domain") or "unknown"),
         fix_plan=json.dumps(analysis_obj.get("suggested_actions", []), ensure_ascii=False),
         darwin_analysis=json.dumps(analysis_obj, ensure_ascii=False),
         darwin_trace_id=darwin_trace_id,
@@ -1415,25 +1505,47 @@ async def switch_model_retry(case_id: int, request: SwitchModelRetryRequest = Sw
 
 @router.post("/{case_id}/verify")
 async def verify_badcase(case_id: int, request: VerifyRequest = VerifyRequest()):
-    """Verify the badcase fix and close or keep fixing it."""
+    """Verify a fix using real retest evidence, then enter release observation.
+
+    Passing verification is deliberately not final closure.  The demo makes the
+    operator record a release/observation note before the case can be closed,
+    rather than pretending it has production monitoring.
+    """
     case = _load_case(case_id)
-    _require_case_status(case, "verify", {"verifying"})
 
     if request.passed:
+        _require_case_status(case, "verify-pass", {"verifying"})
         if not _has_post_apply_retest(case):
             raise HTTPException(
                 status_code=400,
                 detail="请先在当前修复应用后完成一次真实复测",
             )
-        new_status = "closed"
-        updated = db_update_badcase(case_id, status=new_status, verified_by="operator")
+        if not (request.verification_evidence or request.note).strip():
+            raise HTTPException(status_code=400, detail="请记录原案例/同类或边界验证结论后再发布观察")
+        new_status = "released"
+        updated = db_update_badcase(
+            case_id,
+            status=new_status,
+            verified_by="operator",
+            release_note=(request.verification_evidence or request.note).strip(),
+            released_at=now_cn(),
+        )
     else:
+        # A release-observation regression is a real signal to return to
+        # fixing; it must not require a fake second verification state.
+        _require_case_status(case, "verify-fail", {"verifying", "released"})
         if not request.note or not request.note.strip():
             raise HTTPException(status_code=400, detail="verification failure note required")
         new_status = "fixing"
         updated = db_update_badcase(case_id, status=new_status, fix_plan=request.note.strip() or "verification failed")
 
-    _record_action(case_id, "verify", {"passed": request.passed, "note": request.note}, case["status"], new_status)
+    _record_action(
+        case_id,
+        "verify",
+        {"passed": request.passed, "note": request.note, "verification_evidence": request.verification_evidence},
+        case["status"],
+        new_status,
+    )
     return {"badcase": _enrich_badcase(updated)}
 
 
@@ -1478,23 +1590,75 @@ async def darwin_alias_frontend(case_id: int, request: DarwinFixRequest = Darwin
 
 
 @router.post("/{case_id}/close")
-async def close_badcase(case_id: int, note: str = ""):
-    """Close a badcase (verify passed)."""
-    return await verify_badcase(case_id, VerifyRequest(passed=True, note=note))
+async def close_badcase(case_id: int, request: CloseReleaseRequest = CloseReleaseRequest()):
+    """Close an observed release; no claim of automatic online monitoring."""
+    case = _load_case(case_id)
+    _require_case_status(case, "close", {"released"})
+    if not request.observation_note.strip():
+        raise HTTPException(status_code=400, detail="请记录发布后的观察或人工确认结论")
+    updated = db_update_badcase(
+        case_id,
+        status="closed",
+        observed_at=now_cn(),
+        release_note=request.observation_note.strip(),
+    )
+    _record_action(
+        case_id, "close", {"observation_note": request.observation_note.strip()},
+        case["status"], "closed", "operator",
+    )
+    return {"badcase": _enrich_badcase(updated)}
 
 
 @router.post("/{case_id}/reject")
 async def reject_badcase(case_id: int, request: RejectRequest = RejectRequest()):
     """Reject a badcase with a required reason (only from non-terminal states)."""
     case = _load_case(case_id)
-    if is_terminal_status(case["status"]):
-        raise HTTPException(status_code=400, detail=f"cannot reject from terminal status {case['status']}")
+    _require_case_status(case, "reject", {"pending", "classified", "investigating", "fixing", "verifying"})
     if not request.rejected_reason or not request.rejected_reason.strip():
         raise HTTPException(status_code=400, detail="rejected_reason required")
 
     new_status = "rejected"
     updated = db_update_badcase(case_id, status=new_status, rejected_reason=request.rejected_reason.strip())
     _record_action(case_id, "reject", {"reason": request.rejected_reason.strip()}, case["status"], new_status)
+    return {"badcase": _enrich_badcase(updated)}
+
+
+@router.post("/{case_id}/accept-limitation")
+async def accept_limitation(case_id: int, request: AcceptLimitationRequest):
+    """Close a case as an explicit current product boundary, not a fake fix."""
+    case = _load_case(case_id)
+    _require_case_status(case, "accept-limitation", {"pending", "classified", "investigating", "fixing"})
+    if not request.reason.strip():
+        raise HTTPException(status_code=400, detail="accepted limitation reason required")
+    detail = {
+        "reason": request.reason.strip(),
+        "alternative_path": request.alternative_path.strip(),
+        "message": "该能力边界已记录；系统不会把未实现能力伪装成已修复。",
+    }
+    updated = db_update_badcase(
+        case_id,
+        status="accepted_limitation",
+        accepted_limitation_reason=json.dumps(detail, ensure_ascii=False),
+    )
+    _record_action(case_id, "accept-limitation", detail, case["status"], "accepted_limitation", "operator")
+    return {"badcase": _enrich_badcase(updated)}
+
+
+@router.post("/{case_id}/duplicate")
+async def mark_duplicate(case_id: int, request: DuplicateRequest):
+    """Preserve duplicate evidence while linking to the canonical owner case."""
+    case = _load_case(case_id)
+    _require_case_status(case, "mark-duplicate", {"pending", "classified", "investigating", "fixing"})
+    if request.primary_badcase_id == case_id:
+        raise HTTPException(status_code=400, detail="primary_badcase_id cannot equal current case")
+    primary = _load_case(request.primary_badcase_id)
+    detail = {
+        "primary_badcase_id": primary["id"],
+        "primary_title": primary.get("title"),
+        "note": request.note.strip(),
+    }
+    updated = db_update_badcase(case_id, status="duplicate", duplicate_of_id=primary["id"])
+    _record_action(case_id, "mark-duplicate", detail, case["status"], "duplicate", "operator")
     return {"badcase": _enrich_badcase(updated)}
 
 

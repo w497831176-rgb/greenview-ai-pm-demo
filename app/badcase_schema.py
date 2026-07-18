@@ -19,7 +19,38 @@ VALID_CATEGORIES = {
     "pending",
 }
 
-VALID_STATUSES = {"pending", "classified", "fixing", "verifying", "closed", "rejected"}
+# Operational lifecycle: a Badcase is not closed at "prompt changed".  It
+# remains distinguishable between triage, investigation, fix, verification,
+# release observation and final closure.  Compatibility states (pending /
+# classified) are intentionally retained for existing data and UI entrypoints.
+VALID_STATUSES = {
+    "pending", "classified", "investigating", "fixing", "verifying", "released",
+    "closed", "rejected", "duplicate", "accepted_limitation",
+}
+
+ROOT_CAUSE_DOMAINS = {
+    "routing",
+    "knowledge_rag",
+    "model_instruction",
+    "tool_mcp",
+    "authority_safety",
+    "human_collaboration",
+    "ux",
+    "external_dependency",
+    "unknown",
+}
+
+ROOT_CAUSE_DOMAIN_LABELS = {
+    "routing": "意图/路由",
+    "knowledge_rag": "知识/RAG",
+    "model_instruction": "模型/指令/Skill",
+    "tool_mcp": "Tool/MCP",
+    "authority_safety": "权限/安全",
+    "human_collaboration": "人机协同",
+    "ux": "产品体验",
+    "external_dependency": "外部依赖/能力边界",
+    "unknown": "待归因",
+}
 
 CATEGORY_LABELS = {
     "knowledge_gap": "知识库缺口",
@@ -34,10 +65,14 @@ CATEGORY_LABELS = {
 STATUS_LABELS = {
     "pending": "待分类",
     "classified": "已分类",
+    "investigating": "归因中",
     "fixing": "修复中",
     "verifying": "验证中",
+    "released": "已发布观察",
     "closed": "已关闭",
     "rejected": "已驳回",
+    "duplicate": "重复案例",
+    "accepted_limitation": "已接受限制",
 }
 
 ACTION_LABELS = {
@@ -52,6 +87,9 @@ ACTION_LABELS = {
     "retest": "真实复测",
     "verify-pass": "验证通过",
     "verify-fail": "验证不通过",
+    "close": "观察后关闭",
+    "accept-limitation": "记录已知限制",
+    "mark-duplicate": "关联重复案例",
     "reject": "驳回",
     "transition": "状态跳转",
 }
@@ -60,18 +98,22 @@ ACTION_LABELS = {
 # Each key is the source status; the value is the set of statuses reachable
 # through normal lifecycle actions (excluding the admin-only transition fallback).
 STATUS_TRANSITIONS: Dict[str, Set[str]] = {
-    "pending": {"classified", "rejected"},
-    "classified": {"fixing", "rejected"},
+    "pending": {"classified", "rejected", "duplicate", "accepted_limitation"},
+    "classified": {"investigating", "fixing", "rejected", "duplicate", "accepted_limitation"},
+    "investigating": {"fixing", "rejected", "duplicate", "accepted_limitation"},
     "fixing": {"verifying", "rejected"},
-    "verifying": {"closed", "fixing", "rejected"},
+    "verifying": {"released", "fixing", "rejected"},
+    "released": {"closed", "fixing"},
     "closed": set(),
     "rejected": set(),
+    "duplicate": set(),
+    "accepted_limitation": set(),
 }
 
 # Actions exposed to operators in the UI, mapped to the status they require.
 ACTION_STATUS_REQUIREMENTS: Dict[str, Set[str]] = {
     "classify": {"pending"},
-    "darwin-fix": {"classified"},
+    "darwin-fix": {"classified", "investigating"},
     "extract-knowledge": {"classified"},  # knowledge-gap repair draft
     "edit-draft": {"fixing"},
     "review-draft": {"fixing"},
@@ -79,9 +121,12 @@ ACTION_STATUS_REQUIREMENTS: Dict[str, Set[str]] = {
     "accept-capability-gap": {"fixing"},  # backward-compatible alias
     "retest": {"fixing", "verifying"},
     "verify-pass": {"verifying"},
-    "verify-fail": {"verifying"},
-    "reject": {"pending", "classified", "fixing", "verifying"},
-    "transition": {"pending", "classified", "fixing", "verifying", "closed", "rejected"},
+    "verify-fail": {"verifying", "released"},  # post-release observation can reveal a regression
+    "close": {"released"},
+    "accept-limitation": {"pending", "classified", "investigating", "fixing"},
+    "mark-duplicate": {"pending", "classified", "investigating", "fixing"},
+    "reject": {"pending", "classified", "investigating", "fixing", "verifying"},
+    "transition": {"pending", "classified", "investigating", "fixing", "verifying", "released", "closed", "rejected", "duplicate", "accepted_limitation"},
     # check-tools is intentionally omitted from the UI action list; it remains a
     # backend diagnostic helper available from pending/classified.
 }
@@ -132,7 +177,7 @@ CAPABILITY_CATEGORIES = {"mcp_capability"}
 
 
 def is_terminal_status(status: str) -> bool:
-    return status in {"closed", "rejected"}
+    return status in {"closed", "rejected", "duplicate", "accepted_limitation"}
 
 
 def validate_status_transition(from_status: str, to_status: str) -> None:
@@ -175,14 +220,14 @@ def effective_allowed_actions(badcase: Dict[str, Any]) -> List[str]:
     """Return frontend-visible actions, considering runtime evidence and category.
 
     - Terminal statuses: empty.
-    - classified: only show category-relevant draft actions.
+    - classified/investigating: only show category-relevant draft actions.
     - verifying: hide verify-pass until a retest has been run after the latest apply.
     """
     status = badcase.get("status", "pending")
     actions = allowed_actions(status)
     category = badcase.get("category", "pending")
 
-    if status == "classified":
+    if status in {"classified", "investigating"}:
         # Only knowledge-gap cases expose the explicit knowledge draft action;
         # other categories rely on Darwin-fix to generate the right draft type.
         if category not in KNOWLEDGE_CATEGORIES and category != "pending":
@@ -271,12 +316,24 @@ def _enrich_badcase(badcase: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any
     enriched["query"] = enriched.get("original_query") or enriched.get("title") or "-"
     enriched["category_label"] = CATEGORY_LABELS.get(enriched.get("category", ""), enriched.get("category", "-"))
     enriched["status_label"] = STATUS_LABELS.get(enriched.get("status", ""), enriched.get("status", "-"))
+    enriched["root_cause_domain"] = enriched.get("root_cause_domain") or "unknown"
+    enriched["root_cause_domain_label"] = ROOT_CAUSE_DOMAIN_LABELS.get(
+        enriched["root_cause_domain"], enriched["root_cause_domain"]
+    )
+    secondary_domains = _parse_json_field(enriched.get("secondary_root_cause_domains"))
+    enriched["secondary_root_cause_domains"] = secondary_domains if isinstance(secondary_domains, list) else []
     enriched["source"] = enriched.get("source") or "auto"
     source = enriched.get("source")
     if source == "manual":
         enriched["source_label"] = "人工反馈"
     elif source == "user_feedback":
         enriched["source_label"] = "用户反馈"
+    elif source == "evaluation":
+        enriched["source_label"] = "评估失败"
+    elif source in {"mcp_failure", "tool_failure"}:
+        enriched["source_label"] = "工具监测"
+    elif source == "handoff":
+        enriched["source_label"] = "人工协同复盘"
     else:
         enriched["source_label"] = "自动发现"
 

@@ -592,6 +592,11 @@ def init_db():
     _migrate_v1_3_3_badcase_closure(cursor)
     conn.commit()
 
+    # V1.6: Quality operations loop.  This migration only adds explainability
+    # and evaluation records; it never rewrites existing business data.
+    _migrate_v1_6_quality_governance(cursor)
+    conn.commit()
+
     # V1.5.2: create a non-destructive baseline snapshot for existing Skills.
     # It does not change instructions, bindings or enablement; it only makes
     # current state traceable before the first governed edit.
@@ -2037,6 +2042,136 @@ def _migrate_v1_3_3_badcase_closure(cursor):
     )
 
 
+def _migrate_v1_6_quality_governance(cursor):
+    """Non-destructive schema for Badcase → Evaluation → Trace governance.
+
+    The demo deliberately stores only operator-defined test cases and compact
+    runtime evidence.  It does not pretend to provide production monitoring or
+    retain a full copy of every upstream payload.
+    """
+    # Badcase is the operational object.  Keep symptom, expected/actual result
+    # and root-cause domain separate so a label such as "answer wrong" is never
+    # mistaken for a diagnosis.
+    for col, dtype in [
+        ("symptom", "TEXT"),
+        ("expected_behavior", "TEXT"),
+        ("actual_behavior", "TEXT"),
+        ("root_cause_domain", "TEXT"),
+        ("secondary_root_cause_domains", "TEXT"),
+        ("impact_scope", "TEXT"),
+        ("owner", "TEXT"),
+        ("release_version", "TEXT"),
+        ("release_note", "TEXT"),
+        ("released_at", "TEXT"),
+        ("observed_at", "TEXT"),
+        ("linked_evaluation_case_id", "INTEGER"),
+        ("linked_evaluation_run_id", "INTEGER"),
+        ("duplicate_of_id", "INTEGER"),
+        ("accepted_limitation_reason", "TEXT"),
+    ]:
+        try:
+            cursor.execute(f"ALTER TABLE badcases ADD COLUMN {col} {dtype}")
+        except sqlite3.OperationalError:
+            pass
+
+    # A Golden Set case defines business rules rather than a single frozen
+    # natural-language answer.  JSON fields are kept as explicit contracts for
+    # deterministic checks; qualitative judgement stays operator-owned.
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS evaluation_cases (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            case_key TEXT NOT NULL UNIQUE,
+            title TEXT NOT NULL,
+            description TEXT,
+            scenario TEXT,
+            user_message TEXT NOT NULL,
+            session_context_json TEXT,
+            risk_level TEXT DEFAULT 'L2',
+            expected_agent_id TEXT,
+            expected_skills_json TEXT,
+            expected_tools_json TEXT,
+            expected_citation_docs_json TEXT,
+            required_terms_json TEXT,
+            forbidden_terms_json TEXT,
+            expected_handoff INTEGER,
+            rubric_json TEXT,
+            source TEXT DEFAULT 'expert',
+            source_badcase_id INTEGER,
+            status TEXT DEFAULT 'draft',
+            version_label TEXT,
+            owner TEXT,
+            created_at TEXT,
+            updated_at TEXT,
+            FOREIGN KEY (source_badcase_id) REFERENCES badcases(id)
+        )
+        """
+    )
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_evaluation_cases_status ON evaluation_cases(status)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_evaluation_cases_badcase ON evaluation_cases(source_badcase_id)")
+
+    # A run is immutable evidence from one explicit operator-triggered runtime
+    # execution.  It links to the actual chat Trace instead of fabricating a
+    # separate test result.
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS evaluation_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            evaluation_case_id INTEGER NOT NULL,
+            trace_id TEXT,
+            session_id TEXT,
+            status TEXT NOT NULL,
+            answer TEXT,
+            evidence_json TEXT,
+            rule_results_json TEXT,
+            operator_judgement TEXT,
+            operator_note TEXT,
+            badcase_id INTEGER,
+            total_tokens INTEGER,
+            estimated_cost_cny REAL,
+            created_at TEXT,
+            updated_at TEXT,
+            FOREIGN KEY (evaluation_case_id) REFERENCES evaluation_cases(id),
+            FOREIGN KEY (badcase_id) REFERENCES badcases(id)
+        )
+        """
+    )
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_evaluation_runs_case ON evaluation_runs(evaluation_case_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_evaluation_runs_trace ON evaluation_runs(trace_id)")
+
+    # Trace events are compact spans for non-model steps such as RAG and
+    # handoff.  Tool calls remain in the existing detailed MCP audit table.
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS trace_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            trace_id TEXT NOT NULL,
+            span_name TEXT NOT NULL,
+            status TEXT,
+            latency_ms INTEGER,
+            input_summary TEXT,
+            output_summary TEXT,
+            metadata_json TEXT,
+            created_at TEXT
+        )
+        """
+    )
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_trace_events_trace ON trace_events(trace_id)")
+
+    # Associate normal chat traces with an optional evaluation run without
+    # changing how ordinary owner conversations are stored.
+    for col, dtype in [
+        ("run_type", "TEXT DEFAULT 'chat'"),
+        ("evaluation_case_id", "INTEGER"),
+        ("evaluation_run_id", "INTEGER"),
+        ("risk_level", "TEXT"),
+        ("version_snapshot", "TEXT"),
+    ]:
+        try:
+            cursor.execute(f"ALTER TABLE chat_traces ADD COLUMN {col} {dtype}")
+        except sqlite3.OperationalError:
+            pass
+
 def create_work_order(
     work_order_id: str,
     room_id: str,
@@ -2353,6 +2488,15 @@ def create_badcase(
     trace_id: Optional[str] = None,
     priority: str = "medium",
     message_id: Optional[int] = None,
+    symptom: Optional[str] = None,
+    expected_behavior: Optional[str] = None,
+    actual_behavior: Optional[str] = None,
+    root_cause_domain: Optional[str] = None,
+    secondary_root_cause_domains: Optional[str] = None,
+    impact_scope: Optional[str] = None,
+    owner: Optional[str] = None,
+    linked_evaluation_case_id: Optional[int] = None,
+    linked_evaluation_run_id: Optional[int] = None,
 ) -> Dict[str, Any]:
     now = created_at or now_cn("%Y-%m-%d %H:%M")
     conn = _get_conn()
@@ -2362,12 +2506,16 @@ def create_badcase(
         INSERT INTO badcases
         (title, description, category, status, created_at, evidence, source_message_id, session_id,
          root_cause, fix_plan, source, original_query, ai_response, feedback_reason, context_json,
-         trace_id, priority, message_id)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         trace_id, priority, message_id, symptom, expected_behavior, actual_behavior,
+         root_cause_domain, secondary_root_cause_domains, impact_scope, owner,
+         linked_evaluation_case_id, linked_evaluation_run_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (title, description, category, status, now, evidence, source_message_id, session_id,
          root_cause, fix_plan, source, original_query, ai_response, feedback_reason, context_json,
-         trace_id, priority, message_id),
+         trace_id, priority, message_id, symptom, expected_behavior, actual_behavior,
+         root_cause_domain, secondary_root_cause_domains, impact_scope, owner,
+         linked_evaluation_case_id, linked_evaluation_run_id),
     )
     case_id = cursor.lastrowid
     conn.commit()
@@ -2453,6 +2601,21 @@ def update_badcase(
     darwin_trace_id: Optional[str] = None,
     last_applied_at: Optional[str] = None,
     last_retest_at: Optional[str] = None,
+    symptom: Optional[str] = None,
+    expected_behavior: Optional[str] = None,
+    actual_behavior: Optional[str] = None,
+    root_cause_domain: Optional[str] = None,
+    secondary_root_cause_domains: Optional[str] = None,
+    impact_scope: Optional[str] = None,
+    owner: Optional[str] = None,
+    release_version: Optional[str] = None,
+    release_note: Optional[str] = None,
+    released_at: Optional[str] = None,
+    observed_at: Optional[str] = None,
+    linked_evaluation_case_id: Optional[int] = None,
+    linked_evaluation_run_id: Optional[int] = None,
+    duplicate_of_id: Optional[int] = None,
+    accepted_limitation_reason: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     now = now_cn("%Y-%m-%d %H:%M")
     conn = _get_conn()
@@ -2485,6 +2648,21 @@ def update_badcase(
         ("darwin_trace_id", darwin_trace_id),
         ("last_applied_at", last_applied_at),
         ("last_retest_at", last_retest_at),
+        ("symptom", symptom),
+        ("expected_behavior", expected_behavior),
+        ("actual_behavior", actual_behavior),
+        ("root_cause_domain", root_cause_domain),
+        ("secondary_root_cause_domains", secondary_root_cause_domains),
+        ("impact_scope", impact_scope),
+        ("owner", owner),
+        ("release_version", release_version),
+        ("release_note", release_note),
+        ("released_at", released_at),
+        ("observed_at", observed_at),
+        ("linked_evaluation_case_id", linked_evaluation_case_id),
+        ("linked_evaluation_run_id", linked_evaluation_run_id),
+        ("duplicate_of_id", duplicate_of_id),
+        ("accepted_limitation_reason", accepted_limitation_reason),
     ]:
         if val is not None:
             fields.append(f"{col} = ?")
@@ -2585,6 +2763,356 @@ def get_badcase_id_by_trace_id(trace_id: str) -> Optional[int]:
     row = cursor.fetchone()
     conn.close()
     return row["id"] if row else None
+
+
+# -----------------------------------------------------------------------------
+# Evaluation / Golden Set CRUD (V1.6)
+# -----------------------------------------------------------------------------
+
+
+def _json_text(value: Any) -> str:
+    """Serialize optional structured fields consistently for SQLite."""
+    if isinstance(value, str):
+        return value
+    return json.dumps(value if value is not None else [], ensure_ascii=False, default=str)
+
+
+def _parse_json_text(value: Any, default: Any) -> Any:
+    if not isinstance(value, str) or not value:
+        return default
+    try:
+        return json.loads(value)
+    except Exception:
+        return default
+
+
+def _enrich_evaluation_case(row: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not row:
+        return None
+    item = dict(row)
+    for field, default in [
+        ("session_context_json", {}),
+        ("expected_skills_json", []),
+        ("expected_tools_json", []),
+        ("expected_citation_docs_json", []),
+        ("required_terms_json", []),
+        ("forbidden_terms_json", []),
+        ("rubric_json", {}),
+    ]:
+        item[field[:-5]] = _parse_json_text(item.get(field), default)
+    if item.get("expected_handoff") is not None:
+        item["expected_handoff"] = bool(item.get("expected_handoff"))
+    return item
+
+
+def create_evaluation_case(
+    case_key: str,
+    title: str,
+    user_message: str,
+    description: str = "",
+    scenario: str = "",
+    session_context: Optional[Dict[str, Any]] = None,
+    risk_level: str = "L2",
+    expected_agent_id: Optional[str] = None,
+    expected_skills: Optional[List[str]] = None,
+    expected_tools: Optional[List[str]] = None,
+    expected_citation_docs: Optional[List[str]] = None,
+    required_terms: Optional[List[str]] = None,
+    forbidden_terms: Optional[List[str]] = None,
+    expected_handoff: Optional[bool] = None,
+    rubric: Optional[Dict[str, Any]] = None,
+    source: str = "expert",
+    source_badcase_id: Optional[int] = None,
+    status: str = "draft",
+    version_label: Optional[str] = None,
+    owner: Optional[str] = None,
+) -> Dict[str, Any]:
+    now = now_cn()
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        INSERT INTO evaluation_cases
+        (case_key, title, description, scenario, user_message, session_context_json, risk_level,
+         expected_agent_id, expected_skills_json, expected_tools_json, expected_citation_docs_json,
+         required_terms_json, forbidden_terms_json, expected_handoff, rubric_json, source,
+         source_badcase_id, status, version_label, owner, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            case_key, title, description, scenario, user_message, _json_text(session_context or {}), risk_level,
+            expected_agent_id, _json_text(expected_skills or []), _json_text(expected_tools or []),
+            _json_text(expected_citation_docs or []), _json_text(required_terms or []),
+            _json_text(forbidden_terms or []), None if expected_handoff is None else int(expected_handoff),
+            _json_text(rubric or {}), source, source_badcase_id, status, version_label, owner, now, now,
+        ),
+    )
+    case_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return get_evaluation_case(case_id) or {}
+
+
+def get_evaluation_case(case_id: int) -> Optional[Dict[str, Any]]:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM evaluation_cases WHERE id = ?", (case_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return _enrich_evaluation_case(dict(row) if row else None)
+
+
+def list_evaluation_cases(status: Optional[str] = None, source: Optional[str] = None) -> List[Dict[str, Any]]:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    sql = "SELECT * FROM evaluation_cases WHERE 1=1"
+    params: List[Any] = []
+    if status:
+        sql += " AND status = ?"
+        params.append(status)
+    if source:
+        sql += " AND source = ?"
+        params.append(source)
+    sql += " ORDER BY updated_at DESC, id DESC"
+    cursor.execute(sql, params)
+    rows = cursor.fetchall()
+    conn.close()
+    return [_enrich_evaluation_case(dict(row)) or {} for row in rows]
+
+
+def update_evaluation_case(case_id: int, **updates: Any) -> Optional[Dict[str, Any]]:
+    allowed = {
+        "case_key", "title", "description", "scenario", "user_message", "risk_level",
+        "expected_agent_id", "expected_handoff", "source", "source_badcase_id", "status",
+        "version_label", "owner",
+    }
+    json_fields = {
+        "session_context": "session_context_json",
+        "expected_skills": "expected_skills_json",
+        "expected_tools": "expected_tools_json",
+        "expected_citation_docs": "expected_citation_docs_json",
+        "required_terms": "required_terms_json",
+        "forbidden_terms": "forbidden_terms_json",
+        "rubric": "rubric_json",
+    }
+    fields = ["updated_at = ?"]
+    params: List[Any] = [now_cn()]
+    for key, value in updates.items():
+        if value is None:
+            continue
+        if key in json_fields:
+            fields.append(f"{json_fields[key]} = ?")
+            params.append(_json_text(value))
+        elif key in allowed:
+            fields.append(f"{key} = ?")
+            params.append(int(value) if key == "expected_handoff" and value is not None else value)
+    if len(fields) == 1:
+        return get_evaluation_case(case_id)
+    params.append(case_id)
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute(f"UPDATE evaluation_cases SET {', '.join(fields)} WHERE id = ?", params)
+    conn.commit()
+    conn.close()
+    return get_evaluation_case(case_id)
+
+
+def delete_evaluation_case(case_id: int) -> bool:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM evaluation_cases WHERE id = ?", (case_id,))
+    deleted = cursor.rowcount > 0
+    conn.commit()
+    conn.close()
+    return deleted
+
+
+def _enrich_evaluation_run(row: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not row:
+        return None
+    item = dict(row)
+    item["evidence"] = _parse_json_text(item.get("evidence_json"), {})
+    item["rule_results"] = _parse_json_text(item.get("rule_results_json"), [])
+    return item
+
+
+def create_evaluation_run(
+    evaluation_case_id: int,
+    status: str,
+    trace_id: Optional[str] = None,
+    session_id: Optional[str] = None,
+    answer: str = "",
+    evidence: Optional[Dict[str, Any]] = None,
+    rule_results: Optional[List[Dict[str, Any]]] = None,
+    total_tokens: Optional[int] = None,
+    estimated_cost_cny: Optional[float] = None,
+) -> Dict[str, Any]:
+    now = now_cn()
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        INSERT INTO evaluation_runs
+        (evaluation_case_id, trace_id, session_id, status, answer, evidence_json, rule_results_json,
+         total_tokens, estimated_cost_cny, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (evaluation_case_id, trace_id, session_id, status, answer, _json_text(evidence or {}),
+         _json_text(rule_results or []), total_tokens, estimated_cost_cny, now, now),
+    )
+    run_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return get_evaluation_run(run_id) or {}
+
+
+def get_evaluation_run(run_id: int) -> Optional[Dict[str, Any]]:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM evaluation_runs WHERE id = ?", (run_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return _enrich_evaluation_run(dict(row) if row else None)
+
+
+def get_evaluation_run_by_trace_id(trace_id: str) -> Optional[Dict[str, Any]]:
+    if not trace_id:
+        return None
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM evaluation_runs WHERE trace_id = ? ORDER BY id DESC LIMIT 1", (trace_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return _enrich_evaluation_run(dict(row) if row else None)
+
+
+def list_evaluation_runs(evaluation_case_id: Optional[int] = None, limit: int = 100) -> List[Dict[str, Any]]:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    sql = "SELECT * FROM evaluation_runs"
+    params: List[Any] = []
+    if evaluation_case_id is not None:
+        sql += " WHERE evaluation_case_id = ?"
+        params.append(evaluation_case_id)
+    sql += " ORDER BY created_at DESC, id DESC LIMIT ?"
+    params.append(limit)
+    cursor.execute(sql, params)
+    rows = cursor.fetchall()
+    conn.close()
+    return [_enrich_evaluation_run(dict(row)) or {} for row in rows]
+
+
+def update_evaluation_run(
+    run_id: int,
+    status: Optional[str] = None,
+    operator_judgement: Optional[str] = None,
+    operator_note: Optional[str] = None,
+    badcase_id: Optional[int] = None,
+) -> Optional[Dict[str, Any]]:
+    fields = ["updated_at = ?"]
+    params: List[Any] = [now_cn()]
+    for col, value in [
+        ("status", status),
+        ("operator_judgement", operator_judgement),
+        ("operator_note", operator_note),
+        ("badcase_id", badcase_id),
+    ]:
+        if value is not None:
+            fields.append(f"{col} = ?")
+            params.append(value)
+    params.append(run_id)
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute(f"UPDATE evaluation_runs SET {', '.join(fields)} WHERE id = ?", params)
+    conn.commit()
+    conn.close()
+    return get_evaluation_run(run_id)
+
+
+def evaluation_summary() -> Dict[str, Any]:
+    """Return a compact quality/cost summary without inventing production KPIs."""
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT COUNT(*) AS total,
+               SUM(CASE WHEN status = 'passed' THEN 1 ELSE 0 END) AS passed,
+               SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed,
+               SUM(CASE WHEN status = 'needs_manual_review' THEN 1 ELSE 0 END) AS manual_review,
+               COALESCE(SUM(estimated_cost_cny), 0) AS total_cost,
+               COALESCE(SUM(CASE WHEN status = 'passed' THEN estimated_cost_cny ELSE 0 END), 0) AS passed_cost
+        FROM evaluation_runs
+        """
+    )
+    row = dict(cursor.fetchone() or {})
+    cursor.execute(
+        "SELECT risk_level, COUNT(*) AS total FROM evaluation_cases WHERE status = 'active' GROUP BY risk_level"
+    )
+    by_risk = {r["risk_level"]: r["total"] for r in cursor.fetchall()}
+    conn.close()
+    passed = int(row.get("passed") or 0)
+    total = int(row.get("total") or 0)
+    total_cost = float(row.get("total_cost") or 0.0)
+    return {
+        "cases_active_by_risk": by_risk,
+        "runs_total": total,
+        "runs_passed": passed,
+        "runs_failed": int(row.get("failed") or 0),
+        "runs_needing_manual_review": int(row.get("manual_review") or 0),
+        "deterministic_pass_rate": round((passed / total) * 100, 2) if total else None,
+        "model_direct_cost_cny": round(total_cost, 8),
+        "cost_per_passed_run_cny": round(total_cost / passed, 8) if passed else None,
+        "note": "仅统计已显式运行的演示评估与模型直接 Token 估算；不代表生产 SLA 或全量业务成本。",
+    }
+
+
+# -----------------------------------------------------------------------------
+# Compact trace event spans (V1.6)
+# -----------------------------------------------------------------------------
+
+
+def record_trace_event(
+    trace_id: str,
+    span_name: str,
+    status: str = "success",
+    latency_ms: Optional[int] = None,
+    input_summary: Optional[str] = None,
+    output_summary: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        INSERT INTO trace_events
+        (trace_id, span_name, status, latency_ms, input_summary, output_summary, metadata_json, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (trace_id, span_name, status, latency_ms, input_summary, output_summary,
+         _json_text(metadata or {}), now_cn()),
+    )
+    event_id = cursor.lastrowid
+    conn.commit()
+    cursor.execute("SELECT * FROM trace_events WHERE id = ?", (event_id,))
+    row = cursor.fetchone()
+    conn.close()
+    event = dict(row) if row else {}
+    event["metadata"] = _parse_json_text(event.get("metadata_json"), {})
+    return event
+
+
+def list_trace_events(trace_id: str) -> List[Dict[str, Any]]:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM trace_events WHERE trace_id = ? ORDER BY id ASC", (trace_id,))
+    rows = cursor.fetchall()
+    conn.close()
+    results = []
+    for row in rows:
+        item = dict(row)
+        item["metadata"] = _parse_json_text(item.get("metadata_json"), {})
+        results.append(item)
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -3748,16 +4276,21 @@ def create_chat_trace(
     trace_id: str,
     session_id: str,
     user_message: str,
+    run_type: str = "chat",
+    evaluation_case_id: Optional[int] = None,
+    risk_level: Optional[str] = None,
+    version_snapshot: Optional[str] = None,
 ) -> Dict[str, Any]:
     now = now_cn()
     conn = _get_conn()
     cursor = conn.cursor()
     cursor.execute(
         """
-        INSERT INTO chat_traces (trace_id, session_id, user_message, status, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO chat_traces
+        (trace_id, session_id, user_message, status, run_type, evaluation_case_id, risk_level, version_snapshot, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (trace_id, session_id, user_message, "in_progress", now, now),
+        (trace_id, session_id, user_message, "in_progress", run_type, evaluation_case_id, risk_level, version_snapshot, now, now),
     )
     conn.commit()
     conn.close()
@@ -3770,6 +4303,11 @@ def update_chat_trace(
     agent_name: Optional[str] = None,
     agent_id: Optional[str] = None,
     status: Optional[str] = None,
+    run_type: Optional[str] = None,
+    evaluation_case_id: Optional[int] = None,
+    evaluation_run_id: Optional[int] = None,
+    risk_level: Optional[str] = None,
+    version_snapshot: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     now = now_cn()
     conn = _get_conn()
@@ -3788,6 +4326,21 @@ def update_chat_trace(
     if status is not None:
         fields.append("status = ?")
         params.append(status)
+    if run_type is not None:
+        fields.append("run_type = ?")
+        params.append(run_type)
+    if evaluation_case_id is not None:
+        fields.append("evaluation_case_id = ?")
+        params.append(evaluation_case_id)
+    if evaluation_run_id is not None:
+        fields.append("evaluation_run_id = ?")
+        params.append(evaluation_run_id)
+    if risk_level is not None:
+        fields.append("risk_level = ?")
+        params.append(risk_level)
+    if version_snapshot is not None:
+        fields.append("version_snapshot = ?")
+        params.append(version_snapshot)
     if not fields:
         conn.close()
         return get_chat_trace(trace_id)

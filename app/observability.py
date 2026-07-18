@@ -14,15 +14,18 @@ from pydantic import BaseModel, Field
 from db.property_db import (
     create_model_price,
     delete_model_price,
+    evaluation_summary,
     get_badcase_id_by_trace_id,
     get_budget_thresholds,
     get_chat_trace,
+    get_evaluation_run_by_trace_id,
     get_mcp_call_audits_for_trace,
     get_model_call,
     get_model_calls_for_trace,
     get_model_price,
     list_chat_messages,
     list_chat_traces,
+    list_trace_events,
     list_model_prices,
     update_budget_thresholds,
     update_model_price,
@@ -370,13 +373,14 @@ async def overview(
         "failed_calls": data.get("failed_calls") or 0,
         "alerts": alerts,
         "currency": "CNY",
-        "cost_note": "按配置价格估算成本，非供应商实际结算金额",
+        "cost_note": "仅按价格快照估算模型直接 Token 成本，非供应商实际结算金额；Tool、基础设施、人工与返工成本只保留 Trace/Badcase 证据，系统不伪造金额。",
         "today": periods["today"],
         "last_7_days": periods["last_7_days"],
         "this_month": periods["this_month"],
         "by_model": by_model,
         "by_stage": by_stage,
         "price_missing": price_missing,
+        "evaluation_quality": evaluation_summary(),
     }
 
 
@@ -670,6 +674,8 @@ async def trace_detail(trace_id: str):
     trace_messages = [m for m in messages if m.get("trace_id") == trace_id]
 
     model_calls = [_enrich_model_call(c, session_id) for c in raw_calls]
+    trace_events = list_trace_events(trace_id)
+    evaluation_run = get_evaluation_run_by_trace_id(trace_id)
 
     # Summarize context composition from the vertical model call if available.
     # Router calls have no usage and no context_breakdown.
@@ -692,6 +698,8 @@ async def trace_detail(trace_id: str):
         "trace": trace,
         "model_calls": model_calls,
         "mcp_calls": mcp_calls,
+        "trace_events": trace_events,
+        "evaluation_run": evaluation_run,
         "messages": trace_messages,
         "context_breakdown": context_breakdown,
     }

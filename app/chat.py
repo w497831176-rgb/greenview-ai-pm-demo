@@ -77,6 +77,7 @@ from db.property_db import (
     list_user_chat_sessions,
     record_mcp_call_audit,
     record_model_call,
+    record_trace_event,
     request_handoff,
     resume_handoff_after_owner_message,
     resolve_handoff,
@@ -1439,6 +1440,12 @@ async def _stream_agent_response(
 
         # Create the trace record for this turn.
         create_chat_trace(trace_id=trace_id, session_id=session_id, user_message=message)
+        record_trace_event(
+            trace_id,
+            "request_received",
+            input_summary=message[:240],
+            metadata={"session_id": session_id, "channel": "owner_chat"},
+        )
 
         # First send a "start" event
         yield f"event: start\ndata: {json.dumps({'session_id': session_id, 'trace_id': trace_id})}\n\n"
@@ -1478,6 +1485,12 @@ async def _stream_agent_response(
                 usage_source="not_applicable",
             )
             update_chat_trace(trace_id=trace_id, intent="handoff", agent_name="人工协同控制器", agent_id="human_copilot", status="complete")
+            record_trace_event(
+                trace_id, "handoff_policy", "success",
+                latency_ms=int((time.time() - trace_start) * 1000),
+                output_summary=handoff_policy.get("reason", ""),
+                metadata={"handoff": True, "policy": handoff_policy},
+            )
             yield f"event: delta\ndata: {json.dumps({'content': reply}, ensure_ascii=False)}\n\n"
             yield f"event: done\ndata: {_safe_json_dumps({'status': 'complete', 'token_count': 0, 'message_id': saved.get('id') if saved else None, 'handoff': True, 'handoff_state': handoff_session.get('handoff_status'), 'handoff_policy': handoff_policy, 'handoff_package_available': True, 'trace_id': trace_id, 'usage_source': 'not_applicable'})}\n\n"
             done_yielded = True
@@ -1506,6 +1519,12 @@ async def _stream_agent_response(
                 usage_source="not_applicable",
             )
             update_chat_trace(trace_id=trace_id, intent="handoff", agent_name="人工协同控制器", agent_id="human_copilot", status="complete")
+            record_trace_event(
+                trace_id, "handoff_state", "success",
+                latency_ms=int((time.time() - trace_start) * 1000),
+                output_summary=reply,
+                metadata={"handoff_status": handoff_session.get("handoff_status")},
+            )
             yield f"event: delta\ndata: {json.dumps({'content': reply}, ensure_ascii=False)}\n\n"
             yield f"event: done\ndata: {_safe_json_dumps({'status': 'complete', 'token_count': 0, 'message_id': saved.get('id') if saved else None, 'handoff': True, 'handoff_state': handoff_session.get('handoff_status'), 'handoff_package_available': True, 'trace_id': trace_id, 'usage_source': 'not_applicable'})}\n\n"
             done_yielded = True
@@ -1538,6 +1557,12 @@ async def _stream_agent_response(
             )
             yield f"event: route\ndata: {json.dumps({'intent': 'maintenance', 'reason': route_reason, 'current_agent': current_agent, 'current_agent_id': current_agent_id, 'trace_id': trace_id})}\n\n"
             reply = workflow.get("reply", "")
+            record_trace_event(
+                trace_id, "work_order_workflow", "success",
+                latency_ms=int((time.time() - trace_start) * 1000),
+                output_summary=reply[:240],
+                metadata={"action": workflow.get("action"), "work_order_id": workflow.get("work_order_id")},
+            )
             yield f"event: delta\ndata: {_safe_json_dumps({'content': reply, 'current_agent': current_agent, 'current_agent_id': current_agent_id})}\n\n"
             yield f"event: tool_calls\ndata: {_safe_json_dumps({'tool_calls': [workflow_call], 'current_agent': current_agent, 'current_agent_id': current_agent_id})}\n\n"
             saved = save_chat_message(
@@ -1620,12 +1645,40 @@ async def _stream_agent_response(
         except Exception:
             pass
 
+        record_trace_event(
+            trace_id,
+            "router",
+            "success",
+            latency_ms=router_latency_ms,
+            input_summary=message[:240],
+            output_summary=intent_result.get("reason", "")[:240],
+            metadata={
+                "intent": intent,
+                "agent_id": current_agent_id,
+                "agent_name": current_agent,
+                "route_mode": intent_result.get("route_mode", "unknown"),
+                "capability_candidates": intent_result.get("fallback_scores", []),
+            },
+        )
+
         # Yield routing event so the UI can show which agent is handling the request.
         yield f"event: route\ndata: {json.dumps({'intent': intent, 'reason': intent_result.get('reason', ''), 'current_agent': current_agent, 'current_agent_id': current_agent_id, 'trace_id': trace_id})}\n\n"
 
         # Build dynamic context and tools scoped to the current vertical agent.
         skill_context, activated_skills, skill_model_id = _build_skill_context(message, agent_id=current_agent_id)
         rag_context, citations = _build_rag_context(message_for_agent)
+        record_trace_event(
+            trace_id,
+            "rag_retrieval",
+            "success" if citations else "empty",
+            input_summary=message_for_agent[:240],
+            output_summary=f"retrieved {len(citations)} candidate chunks",
+            metadata={
+                "candidate_count": len(citations),
+                "citation_docs": [c.get("doc_title") for c in citations],
+                "citation_chunks": [c.get("chunk_index") for c in citations],
+            },
+        )
         mcp_context = _format_mcp_context(agent_id=current_agent_id, message=message)
         # V1.4.3: narrow policy pre-invocation for readonly MCP servers. Real
         # tool results are injected into context and recorded as policy_preinvoke.
@@ -1993,6 +2046,21 @@ async def _stream_agent_response(
         except Exception:
             pass
 
+        record_trace_event(
+            trace_id,
+            "final_response",
+            "success",
+            latency_ms=int((time.time() - trace_start) * 1000),
+            output_summary=full_content[:240],
+            metadata={
+                "agent_id": current_agent_id,
+                "skills": activated_skills,
+                "citations_used": [c.get("doc_title") for c in citations if c.get("used_in_answer")],
+                "mcp_call_count": len(preinvoke_calls) + sum(len(getattr(toolkit, "recorded_calls", []) or []) for toolkit in mcp_tools),
+                "handoff": ai_handoff,
+            },
+        )
+
         # Build MCP audit list for the done event and persistence.
         mcp_calls_for_done: List[Dict[str, Any]] = []
         # Pre-invoked calls first (policy_preinvoke).
@@ -2108,6 +2176,7 @@ async def _stream_agent_response(
         error_yielded = True
         try:
             update_chat_trace(trace_id=trace_id, status="failed")
+            record_trace_event(trace_id, "final_response", "failed", output_summary=str(e)[:240])
         except Exception:
             pass
     finally:
