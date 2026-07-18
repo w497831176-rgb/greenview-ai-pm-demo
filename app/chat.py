@@ -27,7 +27,12 @@ from pydantic import BaseModel
 
 from app.observability import _check_budget
 from app.handoff_policy import HANDOFF_STATUS_LABELS, evaluate_handoff_policy, handoff_policy_summary
-from app.mcp_policy import allowed_tools_for_agent, extract_tool_outcome, outcome_instruction
+from app.mcp_policy import (
+    allowed_tools_for_agent,
+    extract_tool_outcome,
+    is_builtin_policy_server,
+    outcome_instruction,
+)
 from app.multimodal import get_analysis_context, normalise_analysis_ids
 from app.settings import MODEL_ID, USE_THINKING, build_model
 from app.skill_runtime import activation_evidence, select_skills, skill_contract
@@ -52,6 +57,7 @@ from db.property_db import (
     get_agent_by_agent_id,
     get_agent_skills,
     get_agent_tools,
+    get_skill,
     get_budget_thresholds,
     get_chat_message,
     get_chat_session,
@@ -65,6 +71,8 @@ from db.property_db import (
     list_chat_messages,
     list_handoff_sessions,
     list_mcp_servers,
+    list_mcp_tools,
+    list_knowledge_docs,
     list_skills,
     list_user_chat_sessions,
     record_mcp_call_audit,
@@ -476,6 +484,89 @@ def _annotate_citation_usage(content: str, citations: List[Dict[str, Any]]) -> L
     return annotated
 
 
+def _explicit_knowledge_docs(message: str) -> tuple[List[Dict[str, Any]], bool]:
+    """Find indexed documents explicitly named by the owner in this turn.
+
+    A user can add a document at runtime and then ask “only rely on 《X》”.
+    Retrieval scores alone must not replace that explicit product instruction.
+    """
+    text = (message or "").replace("《", "").replace("》", "").strip().lower()
+    if not text:
+        return [], False
+    try:
+        matched = []
+        for doc in list_knowledge_docs() or []:
+            title = str(doc.get("title") or "").replace("《", "").replace("》", "").strip()
+            if len(title) >= 3 and title.lower() in text and doc.get("is_indexed"):
+                matched.append(dict(doc))
+        only_requested = any(phrase in (message or "") for phrase in ("只依据", "仅依据", "只根据", "仅根据"))
+        return matched, only_requested
+    except Exception:
+        return [], False
+
+
+def _unique_rag_results(results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    unique: List[Dict[str, Any]] = []
+    seen: set[tuple[Any, Any]] = set()
+    for result in results:
+        key = (result.get("doc_id"), result.get("chunk_index"))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(result)
+    return unique
+
+
+def _apply_explicit_document_coverage(
+    message: str,
+    results: List[Dict[str, Any]],
+    settings: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """Honor explicit doc-title constraints and cover every named document.
+
+    This is not a title-hardcoded business rule.  It is a generic retrieval
+    control: when an owner names one or more currently indexed documents, the
+    final evidence set contains the relevant named sources (or, for “only
+    rely”, contains no unrelated sources).  Missing named documents simply do
+    not fabricate a citation.
+    """
+    named_docs, only_requested = _explicit_knowledge_docs(message)
+    if not named_docs:
+        return _unique_rag_results(results)
+
+    named_ids = {doc.get("id") for doc in named_docs}
+    selected = [item for item in results if item.get("doc_id") in named_ids]
+    if not only_requested:
+        selected.extend(item for item in results if item.get("doc_id") not in named_ids)
+
+    existing_ids = {item.get("doc_id") for item in selected}
+    # Ask the same local retrieval stack a title-focused query only for a
+    # named document that was absent from the first mixed query.  This repairs
+    # multi-source questions such as FAQ + service promise without invoking a
+    # model or silently lowering the evidence threshold.
+    for doc in named_docs:
+        doc_id = doc.get("id")
+        if doc_id in existing_ids:
+            continue
+        try:
+            focused = rag_retrieval.advanced_search(
+                f"{doc.get('title', '')}\n{message}", settings=settings
+            ).get("results", [])
+            matched = next((item for item in focused if item.get("doc_id") == doc_id), None)
+            if matched:
+                selected.insert(0, matched)
+                existing_ids.add(doc_id)
+        except Exception:
+            continue
+
+    selected = _unique_rag_results(selected)
+    # Named sources come first so citation indexes are stable and visibly
+    # correspond to the documents the user asked us to use.
+    selected.sort(key=lambda item: (0 if item.get("doc_id") in named_ids else 1, -(float(item.get("score") or 0))))
+    top_k = max(1, min(10, int(settings.get("top_k") or 5)))
+    return selected[:top_k]
+
+
 def _build_rag_context(message: str, top_k: Optional[int] = None, threshold: Optional[float] = None) -> tuple:
     """Run advanced RAG and format retrieved chunks as context.
 
@@ -500,7 +591,11 @@ def _build_rag_context(message: str, top_k: Optional[int] = None, threshold: Opt
             "context_threshold": settings.get("context_threshold", 0.2),
         }
         result = rag_retrieval.advanced_search(message, settings=settings_payload)
-        results = result.get("results", [])
+        results = _apply_explicit_document_coverage(
+            message,
+            result.get("results", []),
+            settings_payload,
+        )
         if not results:
             return "", []
         parts = ["\n\n[相关知识库证据（仅对确有证据支持的结论使用【引用n】；不得把未引用候选、常识或实时数据伪装成知识库结论。每个引用必须对应下方确切分片）："]
@@ -602,7 +697,7 @@ def _build_mcp_tools(
     try:
         if agent_id == "router":
             return tools
-        from db.property_db import get_agent_tools, list_mcp_servers
+        from db.property_db import get_agent_tools, list_mcp_servers, list_mcp_tools
 
         bound_tools = get_agent_tools(agent_id) if agent_id else []
         bound_names = {t.get("tool_name") for t in bound_tools if t.get("tool_name")}
@@ -618,12 +713,26 @@ def _build_mcp_tools(
             name = server.get("name", "mcp-server")
             if excluded_servers and name in excluded_servers:
                 continue
-            if not _mcp_server_relevant(name, message):
+            # Formal servers have a narrow deterministic relevance gate.  A
+            # user-added server is already an explicit Agent binding, so it is
+            # injected as a model-native capability instead of being silently
+            # blocked by the old three-server keyword list.
+            if is_builtin_policy_server(name) and not _mcp_server_relevant(name, message):
                 continue
-            allowed_function_names = allowed_tools_for_agent(agent_id, name)
+            discovered_names = [
+                str(item.get("name"))
+                for item in (list_mcp_tools(server_id=server.get("id")) or [])
+                if item.get("name")
+            ]
+            allowed_function_names = allowed_tools_for_agent(
+                agent_id,
+                name,
+                bound_server_names=bound_names,
+                discovered_tool_names=discovered_names,
+            )
             if not allowed_function_names:
-                # Database binding is not a permission grant; the Host-side
-                # contract must explicitly allow this Agent/server pair.
+                # A bound server with no discovered tool is not callable yet.
+                # The console should run discovery before it becomes live.
                 continue
             command = server.get("command")
             args = server.get("args") or []
@@ -664,13 +773,15 @@ def _format_mcp_context(agent_id: Optional[str] = None, message: str = "") -> st
     try:
         if agent_id == "router":
             return ""
-        from db.property_db import get_agent_tools, list_mcp_servers
+        from db.property_db import get_agent_tools, list_mcp_servers, list_mcp_tools
 
         bound_tools = get_agent_tools(agent_id) if agent_id else []
         bound_names = {t.get("tool_name") for t in bound_tools if t.get("tool_name")}
         servers = [
             s for s in list_mcp_servers()
-            if s.get("enabled") and s.get("name") in bound_names and _mcp_server_relevant(s.get("name", ""), message)
+            if s.get("enabled")
+            and s.get("name") in bound_names
+            and (not is_builtin_policy_server(str(s.get("name") or "")) or _mcp_server_relevant(s.get("name", ""), message))
         ]
         if not servers:
             return ""
@@ -678,11 +789,22 @@ def _format_mcp_context(agent_id: Optional[str] = None, message: str = "") -> st
         for server in servers:
             name = server.get("name", "")
             description = server.get("description", "")
-            allowed_function_names = sorted(allowed_tools_for_agent(agent_id, name))
+            discovered_names = [
+                str(item.get("name"))
+                for item in (list_mcp_tools(server_id=server.get("id")) or [])
+                if item.get("name")
+            ]
+            allowed_function_names = sorted(allowed_tools_for_agent(
+                agent_id,
+                name,
+                bound_server_names=bound_names,
+                discovered_tool_names=discovered_names,
+            ))
             if name and not allowed_function_names:
                 continue
             if name:
-                parts.append(f"- Host allowlist: {name} -> {', '.join(allowed_function_names)}")
+                mode = "内置只读策略" if is_builtin_policy_server(name) else "动态绑定（模型自主调用）"
+                parts.append(f"- {mode}: {name} -> {', '.join(allowed_function_names)}")
                 parts.append(f"- {name}：{description or '无描述'}")
         if not parts:
             return ""
@@ -726,9 +848,13 @@ def _policy_preinvoke_plan(server_name: str, message: str) -> List[Tuple[str, Di
 
     if server_name == "workorder-server":
         plan: List[Tuple[str, Dict[str, Any]]] = []
-        asks_recent = any(word in message for word in ("最近工单", "我的工单", "我家工单", "相似工单", "维修记录", "工单进度"))
+        asks_recent = any(word in message for word in (
+            "最近工单", "房号最近", "我的工单", "我家工单", "相似工单", "维修记录", "工单进度",
+        ))
         asks_open = any(word in message for word in ("待处理", "待派单", "未处理", "还有多少", "未关闭"))
-        asks_system_total = any(word in message for word in ("系统当前", "全小区", "系统中", "总量", "总数"))
+        asks_system_total = any(word in message for word in (
+            "系统当前", "全小区", "系统中", "系统当前待处理", "待处理工单数量", "总量", "总数",
+        ))
         if asks_recent:
             plan.append(("get_my_recent_work_orders", {"limit": 5}))
         if asks_open:
@@ -1003,9 +1129,66 @@ def _request_handoff_with_context(
 
 
 def _get_vertical_agents() -> List[Dict[str, Any]]:
-    """Load enabled vertical agents from the database (cached per call)."""
+    """Load the live vertical-Agent registry with its bound capabilities.
+
+    This is intentionally rebuilt for every owner turn.  Creating/enabling an
+    Agent or binding a Skill/MCP server in the platform console therefore takes
+    effect on the *next message* without a restart, seed migration or a hidden
+    five-Agent allowlist.
+    """
     try:
-        return [dict(a) for a in list_agents(category="vertical")]
+        servers_by_name = {
+            str(server.get("name")): server
+            for server in (list_mcp_servers() or [])
+            if server.get("enabled") and server.get("name")
+        }
+        result: List[Dict[str, Any]] = []
+        for source in list_agents(category="vertical") or []:
+            agent = dict(source)
+            agent_id = str(agent.get("agent_id") or "")
+            skills: List[Dict[str, Any]] = []
+            for skill_id in get_agent_skills(agent_id) or []:
+                skill = get_skill(int(skill_id))
+                if not skill or not skill.get("enabled"):
+                    continue
+                contract = skill_contract(skill)
+                skills.append({
+                    "id": skill.get("id"),
+                    "name": skill.get("name"),
+                    "positive_triggers": contract.get("positive_triggers", []),
+                    "negative_triggers": contract.get("negative_triggers", []),
+                    "tool_hints": contract.get("tool_hints", []),
+                })
+
+            mcp_servers: List[Dict[str, Any]] = []
+            for binding in get_agent_tools(agent_id) or []:
+                server_name = str(binding.get("tool_name") or "")
+                server = servers_by_name.get(server_name)
+                if not server:
+                    continue
+                discovered = [
+                    str(tool.get("name"))
+                    for tool in (list_mcp_tools(server_id=server.get("id")) or [])
+                    if tool.get("name")
+                ]
+                mcp_servers.append({
+                    "name": server_name,
+                    "description": server.get("description") or "",
+                    "tools": discovered,
+                    "runtime_mode": "policy_preinvoke" if is_builtin_policy_server(server_name) else "model_native_dynamic",
+                })
+
+            # Router only needs a compact, inspectable capability card.  The
+            # full prompt remains private to the selected runtime Agent.
+            agent["capability_card"] = {
+                "service_scope": agent.get("description") or "",
+                "routing_hints": (agent.get("instructions") or "")[:480],
+                "skills": skills,
+                "mcp_servers": mcp_servers,
+                "effective_on_next_message": bool(agent.get("enabled")),
+            }
+            result.append(agent)
+        return result
     except Exception:
         return []
 
@@ -1022,7 +1205,17 @@ def _select_agent(agent_id: str, tools: Optional[List[Any]] = None, mcp_context:
     # Determine the display name without constructing the agent.
     db_agent = get_agent_by_agent_id(agent_id)
     agent_name = db_agent.get("name") if db_agent else agent_id
-    return factory, agent_name or agent_id
+    canonical_labels = {
+        "maintenance": "维修 Agent",
+        "billing": "费用 Agent",
+        "complaint": "投诉 Agent",
+        "customer_service": "客服 Agent",
+    }
+    # Preserve an operator-created Agent's own name.  The mapping only repairs
+    # old canonical rows that were accidentally displayed as an English id.
+    if not agent_name or str(agent_name).strip() == agent_id:
+        agent_name = canonical_labels.get(agent_id, agent_id)
+    return factory, agent_name
 
 
 def _agent_id_for_intent(intent: str) -> str:
@@ -1418,6 +1611,7 @@ async def _stream_agent_response(
                 context_breakdown={
                     "route_mode": intent_result.get("route_mode", "unknown"),
                     "reason": intent_result.get("reason", ""),
+                    "capability_candidates": intent_result.get("fallback_scores", []),
                 },
                 usage_normalized=normalize_usage(router_metrics) if has_router_usage else None,
             )

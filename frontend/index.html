@@ -1253,6 +1253,19 @@
       return used;
     }
 
+    function materializeCitationButtons(html, citations) {
+      // marked's renderer callback differs between bundled versions.  Replace
+      // citation markers once more after Markdown rendering so 【引用1】 is
+      // always a real clickable control, never a decorative plain-text token.
+      return String(html || '').replace(/【引用(\d+)】/g, (match, value) => {
+        const index = Number(value);
+        const citation = citations && citations[index - 1];
+        if (!citation || !citation.doc_id) return match;
+        const chunkIndex = typeof citation.chunk_index === 'number' ? citation.chunk_index : '';
+        return `<button type="button" class="inline-citation-btn px-1 py-0.5 mx-0.5 bg-brand-50 text-brand-700 rounded text-[11px] hover:bg-brand-100 transition-colors align-text-bottom" onclick="showCitationChunk(${Number(citation.doc_id)}, '${escapeHtml(String(chunkIndex))}')">引用${index}</button>`;
+      });
+    }
+
     function renderMarkdownWithCitations(content, citations) {
       const safeContent = normalizeCitationMarkers(content);
       if (!citations || citations.length === 0) return marked.parse(safeContent);
@@ -1267,7 +1280,7 @@
           return `<button type="button" class="inline-citation-btn px-1 py-0.5 mx-0.5 bg-brand-50 text-brand-700 rounded text-[11px] hover:bg-brand-100 transition-colors align-text-bottom" onclick="showCitationChunk(${Number(citation.doc_id)}, '${escapeHtml(String(chunkIndex))}')">引用${index}</button>`;
         });
       };
-      return marked.parse(safeContent, { renderer });
+      return materializeCitationButtons(marked.parse(safeContent, { renderer }), citations);
     }
 
     function renderCitations(citations, content = '') {
@@ -4329,7 +4342,13 @@
           return;
         }
 
+        const runtimeNote = `
+          <div class="mb-4 rounded-xl border border-brand-100 bg-brand-50 p-3 text-xs text-brand-800">
+            <div class="font-semibold mb-1">运行时动态注入</div>
+            <div>保存并启用后，该垂直 Agent 会在下一条业主消息立即进入 Router 候选池；绑定的 Skill 与已发现工具的 MCP Server 同步生效，无需重启。</div>
+          </div>`;
         body = `
+          ${runtimeNote}
           ${formInput('名称', 'agent-name', agent ? agent.name : '', '如：维修报修 Agent')}
           ${formInput('描述', 'agent-description', agent ? agent.description : '', '简短描述 Agent 职责')}
           ${formTextarea('System Prompt', 'agent-system-prompt', agent ? agent.system_prompt : '', '定义该 Agent 的系统提示词', 5)}

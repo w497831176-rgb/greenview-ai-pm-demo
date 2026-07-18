@@ -128,13 +128,89 @@ WORK_ORDER_WRITE_BOUNDARY = {
 }
 
 
-def allowed_tools_for_agent(agent_id: Optional[str], server_name: str) -> Set[str]:
-    """Return the Host-side allowlist for one Agent/server pair."""
-    return set(AGENT_SERVER_TOOL_ALLOWLIST.get(agent_id or "", {}).get(server_name, set()))
+def _database_binding(agent_id: Optional[str], server_name: str) -> tuple[bool, Set[str]]:
+    """Return whether an Agent is bound to a live server and its discovered tools.
+
+    The static dictionaries above describe the three built-in demo servers.  They
+    must not become a hidden global allowlist: a platform operator can add a new
+    server, discover its tools, bind it to a new Agent and expect that capability
+    to work in the next owner turn.  The database binding is therefore the
+    runtime admission for user-created capabilities.
+    """
+    if not agent_id or not server_name:
+        return False, set()
+    try:
+        from db.property_db import get_agent_tools, list_mcp_servers, list_mcp_tools
+
+        bound_names = {
+            str(item.get("tool_name"))
+            for item in (get_agent_tools(agent_id) or [])
+            if item.get("tool_name")
+        }
+        if server_name not in bound_names:
+            return False, set()
+        server = next(
+            (item for item in (list_mcp_servers() or []) if item.get("name") == server_name),
+            None,
+        )
+        if not server or not server.get("enabled"):
+            return False, set()
+        discovered = {
+            str(item.get("name"))
+            for item in (list_mcp_tools(server_id=server.get("id")) or [])
+            if item.get("name")
+        }
+        return True, discovered
+    except Exception:
+        # The caller will simply expose no tools if the registry is unavailable.
+        return False, set()
+
+
+def allowed_tools_for_agent(
+    agent_id: Optional[str],
+    server_name: str,
+    *,
+    bound_server_names: Optional[Iterable[str]] = None,
+    discovered_tool_names: Optional[Iterable[str]] = None,
+) -> Set[str]:
+    """Resolve an Agent's live MCP permission from its current binding.
+
+    Built-in servers retain their narrow host policy for their canonical
+    bindings.  Any explicitly bound dynamic server uses its *discovered* tool
+    list as the runtime permission.  Dynamic servers are never policy-preinvoked
+    automatically; their Agent receives them as model-native tools only.
+    """
+    static = set(AGENT_SERVER_TOOL_ALLOWLIST.get(agent_id or "", {}).get(server_name, set()))
+    if static:
+        return static
+
+    if bound_server_names is not None:
+        bound = {str(name) for name in bound_server_names if name}
+        discovered = {str(name) for name in (discovered_tool_names or []) if name}
+        return discovered if server_name in bound else set()
+
+    bound, discovered = _database_binding(agent_id, server_name)
+    return discovered if bound else set()
 
 
 def allowed_server_names(agent_id: Optional[str]) -> Set[str]:
-    return set(AGENT_SERVER_TOOL_ALLOWLIST.get(agent_id or "", {}).keys())
+    """Return all enabled servers currently bound to an Agent, not just built-ins."""
+    try:
+        from db.property_db import get_agent_tools, list_mcp_servers
+
+        enabled = {str(item.get("name")) for item in (list_mcp_servers() or []) if item.get("enabled")}
+        return {
+            str(item.get("tool_name"))
+            for item in (get_agent_tools(agent_id or "") or [])
+            if item.get("tool_name") and str(item.get("tool_name")) in enabled
+        }
+    except Exception:
+        return set(AGENT_SERVER_TOOL_ALLOWLIST.get(agent_id or "", {}).keys())
+
+
+def is_builtin_policy_server(server_name: str) -> bool:
+    """Only formal built-ins may use deterministic policy pre-invocation."""
+    return server_name in MCP_SERVER_CONTRACTS
 
 
 def tool_contract(server_name: str, tool_name: str) -> Dict[str, Any]:

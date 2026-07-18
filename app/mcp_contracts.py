@@ -78,17 +78,29 @@ def list_mcp_contracts() -> Dict[str, Any]:
                 }
             )
 
+        dynamic_server = not bool(policy)
+        dynamic_policy = {
+            "mode": "configuration_bound",
+            "mode_label": "动态绑定（模型自主调用）",
+            "source": "平台管理新增并完成工具发现的 MCP Server",
+            "data_scope": "由该 Server 的工具描述和当前 Agent 绑定共同决定；请在接入前明确数据范围。",
+            "write_boundary": "未知写操作默认不做策略预执行；模型只可调用已发现且已绑定的工具。",
+        }
+        effective_policy = policy or dynamic_policy
+
         contract_rows.append(
             {
                 "server_id": server.get("id"),
                 "server_name": server_name,
                 "enabled": bool(server.get("enabled")),
                 "description": server.get("description", ""),
-                "mode": policy.get("mode", "unclassified"),
-                "mode_label": policy.get("mode_label", "未定义"),
-                "source": policy.get("source", "未声明"),
-                "data_scope": policy.get("data_scope", "未声明"),
-                "write_boundary": policy.get("write_boundary", "未声明"),
+                "mode": effective_policy.get("mode", "unclassified"),
+                "mode_label": effective_policy.get("mode_label", "未定义"),
+                "source": effective_policy.get("source", "未声明"),
+                "data_scope": effective_policy.get("data_scope", "未声明"),
+                "write_boundary": effective_policy.get("write_boundary", "未声明"),
+                "runtime_admission": "Agent 显式绑定 + Server 启用 + 工具已发现",
+                "policy_preinvoke": not dynamic_server,
                 "bindings": bindings,
                 "tools": tools,
             }
