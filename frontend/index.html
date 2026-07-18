@@ -219,7 +219,7 @@
     // ==========================================
     const API_BASE = '';
     const DEFAULT_ROOM_ID = '3-2-1201';
-    const APP_VERSION = 'V1.5.2';
+    const APP_VERSION = 'V1.5.3';
 
     const STATE = {
       topTab: 'owner',
@@ -781,8 +781,14 @@
         const isActive = s.session_id === currentId;
         const title = escapeHtml(s.title || s.last_message_preview || '新会话');
         const time = formatTimeLabel(s.last_message_at || s.updated_at || s.created_at);
-        const handoffText = s.handoff_status === 'active' ? '人工中' : (s.handoff_status === 'requested' ? '待人工' : '');
-        const handoffClass = s.handoff_status === 'active' ? 'bg-green-100 text-green-700' : 'bg-amber-100 text-amber-700';
+        const handoffMeta = {
+          requested: ['待领取', 'bg-amber-100 text-amber-700'],
+          active: ['人工中', 'bg-green-100 text-green-700'],
+          waiting_user: ['待我补充', 'bg-blue-100 text-blue-700'],
+          resolved: ['待确认', 'bg-slate-100 text-slate-700']
+        }[s.handoff_status] || ['', ''];
+        const handoffText = handoffMeta[0];
+        const handoffClass = handoffMeta[1];
         const agentText = s.last_agent ? ` · ${escapeHtml(s.last_agent)}` : '';
         return `
           <button type="button" data-session-id="${escapeHtml(s.session_id)}" class="session-item w-full text-left px-3 py-2.5 rounded-xl transition-colors ${isActive ? 'bg-brand-50 border border-brand-200' : 'hover:bg-slate-100 border border-transparent'}">
@@ -996,21 +1002,24 @@
     function updateHandoffBanner(status) {
       const banner = $('#chat-handoff-banner');
       if (!banner) return;
-      const labels = {
-        none: '',
-        requested: '待人工接管',
-        active: '人工接管中',
-        resolved: '人工接管已结束'
-      };
-      const text = labels[status] || '';
+        const labels = {
+          none: null,
+          requested: { text: '已发起人工协同：等待工作人员领取', cls: 'bg-amber-100 text-amber-700' },
+          active: { text: '人工协同处理中：AI 已停让，工作人员正在负责后续处理', cls: 'bg-green-100 text-green-700' },
+          waiting_user: { text: '人工协同等待您补充信息：您下一条消息会同步给工作人员', cls: 'bg-blue-100 text-blue-700' },
+          resolved: { text: '工作人员已给出处理结果：可继续与 AI 咨询，或由工作人员关闭本次协同', cls: 'bg-slate-100 text-slate-700' },
+          closed: { text: '本次人工协同已关闭', cls: 'bg-slate-100 text-slate-600' },
+          cancelled: { text: '本次人工协同已取消', cls: 'bg-slate-100 text-slate-600' }
+        };
+        const meta = labels[status] || null;
+        const text = meta && meta.text;
       if (!text) {
         banner.classList.add('hidden');
         banner.innerHTML = '';
         return;
       }
-      const colorClass = status === 'active' ? 'bg-green-100 text-green-700' : (status === 'resolved' ? 'bg-slate-100 text-slate-600' : 'bg-amber-100 text-amber-700');
-      banner.classList.remove('hidden');
-      banner.innerHTML = `<span class="inline-block px-3 py-1 rounded-full text-xs font-medium ${colorClass}">${text}</span>`;
+        banner.classList.remove('hidden');
+        banner.innerHTML = `<span class="inline-block px-3 py-1 rounded-full text-xs font-medium ${meta.cls}">${text}</span>`;
     }
 
     window.sendQuickQuestion = function(text) {
@@ -1425,9 +1434,10 @@
                 data.current_agent_id || (STATE.currentRoute && STATE.currentRoute.current_agent_id) || ''
               );
               if (data.handoff) {
-                STATE.chatHandoff = true;
-                updateHandoffBanner(data.handoff_status || 'requested');
-                showToast('已转人工，请等待工作人员回复', 'success');
+                const handoffStatus = data.handoff_state || data.handoff_status || 'requested';
+                STATE.chatHandoff = ['requested', 'active', 'waiting_user'].includes(handoffStatus);
+                updateHandoffBanner(handoffStatus);
+                showToast(handoffStatus === 'active' ? '信息已同步给人工处理人' : '人工协同状态已更新', 'success');
               }
               loadChatSessions().then(() => refreshSidebar());
               STATE.currentTraceId = null;
@@ -1455,7 +1465,7 @@
         const data = await res.json();
         const messages = data.messages || [];
         const session = data.session || {};
-        STATE.chatHandoff = session.handoff_status === 'requested' || session.handoff_status === 'active';
+        STATE.chatHandoff = ['requested', 'active', 'waiting_user'].includes(session.handoff_status);
         const container = $('#chat-message-list');
         if (!container) return;
         // Clear existing messages except the welcome message
@@ -1724,16 +1734,42 @@
       }
     }
 
+    function handoffStatusMeta(status) {
+      return {
+        requested: { label: '等待领取', cls: 'bg-amber-100 text-amber-700', hint: '尚未由工作人员承担责任' },
+        active: { label: '人工处理中', cls: 'bg-green-100 text-green-700', hint: 'AI 已停让，工作人员负责后续处理' },
+        waiting_user: { label: '等待业主补充', cls: 'bg-blue-100 text-blue-700', hint: '下一条业主消息会恢复人工处理' },
+        resolved: { label: '已给出结果', cls: 'bg-slate-100 text-slate-700', hint: '待工作人员确认关闭本次协同' },
+        closed: { label: '已关闭', cls: 'bg-slate-100 text-slate-500', hint: '只读审计记录' },
+        cancelled: { label: '已取消', cls: 'bg-slate-100 text-slate-500', hint: '只读审计记录' }
+      }[status] || { label: status || '未知', cls: 'bg-slate-100 text-slate-600', hint: '' };
+    }
+
+    function compactHandoffEvidence(pkg) {
+      const evidence = pkg.ai_evidence || {};
+      const route = evidence.route || {};
+      const citations = evidence.citations || [];
+      const mcp = evidence.mcp_calls || [];
+      const skills = evidence.skills || [];
+      const names = list => list.map(x => typeof x === 'string' ? x : (x.name || x.tool_name || x.server_name || '未命名')).join('、') || '无';
+      return `
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs">
+          <div class="rounded-xl bg-slate-50 border border-slate-200 p-3"><div class="text-slate-400 mb-1">路由与 Agent</div><div class="text-slate-700">${escapeHtml(route.agent || '无')} ${route.agent_id ? `(${escapeHtml(route.agent_id)})` : ''}</div><div class="text-slate-500 mt-1">${escapeHtml(route.reason || '未记录路由原因')}</div></div>
+          <div class="rounded-xl bg-slate-50 border border-slate-200 p-3"><div class="text-slate-400 mb-1">已命中 Skill</div><div class="text-slate-700">${escapeHtml(names(skills))}</div></div>
+          <div class="rounded-xl bg-slate-50 border border-slate-200 p-3"><div class="text-slate-400 mb-1">MCP / Tool 事实</div><div class="text-slate-700">${escapeHtml(names(mcp))}</div></div>
+          <div class="rounded-xl bg-slate-50 border border-slate-200 p-3"><div class="text-slate-400 mb-1">RAG 证据</div><div class="text-slate-700">${escapeHtml(citations.map(c => `《${c.doc_title || '未知文档'}》分片${c.chunk_index ?? '-'}`).join('、') || '无')}</div></div>
+        </div>`;
+    }
+
     async function renderHandoffPage(container) {
       container.innerHTML = `
         <div class="max-w-7xl mx-auto p-4 md:p-6 space-y-5">
-          <div class="max-w-7xl mx-auto pb-4">
-            <h2 class="text-xl font-semibold text-slate-900">人工接管</h2>
-            <p class="text-sm text-slate-500 mt-1">业主主动要求人工或 AI 判断需要人工处理的会话</p>
+          <div class="flex flex-col md:flex-row md:items-end md:justify-between gap-3">
+            <div><h2 class="text-xl font-semibold text-slate-900">人工协同工作台</h2><p class="text-sm text-slate-500 mt-1">按责任状态接管会话：先看接管包与证据，再回复、索取补充、给出结果并关闭。</p></div>
+            <div class="text-xs text-slate-500 bg-slate-50 border border-slate-200 rounded-xl px-3 py-2">L0 AI 直答 · L1 业主确认 · L2 人工审批 · L3 人工接管</div>
           </div>
           <div id="handoff-content">${loadingState()}</div>
-        </div>
-      `;
+        </div>`;
       await loadHandoffSessions();
     }
 
@@ -1744,196 +1780,49 @@
       try {
         const data = await apiGet('/api/chat/handoffs');
         const sessions = data.sessions || [];
-        if (sessions.length === 0) {
-          content.innerHTML = emptyState('暂无待人工接管的会话');
-          return;
-        }
-        content.innerHTML = `
-          <div class="bg-white rounded-2xl shadow-soft border border-slate-200 overflow-hidden">
-            <table class="w-full text-sm text-left">
-              <thead class="bg-slate-50 text-slate-600">
-                <tr>
-                  <th class="px-4 py-3 font-medium">会话 ID</th>
-                  <th class="px-4 py-3 font-medium">状态</th>
-                  <th class="px-4 py-3 font-medium">原因</th>
-                  <th class="px-4 py-3 font-medium">时间</th>
-                  <th class="px-4 py-3 font-medium">操作</th>
-                </tr>
-              </thead>
-              <tbody class="divide-y divide-slate-100">
-                ${sessions.map(s => `
-                  <tr class="hover:bg-slate-50">
-                    <td class="px-4 py-3 font-mono text-xs text-slate-500">${escapeHtml(s.session_id)}</td>
-                    <td class="px-4 py-3"><span class="text-xs px-2 py-1 rounded-full ${s.handoff_status === 'active' ? 'bg-green-100 text-green-700' : 'bg-amber-100 text-amber-700'}">${s.handoff_status === 'active' ? '接管中' : '待接管'}</span></td>
-                    <td class="px-4 py-3 text-slate-700">${escapeHtml(s.handoff_reason || '-')}</td>
-                    <td class="px-4 py-3 text-slate-500 text-xs">${formatTimeLabel(s.handoff_requested_at)}</td>
-                    <td class="px-4 py-3 flex gap-2">
-                      <button data-session="${escapeHtml(s.session_id)}" data-status="${escapeHtml(s.handoff_status)}" class="handoff-view-btn text-xs px-3 py-1.5 bg-brand-600 hover:bg-brand-700 text-white rounded-lg transition-colors">${s.handoff_status === 'active' ? '继续回复' : '接管'}</button>
-                      ${s.handoff_status === 'active' ? `<button data-session="${escapeHtml(s.session_id)}" class="handoff-resolve-btn text-xs px-3 py-1.5 bg-green-600 hover:bg-green-700 text-white rounded-lg transition-colors">完结</button>` : ''}
-                    </td>
-                  </tr>
-                `).join('')}
-              </tbody>
-            </table>
-          </div>
-        `;
-        $$('.handoff-view-btn').forEach(btn => {
-          btn.addEventListener('click', async () => {
-            const sessionId = btn.dataset.session;
-            if (btn.dataset.status !== 'active') {
-              // Take over the session first.
-              try {
-                const res = await fetch(`${API_BASE}/api/chat/handoff`, {
-                  method: 'POST',
-                  headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({ session_id: sessionId, reason: '工作人员接管会话' })
-                });
-                if (!res.ok) throw new Error('接管失败');
-              } catch (err) {
-                showToast('接管失败：' + err.message, 'error');
-                return;
-              }
-            }
-            openHandoffReplyModal(sessionId);
-          });
-        });
-        $$('.handoff-resolve-btn').forEach(btn => {
-          btn.addEventListener('click', () => resolveHandoff(btn.dataset.session));
-        });
-      } catch (err) {
-        content.innerHTML = emptyState('加载失败，请刷新重试');
-      }
+        if (!sessions.length) { content.innerHTML = emptyState('暂无待处理的人工协同会话'); return; }
+        content.innerHTML = `<div class="bg-white rounded-2xl shadow-soft border border-slate-200 overflow-x-auto"><table class="w-full min-w-[860px] text-sm text-left"><thead class="bg-slate-50 text-slate-600"><tr><th class="px-4 py-3 font-medium">会话</th><th class="px-4 py-3 font-medium">责任状态</th><th class="px-4 py-3 font-medium">风险 / 队列</th><th class="px-4 py-3 font-medium">接管原因</th><th class="px-4 py-3 font-medium">最后动作</th><th class="px-4 py-3 font-medium">操作</th></tr></thead><tbody class="divide-y divide-slate-100">${sessions.map(s => { const meta = handoffStatusMeta(s.handoff_status); return `<tr class="hover:bg-slate-50"><td class="px-4 py-3"><div class="font-mono text-xs text-slate-600">${escapeHtml(s.session_id)}</div><div class="text-[11px] text-slate-400 mt-1">${escapeHtml(s.assigned_to || '未分配')}</div></td><td class="px-4 py-3"><span class="text-xs px-2 py-1 rounded-full ${meta.cls}" title="${escapeHtml(meta.hint)}">${meta.label}</span></td><td class="px-4 py-3"><div class="text-xs font-medium text-slate-700">${escapeHtml(s.handoff_risk_level || 'L3')}</div><div class="text-[11px] text-slate-400">${escapeHtml(s.handoff_queue || 'property_service')}</div></td><td class="px-4 py-3 text-slate-700 max-w-xs">${escapeHtml(s.handoff_reason || '-')}</td><td class="px-4 py-3 text-xs text-slate-500">${formatTimeLabel(s.handoff_last_action_at || s.handoff_requested_at)}</td><td class="px-4 py-3"><button data-session="${escapeHtml(s.session_id)}" class="handoff-workbench-btn text-xs px-3 py-1.5 bg-brand-600 hover:bg-brand-700 text-white rounded-lg transition-colors">查看接管包 / 处理</button></td></tr>`; }).join('')}</tbody></table></div>`;
+        $$('.handoff-workbench-btn').forEach(btn => btn.addEventListener('click', () => openHandoffWorkbench(btn.dataset.session)));
+      } catch (err) { content.innerHTML = emptyState('加载失败，请刷新重试'); }
     }
 
-    function openHandoffReplyModal(sessionId) {
+    function renderHandoffContextMessage(msg) {
+      const role = msg.role === 'staff' ? '工作人员' : (msg.role === 'assistant' ? 'AI' : '业主');
+      const style = msg.role === 'staff' ? 'bg-indigo-50 border-indigo-100' : (msg.role === 'assistant' ? 'bg-brand-50 border-brand-100' : 'bg-slate-50 border-slate-200');
+      return `<div class="mb-2"><p class="text-[10px] text-slate-400 mb-0.5">${role} · ${formatTimeLabel(msg.created_at)}</p><div class="${style} border rounded-lg p-2 text-xs text-slate-700 whitespace-pre-wrap">${escapeHtml(msg.content || '')}</div></div>`;
+    }
+
+    async function openHandoffWorkbench(sessionId) {
       const modal = document.createElement('div');
       modal.className = 'fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4';
-      modal.id = 'handoff-reply-modal';
-      modal.innerHTML = `
-        <div class="bg-white rounded-2xl shadow-2xl w-full max-w-2xl max-h-[90vh] flex flex-col overflow-hidden">
-          <div class="px-6 py-4 border-b border-slate-100 flex items-center justify-between shrink-0">
-            <h3 class="text-lg font-semibold text-slate-900">人工回复 · ${escapeHtml(sessionId)}</h3>
-            <button class="handoff-modal-close text-slate-400 hover:text-slate-600">&times;</button>
-          </div>
-          <div class="p-6 overflow-y-auto flex-1 min-h-0">
-            <div id="handoff-context" class="mb-4">${loadingState()}</div>
-            <div class="border-t border-slate-200 pt-4 space-y-4">
-              <div>
-                <label class="block text-xs font-medium text-slate-600 mb-1">工作人员姓名</label>
-                <input id="handoff-staff-name" type="text" value="张师傅" class="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm focus:outline-none focus:border-brand-400 focus:ring-2 focus:ring-brand-100">
-              </div>
-              <div>
-                <label class="block text-xs font-medium text-slate-600 mb-1">回复内容</label>
-                <textarea id="handoff-reply-text" rows="3" placeholder="请输入回复内容..." class="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm focus:outline-none focus:border-brand-400 focus:ring-2 focus:ring-brand-100 resize-none"></textarea>
-              </div>
-            </div>
-          </div>
-          <div class="px-6 py-4 border-t border-slate-100 flex justify-end gap-2 shrink-0">
-            <button class="handoff-modal-close px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg text-sm">取消</button>
-            <button id="handoff-reply-submit" class="px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white rounded-lg text-sm">发送回复</button>
-          </div>
-        </div>
-      `;
+      modal.innerHTML = `<div class="bg-white rounded-2xl shadow-2xl w-full max-w-5xl max-h-[92vh] flex flex-col overflow-hidden"><div class="px-6 py-4 border-b border-slate-200 flex items-center justify-between"><div><h3 class="text-lg font-semibold text-slate-900">人工协同接管包</h3><p class="text-xs text-slate-400 font-mono mt-1">${escapeHtml(sessionId)}</p></div><button class="handoff-close-modal p-2 text-slate-400 hover:text-slate-600">&times;</button></div><div id="handoff-workbench-content" class="p-6 overflow-y-auto flex-1">${loadingState()}</div></div>`;
       document.body.appendChild(modal);
-
-      const closeModal = () => modal.remove();
-      $$('.handoff-modal-close').forEach(btn => btn.addEventListener('click', closeModal));
-      modal.addEventListener('click', e => { if (e.target === modal) closeModal(); });
-
-      function renderHandoffContextMessage(msg) {
-        const time = formatTimeLabel(msg.created_at);
-        if (msg.role === 'user') {
-          return `
-            <div class="mb-3">
-              <p class="text-[10px] text-slate-500 mb-0.5">业主 · ${time}</p>
-              <div class="bg-slate-50 rounded-lg p-2.5 text-sm text-slate-700 whitespace-pre-wrap border border-slate-200">${escapeHtml(msg.content || '')}</div>
-            </div>
-          `;
-        }
-        if (msg.role === 'staff') {
-          return `
-            <div class="mb-3">
-              <p class="text-[10px] text-indigo-500 mb-0.5">工作人员 · ${time}</p>
-              <div class="bg-indigo-50 rounded-lg p-2.5 text-sm text-slate-700 whitespace-pre-wrap border border-indigo-100">${escapeHtml(msg.content || '')}</div>
-            </div>
-          `;
-        }
-        if (msg.role === 'assistant') {
-          const clean = stripThinking(msg.content || '');
-          const tags = renderAiMessageTags(msg.activated_skills, msg.tools, msg.agent, msg.route_reason, msg.route_intent, msg.model_id, msg.thinking_enabled, msg.model_selection_reason, msg.trace_id, msg.mcp_calls, msg.usage_source, msg.current_agent_id);
-          const footnotes = renderCitations(msg.citations, clean);
-          return `
-            <div class="mb-3">
-              <p class="text-[10px] text-brand-500 mb-0.5">AI · ${time}</p>
-              <div class="bg-brand-50 rounded-lg p-2.5 text-sm text-slate-700 border border-brand-100">
-                <div class="markdown-body text-sm text-slate-700 break-words">${renderMarkdownWithCitations(clean, msg.citations)}</div>
-                ${tags}
-                ${footnotes}
-              </div>
-            </div>
-          `;
-        }
-        return '';
-      }
-
-      async function loadContext() {
-        const container = $('#handoff-context');
-        if (!container) return;
-        container.innerHTML = loadingState();
-        try {
-          const res = await fetch(`${API_BASE}/api/chat/history?session_id=${encodeURIComponent(sessionId)}`);
-          if (!res.ok) throw new Error('加载失败');
-          const data = await res.json();
-          const messages = data.messages || [];
-          if (messages.length === 0) {
-            container.innerHTML = '<p class="text-sm text-slate-500">暂无会话消息</p>';
-            return;
-          }
-          container.innerHTML = messages.map(renderHandoffContextMessage).join('');
-        } catch (err) {
-          container.innerHTML = `<p class="text-sm text-red-600">加载上下文失败：${escapeHtml(err.message)}</p>`;
-        }
-      }
-
-      $('#handoff-reply-submit').addEventListener('click', async () => {
-        const staffName = $('#handoff-staff-name').value.trim() || '物业工作人员';
-        const message = $('#handoff-reply-text').value.trim();
-        if (!message) {
-          showToast('请输入回复内容', 'error');
-          return;
-        }
-        try {
-          const res = await fetch(`${API_BASE}/api/chat/handoff-reply`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ session_id: sessionId, staff_name: staffName, message })
-          });
-          if (!res.ok) throw new Error('发送失败');
-          showToast('回复已发送', 'success');
-          closeModal();
-          await loadHandoffSessions();
-        } catch (err) {
-          showToast('发送失败，请重试', 'error');
-        }
-      });
-
-      loadContext();
-    }
-
-    async function resolveHandoff(sessionId) {
-      if (!confirm('确定要完结该人工会话吗？')) return;
+      const close = () => modal.remove();
+      modal.querySelector('.handoff-close-modal').addEventListener('click', close);
+      modal.addEventListener('click', e => { if (e.target === modal) close(); });
+      const target = modal.querySelector('#handoff-workbench-content');
       try {
-        const res = await fetch(`${API_BASE}/api/chat/handoff-resolve`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ session_id: sessionId })
-        });
-        if (!res.ok) throw new Error('完结失败');
-        showToast('会话已完结', 'success');
-        await loadHandoffSessions();
-      } catch (err) {
-        showToast('完结失败，请重试', 'error');
-      }
+        const [bundle, history] = await Promise.all([apiGet(`/api/chat/handoff/${encodeURIComponent(sessionId)}/package`), apiGet(`/api/chat/history?session_id=${encodeURIComponent(sessionId)}`)]);
+        const session = bundle.session || {};
+        const pkg = bundle.package || {};
+        const risk = pkg.risk || {};
+        const meta = handoffStatusMeta(session.handoff_status);
+        const actions = bundle.actions || [];
+        const messages = history.messages || [];
+        const canClaim = ['requested', 'waiting_user'].includes(session.handoff_status);
+        const canReply = session.handoff_status === 'active';
+        const canResolve = ['active', 'waiting_user'].includes(session.handoff_status);
+        const canClose = session.handoff_status === 'resolved';
+        target.innerHTML = `<div class="space-y-5"><div class="flex flex-wrap items-center gap-2"><span class="px-2 py-1 rounded-full text-xs ${meta.cls}">${meta.label}</span><span class="text-xs text-slate-500">${escapeHtml(meta.hint)}</span><span class="text-xs px-2 py-1 rounded-full bg-red-50 text-red-700">${escapeHtml(session.handoff_risk_level || risk.level || 'L3')}</span><span class="text-xs text-slate-400">队列：${escapeHtml(session.handoff_queue || risk.queue || 'property_service')}</span></div><section class="rounded-xl border border-slate-200 p-4"><h4 class="font-medium text-slate-900 mb-2">业主原始诉求</h4><p class="text-sm text-slate-700 whitespace-pre-wrap">${escapeHtml((pkg.owner_request || {}).content || session.handoff_reason || '-')}</p><p class="text-xs text-slate-500 mt-2">接管原因：${escapeHtml(session.handoff_reason || risk.reason || '-')}</p><p class="text-xs text-slate-500 mt-1">工作人员要决定：${escapeHtml(pkg.human_task || risk.human_task || '-')}</p></section><section><h4 class="font-medium text-slate-900 mb-2">AI 已完成的可核验证据</h4>${compactHandoffEvidence(pkg)}</section><section class="rounded-xl border border-slate-200 p-4"><h4 class="font-medium text-slate-900 mb-2">操作审计</h4><div class="space-y-2">${actions.length ? actions.map(a => `<div class="text-xs border-l-2 border-slate-200 pl-3"><span class="text-slate-700">${escapeHtml(a.action_type)}</span> <span class="text-slate-400">${escapeHtml(a.status_before || '-')} → ${escapeHtml(a.status_after || '-')} · ${escapeHtml(a.actor || '-')} · ${formatTimeLabel(a.created_at)}</span></div>`).join('') : '<p class="text-xs text-slate-400">暂无操作记录</p>'}</div></section><details class="rounded-xl border border-slate-200 p-4"><summary class="font-medium text-slate-900 cursor-pointer">查看最近会话上下文（${messages.length} 条）</summary><div class="mt-3 max-h-64 overflow-y-auto">${messages.slice(-12).map(renderHandoffContextMessage).join('')}</div></details>${session.handoff_summary ? `<section class="rounded-xl bg-emerald-50 border border-emerald-200 p-4"><h4 class="font-medium text-emerald-800 mb-1">人工处理结论</h4><p class="text-sm text-emerald-900 whitespace-pre-wrap">${escapeHtml(session.handoff_summary)}</p></section>` : ''}<section class="rounded-xl bg-slate-50 border border-slate-200 p-4 space-y-3"><h4 class="font-medium text-slate-900">人工操作</h4><div class="grid grid-cols-1 md:grid-cols-2 gap-3"><div><label class="text-xs text-slate-500">工作人员姓名</label><input id="handoff-staff-name" value="${escapeHtml(session.assigned_to || '张师傅')}" class="mt-1 w-full px-3 py-2 border border-slate-200 rounded-lg text-sm"></div><div><label class="text-xs text-slate-500">回复 / 处理结论</label><textarea id="handoff-staff-message" rows="3" placeholder="回复业主，或填写本次处理结论" class="mt-1 w-full px-3 py-2 border border-slate-200 rounded-lg text-sm"></textarea></div></div><label class="flex items-center gap-2 text-xs text-slate-600"><input id="handoff-create-badcase" type="checkbox">此处理暴露了 AI 能力问题，沉淀为 Badcase 复盘</label><div class="flex flex-wrap gap-2">${canClaim ? '<button id="handoff-claim-btn" class="px-3 py-2 bg-brand-600 text-white rounded-lg text-sm">领取并接管</button>' : ''}${canReply ? '<button id="handoff-reply-btn" class="px-3 py-2 bg-indigo-600 text-white rounded-lg text-sm">发送人工回复</button><button id="handoff-wait-btn" class="px-3 py-2 bg-blue-600 text-white rounded-lg text-sm">请求业主补充</button>' : ''}${canResolve ? '<button id="handoff-resolve-btn" class="px-3 py-2 bg-emerald-600 text-white rounded-lg text-sm">记录处理结果</button>' : ''}${canClose ? '<button id="handoff-close-btn" class="px-3 py-2 bg-slate-700 text-white rounded-lg text-sm">关闭协同</button>' : ''}</div></section></div>`;
+        const staff = () => (modal.querySelector('#handoff-staff-name').value.trim() || '物业工作人员');
+        const message = () => modal.querySelector('#handoff-staff-message').value.trim();
+        const post = async (path, body, success) => { const res = await fetch(`${API_BASE}${path}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }); if (!res.ok) { const detail = await res.text(); throw new Error(detail || '操作失败'); } showToast(success, 'success'); close(); await loadHandoffSessions(); };
+        const claim = modal.querySelector('#handoff-claim-btn'); if (claim) claim.addEventListener('click', async () => { try { await post('/api/chat/handoff-claim', { session_id: sessionId, staff_name: staff() }, '已领取人工协同会话'); } catch (err) { showToast('领取失败：' + err.message, 'error'); } });
+        const reply = modal.querySelector('#handoff-reply-btn'); if (reply) reply.addEventListener('click', async () => { if (!message()) return showToast('请输入回复内容', 'error'); try { await post('/api/chat/handoff-reply', { session_id: sessionId, staff_name: staff(), message: message() }, '人工回复已发送'); } catch (err) { showToast('发送失败：' + err.message, 'error'); } });
+        const wait = modal.querySelector('#handoff-wait-btn'); if (wait) wait.addEventListener('click', async () => { if (!message()) return showToast('请说明需要业主补充的信息', 'error'); try { await post('/api/chat/handoff-waiting-user', { session_id: sessionId, staff_name: staff(), message: message() }, '已请求业主补充信息'); } catch (err) { showToast('操作失败：' + err.message, 'error'); } });
+        const resolve = modal.querySelector('#handoff-resolve-btn'); if (resolve) resolve.addEventListener('click', async () => { if (!message()) return showToast('请填写处理结论', 'error'); try { await post('/api/chat/handoff-resolve', { session_id: sessionId, staff_name: staff(), resolution: message(), create_badcase: modal.querySelector('#handoff-create-badcase').checked }, '人工处理结果已记录'); } catch (err) { showToast('操作失败：' + err.message, 'error'); } });
+        const closeBtn = modal.querySelector('#handoff-close-btn'); if (closeBtn) closeBtn.addEventListener('click', async () => { try { await post('/api/chat/handoff-close', { session_id: sessionId, staff_name: staff() }, '人工协同已关闭'); } catch (err) { showToast('关闭失败：' + err.message, 'error'); } });
+      } catch (err) { target.innerHTML = `<p class="text-sm text-red-600">加载接管包失败：${escapeHtml(err.message || String(err))}</p>`; }
     }
 
     // ==========================================

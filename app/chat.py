@@ -26,6 +26,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from app.observability import _check_budget
+from app.handoff_policy import HANDOFF_STATUS_LABELS, evaluate_handoff_policy, handoff_policy_summary
 from app.settings import MODEL_ID, USE_THINKING, build_model
 from app.skill_runtime import activation_evidence, select_skills, skill_contract
 from app.utils.cost_utils import build_price_snapshot, compute_cost_cny, normalize_usage
@@ -39,6 +40,9 @@ from tools.work_order import set_work_order_context
 from db.property_db import (
     activate_handoff,
     add_badcase_action,
+    cancel_handoff,
+    claim_handoff,
+    close_handoff,
     create_badcase,
     create_chat_session,
     create_chat_trace,
@@ -49,6 +53,7 @@ from db.property_db import (
     get_budget_thresholds,
     get_chat_message,
     get_chat_session,
+    get_handoff_package,
     get_enabled_price_for_model,
     get_model_calls_for_trace,
     get_previous_user_message,
@@ -63,10 +68,12 @@ from db.property_db import (
     record_mcp_call_audit,
     record_model_call,
     request_handoff,
+    resume_handoff_after_owner_message,
     resolve_handoff,
     save_chat_message,
     update_budget_thresholds,
     update_chat_trace,
+    wait_for_handoff_user,
     now_cn,
 )
 import rag_indexer
@@ -827,24 +834,104 @@ async def _preinvoke_readonly_mcp_tools(
 
 
 def _detect_handoff_intent(message: str) -> Optional[str]:
-    """Detect explicit handoff requests only.
+    """Backward-compatible explicit-request detector.
 
-    Ordinary mentions of customer service / property management should not
-    trigger automatic human takeover.
+    Responsibility changes are decided by :mod:`app.handoff_policy`, never by
+    a free-form model sentence.  This helper remains for the stream's compact
+    early branch only.
     """
-    lowered = message.lower()
-    explicit_triggers = [
-        "转人工",
-        "人工客服",
-        "找人工",
-        "人工处理",
-        "我要人工",
-        "人工介入",
-        "接人工",
+    policy = evaluate_handoff_policy(message)
+    return policy["reason"] if policy.get("reason_code") == "owner_requested" else None
+
+
+def _latest_ai_evidence(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Extract the last AI turn's verifiable evidence for a staff handoff."""
+    for item in reversed(messages):
+        if item.get("role") != "assistant":
+            continue
+        return {
+            "message_id": item.get("id"),
+            "trace_id": item.get("trace_id"),
+            "route": {
+                "intent": item.get("route_intent"),
+                "reason": item.get("route_reason"),
+                "agent": item.get("current_agent"),
+                "agent_id": item.get("current_agent_id"),
+            },
+            "skills": item.get("activated_skills") or [],
+            "tools": item.get("tool_calls") or [],
+            "mcp_calls": item.get("mcp_calls") or [],
+            "citations": item.get("citations") or [],
+            "model": {
+                "model_id": item.get("model_id"),
+                "token_count": item.get("token_count"),
+                "token_detail": item.get("token_detail"),
+                "usage_source": item.get("usage_source"),
+            },
+        }
+    return {"skills": [], "tools": [], "mcp_calls": [], "citations": []}
+
+
+def _build_handoff_package(
+    session_id: str,
+    policy: Dict[str, Any],
+    *,
+    trace_id: Optional[str] = None,
+    trigger_message: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Build the compact, inspectable context package shown to staff.
+
+    No LLM summary is generated here.  The package preserves the original
+    wording and the facts/evidence that were actually present in the session.
+    """
+    messages = list_chat_messages(session_id)
+    latest_owner = next((m for m in reversed(messages) if m.get("role") in {"user", "owner"}), None)
+    evidence = _latest_ai_evidence(messages)
+    context = [
+        {"role": m.get("role"), "content": m.get("content"), "created_at": m.get("created_at")}
+        for m in messages[-8:]
     ]
-    if any(t in lowered for t in explicit_triggers):
-        return "业主明确要求人工服务"
-    return None
+    verified = []
+    for call in evidence.get("mcp_calls") or []:
+        if str(call.get("status") or "").lower() == "success":
+            verified.append({"type": "mcp", "name": call.get("tool_name") or call.get("server_name"), "summary": call.get("result_summary")})
+    for citation in evidence.get("citations") or []:
+        verified.append({"type": "rag", "name": citation.get("doc_title"), "chunk_index": citation.get("chunk_index")})
+    return {
+        "version": "v1.5.3",
+        "generated_at": now_cn(),
+        "session_id": session_id,
+        "owner_request": {
+            "content": trigger_message or (latest_owner or {}).get("content") or "",
+            "message_id": (latest_owner or {}).get("id"),
+        },
+        "recent_context": context,
+        "ai_evidence": evidence,
+        "verified_facts": verified,
+        "risk": policy,
+        "human_task": policy.get("human_task"),
+        "trigger_trace_id": trace_id or evidence.get("trace_id"),
+    }
+
+
+def _request_handoff_with_context(
+    session_id: str,
+    policy: Dict[str, Any],
+    *,
+    trace_id: Optional[str] = None,
+    trigger_message: Optional[str] = None,
+    actor: str = "owner",
+) -> Dict[str, Any]:
+    package = _build_handoff_package(session_id, policy, trace_id=trace_id, trigger_message=trigger_message)
+    return request_handoff(
+        session_id,
+        policy.get("reason") or "需要人工处理",
+        risk_level=policy.get("level") or "L3",
+        reason_code=policy.get("reason_code") or "owner_requested",
+        queue=policy.get("queue") or "property_service",
+        handoff_package=package,
+        actor=actor,
+    )
 
 
 def _get_vertical_agents() -> List[Dict[str, Any]]:
@@ -1023,7 +1110,7 @@ class FeedbackRequest(BaseModel):
 
 class HandoffRequest(BaseModel):
     session_id: str
-    reason: str
+    reason: Optional[str] = None
 
 
 class HandoffReplyRequest(BaseModel):
@@ -1032,9 +1119,37 @@ class HandoffReplyRequest(BaseModel):
     message: str
 
 
+class HandoffClaimRequest(BaseModel):
+    session_id: str
+    staff_name: str
+
+
+class HandoffWaitForOwnerRequest(BaseModel):
+    session_id: str
+    staff_name: str
+    message: str
+
+
 class HandoffResolveRequest(BaseModel):
     session_id: str
     resolution: Optional[str] = None
+    staff_name: Optional[str] = None
+    create_badcase: bool = False
+
+
+class HandoffCloseRequest(BaseModel):
+    session_id: str
+    staff_name: Optional[str] = None
+
+
+class HandoffCancelRequest(BaseModel):
+    session_id: str
+    reason: Optional[str] = None
+
+
+class HandoffPolicyDiagnosticRequest(BaseModel):
+    message: str
+    mcp_calls: Optional[List[Dict[str, Any]]] = None
 
 
 async def _stream_agent_response(
@@ -1068,28 +1183,60 @@ async def _stream_agent_response(
         # Persist the user message before invoking the agent.
         save_chat_message(session_id=session_id, role="user", content=message, trace_id=trace_id)
 
-        # Owner-initiated handoff detection.
-        handoff_reason = _detect_handoff_intent(message)
-        if handoff_reason:
-            request_handoff(session_id, handoff_reason)
-            reply = (
-                "已收到您的请求，已为您转接人工服务。"
-                "物业工作人员会尽快在对话中回复您，请稍候。"
+        # Human collaboration is controlled by deterministic policy, not by a
+        # model sentence.  It makes the accountability boundary explainable and
+        # prevents a casual mention of customer service from taking over a chat.
+        handoff_policy = evaluate_handoff_policy(message)
+        if handoff_policy.get("should_request_handoff"):
+            handoff_session = _request_handoff_with_context(
+                session_id, handoff_policy, trace_id=trace_id, trigger_message=message, actor="owner"
             )
-            save_chat_message(session_id=session_id, role="assistant", content=reply, trace_id=trace_id)
-            update_chat_trace(trace_id=trace_id, intent="handoff", agent_name="人工", status="complete")
-            yield f"event: delta\ndata: {json.dumps({'content': reply})}\n\n"
-            yield f"event: done\ndata: {_safe_json_dumps({'status': 'complete', 'token_count': 0, 'message_id': None, 'handoff': True, 'trace_id': trace_id})}\n\n"
+            reply = (
+                "已为您发起人工协同处理。当前状态：等待工作人员领取。\n\n"
+                f"原因：{handoff_policy.get('reason')}\n"
+                "AI 将不再代替工作人员作出后续处理决定；您可以继续补充信息，补充内容会同步到接管包。"
+            )
+            saved = save_chat_message(
+                session_id=session_id,
+                role="assistant",
+                content=reply,
+                trace_id=trace_id,
+                current_agent="人工协同控制器",
+                current_agent_id="human_copilot",
+                status="complete",
+                usage_source="not_applicable",
+            )
+            update_chat_trace(trace_id=trace_id, intent="handoff", agent_name="人工协同控制器", agent_id="human_copilot", status="complete")
+            yield f"event: delta\ndata: {json.dumps({'content': reply}, ensure_ascii=False)}\n\n"
+            yield f"event: done\ndata: {_safe_json_dumps({'status': 'complete', 'token_count': 0, 'message_id': saved.get('id') if saved else None, 'handoff': True, 'handoff_state': handoff_session.get('handoff_status'), 'handoff_policy': handoff_policy, 'handoff_package_available': True, 'trace_id': trace_id, 'usage_source': 'not_applicable'})}\n\n"
             done_yielded = True
             return
 
-        # If handoff is active, do not run the agent; tell user to wait.
-        if is_handoff_active(session_id):
-            reply = "当前会话已由人工接管，工作人员会尽快回复您，请稍候。"
-            save_chat_message(session_id=session_id, role="assistant", content=reply, trace_id=trace_id)
-            update_chat_trace(trace_id=trace_id, intent="handoff", agent_name="人工", status="complete")
-            yield f"event: delta\ndata: {json.dumps({'content': reply})}\n\n"
-            yield f"event: done\ndata: {_safe_json_dumps({'status': 'complete', 'token_count': 0, 'message_id': None, 'handoff': True, 'trace_id': trace_id})}\n\n"
+        current_handoff = get_chat_session(session_id) or {}
+        handoff_status = current_handoff.get("handoff_status") or "none"
+        if handoff_status == "waiting_user":
+            handoff_session = resume_handoff_after_owner_message(session_id)
+            reply = "已将您补充的信息同步给接管工作人员，人工处理已恢复。"
+        elif handoff_status in {"requested", "active"}:
+            handoff_session = current_handoff
+            reply = "当前会话正在人工协同处理中。您的补充信息已保存并会同步给工作人员，AI 不会重复作出处理决定。"
+        else:
+            handoff_session = None
+            reply = ""
+        if handoff_session is not None:
+            saved = save_chat_message(
+                session_id=session_id,
+                role="assistant",
+                content=reply,
+                trace_id=trace_id,
+                current_agent="人工协同控制器",
+                current_agent_id="human_copilot",
+                status="complete",
+                usage_source="not_applicable",
+            )
+            update_chat_trace(trace_id=trace_id, intent="handoff", agent_name="人工协同控制器", agent_id="human_copilot", status="complete")
+            yield f"event: delta\ndata: {json.dumps({'content': reply}, ensure_ascii=False)}\n\n"
+            yield f"event: done\ndata: {_safe_json_dumps({'status': 'complete', 'token_count': 0, 'message_id': saved.get('id') if saved else None, 'handoff': True, 'handoff_state': handoff_session.get('handoff_status'), 'handoff_package_available': True, 'trace_id': trace_id, 'usage_source': 'not_applicable'})}\n\n"
             done_yielded = True
             return
 
@@ -1481,12 +1628,11 @@ async def _stream_agent_response(
         full_content = _canonicalize_citation_markers(full_content)
         citations = _annotate_citation_usage(full_content, citations)
 
-        # AI-initiated handoff: if the agent explicitly asks to transfer.
+        # A natural-language phrase such as “建议转人工” must not mutate the
+        # responsibility state.  The model may recommend escalation, but only
+        # deterministic policy or an explicit owner/staff action creates a
+        # handoff record.
         ai_handoff = False
-        handoff_phrases = ["已为您转接人工", "已转人工", "已转接人工", "转接人工服务"]
-        if full_content and any(p in full_content for p in handoff_phrases):
-            ai_handoff = True
-            request_handoff(session_id, "AI 判断需要人工处理")
 
         # Determine the model actually used for this turn.
         runtime_model_id = skill_model_id if skill_model_id else MODEL_ID
@@ -1867,20 +2013,46 @@ async def chat_feedback(request: FeedbackRequest):
 
 @router.post("/handoff")
 async def chat_handoff(request: HandoffRequest):
-    """Request human handoff for a chat session."""
-    if not request.reason or not request.reason.strip():
-        raise HTTPException(status_code=400, detail="转人工原因不能为空")
-    session = request_handoff(request.session_id, request.reason.strip())
-    return {"status": "ok", "session": session}
+    """Owner-facing explicit transfer request with an inspectable context package."""
+    reason = (request.reason or "业主主动请求人工服务").strip()
+    policy = evaluate_handoff_policy("", explicit_reason=reason)
+    session = _request_handoff_with_context(request.session_id, policy, actor="owner")
+    return {"status": "ok", "session": session, "policy": policy, "package_available": True}
+
+
+@router.post("/handoff-policy")
+async def chat_handoff_policy(request: HandoffPolicyDiagnosticRequest):
+    """Explain the deterministic collaboration boundary without calling a model."""
+    return {"policy": evaluate_handoff_policy(request.message, mcp_calls=request.mcp_calls)}
 
 
 @router.get("/handoffs")
 async def chat_handoffs(
     status: Optional[str] = Query(None, description="Filter by handoff status"),
+    include_completed: bool = Query(False, description="Include closed/cancelled sessions"),
 ):
-    """List chat sessions awaiting or under human takeover."""
-    sessions = list_handoff_sessions(status=status)
+    """List actionable human-copilot sessions and their responsibility state."""
+    sessions = list_handoff_sessions(status=status, include_completed=include_completed)
     return {"sessions": sessions}
+
+
+@router.get("/handoff/{session_id}/package")
+async def chat_handoff_package(session_id: str):
+    try:
+        return get_handoff_package(session_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+
+@router.post("/handoff-claim")
+async def chat_handoff_claim(request: HandoffClaimRequest):
+    if not request.staff_name or not request.staff_name.strip():
+        raise HTTPException(status_code=400, detail="工作人员姓名不能为空")
+    try:
+        session = claim_handoff(request.session_id, request.staff_name.strip())
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    return {"status": "ok", "session": session}
 
 
 @router.post("/handoff-reply")
@@ -1889,10 +2061,16 @@ async def chat_handoff_reply(request: HandoffReplyRequest):
     if not request.message or not request.message.strip():
         raise HTTPException(status_code=400, detail="回复内容不能为空")
 
-    # Activate handoff if this is the first staff reply.
     current = get_chat_session(request.session_id)
-    if current is None or current.get("handoff_status") != "active":
-        activate_handoff(request.session_id, request.staff_name)
+    if current is None:
+        raise HTTPException(status_code=404, detail="会话不存在")
+    if current.get("handoff_status") in {"requested", "waiting_user"}:
+        try:
+            claim_handoff(request.session_id, request.staff_name)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+    elif current.get("handoff_status") != "active":
+        raise HTTPException(status_code=409, detail="当前状态不允许人工回复")
 
     save_chat_message(
         session_id=request.session_id,
@@ -1904,8 +2082,65 @@ async def chat_handoff_reply(request: HandoffReplyRequest):
     return {"status": "ok", "messages": messages, "session": session}
 
 
+@router.post("/handoff-waiting-user")
+async def chat_handoff_waiting_user(request: HandoffWaitForOwnerRequest):
+    if not request.message or not request.message.strip():
+        raise HTTPException(status_code=400, detail="请说明需要业主补充的信息")
+    try:
+        session = wait_for_handoff_user(request.session_id, request.staff_name.strip() or "物业工作人员", request.message.strip())
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    save_chat_message(session_id=request.session_id, role="staff", content=request.message.strip())
+    return {"status": "ok", "session": session}
+
+
 @router.post("/handoff-resolve")
 async def chat_handoff_resolve(request: HandoffResolveRequest):
-    """Resolve a handoff request."""
-    session = resolve_handoff(request.session_id)
+    """Record a human result; it remains reviewable until explicitly closed."""
+    staff_name = (request.staff_name or "物业工作人员").strip()
+    try:
+        session = resolve_handoff(request.session_id, request.resolution, staff_name)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    if request.resolution:
+        save_chat_message(session_id=request.session_id, role="staff", content=request.resolution.strip())
+    badcase = None
+    if request.create_badcase:
+        package = get_handoff_package(request.session_id)
+        badcase = create_badcase(
+            title="人工协同需复盘",
+            description=request.resolution or "工作人员标记该人工协同需要沉淀为 Badcase。",
+            category="response_quality",
+            status="pending",
+            created_at=now_cn(),
+            evidence=json.dumps(package.get("package") or {}, ensure_ascii=False, default=str),
+            session_id=request.session_id,
+            source="human_handoff",
+            original_query=((package.get("package") or {}).get("owner_request") or {}).get("content") or "",
+            feedback_reason=request.resolution or "人工协同复盘",
+            context_json=json.dumps(package, ensure_ascii=False, default=str),
+            priority="medium",
+        )
+        add_badcase_action(
+            badcase_id=badcase["id"], action_type="human_handoff_outcome", action_detail=json.dumps({"session_id": request.session_id}, ensure_ascii=False),
+            status_before="pending", status_after="pending", created_by=staff_name,
+        )
+    return {"status": "ok", "session": session, "badcase": badcase}
+
+
+@router.post("/handoff-close")
+async def chat_handoff_close(request: HandoffCloseRequest):
+    try:
+        session = close_handoff(request.session_id, (request.staff_name or "物业工作人员").strip())
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    return {"status": "ok", "session": session}
+
+
+@router.post("/handoff-cancel")
+async def chat_handoff_cancel(request: HandoffCancelRequest):
+    try:
+        session = cancel_handoff(request.session_id, "owner", request.reason)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
     return {"status": "ok", "session": session}

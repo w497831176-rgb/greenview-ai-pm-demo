@@ -14,6 +14,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from app.handoff_policy import HANDOFF_TRANSITIONS, is_transition_allowed
+
 # Persist DB on the mounted volume so data survives container restarts.
 DB_DIR = Path(os.getenv("PROPERTY_DATA_DIR", "/app/data"))
 DB_DIR.mkdir(parents=True, exist_ok=True)
@@ -349,6 +351,45 @@ def init_db():
             updated_at TEXT
         )
         """
+    )
+
+    # V1.5.3: Human copilot is a responsibility workflow, not just a boolean
+    # transfer flag.  All additions are non-destructive migrations so existing
+    # owner conversations stay available after upgrade.
+    for col, dtype in [
+        ("handoff_risk_level", "TEXT"),
+        ("handoff_reason_code", "TEXT"),
+        ("handoff_queue", "TEXT"),
+        ("handoff_package_json", "TEXT"),
+        ("handoff_summary", "TEXT"),
+        ("handoff_outcome", "TEXT"),
+        ("handoff_waiting_at", "TEXT"),
+        ("handoff_closed_at", "TEXT"),
+        ("handoff_cancelled_at", "TEXT"),
+        ("handoff_last_actor", "TEXT"),
+        ("handoff_last_action_at", "TEXT"),
+    ]:
+        try:
+            cursor.execute(f"ALTER TABLE chat_sessions ADD COLUMN {col} {dtype}")
+        except sqlite3.OperationalError:
+            pass
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS handoff_actions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            action_type TEXT NOT NULL,
+            status_before TEXT,
+            status_after TEXT,
+            actor TEXT,
+            action_detail TEXT,
+            created_at TEXT
+        )
+        """
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_handoff_actions_session ON handoff_actions(session_id, id)"
     )
 
     # Migration: add session metadata columns.
@@ -3443,67 +3484,207 @@ def list_user_chat_sessions(user_id: Optional[str] = None, limit: int = 100) -> 
     return [dict(r) for r in rows]
 
 
-def request_handoff(session_id: str, reason: str) -> Dict[str, Any]:
-    """Mark a session as waiting for human takeover."""
+def _normalize_handoff_session(session: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not session:
+        return None
+    raw_package = session.get("handoff_package_json")
+    if raw_package:
+        try:
+            session["handoff_package"] = json.loads(raw_package)
+        except (TypeError, json.JSONDecodeError):
+            session["handoff_package"] = None
+    else:
+        session["handoff_package"] = None
+    return session
+
+
+def _record_handoff_action(
+    cursor: sqlite3.Cursor,
+    session_id: str,
+    action_type: str,
+    status_before: Optional[str],
+    status_after: Optional[str],
+    actor: str,
+    detail: Optional[Dict[str, Any]] = None,
+) -> None:
+    cursor.execute(
+        """
+        INSERT INTO handoff_actions
+        (session_id, action_type, status_before, status_after, actor, action_detail, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            session_id,
+            action_type,
+            status_before,
+            status_after,
+            actor,
+            json.dumps(detail or {}, ensure_ascii=False, default=str),
+            now_cn(),
+        ),
+    )
+
+
+def list_handoff_actions(session_id: str) -> List[Dict[str, Any]]:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM handoff_actions WHERE session_id = ? ORDER BY id ASC", (session_id,))
+    rows = []
+    for row in cursor.fetchall():
+        item = dict(row)
+        if item.get("action_detail"):
+            try:
+                item["action_detail"] = json.loads(item["action_detail"])
+            except (TypeError, json.JSONDecodeError):
+                pass
+        rows.append(item)
+    conn.close()
+    return rows
+
+
+def _load_session_for_transition(cursor: sqlite3.Cursor, session_id: str) -> Dict[str, Any]:
+    cursor.execute("SELECT * FROM chat_sessions WHERE session_id = ?", (session_id,))
+    row = cursor.fetchone()
+    if not row:
+        raise ValueError("会话不存在")
+    return dict(row)
+
+
+def request_handoff(
+    session_id: str,
+    reason: str,
+    *,
+    risk_level: str = "L3",
+    reason_code: str = "owner_requested",
+    queue: Optional[str] = "property_service",
+    handoff_package: Optional[Dict[str, Any]] = None,
+    actor: str = "owner",
+) -> Dict[str, Any]:
+    """Create or refresh a human-takeover request with its evidence package.
+
+    A repeated request never silently takes a session away from an active staff
+    member.  It only refreshes context and writes an audit action.
+    """
     ensure_chat_session(session_id)
     now = now_cn()
     conn = _get_conn()
     cursor = conn.cursor()
-    cursor.execute(
-        """
-        UPDATE chat_sessions
-        SET handoff_status = 'requested',
-            handoff_reason = ?,
-            handoff_requested_at = ?,
-            updated_at = ?
-        WHERE session_id = ?
-        """,
-        (reason, now, now, session_id),
+    current = _load_session_for_transition(cursor, session_id)
+    before = current.get("handoff_status") or "none"
+    target = "requested" if before in {"none", "cancelled", "closed", "resolved"} else before
+    package_json = json.dumps(handoff_package, ensure_ascii=False, default=str) if handoff_package else current.get("handoff_package_json")
+    fields = [
+        "handoff_reason = ?", "handoff_risk_level = ?", "handoff_reason_code = ?", "handoff_queue = ?",
+        "handoff_package_json = ?", "handoff_last_actor = ?", "handoff_last_action_at = ?", "updated_at = ?",
+    ]
+    params: List[Any] = [reason, risk_level, reason_code, queue, package_json, actor, now, now]
+    if target != before:
+        fields.extend([
+            "handoff_status = ?", "handoff_requested_at = ?", "handoff_active_at = NULL",
+            "handoff_waiting_at = NULL", "handoff_resolved_at = NULL", "handoff_closed_at = NULL",
+            "handoff_cancelled_at = NULL", "handoff_summary = NULL", "handoff_outcome = NULL", "assigned_to = NULL",
+        ])
+        params.extend([target, now])
+    cursor.execute(f"UPDATE chat_sessions SET {', '.join(fields)} WHERE session_id = ?", tuple(params + [session_id]))
+    _record_handoff_action(
+        cursor, session_id, "request" if target != before else "request_refresh", before, target, actor,
+        {"reason": reason, "risk_level": risk_level, "reason_code": reason_code, "queue": queue},
     )
     conn.commit()
     conn.close()
-    return get_chat_session(session_id)
+    return get_chat_session(session_id) or {"session_id": session_id, "handoff_status": target}
+
+
+def _transition_handoff(
+    session_id: str,
+    target: str,
+    *,
+    action_type: str,
+    actor: str,
+    detail: Optional[Dict[str, Any]] = None,
+    assigned_to: Optional[str] = None,
+    summary: Optional[str] = None,
+) -> Dict[str, Any]:
+    ensure_chat_session(session_id)
+    now = now_cn()
+    conn = _get_conn()
+    cursor = conn.cursor()
+    current = _load_session_for_transition(cursor, session_id)
+    before = current.get("handoff_status") or "none"
+    if not is_transition_allowed(before, target):
+        conn.close()
+        raise ValueError(f"人工协同状态不能从 {before} 变更为 {target}")
+    fields = ["handoff_status = ?", "handoff_last_actor = ?", "handoff_last_action_at = ?", "updated_at = ?"]
+    params: List[Any] = [target, actor, now, now]
+    if target == "active":
+        fields.extend(["assigned_to = ?", "handoff_active_at = ?"])
+        params.extend([assigned_to or current.get("assigned_to") or actor, now])
+    elif target == "waiting_user":
+        fields.append("handoff_waiting_at = ?")
+        params.append(now)
+    elif target == "resolved":
+        resolved_summary = summary or "工作人员已给出处理结论，等待业主确认。"
+        fields.extend(["handoff_resolved_at = ?", "handoff_summary = ?", "handoff_outcome = ?"])
+        params.extend([now, resolved_summary, resolved_summary])
+    elif target == "closed":
+        fields.append("handoff_closed_at = ?")
+        params.append(now)
+    elif target == "cancelled":
+        fields.append("handoff_cancelled_at = ?")
+        params.append(now)
+    cursor.execute(f"UPDATE chat_sessions SET {', '.join(fields)} WHERE session_id = ?", tuple(params + [session_id]))
+    _record_handoff_action(cursor, session_id, action_type, before, target, actor, detail)
+    conn.commit()
+    conn.close()
+    return get_chat_session(session_id) or {"session_id": session_id, "handoff_status": target}
+
+
+def claim_handoff(session_id: str, staff_name: str) -> Dict[str, Any]:
+    return _transition_handoff(
+        session_id, "active", action_type="claim", actor=staff_name, assigned_to=staff_name,
+        detail={"assigned_to": staff_name},
+    )
 
 
 def activate_handoff(session_id: str, assigned_to: str) -> Dict[str, Any]:
-    """Mark a handoff as actively taken by a staff member."""
-    now = now_cn()
-    conn = _get_conn()
-    cursor = conn.cursor()
-    cursor.execute(
-        """
-        UPDATE chat_sessions
-        SET handoff_status = 'active',
-            assigned_to = ?,
-            handoff_active_at = ?,
-            updated_at = ?
-        WHERE session_id = ?
-        """,
-        (assigned_to, now, now, session_id),
-    )
-    conn.commit()
-    conn.close()
-    return get_chat_session(session_id)
+    """Backward-compatible alias for the explicit staff claim action."""
+    return claim_handoff(session_id, assigned_to)
 
 
-def resolve_handoff(session_id: str) -> Dict[str, Any]:
-    """Resolve a handoff request."""
-    now = now_cn()
-    conn = _get_conn()
-    cursor = conn.cursor()
-    cursor.execute(
-        """
-        UPDATE chat_sessions
-        SET handoff_status = 'resolved',
-            handoff_resolved_at = ?,
-            updated_at = ?
-        WHERE session_id = ?
-        """,
-        (now, now, session_id),
+def wait_for_handoff_user(session_id: str, staff_name: str, prompt: str) -> Dict[str, Any]:
+    return _transition_handoff(
+        session_id, "waiting_user", action_type="request_owner_input", actor=staff_name,
+        detail={"prompt": prompt},
     )
-    conn.commit()
-    conn.close()
-    return get_chat_session(session_id)
+
+
+def resume_handoff_after_owner_message(session_id: str) -> Dict[str, Any]:
+    session = get_chat_session(session_id) or {}
+    return _transition_handoff(
+        session_id, "active", action_type="owner_supplied_requested_info", actor="owner",
+        assigned_to=session.get("assigned_to") or "物业工作人员",
+        detail={"note": "业主已补充工作人员要求的信息"},
+    )
+
+
+def resolve_handoff(session_id: str, resolution: Optional[str] = None, staff_name: str = "物业工作人员") -> Dict[str, Any]:
+    return _transition_handoff(
+        session_id, "resolved", action_type="resolve", actor=staff_name, summary=resolution,
+        detail={"resolution": resolution or ""},
+    )
+
+
+def close_handoff(session_id: str, staff_name: str = "物业工作人员") -> Dict[str, Any]:
+    return _transition_handoff(
+        session_id, "closed", action_type="close", actor=staff_name,
+        detail={"note": "人工协同闭环已关闭"},
+    )
+
+
+def cancel_handoff(session_id: str, actor: str = "owner", reason: Optional[str] = None) -> Dict[str, Any]:
+    return _transition_handoff(
+        session_id, "cancelled", action_type="cancel", actor=actor, detail={"reason": reason or ""},
+    )
 
 
 def get_chat_session(session_id: str) -> Optional[Dict[str, Any]]:
@@ -3512,35 +3693,38 @@ def get_chat_session(session_id: str) -> Optional[Dict[str, Any]]:
     cursor.execute("SELECT * FROM chat_sessions WHERE session_id = ?", (session_id,))
     row = cursor.fetchone()
     conn.close()
-    return dict(row) if row else None
+    return _normalize_handoff_session(dict(row)) if row else None
 
 
-def list_handoff_sessions(status: Optional[str] = None) -> List[Dict[str, Any]]:
-    """Return chat sessions that need or are under human takeover."""
+def get_handoff_package(session_id: str) -> Dict[str, Any]:
+    session = get_chat_session(session_id)
+    if not session:
+        raise ValueError("会话不存在")
+    return {"session": session, "package": session.get("handoff_package") or {}, "actions": list_handoff_actions(session_id)}
+
+
+def list_handoff_sessions(status: Optional[str] = None, include_completed: bool = False) -> List[Dict[str, Any]]:
+    """Return actionable human-copilot sessions, including result review by default."""
     conn = _get_conn()
     cursor = conn.cursor()
     if status:
-        cursor.execute(
-            "SELECT * FROM chat_sessions WHERE handoff_status = ? ORDER BY handoff_requested_at DESC",
-            (status,),
-        )
+        cursor.execute("SELECT * FROM chat_sessions WHERE handoff_status = ? ORDER BY handoff_last_action_at DESC, handoff_requested_at DESC", (status,))
+    elif include_completed:
+        cursor.execute("SELECT * FROM chat_sessions WHERE handoff_status != 'none' ORDER BY handoff_last_action_at DESC, handoff_requested_at DESC")
     else:
-        cursor.execute(
-            "SELECT * FROM chat_sessions WHERE handoff_status IN ('requested', 'active') ORDER BY handoff_requested_at DESC"
-        )
+        cursor.execute("SELECT * FROM chat_sessions WHERE handoff_status IN ('requested', 'active', 'waiting_user', 'resolved') ORDER BY handoff_last_action_at DESC, handoff_requested_at DESC")
     rows = cursor.fetchall()
     conn.close()
-    return [dict(r) for r in rows]
+    return [_normalize_handoff_session(dict(row)) or {} for row in rows]
 
 
 def is_handoff_active(session_id: str) -> bool:
-    """Return True if the session is under active human takeover."""
+    """Return True when AI must yield responsibility to a human."""
     session = get_chat_session(session_id)
-    return session is not None and session.get("handoff_status") == "active"
+    return session is not None and session.get("handoff_status") in {"requested", "active"}
 
 
 def is_handoff_requested(session_id: str) -> bool:
-    """Return True if the session has a pending handoff request."""
     session = get_chat_session(session_id)
     return session is not None and session.get("handoff_status") == "requested"
 
