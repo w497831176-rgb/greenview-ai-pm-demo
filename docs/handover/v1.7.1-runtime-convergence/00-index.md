@@ -24,6 +24,7 @@
 5. [05-deployment-data-and-safety-boundaries.md](05-deployment-data-and-safety-boundaries.md)：NAS、数据卷、Git 与部署边界。
 6. [06-manual-demo-and-acceptance-matrix.md](06-manual-demo-and-acceptance-matrix.md)：用户如何手点、接手者如何低成本验收。
 7. [07-new-coding-session-bootstrap.md](07-new-coding-session-bootstrap.md)：可直接复制给新会话的完整提示词。
+8. [08-v1.8-enterprise-runtime-architecture-contract.md](08-v1.8-enterprise-runtime-architecture-contract.md)：V1.8 经企业级架构复核后的静态权威契约；后续实现不得只凭聊天上下文偏离。
 
 ## 绝对优先级
 
