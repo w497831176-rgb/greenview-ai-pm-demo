@@ -11,6 +11,7 @@
 - 仓库：`https://github.com/w497831176-rgb/greenview-ai-pm-demo`
 - 基线：`main` / annotated tag `v1.7.1`
 - 基线提交：`c531d97e582fe9d7feb567701d3b9c391bb5e17b`
+- 本交接包所在分支：`docs/v1.7.1-runtime-convergence-handover`（故默认 `main` clone 不会自动包含这些文档）。
 - 本次交接时的代码状态：V1.7.1 已修复“完整报修字段未进入工作流”“确认提交未真建单”“动态儿童教育 Skill 未命中”三项运行时契约。
 - 不应把任何旧版本（V1.2～V1.7.0）的展示描述当成当前事实；先以此 tag、代码和实际数据库配置为准。
 

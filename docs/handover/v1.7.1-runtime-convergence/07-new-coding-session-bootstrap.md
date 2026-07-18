@@ -12,9 +12,20 @@ https://github.com/w497831176-rgb/greenview-ai-pm-demo
 main / annotated tag v1.7.1
 commit: c531d97e582fe9d7feb567701d3b9c391bb5e17b
 
-先阅读仓库：
-docs/handover/v1.7.1-runtime-convergence/00-index.md
-及其 01～06 全部文档。
+交接文档在独立分支 `docs/v1.7.1-runtime-convergence-handover`，尚未合入 main。
+先执行只读获取：
+
+```bash
+git fetch origin docs/v1.7.1-runtime-convergence-handover
+```
+
+然后读取：
+
+```bash
+git show origin/docs/v1.7.1-runtime-convergence-handover:docs/handover/v1.7.1-runtime-convergence/00-index.md
+```
+
+再依次读取同目录 `01` 至 `06` 全部文档。不要把文档分支 checkout 到 NAS 正在运行的 main 工作目录。
 
 【项目目的】
 这不是要建设生产物业系统。它是我面试企业级 AI 产品经理时，用来证明自己对 AI 技术栈“知其然也知其所以然”的演示项目。
