@@ -568,6 +568,11 @@ def init_db():
         _seed_model_configs(cursor)
         conn.commit()
 
+    # V1.3 observability creates model_prices/budget/trace tables.  It must run
+    # before later price migrations so a brand-new database boots cleanly.
+    _migrate_v1_3_observability(cursor)
+    conn.commit()
+
     # V1.4.3: enforce official DeepSeek prices without deleting user-added rows.
     _migrate_official_prices_v143(cursor)
     conn.commit()
@@ -582,10 +587,6 @@ def init_db():
 
     # V1.4.3: one-time MCP hygiene migration only.
     _migrate_mcp_hygiene_v143(cursor)
-    conn.commit()
-
-    # V1.3 observability & cost governance schema.
-    _migrate_v1_3_observability(cursor)
     conn.commit()
 
     # V1.3.3 Badcase operational closure schema.
@@ -1659,7 +1660,7 @@ def _migrate_runtime_contract(cursor):
 def _migrate_mcp_hygiene_v143(cursor):
     """One-time MCP hygiene migration for V1.4.3.
 
-    - Ensures canonical demo MCP server rows exist via INSERT OR IGNORE.
+    - Ensures canonical demo MCP server rows exist via an explicit name lookup.
     - Does NOT update command/args/description/enabled of existing servers.
     - Does NOT delete user-created MCP servers or bindings.
     - Does NOT force agent-tool bindings on maintenance/customer_service.
@@ -1693,12 +1694,17 @@ def _migrate_mcp_hygiene_v143(cursor):
 
     for server in canonical_servers:
         cursor.execute(
-            """
-            INSERT OR IGNORE INTO mcp_servers (name, command, args, env, description, enabled, is_builtin, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, 1, 1, ?, ?)
-            """,
-            (server["name"], server["command"], json.dumps(server["args"]), "{}", server["description"], now, now),
+            "SELECT 1 FROM mcp_servers WHERE name = ? LIMIT 1",
+            (server["name"],),
         )
+        if cursor.fetchone() is None:
+            cursor.execute(
+                """
+                INSERT INTO mcp_servers (name, command, args, env, description, enabled, is_builtin, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, 1, 1, ?, ?)
+                """,
+                (server["name"], server["command"], json.dumps(server["args"]), "{}", server["description"], now, now),
+            )
 
     cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_mcp_servers_name ON mcp_servers(name)")
     _mark_migration_applied(cursor, "v143_mcp_hygiene", now)

@@ -3,11 +3,19 @@
 from __future__ import annotations
 
 import os
+import sys
 import tempfile
 from pathlib import Path
 
 
-TEMP_DIR = tempfile.TemporaryDirectory(prefix="yiai-v180-")
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+TEMP_DIR = tempfile.TemporaryDirectory(
+    prefix="yiai-v180-",
+    ignore_cleanup_errors=True,
+)
 os.environ["PROPERTY_DATA_DIR"] = TEMP_DIR.name
 os.environ["RUNTIME_ENGINE"] = "v18"
 

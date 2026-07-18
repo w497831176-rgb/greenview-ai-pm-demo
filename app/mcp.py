@@ -226,10 +226,10 @@ async def discover_server_tools(server: Dict[str, Any]) -> List[Dict[str, Any]]:
                     name = getattr(tool, "name", "")
                     description = getattr(tool, "description", "") or ""
                     input_schema = getattr(tool, "inputSchema", {}) or {}
-                prior_metadata = (
-                    existing_by_name.get(str(name), {}).get("tool_metadata") or {}
-                )
-                tool_metadata = {**prior_metadata, "source": "discovered"}
+                    prior_metadata = (
+                        existing_by_name.get(str(name), {}).get("tool_metadata") or {}
+                    )
+                    tool_metadata = {**prior_metadata, "source": "discovered"}
                     save_mcp_tool(
                         server_id=server_id,
                         name=name,
