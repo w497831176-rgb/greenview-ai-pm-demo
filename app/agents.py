@@ -102,6 +102,13 @@ def _serialize_agent(agent: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]
     agent["available_mcp_tools"] = [
         t.get("tool_name") for t in agent["tools"] if t.get("tool_name")
     ]
+    agent["runtime_registration"] = {
+        "router_candidate": bool(agent.get("enabled")) and not agent["is_router"],
+        "effective_on": "next_owner_message" if bool(agent.get("enabled")) and not agent["is_router"] else None,
+        "skill_binding_count": len(agent["skill_ids"]),
+        "mcp_server_binding_count": len(agent["available_mcp_tools"]),
+        "note": "启用的垂直 Agent 会在下一条业主消息进入路由候选池；无需重启服务。",
+    }
     if agent.get("is_router"):
         agent["members"] = _get_router_members()
     return agent

@@ -17,11 +17,18 @@ from db.property_db import get_agent_by_agent_id
 
 def _base_router_instructions(vertical_agents: List[Dict[str, Any]]) -> List[str]:
     """Build router instructions from DB Router config + current enabled vertical agents."""
-    valid_targets = [
-        {"agent_id": a.get("agent_id"), "name": a.get("name"), "description": a.get("description", "")}
-        for a in vertical_agents
-        if a.get("agent_id") and a.get("enabled")
-    ]
+    valid_targets = []
+    for agent in vertical_agents:
+        if not agent.get("agent_id") or not agent.get("enabled"):
+            continue
+        card = agent.get("capability_card") or {}
+        valid_targets.append({
+            "agent_id": agent.get("agent_id"),
+            "name": agent.get("name"),
+            "description": agent.get("description", ""),
+            "skills": [str(item.get("name")) for item in card.get("skills") or [] if item.get("name")],
+            "mcp_servers": [str(item.get("name")) for item in card.get("mcp_servers") or [] if item.get("name")],
+        })
     if not valid_targets:
         valid_targets = [
             {"agent_id": "maintenance", "name": "维修 Agent", "description": "维修报修"},
@@ -31,6 +38,8 @@ def _base_router_instructions(vertical_agents: List[Dict[str, Any]]) -> List[str
         ]
     target_lines = "\n".join(
         f'- {t["agent_id"]}（{t["name"]}）：{t["description"] or "无描述"}'
+        + (f'；Skill={"、".join(t["skills"])}' if t.get("skills") else "")
+        + (f'；MCP={"、".join(t["mcp_servers"])}' if t.get("mcp_servers") else "")
         for t in valid_targets
     )
 
@@ -113,6 +122,112 @@ def _fallback_reason(message: str, target_agent_id: str, vertical_agents: Option
     return f"根据问题内容与{target_name}的服务范围匹配，由{target_name}处理。"
 
 
+_ROUTING_STOP_TERMS = {
+    "负责", "处理", "服务", "咨询", "问题", "用户", "业主", "相关", "当前", "需要", "可以",
+    "系统", "平台", "能力", "帮助", "提供", "进行", "通过", "以及", "一般", "工作",
+}
+
+
+_CANONICAL_FALLBACK_TERMS = {
+    "maintenance": ("报修", "漏水", "维修", "工单", "电梯", "下水道", "上门", "师傅"),
+    "billing": ("缴费", "物业费", "账单", "收费", "费用", "停车费", "价格"),
+    "complaint": ("投诉", "扰民", "纠纷", "噪音", "赔偿", "不满意", "举报"),
+}
+
+
+def _routing_terms(agent: Dict[str, Any]) -> List[tuple[str, str]]:
+    """Extract compact routing signals from an Agent's live capability card."""
+    card = agent.get("capability_card") or {}
+    sources: List[tuple[str, str]] = [
+        ("Agent 名称", str(agent.get("name") or "")),
+        ("服务范围", str(agent.get("description") or card.get("service_scope") or "")),
+        ("路由提示", str(card.get("routing_hints") or "")),
+    ]
+    for skill in card.get("skills") or []:
+        sources.append(("绑定 Skill", str(skill.get("name") or "")))
+        for trigger in skill.get("positive_triggers") or []:
+            sources.append(("Skill 触发词", str(trigger)))
+        for hint in skill.get("tool_hints") or []:
+            sources.append(("Skill 工具提示", str(hint)))
+    for server in card.get("mcp_servers") or []:
+        sources.append(("绑定 MCP", str(server.get("name") or "")))
+        sources.append(("MCP 说明", str(server.get("description") or "")))
+        for tool_name in server.get("tools") or []:
+            sources.append(("MCP 工具", str(tool_name)))
+
+    terms: List[tuple[str, str]] = []
+    seen: set[str] = set()
+    for source, text in sources:
+        for phrase in re.findall(r"[\u4e00-\u9fff]{2,16}|[a-zA-Z][a-zA-Z0-9_-]{2,}", text or ""):
+            phrase = phrase.strip().lower()
+            if phrase in _ROUTING_STOP_TERMS or phrase in seen:
+                continue
+            seen.add(phrase)
+            terms.append((phrase, source))
+            # Long Chinese capability phrases are useful both as a whole and
+            # via short meaningful windows, e.g. “老年关怀” -> “老年”.
+            if len(phrase) >= 4 and re.fullmatch(r"[\u4e00-\u9fff]+", phrase):
+                for size in (2, 3, 4):
+                    for start in range(0, len(phrase) - size + 1):
+                        window = phrase[start : start + size]
+                        if window not in _ROUTING_STOP_TERMS and window not in seen:
+                            seen.add(window)
+                            terms.append((window, source))
+    return terms
+
+
+def _capability_fallback(message: str, vertical_agents: Optional[List[Dict[str, Any]]]) -> tuple[str, str, List[Dict[str, Any]]]:
+    """Choose a live Agent when Router JSON is absent or invalid.
+
+    This is deliberately capability-driven: all currently enabled vertical
+    Agents participate, including an Agent created seconds ago in the console.
+    Canonical property terms give reliable emergency/business fallbacks, while
+    names, descriptions, Skill triggers and bound MCP tools make extension
+    domains such as child education or elderly care routable without code edits.
+    """
+    agents = [dict(agent) for agent in (vertical_agents or []) if agent.get("enabled") and agent.get("agent_id")]
+    if not agents:
+        return "customer_service", "能力回退：没有可用垂直 Agent，降级到客服。", []
+
+    lowered = (message or "").lower()
+    scored: List[Dict[str, Any]] = []
+    for order, agent in enumerate(agents):
+        agent_id = str(agent.get("agent_id"))
+        score = 0
+        matches: List[Dict[str, Any]] = []
+        for term in _CANONICAL_FALLBACK_TERMS.get(agent_id, ()):
+            if term in lowered:
+                weight = 100 + min(len(term), 6)
+                score += weight
+                matches.append({"term": term, "source": "基础业务规则", "weight": weight})
+        for term, source in _routing_terms(agent):
+            if len(term) < 2 or term not in lowered:
+                continue
+            # Descriptions / Skill triggers are stronger than a bare tool name.
+            weight = 35 + min(len(term), 8) * 4
+            if source in {"服务范围", "绑定 Skill", "Skill 触发词"}:
+                weight += 15
+            score += weight
+            matches.append({"term": term, "source": source, "weight": weight})
+        scored.append({"agent_id": agent_id, "name": agent.get("name") or agent_id, "score": score, "matches": matches, "order": order})
+
+    scored.sort(key=lambda item: (-item["score"], item["order"]))
+    winner = scored[0]
+    if winner["score"] <= 0:
+        customer = next((item for item in scored if item["agent_id"] == "customer_service"), winner)
+        return (
+            customer["agent_id"],
+            f"能力回退：未命中特定能力，转由{customer['name']}承接通用咨询。",
+            scored,
+        )
+    strongest = winner["matches"][0]
+    return (
+        winner["agent_id"],
+        f"能力回退：命中“{strongest['term']}”（{strongest['source']}），与{winner['name']}的已配置能力匹配。",
+        scored,
+    )
+
+
 async def classify_intent(
     message: str,
     vertical_agents: Optional[List[Dict[str, Any]]] = None,
@@ -127,10 +242,19 @@ async def classify_intent(
     enabled_ids = {a.get("agent_id") for a in vertical_agents if a.get("enabled") and a.get("agent_id")}
     if not enabled_ids:
         enabled_ids = {"maintenance", "billing", "complaint", "customer_service"}
-    valid_lines = "\n".join(
-        f'- {a.get("agent_id")}（{a.get("name")}）：{a.get("description") or "无描述"}'
-        for a in vertical_agents if a.get("enabled") and a.get("agent_id")
-    ) or "- maintenance（维修 Agent）\n- billing（费用 Agent）\n- complaint（投诉 Agent）\n- customer_service（客服 Agent）"
+    valid_entries = []
+    for agent in vertical_agents:
+        if not agent.get("enabled") or not agent.get("agent_id"):
+            continue
+        card = agent.get("capability_card") or {}
+        skills = [str(item.get("name")) for item in card.get("skills") or [] if item.get("name")]
+        mcp_servers = [str(item.get("name")) for item in card.get("mcp_servers") or [] if item.get("name")]
+        valid_entries.append(
+            f'- {agent.get("agent_id")}（{agent.get("name")}）：{agent.get("description") or "无描述"}'
+            + (f'；绑定 Skill={"、".join(skills)}' if skills else "")
+            + (f'；绑定 MCP={"、".join(mcp_servers)}' if mcp_servers else "")
+        )
+    valid_lines = "\n".join(valid_entries) or "- maintenance（维修 Agent）\n- billing（费用 Agent）\n- complaint（投诉 Agent）\n- customer_service（客服 Agent）"
     prompt = (
         "请判断以下业主问题的意图，并从当前启用的垂直 Agent 中选择一个目标。只输出 JSON，不要添加其他解释。\n"
         "选择规则：优先选择描述与用户问题关键词最匹配的垂直 Agent；"
@@ -170,14 +294,26 @@ async def classify_intent(
             target = parsed.get("target_agent_id", parsed.get("intent", "customer_service"))
             reason = parsed.get("reason", "")
         else:
-            target = _keyword_intent(message, vertical_agents)
-            reason = _fallback_reason(message, target, vertical_agents)
-            route_mode = "rule_fallback"
+            target, reason, fallback_scores = _capability_fallback(message, vertical_agents)
+            route_mode = "capability_fallback"
 
+        capability_target, capability_reason, capability_scores = _capability_fallback(message, vertical_agents)
         if target not in enabled_ids:
-            target = _keyword_intent(message, vertical_agents)
-            reason = _fallback_reason(message, target, vertical_agents)
-            route_mode = "rule_fallback"
+            target, reason, fallback_scores = capability_target, capability_reason, capability_scores
+            route_mode = "capability_fallback"
+        elif route_mode == "model_success" and capability_target != target:
+            # A valid JSON response can still be an obviously weaker choice.
+            # Only correct it when the live capability evidence is decisive;
+            # this keeps fuzzy new domains under model control while ensuring
+            # a repair/work-order composite does not fall through to customer
+            # service merely because the Router returned syntactically valid JSON.
+            score_by_id = {item["agent_id"]: item["score"] for item in capability_scores}
+            best_score = score_by_id.get(capability_target, 0)
+            selected_score = score_by_id.get(target, 0)
+            if best_score >= 100 and best_score >= selected_score + 45:
+                target = capability_target
+                reason = f"能力策略校正：{capability_reason}"
+                route_mode = "capability_policy_override"
 
         return {
             "target_agent_id": target,
@@ -185,16 +321,23 @@ async def classify_intent(
             "raw": raw_response,
             "route_mode": route_mode,
             "metrics": metrics,
+            "fallback_scores": (
+                fallback_scores if route_mode == "capability_fallback"
+                else capability_scores if route_mode == "capability_policy_override"
+                else []
+            ),
         }
     except Exception:
         import traceback
         traceback.print_exc()
+        target, reason, fallback_scores = _capability_fallback(message, vertical_agents)
         return {
-            "target_agent_id": _keyword_intent(message, vertical_agents),
-            "reason": _fallback_reason(message, _keyword_intent(message, vertical_agents), vertical_agents),
+            "target_agent_id": target,
+            "reason": reason,
             "raw": raw_response,
-            "route_mode": "rule_fallback",
+            "route_mode": "capability_fallback",
             "metrics": metrics,
+            "fallback_scores": fallback_scores,
         }
 
 
