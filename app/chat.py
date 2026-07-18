@@ -1310,6 +1310,10 @@ def _extract_tool_calls(chunk: Any) -> List[Dict[str, Any]]:
                     })
     except Exception:
         pass
+    # Some Agno response metadata objects describe the tool schema rather
+    # than an invocation.  They have no callable name and must not be sent
+    # to the UI or persisted as a phantom tool call.
+    tool_calls = [call for call in tool_calls if str(call.get("tool_name") or "").strip()]
     return tool_calls
 
 
