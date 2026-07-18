@@ -568,6 +568,11 @@ def init_db():
         _seed_model_configs(cursor)
         conn.commit()
 
+    # V1.3 observability creates model_prices/budget/trace tables.  It must run
+    # before later price migrations so a brand-new database boots cleanly.
+    _migrate_v1_3_observability(cursor)
+    conn.commit()
+
     # V1.4.3: enforce official DeepSeek prices without deleting user-added rows.
     _migrate_official_prices_v143(cursor)
     conn.commit()
@@ -584,10 +589,6 @@ def init_db():
     _migrate_mcp_hygiene_v143(cursor)
     conn.commit()
 
-    # V1.3 observability & cost governance schema.
-    _migrate_v1_3_observability(cursor)
-    conn.commit()
-
     # V1.3.3 Badcase operational closure schema.
     _migrate_v1_3_3_badcase_closure(cursor)
     conn.commit()
@@ -595,6 +596,13 @@ def init_db():
     # V1.6: Quality operations loop.  This migration only adds explainability
     # and evaluation records; it never rewrites existing business data.
     _migrate_v1_6_quality_governance(cursor)
+    conn.commit()
+
+    # V1.8: versioned runtime releases, immutable per-session snapshots,
+    # governed tool/action execution and a single evidence ledger.  This is an
+    # additive migration only: existing platform configuration and business
+    # records are never rewritten during startup.
+    _migrate_v1_8_runtime_convergence(cursor)
     conn.commit()
 
     # V1.5.2: create a non-destructive baseline snapshot for existing Skills.
@@ -1652,7 +1660,7 @@ def _migrate_runtime_contract(cursor):
 def _migrate_mcp_hygiene_v143(cursor):
     """One-time MCP hygiene migration for V1.4.3.
 
-    - Ensures canonical demo MCP server rows exist via INSERT OR IGNORE.
+    - Ensures canonical demo MCP server rows exist via an explicit name lookup.
     - Does NOT update command/args/description/enabled of existing servers.
     - Does NOT delete user-created MCP servers or bindings.
     - Does NOT force agent-tool bindings on maintenance/customer_service.
@@ -1686,12 +1694,17 @@ def _migrate_mcp_hygiene_v143(cursor):
 
     for server in canonical_servers:
         cursor.execute(
-            """
-            INSERT OR IGNORE INTO mcp_servers (name, command, args, env, description, enabled, is_builtin, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, 1, 1, ?, ?)
-            """,
-            (server["name"], server["command"], json.dumps(server["args"]), "{}", server["description"], now, now),
+            "SELECT 1 FROM mcp_servers WHERE name = ? LIMIT 1",
+            (server["name"],),
         )
+        if cursor.fetchone() is None:
+            cursor.execute(
+                """
+                INSERT INTO mcp_servers (name, command, args, env, description, enabled, is_builtin, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, 1, 1, ?, ?)
+                """,
+                (server["name"], server["command"], json.dumps(server["args"]), "{}", server["description"], now, now),
+            )
 
     cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_mcp_servers_name ON mcp_servers(name)")
     _mark_migration_applied(cursor, "v143_mcp_hygiene", now)
@@ -2171,6 +2184,190 @@ def _migrate_v1_6_quality_governance(cursor):
             cursor.execute(f"ALTER TABLE chat_traces ADD COLUMN {col} {dtype}")
         except sqlite3.OperationalError:
             pass
+
+
+def _migrate_v1_8_runtime_convergence(cursor):
+    """Add the V1.8 control-plane and evidence-plane schema.
+
+    Platform CRUD tables remain the editable source configuration.  A runtime
+    can only execute a validated, published release compiled from those
+    tables, and each conversation pins one immutable release snapshot.
+    """
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS runtime_releases (
+            release_id TEXT PRIMARY KEY,
+            version INTEGER NOT NULL UNIQUE,
+            status TEXT NOT NULL,
+            config_hash TEXT NOT NULL,
+            config_json TEXT NOT NULL,
+            validation_json TEXT,
+            parent_release_id TEXT,
+            created_by TEXT,
+            created_at TEXT NOT NULL,
+            published_at TEXT,
+            superseded_at TEXT
+        )
+        """
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_runtime_releases_status ON runtime_releases(status, version)"
+    )
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS runtime_release_pointer (
+            pointer_key TEXT PRIMARY KEY,
+            release_id TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (release_id) REFERENCES runtime_releases(release_id)
+        )
+        """
+    )
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS run_config_snapshots (
+            snapshot_id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL UNIQUE,
+            release_id TEXT NOT NULL,
+            config_hash TEXT NOT NULL,
+            snapshot_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (release_id) REFERENCES runtime_releases(release_id)
+        )
+        """
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_run_snapshots_release ON run_config_snapshots(release_id)"
+    )
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS tool_policies (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            release_id TEXT NOT NULL,
+            server_id INTEGER,
+            server_name TEXT NOT NULL,
+            tool_name TEXT NOT NULL,
+            effect TEXT NOT NULL,
+            risk_level TEXT NOT NULL,
+            allowed_paths_json TEXT NOT NULL,
+            requires_confirmation INTEGER DEFAULT 0,
+            enabled INTEGER DEFAULT 1,
+            policy_reason TEXT,
+            created_at TEXT NOT NULL,
+            UNIQUE(release_id, server_name, tool_name),
+            FOREIGN KEY (release_id) REFERENCES runtime_releases(release_id)
+        )
+        """
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tool_policies_release ON tool_policies(release_id)"
+    )
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS run_evidence_ledgers (
+            trace_id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            release_id TEXT,
+            config_hash TEXT,
+            runtime_path TEXT,
+            status TEXT,
+            ledger_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_evidence_ledgers_session ON run_evidence_ledgers(session_id, created_at)"
+    )
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS action_proposals (
+            proposal_id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            trace_id TEXT,
+            release_id TEXT,
+            action_type TEXT NOT NULL,
+            risk_level TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            status TEXT NOT NULL,
+            idempotency_key TEXT NOT NULL UNIQUE,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_action_proposals_session ON action_proposals(session_id, created_at)"
+    )
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS action_approvals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            proposal_id TEXT NOT NULL,
+            decision TEXT NOT NULL,
+            actor TEXT NOT NULL,
+            comment TEXT,
+            decided_at TEXT NOT NULL,
+            FOREIGN KEY (proposal_id) REFERENCES action_proposals(proposal_id)
+        )
+        """
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_action_approvals_proposal ON action_approvals(proposal_id, id)"
+    )
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS action_receipts (
+            receipt_id TEXT PRIMARY KEY,
+            proposal_id TEXT NOT NULL UNIQUE,
+            idempotency_key TEXT NOT NULL UNIQUE,
+            status TEXT NOT NULL,
+            resource_type TEXT,
+            resource_id TEXT,
+            result_json TEXT,
+            committed_at TEXT,
+            error_summary TEXT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (proposal_id) REFERENCES action_proposals(proposal_id)
+        )
+        """
+    )
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS agent_knowledge_bindings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            agent_id TEXT NOT NULL,
+            knowledge_doc_id INTEGER NOT NULL,
+            enabled INTEGER DEFAULT 1,
+            UNIQUE(agent_id, knowledge_doc_id),
+            FOREIGN KEY (knowledge_doc_id) REFERENCES knowledge_docs(id)
+        )
+        """
+    )
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS agent_knowledge_scopes (
+            agent_id TEXT PRIMARY KEY,
+            binding_mode TEXT NOT NULL DEFAULT 'explicit',
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS runtime_acceptance_runs (
+            acceptance_run_id TEXT PRIMARY KEY,
+            case_key TEXT NOT NULL,
+            release_id TEXT,
+            status TEXT NOT NULL,
+            evidence_json TEXT,
+            cleanup_json TEXT,
+            created_at TEXT NOT NULL,
+            completed_at TEXT
+        )
+        """
+    )
 
 def create_work_order(
     work_order_id: str,
@@ -5183,10 +5380,15 @@ def save_mcp_tool(
             json.dumps(tool_metadata, ensure_ascii=False) if tool_metadata else None,
         ),
     )
-    tool_id = cursor.lastrowid
+    cursor.execute(
+        "SELECT id FROM mcp_tools WHERE server_id = ? AND name = ?",
+        (server_id, name),
+    )
+    selected = cursor.fetchone()
+    tool_id = int(selected["id"]) if selected else int(cursor.lastrowid or 0)
     conn.commit()
     conn.close()
-    return get_mcp_tool(tool_id)
+    return get_mcp_tool(tool_id) or {}
 
 
 def get_mcp_tool(tool_id: int) -> Optional[Dict[str, Any]]:
@@ -5242,3 +5444,689 @@ def toggle_mcp_server_enabled(server_id: int, enabled: bool) -> Optional[Dict[st
     conn.commit()
     conn.close()
     return get_mcp_server(server_id)
+
+
+# ---------------------------------------------------------------------------
+# V1.8 runtime control plane
+# ---------------------------------------------------------------------------
+
+def _parse_runtime_release(row: Optional[sqlite3.Row]) -> Optional[Dict[str, Any]]:
+    if not row:
+        return None
+    item = dict(row)
+    item["config"] = _parse_json_text(item.pop("config_json", None), {})
+    item["validation"] = _parse_json_text(item.pop("validation_json", None), {})
+    return item
+
+
+def next_runtime_release_version() -> int:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute("SELECT COALESCE(MAX(version), 0) + 1 FROM runtime_releases")
+    value = int(cursor.fetchone()[0])
+    conn.close()
+    return value
+
+
+def create_runtime_release(
+    release_id: str,
+    version: int,
+    config_hash: str,
+    config: Dict[str, Any],
+    validation: Dict[str, Any],
+    parent_release_id: Optional[str] = None,
+    created_by: str = "system",
+    status: str = "draft",
+) -> Dict[str, Any]:
+    now = now_cn()
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        INSERT INTO runtime_releases (
+            release_id, version, status, config_hash, config_json,
+            validation_json, parent_release_id, created_by, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            release_id,
+            int(version),
+            status,
+            config_hash,
+            _json_text(config),
+            _json_text(validation),
+            parent_release_id,
+            created_by,
+            now,
+        ),
+    )
+    conn.commit()
+    conn.close()
+    return get_runtime_release(release_id) or {}
+
+
+def get_runtime_release(release_id: str) -> Optional[Dict[str, Any]]:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM runtime_releases WHERE release_id = ?", (release_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return _parse_runtime_release(row)
+
+
+def get_current_runtime_release() -> Optional[Dict[str, Any]]:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT r.*
+        FROM runtime_release_pointer p
+        JOIN runtime_releases r ON r.release_id = p.release_id
+        WHERE p.pointer_key = 'current'
+        """
+    )
+    row = cursor.fetchone()
+    conn.close()
+    return _parse_runtime_release(row)
+
+
+def list_runtime_releases(limit: int = 50) -> List[Dict[str, Any]]:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT * FROM runtime_releases ORDER BY version DESC LIMIT ?",
+        (max(1, min(int(limit), 200)),),
+    )
+    rows = cursor.fetchall()
+    conn.close()
+    return [_parse_runtime_release(row) or {} for row in rows]
+
+
+def publish_runtime_release(release_id: str) -> Dict[str, Any]:
+    """Atomically move the current pointer to one validated draft release."""
+    now = now_cn()
+    conn = _get_conn()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("BEGIN IMMEDIATE")
+        cursor.execute(
+            "SELECT status, validation_json FROM runtime_releases WHERE release_id = ?",
+            (release_id,),
+        )
+        row = cursor.fetchone()
+        if not row:
+            raise ValueError("runtime release not found")
+        validation = _parse_json_text(row["validation_json"], {})
+        if not validation.get("valid"):
+            raise ValueError("runtime release validation failed")
+
+        cursor.execute(
+            """
+            SELECT release_id FROM runtime_release_pointer
+            WHERE pointer_key = 'current'
+            """
+        )
+        current = cursor.fetchone()
+        if current and current["release_id"] != release_id:
+            cursor.execute(
+                """
+                UPDATE runtime_releases
+                SET status = 'superseded', superseded_at = ?
+                WHERE release_id = ? AND status = 'published'
+                """,
+                (now, current["release_id"]),
+            )
+        cursor.execute(
+            """
+            UPDATE runtime_releases
+            SET status = 'published', published_at = ?, superseded_at = NULL
+            WHERE release_id = ?
+            """,
+            (now, release_id),
+        )
+        cursor.execute(
+            """
+            INSERT INTO runtime_release_pointer (pointer_key, release_id, updated_at)
+            VALUES ('current', ?, ?)
+            ON CONFLICT(pointer_key) DO UPDATE SET
+                release_id = excluded.release_id,
+                updated_at = excluded.updated_at
+            """,
+            (release_id, now),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return get_runtime_release(release_id) or {}
+
+
+def rollback_runtime_release(release_id: str) -> Dict[str, Any]:
+    """Re-publish a historical validated snapshot without recompiling it."""
+    return publish_runtime_release(release_id)
+
+
+def save_run_config_snapshot(
+    snapshot_id: str,
+    session_id: str,
+    release_id: str,
+    config_hash: str,
+    snapshot: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Pin the first release seen by a session; never overwrite it."""
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        INSERT OR IGNORE INTO run_config_snapshots (
+            snapshot_id, session_id, release_id, config_hash, snapshot_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (snapshot_id, session_id, release_id, config_hash, _json_text(snapshot), now_cn()),
+    )
+    conn.commit()
+    conn.close()
+    return get_run_config_snapshot(session_id) or {}
+
+
+def get_run_config_snapshot(session_id: str) -> Optional[Dict[str, Any]]:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT * FROM run_config_snapshots WHERE session_id = ?",
+        (session_id,),
+    )
+    row = cursor.fetchone()
+    conn.close()
+    if not row:
+        return None
+    item = dict(row)
+    item["snapshot"] = _parse_json_text(item.pop("snapshot_json", None), {})
+    return item
+
+
+def replace_tool_policies(release_id: str, policies: List[Dict[str, Any]]) -> None:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("BEGIN IMMEDIATE")
+        cursor.execute("DELETE FROM tool_policies WHERE release_id = ?", (release_id,))
+        for policy in policies:
+            cursor.execute(
+                """
+                INSERT INTO tool_policies (
+                    release_id, server_id, server_name, tool_name, effect,
+                    risk_level, allowed_paths_json, requires_confirmation,
+                    enabled, policy_reason, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    release_id,
+                    policy.get("server_id"),
+                    policy.get("server_name") or "",
+                    policy.get("tool_name") or "",
+                    policy.get("effect") or "unknown",
+                    policy.get("risk_level") or "L3",
+                    _json_text(policy.get("allowed_paths") or []),
+                    1 if policy.get("requires_confirmation") else 0,
+                    1 if policy.get("enabled", True) else 0,
+                    policy.get("policy_reason"),
+                    now_cn(),
+                ),
+            )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def list_tool_policies(release_id: str) -> List[Dict[str, Any]]:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT * FROM tool_policies WHERE release_id = ? ORDER BY server_name, tool_name",
+        (release_id,),
+    )
+    rows = cursor.fetchall()
+    conn.close()
+    result = []
+    for row in rows:
+        item = dict(row)
+        item["allowed_paths"] = _parse_json_text(item.pop("allowed_paths_json", None), [])
+        item["requires_confirmation"] = bool(item.get("requires_confirmation"))
+        item["enabled"] = bool(item.get("enabled"))
+        result.append(item)
+    return result
+
+
+def save_evidence_ledger(
+    trace_id: str,
+    session_id: str,
+    ledger: Dict[str, Any],
+    release_id: Optional[str] = None,
+    config_hash: Optional[str] = None,
+    runtime_path: Optional[str] = None,
+    status: str = "running",
+) -> Dict[str, Any]:
+    now = now_cn()
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        INSERT INTO run_evidence_ledgers (
+            trace_id, session_id, release_id, config_hash, runtime_path,
+            status, ledger_json, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(trace_id) DO UPDATE SET
+            release_id = excluded.release_id,
+            config_hash = excluded.config_hash,
+            runtime_path = excluded.runtime_path,
+            status = excluded.status,
+            ledger_json = excluded.ledger_json,
+            updated_at = excluded.updated_at
+        """,
+        (
+            trace_id,
+            session_id,
+            release_id,
+            config_hash,
+            runtime_path,
+            status,
+            _json_text(ledger),
+            now,
+            now,
+        ),
+    )
+    conn.commit()
+    conn.close()
+    return get_evidence_ledger(trace_id) or {}
+
+
+def set_agent_knowledge_bindings(agent_id: str, knowledge_doc_ids: List[int]) -> None:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("BEGIN IMMEDIATE")
+        cursor.execute(
+            """
+            INSERT INTO agent_knowledge_scopes (agent_id, binding_mode, updated_at)
+            VALUES (?, 'explicit', ?)
+            ON CONFLICT(agent_id) DO UPDATE SET
+                binding_mode = 'explicit',
+                updated_at = excluded.updated_at
+            """,
+            (agent_id, now_cn()),
+        )
+        cursor.execute(
+            "DELETE FROM agent_knowledge_bindings WHERE agent_id = ?",
+            (agent_id,),
+        )
+        for doc_id in sorted({int(item) for item in knowledge_doc_ids}):
+            cursor.execute(
+                """
+                INSERT INTO agent_knowledge_bindings (
+                    agent_id, knowledge_doc_id, enabled
+                ) VALUES (?, ?, 1)
+                """,
+                (agent_id, doc_id),
+            )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def get_agent_knowledge_bindings(agent_id: str) -> Optional[List[int]]:
+    """Return None for legacy compatibility scope, or an explicit ID list."""
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT binding_mode FROM agent_knowledge_scopes WHERE agent_id = ?",
+        (agent_id,),
+    )
+    scope = cursor.fetchone()
+    if not scope:
+        conn.close()
+        return None
+    cursor.execute(
+        """
+        SELECT knowledge_doc_id FROM agent_knowledge_bindings
+        WHERE agent_id = ? AND enabled = 1
+        ORDER BY knowledge_doc_id
+        """,
+        (agent_id,),
+    )
+    rows = cursor.fetchall()
+    conn.close()
+    return [int(row["knowledge_doc_id"]) for row in rows]
+
+
+def get_evidence_ledger(trace_id: str) -> Optional[Dict[str, Any]]:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM run_evidence_ledgers WHERE trace_id = ?", (trace_id,))
+    row = cursor.fetchone()
+    conn.close()
+    if not row:
+        return None
+    item = dict(row)
+    item["ledger"] = _parse_json_text(item.pop("ledger_json", None), {})
+    return item
+
+
+def create_action_proposal(
+    proposal_id: str,
+    session_id: str,
+    action_type: str,
+    risk_level: str,
+    payload: Dict[str, Any],
+    idempotency_key: str,
+    trace_id: Optional[str] = None,
+    release_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    now = now_cn()
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        INSERT OR IGNORE INTO action_proposals (
+            proposal_id, session_id, trace_id, release_id, action_type,
+            risk_level, payload_json, status, idempotency_key, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending_confirmation', ?, ?, ?)
+        """,
+        (
+            proposal_id,
+            session_id,
+            trace_id,
+            release_id,
+            action_type,
+            risk_level,
+            _json_text(payload),
+            idempotency_key,
+            now,
+            now,
+        ),
+    )
+    conn.commit()
+    conn.close()
+    return get_action_proposal_by_idempotency_key(idempotency_key) or {}
+
+
+def _parse_action_proposal(row: Optional[sqlite3.Row]) -> Optional[Dict[str, Any]]:
+    if not row:
+        return None
+    item = dict(row)
+    item["payload"] = _parse_json_text(item.pop("payload_json", None), {})
+    return item
+
+
+def get_action_proposal(proposal_id: str) -> Optional[Dict[str, Any]]:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM action_proposals WHERE proposal_id = ?", (proposal_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return _parse_action_proposal(row)
+
+
+def get_action_proposal_by_idempotency_key(idempotency_key: str) -> Optional[Dict[str, Any]]:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT * FROM action_proposals WHERE idempotency_key = ?",
+        (idempotency_key,),
+    )
+    row = cursor.fetchone()
+    conn.close()
+    return _parse_action_proposal(row)
+
+
+def get_pending_action_proposal(session_id: str, action_type: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    if action_type:
+        cursor.execute(
+            """
+            SELECT * FROM action_proposals
+            WHERE session_id = ? AND action_type = ? AND status = 'pending_confirmation'
+            ORDER BY created_at DESC LIMIT 1
+            """,
+            (session_id, action_type),
+        )
+    else:
+        cursor.execute(
+            """
+            SELECT * FROM action_proposals
+            WHERE session_id = ? AND status = 'pending_confirmation'
+            ORDER BY created_at DESC LIMIT 1
+            """,
+            (session_id,),
+        )
+    row = cursor.fetchone()
+    conn.close()
+    return _parse_action_proposal(row)
+
+
+def get_latest_action_proposal(session_id: str, action_type: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    if action_type:
+        cursor.execute(
+            """
+            SELECT * FROM action_proposals
+            WHERE session_id = ? AND action_type = ?
+            ORDER BY created_at DESC LIMIT 1
+            """,
+            (session_id, action_type),
+        )
+    else:
+        cursor.execute(
+            """
+            SELECT * FROM action_proposals
+            WHERE session_id = ?
+            ORDER BY created_at DESC LIMIT 1
+            """,
+            (session_id,),
+        )
+    row = cursor.fetchone()
+    conn.close()
+    return _parse_action_proposal(row)
+
+
+def record_action_approval(
+    proposal_id: str,
+    decision: str,
+    actor: str,
+    comment: Optional[str] = None,
+) -> Dict[str, Any]:
+    if decision not in {"approved", "rejected"}:
+        raise ValueError("decision must be approved or rejected")
+    now = now_cn()
+    conn = _get_conn()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("BEGIN IMMEDIATE")
+        cursor.execute(
+            "SELECT status FROM action_proposals WHERE proposal_id = ?",
+            (proposal_id,),
+        )
+        row = cursor.fetchone()
+        if not row:
+            raise ValueError("action proposal not found")
+        if row["status"] not in {"pending_confirmation", decision}:
+            raise ValueError("action proposal is not pending confirmation")
+        cursor.execute(
+            """
+            INSERT INTO action_approvals (proposal_id, decision, actor, comment, decided_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (proposal_id, decision, actor, comment, now),
+        )
+        cursor.execute(
+            "UPDATE action_proposals SET status = ?, updated_at = ? WHERE proposal_id = ?",
+            (decision, now, proposal_id),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return get_action_proposal(proposal_id) or {}
+
+
+def list_action_approvals(proposal_id: str) -> List[Dict[str, Any]]:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT proposal_id, decision, actor, comment, decided_at
+        FROM action_approvals
+        WHERE proposal_id = ?
+        ORDER BY id ASC
+        """,
+        (proposal_id,),
+    )
+    rows = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+    return rows
+
+
+def get_action_receipt_by_idempotency_key(idempotency_key: str) -> Optional[Dict[str, Any]]:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT * FROM action_receipts WHERE idempotency_key = ?",
+        (idempotency_key,),
+    )
+    row = cursor.fetchone()
+    conn.close()
+    if not row:
+        return None
+    item = dict(row)
+    item["result"] = _parse_json_text(item.pop("result_json", None), {})
+    return item
+
+
+def save_runtime_acceptance_run(
+    acceptance_run_id: str,
+    case_key: str,
+    release_id: Optional[str],
+    status: str,
+    evidence: Dict[str, Any],
+    cleanup: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    now = now_cn()
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        INSERT INTO runtime_acceptance_runs (
+            acceptance_run_id, case_key, release_id, status,
+            evidence_json, cleanup_json, created_at, completed_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(acceptance_run_id) DO UPDATE SET
+            status = excluded.status,
+            evidence_json = excluded.evidence_json,
+            cleanup_json = excluded.cleanup_json,
+            completed_at = excluded.completed_at
+        """,
+        (
+            acceptance_run_id,
+            case_key,
+            release_id,
+            status,
+            _json_text(evidence),
+            _json_text(cleanup or {}),
+            now,
+            now if status in {"passed", "failed"} else None,
+        ),
+    )
+    conn.commit()
+    cursor.execute(
+        "SELECT * FROM runtime_acceptance_runs WHERE acceptance_run_id = ?",
+        (acceptance_run_id,),
+    )
+    row = cursor.fetchone()
+    conn.close()
+    item = dict(row) if row else {}
+    item["evidence"] = _parse_json_text(item.pop("evidence_json", None), {})
+    item["cleanup"] = _parse_json_text(item.pop("cleanup_json", None), {})
+    return item
+
+
+def list_runtime_acceptance_runs(limit: int = 50) -> List[Dict[str, Any]]:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT * FROM runtime_acceptance_runs
+        ORDER BY created_at DESC
+        LIMIT ?
+        """,
+        (max(1, min(int(limit), 200)),),
+    )
+    rows = cursor.fetchall()
+    conn.close()
+    result: List[Dict[str, Any]] = []
+    for row in rows:
+        item = dict(row)
+        item["evidence"] = _parse_json_text(item.pop("evidence_json", None), {})
+        item["cleanup"] = _parse_json_text(item.pop("cleanup_json", None), {})
+        result.append(item)
+    return result
+
+
+def save_action_receipt(
+    receipt_id: str,
+    proposal_id: str,
+    idempotency_key: str,
+    status: str,
+    result: Optional[Dict[str, Any]] = None,
+    resource_type: Optional[str] = None,
+    resource_id: Optional[str] = None,
+    error_summary: Optional[str] = None,
+) -> Dict[str, Any]:
+    now = now_cn()
+    conn = _get_conn()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("BEGIN IMMEDIATE")
+        cursor.execute(
+            """
+            INSERT OR IGNORE INTO action_receipts (
+                receipt_id, proposal_id, idempotency_key, status,
+                resource_type, resource_id, result_json, committed_at,
+                error_summary, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                receipt_id,
+                proposal_id,
+                idempotency_key,
+                status,
+                resource_type,
+                resource_id,
+                _json_text(result or {}),
+                now if status == "committed" else None,
+                error_summary,
+                now,
+            ),
+        )
+        cursor.execute(
+            "UPDATE action_proposals SET status = ?, updated_at = ? WHERE proposal_id = ?",
+            ("committed" if status == "committed" else "failed", now, proposal_id),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return get_action_receipt_by_idempotency_key(idempotency_key) or {}

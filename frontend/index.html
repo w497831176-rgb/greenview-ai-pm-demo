@@ -219,7 +219,7 @@
     // ==========================================
     const API_BASE = '';
     const DEFAULT_ROOM_ID = '3-2-1201';
-    const APP_VERSION = 'V1.7.0';
+    const APP_VERSION = 'V1.8.0';
 
     const STATE = {
       topTab: 'owner',
@@ -256,6 +256,7 @@
         { id: 'handoff-orders', label: '人工接管', icon: 'handoff' }
       ],
       platform: [
+        { id: 'runtime', label: '运行时发布', icon: 'release' },
         { id: 'agents', label: 'Agent 管理', icon: 'agent' },
         { id: 'models', label: '模型配置', icon: 'model' },
         { id: 'skills', label: 'Skill 管理', icon: 'skill' },
@@ -282,7 +283,8 @@
       evaluation: `<svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m5 2a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>`,
       agent: `<svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z"></path></svg>`,
       model: `<svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"></path></svg>`,
-      cost: `<svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>`
+      cost: `<svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>`,
+      release: `<svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 16a4 4 0 01-.88-7.903A5.002 5.002 0 0115.9 6H16a5 5 0 011 9.9M9 12l3-3m0 0l3 3m-3-3v12"></path></svg>`
     };
 
     // ==========================================
@@ -534,21 +536,25 @@
       if (routeReason) tags.push(`<span class="px-1.5 py-0.5 bg-slate-100 text-slate-600 rounded text-[10px]" title="${escapeHtml(routeIntent || '')}">路由原因：${escapeHtml(routeReason)}</span>`);
       if (agent) tags.push(`<span class="px-1.5 py-0.5 bg-indigo-50 text-indigo-600 rounded text-[10px]" title="agent_id: ${escapeHtml(currentAgentId || '')}">当前处理 Agent：${escapeHtml(agent)}</span>`);
       if (skills && skills.length) tags.push(`<span class="px-1.5 py-0.5 bg-brand-50 text-brand-600 rounded text-[10px]" title="Skill 提供可复用的业务规则与执行方法；它不是知识库引用。">已命中 Skill（业务规则）：${escapeHtml(skills.map(s => (typeof s === 'object' && s !== null ? (s.name || JSON.stringify(s)) : String(s))).join('、'))}</span>`);
-      const visibleToolNames = [...new Set([
-        ...(tools || []).map(t => typeof t === 'string' ? t : (t.name || t.tool_name || '')).filter(Boolean),
-        ...(mcpCalls || []).map(c => c.tool_name || '').filter(name => name && name !== 'discovery')
-      ])];
-      if (visibleToolNames.length) tags.push(`<span class="px-1.5 py-0.5 bg-gold-50 text-gold-600 rounded text-[10px]">已调用工具：${escapeHtml(visibleToolNames.join('、'))}</span>`);
+      if (tools && tools.length) tags.push(`<span class="px-1.5 py-0.5 bg-gold-50 text-gold-600 rounded text-[10px]">已调用工具：${escapeHtml(tools.map(t => typeof t === 'string' ? t : (t.name || t.tool_name || JSON.stringify(t))).join('、'))}</span>`);
       if (mcpCalls && mcpCalls.length) {
         const okCount = mcpCalls.filter(c => c.status === 'success').length;
-        const businessCount = mcpCalls.filter(c => ['empty', 'not_found', 'unauthorized'].includes(c.status)).length;
-        const issueCount = mcpCalls.filter(c => !['success', 'empty', 'not_found', 'unauthorized'].includes(c.status)).length;
-        const statusText = `成功 ${okCount} / 业务结果 ${businessCount} / 失败 ${issueCount}`;
+        const expectedCount = mcpCalls.filter(c => ['empty', 'not_found', 'invalid_input', 'unauthorized'].includes(c.status)).length;
+        const issueCount = mcpCalls.filter(c => ['timeout', 'upstream_error', 'failed'].includes(c.status)).length;
+        const statusText = `success ${okCount} / expected ${expectedCount} / issue ${issueCount}`;
         const summary = mcpCalls.map(c => `[${escapeHtml(c.server_name || 'unknown')}] ${escapeHtml(c.tool_name || '')} outcome=${escapeHtml(c.status || 'unknown')} ${c.latency_ms || 0}ms`).join('\n');
         tags.push(`<span class="px-1.5 py-0.5 bg-cyan-50 text-cyan-600 rounded text-[10px] cursor-help" title="${escapeHtml(summary)}">MCP 调用：${statusText}</span>`);
       }
       if (traceId) {
-        const sourceLabel = usageSource === 'provider_reported' ? 'Provider账单' : (usageSource === 'estimated_tokenization' ? '本地估算' : '未知');
+        const sourceLabel = {
+          provider_reported_complete: 'Provider完整',
+          provider_reported_total_only: 'Provider仅总量',
+          local_estimate: '本地估算',
+          unavailable: '不可得',
+          not_applicable: '不适用',
+          provider_reported: 'Provider账单',
+          estimated_tokenization: '本地估算'
+        }[usageSource] || '未知';
         tags.push(`<button type="button" class="px-1.5 py-0.5 bg-slate-50 text-slate-500 rounded text-[10px] hover:bg-slate-100 hover:text-slate-700 transition-colors" title="trace_id: ${escapeHtml(traceId)} · usage_source: ${escapeHtml(usageSource || 'unknown')}" onclick="openTraceDrawer('${escapeHtml(traceId)}')">Trace · ${escapeHtml(sourceLabel)}</button>`);
       }
       return tags.length ? `<div class="flex flex-wrap items-center gap-1 mt-2">${tags.join('')}</div>` : '';
@@ -556,7 +562,11 @@
 
     async function openTraceDrawer(traceId) {
       try {
-        const data = await apiGet(`/api/observability/traces/${traceId}`);
+        const [data, runtimeEvidenceData] = await Promise.all([
+          apiGet(`/api/observability/traces/${traceId}`),
+          apiGet(`/api/runtime/traces/${traceId}/evidence`).catch(() => ({}))
+        ]);
+        const runtimeEvidence = runtimeEvidenceData.ledger || {};
         const trace = data.trace || {};
         const modelCalls = data.model_calls || [];
         const mcpCalls = data.mcp_calls || [];
@@ -566,7 +576,15 @@
         const currentAgentId = assistantMsg.current_agent_id || trace.agent_id || '-';
         const skills = (assistantMsg.activated_skills || []).map(s => typeof s === 'object' ? (s.name || JSON.stringify(s)) : String(s));
         const stageName = { router: '路由判定', vertical_agent: '业务 Agent 回答', darwin: 'Darwin 分析', retest: 'Badcase 复测' };
-        const sourceName = { provider_reported: '模型服务商实际返回', estimated_tokenization: '本地估算', unavailable: '本次不可得', not_applicable: '不适用' };
+        const sourceName = {
+          provider_reported_complete: 'Provider 返回完整拆分',
+          provider_reported_total_only: 'Provider 仅返回总量',
+          local_estimate: '本地估算（不计费）',
+          unavailable: '本次不可得',
+          not_applicable: '不适用',
+          provider_reported: '模型服务商实际返回',
+          estimated_tokenization: '本地估算'
+        };
         const money = value => value === null || value === undefined ? '--' : `¥${Number(value).toFixed(6)}`;
         const priceText = snapshot => snapshot && snapshot.input_price_per_1m !== undefined
           ? `单价：未缓存输入 ¥${snapshot.input_price_per_1m}/百万 · 缓存命中 ¥${snapshot.cached_input_price_per_1m}/百万 · 输出 ¥${snapshot.output_price_per_1m}/百万`
@@ -609,8 +627,20 @@
           </div>`).join('')}</div>` : '<p class="text-sm text-slate-400">该版本前的历史对话未记录 span 事件；不补造历史过程。</p>';
         const evaluationRun = data.evaluation_run;
         const evaluationHtml = evaluationRun ? `<div class="bg-violet-50 border border-violet-200 rounded-xl p-3 text-sm space-y-1"><div class="font-medium text-violet-900">Golden Set 评估运行 #${escapeHtml(String(evaluationRun.id || '-'))}</div><div class="text-xs text-violet-700">状态：${escapeHtml(evaluationRun.status || '-')} · 风险：${escapeHtml(trace.risk_level || '-')} · 用例 ID：${escapeHtml(String(trace.evaluation_case_id || '-'))}</div><div class="text-xs text-violet-700">该 Trace 是操作员主动运行的质量验证，不等同于线上 SLA 或自动放量。</div></div>` : '';
-        const summaryText = [`Trace ID：${traceId}`, `当前 Agent：${currentAgent} (${currentAgentId})`, `激活 Skill：${skills.join('、') || '无'}`, `模型调用：${modelCalls.length} 次`, `MCP 调用：${mcpCalls.length} 次`, `回答实际引用：${usedCitations.map(c => `《${c.doc_title}》分片${c.chunk_index}`).join('、') || '无'}`, `链路事件：${traceEvents.map(e => spanLabels[e.span_name] || e.span_name).join(' → ') || '历史 Trace 无 span 记录'}`].join('\n');
-        const html = `<div class="space-y-5"><div class="bg-slate-50 rounded-xl p-3 border border-slate-200 text-sm space-y-1"><div><span class="text-slate-500">Trace：</span><span class="font-mono">${escapeHtml(traceId)}</span></div><div><span class="text-slate-500">当前 Agent：</span>${escapeHtml(currentAgent)} <span class="text-xs text-slate-400">(${escapeHtml(currentAgentId)})</span></div><div><span class="text-slate-500">激活 Skill：</span>${escapeHtml(skills.join('、') || '无')}</div></div>${evaluationHtml}${workflowHtml ? `<div><h4 class="font-medium text-slate-900 mb-2">业务工作流</h4>${workflowHtml}</div>` : ''}<div><h4 class="font-medium text-slate-900 mb-2">链路事件（Span）</h4>${eventHtml}</div><div><h4 class="font-medium text-slate-900 mb-2">模型调用与成本</h4><div class="space-y-2">${modelCards}</div></div><div><h4 class="font-medium text-slate-900 mb-2">MCP 工具证据</h4><div class="space-y-2">${mcpHtml}</div></div><div><h4 class="font-medium text-slate-900 mb-2">RAG 证据</h4><p class="text-xs text-slate-500 mb-1">回答实际引用</p>${citationList(usedCitations)}<details class="mt-3"><summary class="text-xs text-slate-500 cursor-pointer">仅检索到、未写入回答的候选（${candidateCitations.length}）</summary>${citationList(candidateCitations)}</details></div><button type="button" id="trace-copy-summary" class="w-full px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white rounded-xl text-sm transition-colors">复制可读摘要</button></div>`;
+        const config = runtimeEvidence.config_snapshot || {};
+        const violations = runtimeEvidence.contract_violations || [];
+        const proposals = runtimeEvidence.action_proposals || [];
+        const approvals = runtimeEvidence.approval_events || [];
+        const receipts = runtimeEvidence.action_receipts || [];
+        const runtimeContractHtml = Object.keys(runtimeEvidence).length ? `
+          <div class="rounded-xl border ${violations.length ? 'border-amber-200 bg-amber-50' : 'border-emerald-200 bg-emerald-50'} p-3 text-sm">
+            <div class="font-medium ${violations.length ? 'text-amber-900' : 'text-emerald-900'}">V1.8 Evidence Ledger</div>
+            <div class="mt-1 text-xs text-slate-700">Release：${escapeHtml(config.release_id || '-')} · Snapshot：${escapeHtml(config.snapshot_id || '-')}</div>
+            <div class="mt-1 text-xs text-slate-700">Proposal ${proposals.length} · Approval ${approvals.length} · Receipt ${receipts.length} · Contract violation ${violations.length}</div>
+            ${violations.length ? `<details class="mt-2"><summary class="text-xs cursor-pointer">查看契约违规</summary><pre class="mt-1 text-[10px] bg-white/70 p-2 rounded overflow-x-auto">${escapeHtml(JSON.stringify(violations, null, 2))}</pre></details>` : ''}
+          </div>` : '';
+        const summaryText = [`Trace ID：${traceId}`, `Release：${config.release_id || '-'}`, `Snapshot：${config.snapshot_id || '-'}`, `当前 Agent：${currentAgent} (${currentAgentId})`, `激活 Skill：${skills.join('、') || '无'}`, `模型调用：${modelCalls.length} 次`, `MCP 调用：${mcpCalls.length} 次`, `回答实际引用：${usedCitations.map(c => `《${c.doc_title}》分片${c.chunk_index}`).join('、') || '无'}`, `契约违规：${violations.length}`, `链路事件：${traceEvents.map(e => spanLabels[e.span_name] || e.span_name).join(' → ') || '历史 Trace 无 span 记录'}`].join('\n');
+        const html = `<div class="space-y-5"><div class="bg-slate-50 rounded-xl p-3 border border-slate-200 text-sm space-y-1"><div><span class="text-slate-500">Trace：</span><span class="font-mono">${escapeHtml(traceId)}</span></div><div><span class="text-slate-500">当前 Agent：</span>${escapeHtml(currentAgent)} <span class="text-xs text-slate-400">(${escapeHtml(currentAgentId)})</span></div><div><span class="text-slate-500">激活 Skill：</span>${escapeHtml(skills.join('、') || '无')}</div></div>${runtimeContractHtml}${evaluationHtml}${workflowHtml ? `<div><h4 class="font-medium text-slate-900 mb-2">业务工作流</h4>${workflowHtml}</div>` : ''}<div><h4 class="font-medium text-slate-900 mb-2">链路事件（Span）</h4>${eventHtml}</div><div><h4 class="font-medium text-slate-900 mb-2">模型调用与成本</h4><div class="space-y-2">${modelCards}</div></div><div><h4 class="font-medium text-slate-900 mb-2">MCP 工具证据</h4><div class="space-y-2">${mcpHtml}</div></div><div><h4 class="font-medium text-slate-900 mb-2">RAG 证据</h4><p class="text-xs text-slate-500 mb-1">回答实际引用</p>${citationList(usedCitations)}<details class="mt-3"><summary class="text-xs text-slate-500 cursor-pointer">仅检索到、未写入回答的候选（${candidateCitations.length}）</summary>${citationList(candidateCitations)}</details></div><button type="button" id="trace-copy-summary" class="w-full px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white rounded-xl text-sm transition-colors">复制可读摘要</button></div>`;
         openDrawer('Trace 详情', html);
         setTimeout(() => { const button = $('#trace-copy-summary'); if (button) button.addEventListener('click', async () => { try { await navigator.clipboard.writeText(summaryText); showToast('Trace 摘要已复制', 'success'); } catch (_) { showToast('复制失败', 'error'); } }); }, 0);
       } catch (err) {
@@ -763,6 +793,7 @@
         case 'processing-orders': renderProcessingOrdersPage(main); break;
         case 'history-orders': renderStaffOrdersPage(main, '已完成', 'history'); break;
         case 'handoff-orders': renderHandoffPage(main); break;
+        case 'runtime': await renderRuntimePage(main); break;
         case 'agents': renderAgentsPage(main); break;
         case 'models': renderModelsPage(main); break;
         case 'model-ab': renderModelAbPage(main); break;
@@ -1291,22 +1322,13 @@
         : label;
     }
 
-    function normalizeBareCitationMarkers(content) {
-      return String(content || '').replace(/(?:\u53c2\u8003)?\u5f15\u7528\s*(\d+)/g, (match, value, offset, source) => {
-        const before = source.charAt(offset - 1);
-        const after = source.charAt(offset + match.length);
-        if ('\u3010[\uff08('.includes(before) || '\u3011]\uff09)'.includes(after)) return match;
-        return `\u3010\u5f15\u7528${value}\u3011`;
-      });
-    }
-
     function normalizeCitationMarkers(content) {
       return String(content || '').replace(/【(?:参考)?引用\s*(\d+)】|\[(?:参考)?引用\s*(\d+)\]|[（(](?:参考)?引用\s*(\d+)[）)]/g, (_, a, b, c) => `【引用${a || b || c}】`);
     }
 
     function getUsedCitationIndices(content, maxCount) {
       const used = new Set();
-      const normalized = normalizeCitationMarkers(normalizeBareCitationMarkers(content));
+      const normalized = normalizeCitationMarkers(content);
       const regex = /【引用(\d+)】/g;
       let match;
       while ((match = regex.exec(normalized)) !== null) {
@@ -1323,14 +1345,18 @@
       return String(html || '').replace(/【引用(\d+)】/g, (match, value) => {
         const index = Number(value);
         const citation = citations && citations[index - 1];
-        if (!citation || !citation.doc_id) return match;
+        if (!citation || (!citation.doc_id && !citation.evidence_id)) return match;
         const chunkIndex = typeof citation.chunk_index === 'number' ? citation.chunk_index : '';
+        if (citation.evidence_id && (citation.content_snapshot || citation.content)) {
+          registerCitationSnapshot(citation);
+          return `<button type="button" class="inline-citation-btn px-1 py-0.5 mx-0.5 bg-brand-50 text-brand-700 rounded text-[11px] hover:bg-brand-100 transition-colors align-text-bottom" onclick="showCitationEvidence('${escapeHtml(citation.evidence_id)}')">引用${index}</button>`;
+        }
         return `<button type="button" class="inline-citation-btn px-1 py-0.5 mx-0.5 bg-brand-50 text-brand-700 rounded text-[11px] hover:bg-brand-100 transition-colors align-text-bottom" onclick="showCitationChunk(${Number(citation.doc_id)}, '${escapeHtml(String(chunkIndex))}')">引用${index}</button>`;
       });
     }
 
     function renderMarkdownWithCitations(content, citations) {
-      const safeContent = normalizeCitationMarkers(normalizeBareCitationMarkers(content));
+      const safeContent = normalizeCitationMarkers(content);
       if (!citations || citations.length === 0) return marked.parse(safeContent);
       const renderer = new marked.Renderer();
       renderer.text = (token) => {
@@ -1338,8 +1364,12 @@
         return String(rawText).replace(/【引用(\d+)】/g, (match, value) => {
           const index = parseInt(value, 10);
           const citation = citations[index - 1];
-          if (!citation || !citation.doc_id) return match;
+          if (!citation || (!citation.doc_id && !citation.evidence_id)) return match;
           const chunkIndex = typeof citation.chunk_index === 'number' ? citation.chunk_index : '';
+          if (citation.evidence_id && (citation.content_snapshot || citation.content)) {
+            registerCitationSnapshot(citation);
+            return `<button type="button" class="inline-citation-btn px-1 py-0.5 mx-0.5 bg-brand-50 text-brand-700 rounded text-[11px] hover:bg-brand-100 transition-colors align-text-bottom" onclick="showCitationEvidence('${escapeHtml(citation.evidence_id)}')">引用${index}</button>`;
+          }
           return `<button type="button" class="inline-citation-btn px-1 py-0.5 mx-0.5 bg-brand-50 text-brand-700 rounded text-[11px] hover:bg-brand-100 transition-colors align-text-bottom" onclick="showCitationChunk(${Number(citation.doc_id)}, '${escapeHtml(String(chunkIndex))}')">引用${index}</button>`;
         });
       };
@@ -1354,7 +1384,8 @@
       const candidates = items.filter(item => !usedSet.has(item.index) && item.citation.used_in_answer !== true);
       const renderItem = (item) => {
         const citation = item.citation;
-        const score = typeof citation.score === 'number' ? citation.score.toFixed(3) : '-';
+        const scoreValue = citation.retrieval_score ?? citation.score;
+        const score = typeof scoreValue === 'number' ? scoreValue.toFixed(3) : '-';
         const provenance = [
           citation.retrieval_sources?.length ? `召回：${citation.retrieval_sources.join('+')}` : '',
           citation.retrieval_paths?.length ? `路径：${citation.retrieval_paths.join('+')}` : '',
@@ -1363,7 +1394,11 @@
         const title = escapeHtml(citation.doc_title || '未知文档');
         const docId = Number(citation.doc_id || 0);
         const chunkIndex = typeof citation.chunk_index === 'number' ? citation.chunk_index : '';
-        const click = docId ? `class="mt-1 cursor-pointer hover:text-brand-600 hover:underline" onclick="showCitationChunk(${docId}, '${escapeHtml(String(chunkIndex))}')"` : 'class="mt-1"';
+        let click = docId ? `class="mt-1 cursor-pointer hover:text-brand-600 hover:underline" onclick="showCitationChunk(${docId}, '${escapeHtml(String(chunkIndex))}')"` : 'class="mt-1"';
+        if (citation.evidence_id && (citation.content_snapshot || citation.content)) {
+          registerCitationSnapshot(citation);
+          click = `class="mt-1 cursor-pointer hover:text-brand-600 hover:underline" onclick="showCitationEvidence('${escapeHtml(citation.evidence_id)}')"`;
+        }
         return `<li ${click}>[${item.index}] 《${title}》${chunkIndex !== '' ? ` · 分片 ${chunkIndex}` : ''}<span class="text-slate-400">（相关度 ${score}）</span>${provenance ? `<span class="block text-[9px] text-slate-400">${escapeHtml(provenance)}</span>` : ''}</li>`;
       };
       let html = '<div class="ai-message-citations mt-2 pt-2 border-t border-slate-100">';
@@ -1371,6 +1406,29 @@
       if (candidates.length) html += `<details class="mt-2"><summary class="text-[10px] text-slate-400 cursor-pointer hover:text-slate-600 select-none">本轮检索候选（${candidates.length} 条未在回答中引用）</summary><ol class="text-[10px] text-slate-500 list-decimal list-inside mt-1">${candidates.map(renderItem).join('')}</ol></details>`;
       return html + '</div>';
     }
+
+    const CITATION_SNAPSHOTS = {};
+
+    function registerCitationSnapshot(citation) {
+      if (citation && citation.evidence_id) CITATION_SNAPSHOTS[citation.evidence_id] = citation;
+    }
+
+    function showCitationEvidence(evidenceId) {
+      const citation = CITATION_SNAPSHOTS[evidenceId];
+      if (!citation) {
+        showToast('该历史证据快照不可得；不会改为查询当前索引。', 'error');
+        return;
+      }
+      const title = citation.doc_title || citation.title || '知识文档';
+      const content = citation.content_snapshot || citation.content || '';
+      const html = `<div class="bg-slate-50 rounded-xl p-3 border border-slate-200">
+        <p class="text-xs text-slate-500 mb-2">Evidence ID：${escapeHtml(evidenceId)} · 分片 ${escapeHtml(String(citation.chunk_index ?? '-'))}</p>
+        <p class="text-xs text-slate-500 mb-2">文档版本：${escapeHtml(citation.document_version || '-')} · Chunk：${escapeHtml(citation.chunk_id || '-')}</p>
+        <p class="text-sm text-slate-700 whitespace-pre-line">${escapeHtml(content)}</p>
+      </div>`;
+      openModal(`《${escapeHtml(title)}》历史证据快照`, html, null, '关闭');
+    }
+    window.showCitationEvidence = showCitationEvidence;
 
     async function showCitationChunk(docId, chunkIndex, snippet = '') {
       try {
@@ -2322,10 +2380,10 @@
           try {
             if (isEdit) {
               await apiPut(`/api/knowledge/docs/${doc.id}`, payload);
-              showToast('知识文档已更新');
+              showToast('知识文档 Draft 已更新；发布 RuntimeRelease 后进入下一新会话');
             } else {
               await apiPost('/api/knowledge/docs', payload);
-              showToast('知识文档已创建');
+              showToast('知识文档 Draft 已创建并索引；发布 RuntimeRelease 后进入下一新会话');
             }
             closeModal();
             if (activeTab === 'docs') await loadDocs($('#knowledge-search-input').value.trim());
@@ -4436,6 +4494,130 @@
     }
 
 
+    async function renderRuntimePage(container) {
+      container.innerHTML = `
+        <div class="max-w-6xl mx-auto p-4 md:p-6 space-y-5">
+          <div class="flex flex-col md:flex-row md:items-end md:justify-between gap-3">
+            <div>
+              <h2 class="text-xl font-semibold text-slate-900">V1.8 运行时发布</h2>
+              <p class="text-sm text-slate-500 mt-1">平台配置先保存，校验通过后发布为不可变 RuntimeRelease；仅下一新会话生效。</p>
+            </div>
+            <div class="flex gap-2">
+              <button id="runtime-compile-btn" class="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl text-sm">仅校验草稿</button>
+              <button id="runtime-publish-btn" class="px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white rounded-xl text-sm">校验并发布</button>
+            </div>
+          </div>
+          <div class="rounded-2xl border border-indigo-200 bg-indigo-50 p-4 text-sm text-indigo-900">
+            <div class="font-semibold">生效契约</div>
+            <div class="mt-1">Draft 不进入聊天；发布后，新会话固定到新 Snapshot；已有会话继续使用原 Snapshot，不热切换能力。</div>
+          </div>
+          <div id="runtime-content">${loadingState()}</div>
+        </div>`;
+
+      const renderRelease = (release, currentReleaseId = '') => {
+        const validation = release.validation || {};
+        const counts = validation.counts || {};
+        return `
+          <div class="bg-white rounded-2xl border border-slate-200 shadow-soft p-5">
+            <div class="flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <div class="flex items-center gap-2">
+                  <h3 class="font-semibold text-slate-900">Release #${escapeHtml(String(release.version || '-'))}</h3>
+                  <span class="text-xs px-2 py-1 rounded-full ${release.status === 'published' ? 'bg-emerald-50 text-emerald-700' : 'bg-slate-100 text-slate-600'}">${escapeHtml(release.status || '-')}</span>
+                </div>
+                <div class="mt-1 text-xs font-mono text-slate-500">${escapeHtml(release.release_id || '')} · ${escapeHtml((release.config_hash || '').slice(0, 16))}</div>
+              </div>
+              <div class="text-xs text-slate-600">Agent ${counts.agents || 0} · Skill ${counts.skills || 0} · RAG ${counts.knowledge_docs || 0} · MCP ${counts.mcp_servers || 0} · Policy ${counts.tool_policies || 0}</div>
+            </div>
+            <div class="mt-3 flex items-center justify-between gap-3 text-xs ${validation.valid ? 'text-emerald-700' : 'text-red-700'}">
+              <span>校验：${validation.valid ? '通过' : '失败'} · errors ${(validation.errors || []).length} · warnings ${(validation.warnings || []).length}</span>
+              ${validation.valid && release.release_id !== currentReleaseId && release.status !== 'draft' ? `<button class="runtime-rollback-btn px-2 py-1 rounded-lg border border-amber-200 bg-amber-50 text-amber-700 hover:bg-amber-100" data-release-id="${escapeHtml(release.release_id)}">回滚到此版本</button>` : ''}
+            </div>
+          </div>`;
+      };
+
+      async function loadRuntime() {
+        $('#runtime-content').innerHTML = loadingState();
+        try {
+          const [currentData, releasesData, casesData, runsData] = await Promise.all([
+            apiGet('/api/runtime/releases/current'),
+            apiGet('/api/runtime/releases'),
+            apiGet('/api/runtime/acceptance/cases'),
+            apiGet('/api/runtime/acceptance/runs')
+          ]);
+          const current = currentData.release || {};
+          const releases = releasesData.releases || [];
+          const cases = casesData.cases || [];
+          const runs = runsData.runs || [];
+          $('#runtime-content').innerHTML = `
+            <div class="space-y-5">
+              <div>
+                <h3 class="text-sm font-semibold text-slate-700 mb-2">当前 Published RuntimeRelease</h3>
+                ${renderRelease(current, current.release_id)}
+              </div>
+              <div class="bg-white rounded-2xl border border-slate-200 p-5">
+                <h3 class="font-semibold text-slate-900 mb-3">固定验收矩阵（${cases.length}）</h3>
+                <div class="grid md:grid-cols-2 gap-2">
+                  ${cases.map(item => `<div class="rounded-xl bg-slate-50 border border-slate-100 p-3"><div class="text-xs font-semibold text-brand-700">${escapeHtml(item.case_key)}</div><div class="text-xs text-slate-600 mt-1">${escapeHtml(item.input)}</div><div class="text-[11px] text-slate-500 mt-1">写库：${escapeHtml(item.business_write)}</div></div>`).join('')}
+                </div>
+              </div>
+              <details class="bg-white rounded-2xl border border-slate-200 p-5">
+                <summary class="font-semibold text-slate-900 cursor-pointer">历史 Release（${releases.length}）</summary>
+                <div class="space-y-2 mt-3">${releases.map(release => renderRelease(release, current.release_id)).join('')}</div>
+              </details>
+              <details class="bg-white rounded-2xl border border-slate-200 p-5">
+                <summary class="font-semibold text-slate-900 cursor-pointer">无模型契约验收记录（${runs.length}）</summary>
+                <div class="space-y-2 mt-3">${runs.length ? runs.map(run => `<div class="rounded-xl border border-slate-100 bg-slate-50 p-3 text-xs"><span class="font-semibold">${escapeHtml(run.case_key)}</span> · <span class="${run.status === 'passed' ? 'text-emerald-700' : 'text-red-700'}">${escapeHtml(run.status)}</span> · ${escapeHtml(run.release_id || '-')} · ${escapeHtml(run.completed_at || run.created_at || '')}</div>`).join('') : '<p class="text-xs text-slate-400">尚未运行无模型快照契约。</p>'}</div>
+              </details>
+            </div>`;
+          $$('.runtime-rollback-btn').forEach(button => {
+            button.addEventListener('click', async () => {
+              const releaseId = button.dataset.releaseId;
+              if (!confirm(`确认把当前指针回滚到 ${releaseId}？仅下一新会话生效。`)) return;
+              try {
+                await apiPost('/api/runtime/releases/rollback', { release_id: releaseId });
+                showToast(`已回滚到 ${releaseId}；已有会话仍保持原 Snapshot`);
+                await loadRuntime();
+              } catch (err) {
+                showToast('回滚失败：' + (err.message || err), 'error');
+              }
+            });
+          });
+        } catch (err) {
+          $('#runtime-content').innerHTML = emptyState('运行时发布信息加载失败');
+        }
+      }
+
+      $('#runtime-compile-btn').addEventListener('click', async () => {
+        try {
+          const data = await apiPost('/api/runtime/releases/compile', { created_by: 'platform-ui' });
+          const release = data.release || {};
+          const valid = !!(release.validation || {}).valid;
+          openDrawer('RuntimeRelease 草稿校验', renderRelease(release));
+          showToast(valid ? '草稿校验通过，尚未发布' : '草稿校验失败，请查看错误', valid ? 'success' : 'error');
+        } catch (err) {
+          showToast('草稿校验失败：' + (err.message || err), 'error');
+        }
+      });
+      $('#runtime-publish-btn').addEventListener('click', async () => {
+        if (!confirm('发布后仅影响下一新会话；已有会话继续使用原 Snapshot。确认校验并发布？')) return;
+        try {
+          const data = await apiPost('/api/runtime/releases/publish-current-config', { created_by: 'platform-ui' });
+          if (!data.published) {
+            openDrawer('发布校验未通过', renderRelease(data.release || {}));
+            showToast('发布失败：配置校验未通过', 'error');
+            return;
+          }
+          showToast(`已发布 ${(data.release || {}).release_id || '新 RuntimeRelease'}；请新建会话验收`);
+          await loadRuntime();
+        } catch (err) {
+          showToast('发布失败：' + (err.message || err), 'error');
+        }
+      });
+      await loadRuntime();
+    }
+
+
     async function renderAgentsPage(container) {
       container.innerHTML = `
         <div class="max-w-6xl mx-auto p-4 md:p-6 space-y-5">
@@ -4526,7 +4708,7 @@
             const enabled = toggle.checked;
             try {
               await apiPatch(`/api/agents/${agentId}`, { enabled });
-              showToast(enabled ? 'Agent 已启用' : 'Agent 已禁用');
+              showToast(`Agent Draft 已${enabled ? '启用' : '禁用'}；发布 RuntimeRelease 后进入下一新会话`);
               await loadAgents();
             } catch (err) {
               showToast('状态更新失败', 'error');
@@ -4543,9 +4725,17 @@
         const selectedSkillNames = (agent && agent.available_skills || []).map(s => (typeof s === 'object' && s !== null ? (s.name || '') : String(s))).filter(Boolean);
         let skills = [];
         let mcpTools = [];
+        let knowledgeDocs = [];
         try {
-          const [skillsData, mcpData] = await Promise.all([apiGet('/api/skills'), apiGet('/api/mcp-servers')]);
+          const [skillsData, mcpData, knowledgeData] = await Promise.all([
+            apiGet('/api/skills'),
+            apiGet('/api/mcp-servers'),
+            apiGet('/api/knowledge/docs')
+          ]);
           skills = (skillsData.skills || []).map(s => ({ value: s.name, label: `${s.name} (${s.category || '未分类'})` }));
+          knowledgeDocs = (knowledgeData.knowledge_docs || [])
+            .filter(doc => doc.source_type !== 'demo_test' && doc.is_indexed)
+            .map(doc => ({ value: String(doc.id), label: `${doc.title}（${doc.chunk_count || 0} 分片）` }));
           // Bindings are stored at MCP Server level (tool_name = server name).  Only
           // enabled servers with at least one successfully discovered tool are shown
           // as bindable; disabled / test / tool-less servers are hidden by default.
@@ -4630,8 +4820,13 @@
         const runtimeNote = `
           <div class="mb-4 rounded-xl border border-brand-100 bg-brand-50 p-3 text-xs text-brand-800">
             <div class="font-semibold mb-1">运行时动态注入</div>
-            <div>保存并启用后，该垂直 Agent 会在下一条业主消息立即进入 Router 候选池；绑定的 Skill 与已发现工具的 MCP Server 同步生效，无需重启。</div>
+            <div>保存只更新平台 Draft。请到“V1.8 运行时发布”校验并发布；之后该 Agent、Skill、MCP 与 RAG 绑定仅在下一新会话生效，已有会话不热切换。</div>
           </div>`;
+        const selectedKnowledgeIds = agent
+          ? (agent.knowledge_doc_ids === null
+            ? knowledgeDocs.map(item => item.value)
+            : (agent.knowledge_doc_ids || []).map(String))
+          : [];
         body = `
           ${runtimeNote}
           ${formInput('名称', 'agent-name', agent ? agent.name : '', '如：维修报修 Agent')}
@@ -4639,6 +4834,7 @@
           ${formTextarea('System Prompt', 'agent-system-prompt', agent ? agent.system_prompt : '', '定义该 Agent 的系统提示词', 5)}
           ${formCheckboxGroup('可用 Skill', 'agent-skills', skills, agent ? selectedSkillNames : [])}
           ${formCheckboxGroup('可用 MCP Server（展开查看可调用工具）', 'agent-mcp-tools', mcpTools, agent ? agent.available_mcp_tools : [])}
+          ${formCheckboxGroup('可用 RAG 文档（发布快照固定）', 'agent-knowledge-docs', knowledgeDocs, selectedKnowledgeIds)}
         `;
         openModal(title, body, async () => {
           const payload = {
@@ -4647,6 +4843,7 @@
             system_prompt: $('#agent-system-prompt').value.trim(),
             available_skills: Array.from(document.querySelectorAll('input[name="agent-skills"]:checked')).map(cb => cb.value),
             available_mcp_tools: Array.from(document.querySelectorAll('input[name="agent-mcp-tools"]:checked')).map(cb => cb.value),
+            knowledge_doc_ids: Array.from(document.querySelectorAll('input[name="agent-knowledge-docs"]:checked')).map(cb => Number(cb.value)),
             enabled: true
           };
           if (!payload.name || !payload.system_prompt) {
@@ -4656,10 +4853,10 @@
           try {
             if (isEdit) {
               await apiPut(`/api/agents/${agent.id}`, payload);
-              showToast('Agent 已更新');
+              showToast('Agent Draft 已更新；请发布 RuntimeRelease');
             } else {
               await apiPost('/api/agents', payload);
-              showToast('Agent 已创建');
+              showToast('Agent Draft 已创建；请绑定能力并发布 RuntimeRelease');
             }
             closeModal();
             await loadAgents();
@@ -4682,7 +4879,7 @@
         if (!confirm('确定要删除这个 Agent 吗？')) return;
         try {
           await apiDelete(`/api/agents/${agentId}`);
-          showToast('Agent 已删除');
+          showToast('Agent 已从 Draft 删除；已发布会话快照不受影响');
           await loadAgents();
         } catch (err) {
           showToast('删除失败，请重试', 'error');
@@ -4982,7 +5179,7 @@
                 skill_metadata: skill.skill_metadata || {},
                 model_id: skill.model_id || null
               });
-              showToast(enabled ? 'Skill 已启用' : 'Skill 已禁用');
+              showToast(`Skill Draft 已${enabled ? '启用' : '禁用'}；请发布 RuntimeRelease`);
               await loadSkills();
             } catch (err) {
               showToast('状态更新失败', 'error');
@@ -5048,10 +5245,10 @@
           try {
             if (isEdit) {
               await apiPut(`/api/skills/${skill.id}`, payload);
-              showToast('Skill 已更新');
+               showToast('Skill Draft 已更新；请发布 RuntimeRelease');
             } else {
               await apiPost('/api/skills', payload);
-              showToast('Skill 已创建');
+               showToast('Skill Draft 已创建；请绑定 Agent 并发布 RuntimeRelease');
             }
             closeModal();
             await loadSkills();
@@ -5074,7 +5271,7 @@
         if (!confirm('确定要删除这个 Skill 吗？')) return;
         try {
           await apiDelete(`/api/skills/${skillId}`);
-          showToast('Skill 已删除');
+          showToast('Skill 已从 Draft 删除；已发布会话快照不受影响');
           await loadSkills();
         } catch (err) {
           showToast('删除失败，请重试', 'error');
@@ -5382,7 +5579,7 @@
                 description: server.description,
                 enabled: enabled
               });
-              showToast(enabled ? 'MCP Server 已启用' : 'MCP Server 已禁用');
+              showToast(`MCP Server Draft 已${enabled ? '启用' : '禁用'}；请发布 RuntimeRelease`);
               await loadMcpServers();
             } catch (err) {
               showToast('状态更新失败', 'error');
@@ -5427,10 +5624,10 @@
           try {
             if (isEdit) {
               await apiPut(`/api/mcp-servers/${server.id}`, payload);
-              showToast('MCP Server 已更新');
+               showToast('MCP Server Draft 已更新；发现工具并发布 RuntimeRelease 后生效');
             } else {
               await apiPost('/api/mcp-servers', payload);
-              showToast('MCP Server 已创建');
+               showToast('MCP Server Draft 已创建；发现工具、绑定 Agent 并发布 RuntimeRelease');
             }
             closeModal();
             await loadMcpServers();
@@ -5452,7 +5649,9 @@
           const contractTools = Object.fromEntries((contract.tools || []).map(item => [item.name, item]));
           const body = tools.length === 0
             ? '<p class="text-sm text-slate-500">该 MCP Server 暂未返回工具列表。</p>'
-            : `<div class="space-y-3">${tools.map(t => `
+              : `<div class="space-y-3">${tools.map(t => {
+                const effect = (t.tool_metadata || {}).effect || 'unknown';
+                return `
                 <div class="bg-slate-50 rounded-xl p-3 border border-slate-200">
                   <div class="flex items-center justify-between mb-1">
                     <span class="text-sm font-medium text-slate-900">${escapeHtml(t.name)}</span>
@@ -5461,10 +5660,29 @@
                   <p class="text-xs text-slate-600 mb-2">${escapeHtml(t.description || '暂无描述')}</p>
                   ${contractTools[t.name]?.policy?.purpose ? `<p class="text-xs text-slate-500 mb-2">调用目的：${escapeHtml(contractTools[t.name].policy.purpose)}</p>` : ''}
                   <p class="text-xs text-slate-500 mb-2">允许 Agent：${escapeHtml((contractTools[t.name]?.allowed_by || []).join('、') || '当前无正式运行时授权')}</p>
+                  <div class="flex items-center gap-2 mb-2">
+                    <label class="text-xs text-slate-500">ToolEffect</label>
+                    <select class="mcp-effect-select text-xs border border-slate-200 rounded-lg px-2 py-1 bg-white" data-tool-id="${t.id}">
+                      ${['read','create','update','delete','unknown'].map(value => `<option value="${value}" ${value === effect ? 'selected' : ''}>${value}</option>`).join('')}
+                    </select>
+                    <button class="mcp-effect-save text-xs px-2 py-1 rounded-lg bg-slate-800 text-white" data-tool-id="${t.id}">保存分类</button>
+                  </div>
                   ${t.input_schema ? `<pre class="text-[10px] bg-white rounded-lg p-2 border border-slate-200 overflow-x-auto">${escapeHtml(JSON.stringify(t.input_schema, null, 2))}</pre>` : ''}
                 </div>
-              `).join('')}</div>`;
+              `}).join('')}</div>`;
           openDrawer(`${escapeHtml(server.name || 'MCP Server')} 工具列表`, body);
+          $$('.mcp-effect-save').forEach(button => {
+            button.addEventListener('click', async () => {
+              const toolId = Number(button.dataset.toolId);
+              const select = document.querySelector(`.mcp-effect-select[data-tool-id="${toolId}"]`);
+              try {
+                await apiPut(`/api/mcp-servers/${serverId}/tools/${toolId}/policy`, { effect: select.value });
+                showToast('ToolEffect Draft 已保存；发布 RuntimeRelease 后生效');
+              } catch (err) {
+                showToast('ToolEffect 保存失败：' + (err.message || err), 'error');
+              }
+            });
+          });
         } catch (err) {
           showToast('加载工具列表失败', 'error');
         }
@@ -5483,7 +5701,7 @@
         if (!confirm('确定要删除这个 MCP Server 吗？')) return;
         try {
           await apiDelete(`/api/mcp-servers/${serverId}`);
-          showToast('MCP Server 已删除');
+          showToast('MCP Server 已从 Draft 删除；已发布会话快照不受影响');
           await loadMcpServers();
         } catch (err) {
           showToast('删除失败，请重试', 'error');

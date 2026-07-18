@@ -95,6 +95,7 @@ MODEL = build_model(MODEL_ID)
 # Environment
 # ---------------------------------------------------------------------------
 RUNTIME_ENV = getenv("RUNTIME_ENV", "prd")
+RUNTIME_ENGINE = getenv("RUNTIME_ENGINE", "v18").strip().lower()
 SCHEDULER_BASE_URL = getenv("AGENTOS_URL", "http://127.0.0.1:8000")
 SLACK_TOKEN = getenv("SLACK_TOKEN", "")
 SLACK_SIGNING_SECRET = getenv("SLACK_SIGNING_SECRET", "")

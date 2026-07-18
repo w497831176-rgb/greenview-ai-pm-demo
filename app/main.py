@@ -1,10 +1,4 @@
-"""
-YIAI物业 V1.2｜AI 智能客服与工单协同原型
-============================================
-
-物业场景下可运行的最小 AgentOS 入口。
-仅挂载 V1.2 需要的 Property Agent、业务 API 与 RAG 能力。
-"""
+"""YIAI物业 V1.8 enterprise runtime convergence demo."""
 
 import asyncio
 from contextlib import asynccontextmanager
@@ -12,9 +6,7 @@ from contextlib import asynccontextmanager
 from fastapi.middleware.cors import CORSMiddleware
 
 from agno.os import AgentOS
-from agno.os.config import AuthorizationConfig
 
-from agents.property import property_agent
 from app.agents import router as agents_router
 from app.badcases import router as badcases_router
 from app.evaluations import router as evaluations_router
@@ -26,6 +18,10 @@ from app.mcp import discover_all_mcp_tools, router as mcp_router
 from app.model_configs import router as model_configs_router
 from app.models_compat import router as models_compat_router
 from app.observability import router as observability_router
+from app.runtime.agent_factory import runtime_agent_factory
+from app.runtime.api import router as runtime_router
+from app.runtime.release_compiler import ensure_bootstrap_release
+from app.runtime.workflow_factory import runtime_workflow_factory
 from app.skills import router as skills_router
 from app.settings import RUNTIME_ENV, agent_db
 from app.work_orders import router as work_orders_router
@@ -49,6 +45,9 @@ async def lifespan(app):  # type: ignore[no-untyped-def]
     except Exception:
         import traceback
         traceback.print_exc()
+    # Compile and publish exactly one bootstrap release only when no published
+    # release exists.  Existing platform configuration is never overwritten.
+    await asyncio.to_thread(ensure_bootstrap_release)
     yield
 
 
@@ -58,13 +57,14 @@ async def lifespan(app):  # type: ignore[no-untyped-def]
 # Create AgentOS
 # ---------------------------------------------------------------------------
 agent_os = AgentOS(
-    name="YIAI物业 V1.2",
+    name="YIAI物业 V1.8",
     tracing=True,
     scheduler=False,
     authorization=False,
     lifespan=lifespan,
     db=agent_db,
-    agents=[property_agent],
+    agents=[runtime_agent_factory],
+    workflows=[runtime_workflow_factory],
 )
 
 app = agent_os.get_app()
@@ -96,6 +96,7 @@ app.include_router(model_configs_router)
 app.include_router(agents_router)
 app.include_router(observability_router)
 app.include_router(evaluations_router)
+app.include_router(runtime_router)
 # Badcase endpoints under both /api/badcases and /api/knowledge/badcases (frontend).
 app.include_router(badcases_router, prefix="/api/badcases")
 app.include_router(badcases_router, prefix="/api/knowledge/badcases")
