@@ -6,6 +6,7 @@ Classifies owner intent and dispatches to the appropriate vertical agent.
 """
 
 import json
+import inspect
 import re
 from typing import Any, AsyncIterator, Dict, List, Optional
 
@@ -90,7 +91,10 @@ async def _collect_response(generator) -> str:
                 elif isinstance(chunk, str):
                     response += chunk
             return response.strip()
-        result = await generator
+        # Agno may return either an awaitable run or an already materialised
+        # RunOutput, depending on the SDK execution path.  Only await the
+        # former; awaiting a completed RunOutput aborts the whole SSE stream.
+        result = await generator if inspect.isawaitable(generator) else generator
         if hasattr(result, "content"):
             return str(result.content).strip()
         if isinstance(result, str):
