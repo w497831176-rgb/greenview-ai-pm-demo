@@ -1001,12 +1001,8 @@ async def _preinvoke_readonly_mcp_tools(
                     f"[{server_name}:{fn_name}] policy_preinvoke "
                     f"outcome={status}; {outcome_instruction(status)}; result={result_summary}"
                 )
-                # Audit via wrapper if available; otherwise skip (we already recorded above).
-                if hasattr(tool, "_record_audit"):
-                    try:
-                        tool._record_audit(fn_name, arguments, status, result_summary, error_summary, latency_ms)
-                    except Exception:
-                        pass
+                # ObservableMCPTools wraps entrypoint() and writes the one authoritative
+                # audit row.  call_records above is only the in-memory done-event list.
 
         if hasattr(tool, "close"):
             try:

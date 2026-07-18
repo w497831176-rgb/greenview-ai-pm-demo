@@ -60,6 +60,21 @@ def _context_relevance_score(query: str, content: str) -> float:
     return round(overlap / len(query_tokens), 4)
 
 
+def _is_structural_chunk(content: str, doc_title: str = "") -> bool:
+    """Return True for title-only and heading-only chunks.
+
+    These fragments may help index navigation, but they cannot support an
+    owner-facing factual answer or a clickable citation on their own.
+    """
+    normalized = re.sub(r"[^\u4e00-\u9fa5a-z0-9]", "", (content or "").lower())
+    title_normalized = re.sub(r"[^\u4e00-\u9fa5a-z0-9]", "", (doc_title or "").lower())
+    if not normalized:
+        return True
+    if title_normalized and normalized == title_normalized:
+        return True
+    return bool(re.fullmatch(r"第[0-9一二三四五六七八九十百]+[章节].{0,24}|[总附]则", normalized))
+
+
 def _build_keyword_index() -> Dict[int, Dict[str, int]]:
     """Build in-memory TF index for knowledge docs."""
     docs = db.list_knowledge_docs()
@@ -135,6 +150,8 @@ def _keyword_search(query: str, top_k: int = 10, threshold: Optional[float] = No
             continue
         title_tokens = _tokenize(doc.get("title") or "")
         for chunk in chunks:
+            if _is_structural_chunk(chunk.get("content", ""), doc.get("title") or ""):
+                continue
             chunk_tokens = _tokenize(chunk.get("content", ""))
             # Inject title terms into each chunk so the document title still contributes.
             tokens = title_tokens + chunk_tokens
@@ -195,6 +212,8 @@ def _semantic_search(query: str, top_k: int = 10, threshold: Optional[float] = N
     for chunk in chunks:
         doc = db.get_knowledge_doc(chunk.get("doc_id"))
         if not doc or not doc.get("is_indexed"):
+            continue
+        if _is_structural_chunk(chunk.get("content", ""), doc.get("title") or ""):
             continue
         results.append({
             "id": doc["id"],
@@ -440,6 +459,8 @@ def _title_boosted_results(
         chunks = rag_store.list_chunks_for_doc(doc_id)
         for c in chunks:
             content = c.get("content", "")
+            if _is_structural_chunk(content, doc_title):
+                continue
             ctx_text = f"{doc_title} {content}"
             ctx_score = _context_relevance_score(query, ctx_text)
             if ctx_score < context_threshold:
