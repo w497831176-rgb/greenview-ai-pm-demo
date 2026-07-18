@@ -1092,7 +1092,7 @@ def _build_handoff_package(
     for citation in evidence.get("citations") or []:
         verified.append({"type": "rag", "name": citation.get("doc_title"), "chunk_index": citation.get("chunk_index")})
     return {
-        "version": "v1.5.3",
+        "version": "v1.5.7",
         "generated_at": now_cn(),
         "session_id": session_id,
         "owner_request": {

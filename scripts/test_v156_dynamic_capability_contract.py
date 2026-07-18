@@ -45,6 +45,17 @@ def main():
 
     target, reason, scores = _capability_fallback("孩子放学后想参加亲子课程和托管", registry)
     assert target == "children_education", (target, reason, scores)
+    assert all(
+        match["term"] != "agent"
+        for score in scores
+        for match in score["matches"]
+    ), (reason, scores)
+    assert scores[0]["matches"][0]["source"] != "Agent 名称", (reason, scores)
+
+    # Asking "which Agent" alone is meta-language, not business intent.  It
+    # must not randomly route to the first enabled dynamic Agent.
+    target, reason, scores = _capability_fallback("请问应该由哪个 Agent 处理？", registry)
+    assert target == "customer_service", (target, reason, scores)
 
     target, reason, scores = _capability_fallback("想咨询老人陪诊和老年活动", registry)
     assert target == "elderly_care", (target, reason, scores)
