@@ -79,9 +79,34 @@ def _issue_type(text: str) -> str:
 
 
 def is_explicit_work_order_request(message: str) -> bool:
-    lowered = (message or "").lower()
-    return any(word in lowered for word in (
-        "报修", "创建工单", "创建维修工单", "提交工单", "安排维修", "安排师傅", "派师傅", "上门维修", "我要修", "帮我修",
+    """Return True only for an affirmative *command* to start a repair draft.
+
+    A repair-related noun is not authority to start a state-changing workflow.
+    Questions such as "报修前要准备什么" and explicit instructions such as
+    "本轮不要创建工单" must remain normal Agent/RAG/MCP conversations.
+    """
+    text = (message or "").strip()
+    compact = re.sub(r"\s+", "", text)
+    if not compact or _has_creation_negation(compact):
+        return False
+
+    affirmative_patterns = (
+        r"(?:我要|我想|请|帮我|麻烦|需要)(?:马上|现在|直接|尽快)?(?:报修|创建(?:维修)?工单|提交(?:维修)?工单|安排(?:师傅|维修|上门)|派师傅|上门维修|修一下)",
+        r"(?:创建|提交)(?:一张|一个)?(?:维修)?工单",
+        r"(?:请|帮我)安排(?:师傅|维修|上门)",
+    )
+    return any(re.search(pattern, compact, flags=re.IGNORECASE) for pattern in affirmative_patterns)
+
+
+def _has_creation_negation(text: str) -> bool:
+    """Recognise explicit non-creation intent before the draft controller runs."""
+    return bool(re.search(
+        r"(?:不要|不需要|无需|暂不|先不|仅|只)(?:马上|现在|本轮|先)?(?:创建|提交|生成|新建)?(?:真实|正式)?(?:维修)?(?:工单|报修)?",
+        text,
+        flags=re.IGNORECASE,
+    )) and any(token in text for token in (
+        "不要创建", "不创建", "不要新建", "不新建", "暂不", "先不",
+        "无需", "不需要", "仅咨询", "只咨询", "仅查询", "只查询",
     ))
 
 
@@ -92,6 +117,34 @@ def is_cancel_request(message: str) -> bool:
 def is_confirmation(message: str) -> bool:
     normalized = (message or "").strip().lower()
     return bool(re.search(r"^(确认创建|确认|同意创建|好的.*创建|就.*创建|创建.*)$", normalized))
+
+
+def _is_draft_follow_up(message: str) -> bool:
+    """Only let concise field-completion messages advance an existing draft.
+
+    A stale draft must never hijack a later request for weather, RAG evidence,
+    work-order enquiry or an unrelated consultation in the same session.
+    """
+    text = (message or "").strip()
+    compact = re.sub(r"\s+", "", text)
+    if not text or _has_creation_negation(compact):
+        return False
+    if is_confirmation(text) or is_cancel_request(text) or is_explicit_work_order_request(text):
+        return True
+    if len(text) > 90:
+        return False
+    # These are concrete fields the draft needs; generic "漏水" or "报修"
+    # alone intentionally do not continue the workflow.
+    appointment_follow_up = bool(re.search(
+        r"(?:预约|上门时间|可上门|今天(?:上午|下午|晚上)|明天(?:上午|下午|晚上)|\d{1,2}月\d{1,2}日)",
+        text,
+    ))
+    # A bare priority such as "紧急" is a valid field answer.  Do not treat a
+    # normal sentence merely mentioning an urgent repair as draft completion.
+    explicit_urgency = bool(re.fullmatch(r"(?:紧急|高|中|低)", compact))
+    room_follow_up = len(compact) <= 24 and bool(_room_id(text))
+    contact_follow_up = "联系人" in text and bool(_contact_name(text))
+    return bool(_phone(text) or room_follow_up or contact_follow_up or appointment_follow_up or explicit_urgency)
 
 
 def _missing(draft: Dict[str, Any]) -> List[str]:
@@ -146,7 +199,12 @@ def advance_work_order_workflow(session_id: str, message: str) -> Optional[Dict[
             {},
         )
 
-    if not existing and not is_explicit_work_order_request(message):
+    if not existing:
+        if not is_explicit_work_order_request(message):
+            return None
+    elif not _is_draft_follow_up(message):
+        # Preserve the unconfirmed draft, but do not turn every subsequent
+        # consultation into a stateful ticket interaction.
         return None
 
     if existing and is_confirmation(message):

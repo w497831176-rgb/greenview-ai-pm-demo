@@ -33,10 +33,21 @@ workflow.delete_work_order_draft = fake_delete
 workflow.create_work_order = fake_create
 
 session = "DEMO_TEST_V150_WORKFLOW"
+consultation = (
+    "卫生间天花板持续滴水。请查询上海当前天气、我的最近工单，"
+    "并依据知识库说明紧急维修时效；本轮不要创建真实工单。"
+)
+assert workflow.advance_work_order_workflow("DEMO_TEST_V150_CONSULT", consultation) is None
+
 first = workflow.advance_work_order_workflow(session, "厨房漏水，我要报修")
 assert first and first["action"] == "draft_updated"
 assert first["missing_fields"] == ["紧急程度", "联系电话", "预约上门时间"]
 assert not created
+
+# A pending draft must not steal a later normal consultation in the same
+# session. It remains saved, but the Agent/RAG/MCP runtime gets the turn.
+assert workflow.advance_work_order_workflow(session, consultation) is None
+assert session in drafts
 
 second = workflow.advance_work_order_workflow(session, "紧急。18927405209")
 assert second and second["action"] == "awaiting_confirmation"

@@ -658,35 +658,6 @@ def _mcp_server_relevant(server_name: str, message: str) -> bool:
     return server_name.lower() in lowered
 
 
-def _user_requests_work_order_creation(message: str) -> bool:
-    """Detect an explicit request to create a new repair work order."""
-    lowered = message.lower()
-    creation_keywords = ["创建工单", "创建维修工单", "报修", "我要修", "帮我修", "提交工单"]
-    if any(k in lowered for k in creation_keywords):
-        return True
-    return "工单" in lowered and "创建" in lowered
-
-
-def _user_confirms_work_order(message: str) -> bool:
-    """Detect a confirmation reply for a pending work-order draft."""
-    if not message:
-        return False
-    lowered = message.strip().lower()
-    confirm_patterns = [r"^确认创建", r"^确认", r"^好的.*创建", r"^同意创建", r"^就.*创建", r"^创建.*"]
-    return any(re.search(p, lowered) for p in confirm_patterns)
-
-
-def _has_pending_work_order_draft(session_id: Optional[str]) -> bool:
-    """Return True if the session already has an unconfirmed work-order draft."""
-    if not session_id:
-        return False
-    try:
-        from db.property_db import get_work_order_draft
-        return bool(get_work_order_draft(session_id))
-    except Exception:
-        return False
-
-
 def _build_mcp_tools(
     agent_id: Optional[str] = None,
     trace_id: Optional[str] = None,
