@@ -350,6 +350,7 @@ def _is_pro_model(model_id: Optional[str]) -> bool:
 
 DEFAULT_ROOM_ID = "3-2-1201"
 DEFAULT_OWNER_NAME = "王先生"
+MAX_SKILL_INJECTION_CHARS = 6000
 
 
 def _get_price_snapshot(model_id: str) -> Optional[Dict[str, Any]]:
@@ -439,13 +440,19 @@ def _build_skill_context(message: str, agent_id: Optional[str] = None) -> tuple:
             instructions = skill_storage.build_instructions(skill.get("id"), skill)
             if not name or not instructions:
                 continue
+            original_instruction_chars = len(instructions)
+            if original_instruction_chars > MAX_SKILL_INJECTION_CHARS:
+                instructions = instructions[:MAX_SKILL_INJECTION_CHARS] + "\n[Skill 指令超出本轮注入预算，已截断；完整版本仍保留在 Skill 管理中。]"
             contract = decision["contract"]
             header = (
                 f"【Skill：{name}｜版本 {contract['version']}｜{decision['match_reason']}】\n"
                 "权限边界：Skill 提供业务 SOP，不新增工具权限；仅可使用当前 Agent 已绑定的 MCP 工具。"
             )
             parts.append(f"{header}\n{instructions}")
-            activated.append(activation_evidence(decision, len(instructions)))
+            evidence = activation_evidence(decision, len(instructions))
+            evidence["original_instruction_chars"] = original_instruction_chars
+            evidence["truncated_for_runtime"] = original_instruction_chars > MAX_SKILL_INJECTION_CHARS
+            activated.append(evidence)
         if not parts:
             return "", [], None
         return (

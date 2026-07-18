@@ -20,12 +20,15 @@ def _as_list(value: Any) -> List[str]:
     if value is None:
         return []
     if isinstance(value, str):
-        values = re.split(r"[,，、；;｜|\\/\\n]+", value)
+        raw_values = [value]
     elif isinstance(value, (list, tuple, set)):
-        values = value
+        raw_values = value
     else:
         return []
-    return [str(item).strip() for item in values if str(item).strip()]
+    values: List[str] = []
+    for item in raw_values:
+        values.extend(re.split(r"[,，、；;。.!！？?｜|/\\n]+", str(item)))
+    return [item.strip() for item in values if item.strip()]
 
 
 def _as_int(value: Any, default: int = DEFAULT_PRIORITY) -> int:
@@ -39,6 +42,8 @@ def _normalise(text: str) -> str:
     text = (text or "").lower().strip()
     for stop_word in ("用户", "业主", "提到", "说到", "询问", "问题", "关于", "相关", "的", "时", "如果", "当", "要", "等"):
         text = text.replace(stop_word, "")
+    for source, canonical in (("孩子", "儿童"), ("小孩", "儿童"), ("娃", "儿童")):
+        text = text.replace(source, canonical)
     return text
 
 
@@ -64,7 +69,10 @@ def _term_matches(term: str, message: str) -> bool:
     term_bigrams, message_bigrams = _bigrams(term), _bigrams(message)
     if not term_bigrams or not message_bigrams:
         return False
-    return len(term_bigrams & message_bigrams) / len(term_bigrams | message_bigrams) >= 0.45
+    overlap = term_bigrams & message_bigrams
+    jaccard = len(overlap) / len(term_bigrams | message_bigrams)
+    term_coverage = len(overlap) / len(term_bigrams)
+    return jaccard >= 0.45 or (len(overlap) >= 2 and term_coverage >= 0.40)
 
 
 def skill_contract(skill: Dict[str, Any]) -> Dict[str, Any]:

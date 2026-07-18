@@ -66,6 +66,15 @@ def _appointment(text: str, urgency: str) -> str:
     return ""
 
 
+def _labelled_value(text: str, *labels: str) -> str:
+    """Read a single value from the owner-chat's labelled field format."""
+    for label in labels:
+        match = re.search(rf"(?:^|\n)\s*(?:✅\s*)?{re.escape(label)}[：:]\s*([^\n]+)", text or "")
+        if match:
+            return match.group(1).strip()
+    return ""
+
+
 def _issue_type(text: str) -> str:
     if any(word in text for word in ("水", "漏", "渗", "滴", "管", "下水道", "马桶", "龙头", "水槽")):
         return "水电"
@@ -76,6 +85,18 @@ def _issue_type(text: str) -> str:
     if any(word in text for word in ("门", "窗", "玻璃", "锁")):
         return "门窗"
     return "其他"
+
+
+def _looks_like_structured_work_order_payload(text: str) -> bool:
+    """Recognise an owner supplying a complete, labelled repair payload.
+
+    This starts only a draft, never a real order. It covers the common UX path
+    where the assistant asks for fields and the owner pastes them back without
+    repeating “please create a work order”.
+    """
+    labels = ("房号", "问题描述", "紧急程度", "联系电话", "预约上门", "预约时间")
+    field_count = sum(1 for label in labels if label in (text or ""))
+    return bool(_phone(text) and field_count >= 2)
 
 
 def is_explicit_work_order_request(message: str) -> bool:
@@ -95,7 +116,7 @@ def is_explicit_work_order_request(message: str) -> bool:
         r"(?:创建|提交)(?:一张|一个)?(?:维修)?工单",
         r"(?:请|帮我)安排(?:师傅|维修|上门)",
     )
-    return any(re.search(pattern, compact, flags=re.IGNORECASE) for pattern in affirmative_patterns)
+    return any(re.search(pattern, compact, flags=re.IGNORECASE) for pattern in affirmative_patterns) or _looks_like_structured_work_order_payload(text)
 
 
 def _has_creation_negation(text: str) -> bool:
@@ -116,7 +137,7 @@ def is_cancel_request(message: str) -> bool:
 
 def is_confirmation(message: str) -> bool:
     normalized = (message or "").strip().lower()
-    return bool(re.search(r"^(确认创建|确认|同意创建|好的.*创建|就.*创建|创建.*)$", normalized))
+    return bool(re.search(r"^(?:确认(?:创建|提交|报修|工单)?|同意(?:创建|提交|报修|工单)?|好的.*(?:创建|提交)|就.*(?:创建|提交)|(?:创建|提交).*)$", normalized))
 
 
 def _is_draft_follow_up(message: str) -> bool:
@@ -238,8 +259,9 @@ def advance_work_order_workflow(session_id: str, message: str) -> Optional[Dict[
         )
 
     base = dict(existing or {})
-    issue_desc = base.get("issue_desc") or message.strip()
-    urgency = _urgency(message) or base.get("urgency") or ""
+    issue_desc = _labelled_value(message, "问题描述", "报修内容", "故障描述") or base.get("issue_desc") or message.strip()
+    urgency = _labelled_value(message, "紧急程度") or _urgency(message) or base.get("urgency") or ""
+    appointment = _labelled_value(message, "预约上门时间", "预约时间") or _appointment(message, urgency) or base.get("appointment_time") or ""
     draft = {
         "room_id": _room_id(message) or base.get("room_id") or DEFAULT_ROOM_ID,
         "issue_type": base.get("issue_type") or _issue_type(issue_desc),
@@ -247,7 +269,7 @@ def advance_work_order_workflow(session_id: str, message: str) -> Optional[Dict[
         "urgency": urgency,
         "contact_name": _contact_name(message) or base.get("contact_name") or DEFAULT_OWNER_NAME,
         "contact_phone": _phone(message) or base.get("contact_phone") or "",
-        "appointment_time": _appointment(message, urgency) or base.get("appointment_time") or "",
+        "appointment_time": appointment,
     }
     save_work_order_draft(session_id=session_id, **draft)
     missing = _missing(draft)
