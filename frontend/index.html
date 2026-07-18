@@ -219,7 +219,7 @@
     // ==========================================
     const API_BASE = '';
     const DEFAULT_ROOM_ID = '3-2-1201';
-    const APP_VERSION = 'V1.6.1';
+    const APP_VERSION = 'V1.7.0';
 
     const STATE = {
       topTab: 'owner',
@@ -534,12 +534,16 @@
       if (routeReason) tags.push(`<span class="px-1.5 py-0.5 bg-slate-100 text-slate-600 rounded text-[10px]" title="${escapeHtml(routeIntent || '')}">路由原因：${escapeHtml(routeReason)}</span>`);
       if (agent) tags.push(`<span class="px-1.5 py-0.5 bg-indigo-50 text-indigo-600 rounded text-[10px]" title="agent_id: ${escapeHtml(currentAgentId || '')}">当前处理 Agent：${escapeHtml(agent)}</span>`);
       if (skills && skills.length) tags.push(`<span class="px-1.5 py-0.5 bg-brand-50 text-brand-600 rounded text-[10px]" title="Skill 提供可复用的业务规则与执行方法；它不是知识库引用。">已命中 Skill（业务规则）：${escapeHtml(skills.map(s => (typeof s === 'object' && s !== null ? (s.name || JSON.stringify(s)) : String(s))).join('、'))}</span>`);
-      if (tools && tools.length) tags.push(`<span class="px-1.5 py-0.5 bg-gold-50 text-gold-600 rounded text-[10px]">已调用工具：${escapeHtml(tools.map(t => typeof t === 'string' ? t : (t.name || t.tool_name || JSON.stringify(t))).join('、'))}</span>`);
+      const visibleToolNames = [...new Set([
+        ...(tools || []).map(t => typeof t === 'string' ? t : (t.name || t.tool_name || '')).filter(Boolean),
+        ...(mcpCalls || []).map(c => c.tool_name || '').filter(name => name && name !== 'discovery')
+      ])];
+      if (visibleToolNames.length) tags.push(`<span class="px-1.5 py-0.5 bg-gold-50 text-gold-600 rounded text-[10px]">已调用工具：${escapeHtml(visibleToolNames.join('、'))}</span>`);
       if (mcpCalls && mcpCalls.length) {
         const okCount = mcpCalls.filter(c => c.status === 'success').length;
-        const expectedCount = mcpCalls.filter(c => ['empty', 'not_found', 'invalid_input', 'unauthorized'].includes(c.status)).length;
-        const issueCount = mcpCalls.filter(c => ['timeout', 'upstream_error', 'failed'].includes(c.status)).length;
-        const statusText = `success ${okCount} / expected ${expectedCount} / issue ${issueCount}`;
+        const businessCount = mcpCalls.filter(c => ['empty', 'not_found', 'unauthorized'].includes(c.status)).length;
+        const issueCount = mcpCalls.filter(c => !['success', 'empty', 'not_found', 'unauthorized'].includes(c.status)).length;
+        const statusText = `成功 ${okCount} / 业务结果 ${businessCount} / 失败 ${issueCount}`;
         const summary = mcpCalls.map(c => `[${escapeHtml(c.server_name || 'unknown')}] ${escapeHtml(c.tool_name || '')} outcome=${escapeHtml(c.status || 'unknown')} ${c.latency_ms || 0}ms`).join('\n');
         tags.push(`<span class="px-1.5 py-0.5 bg-cyan-50 text-cyan-600 rounded text-[10px] cursor-help" title="${escapeHtml(summary)}">MCP 调用：${statusText}</span>`);
       }
@@ -1287,13 +1291,22 @@
         : label;
     }
 
+    function normalizeBareCitationMarkers(content) {
+      return String(content || '').replace(/(?:\u53c2\u8003)?\u5f15\u7528\s*(\d+)/g, (match, value, offset, source) => {
+        const before = source.charAt(offset - 1);
+        const after = source.charAt(offset + match.length);
+        if ('\u3010[\uff08('.includes(before) || '\u3011]\uff09)'.includes(after)) return match;
+        return `\u3010\u5f15\u7528${value}\u3011`;
+      });
+    }
+
     function normalizeCitationMarkers(content) {
       return String(content || '').replace(/【(?:参考)?引用\s*(\d+)】|\[(?:参考)?引用\s*(\d+)\]|[（(](?:参考)?引用\s*(\d+)[）)]/g, (_, a, b, c) => `【引用${a || b || c}】`);
     }
 
     function getUsedCitationIndices(content, maxCount) {
       const used = new Set();
-      const normalized = normalizeCitationMarkers(content);
+      const normalized = normalizeCitationMarkers(normalizeBareCitationMarkers(content));
       const regex = /【引用(\d+)】/g;
       let match;
       while ((match = regex.exec(normalized)) !== null) {
@@ -1317,7 +1330,7 @@
     }
 
     function renderMarkdownWithCitations(content, citations) {
-      const safeContent = normalizeCitationMarkers(content);
+      const safeContent = normalizeCitationMarkers(normalizeBareCitationMarkers(content));
       if (!citations || citations.length === 0) return marked.parse(safeContent);
       const renderer = new marked.Renderer();
       renderer.text = (token) => {

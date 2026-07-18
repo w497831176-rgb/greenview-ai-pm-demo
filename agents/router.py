@@ -71,7 +71,7 @@ def create_router_agent(vertical_agents: Optional[List[Dict[str, Any]]] = None) 
         add_datetime_to_context=True,
         add_history_to_context=True,
         read_chat_history=True,
-        num_history_runs=3,
+        num_history_runs=1,
         markdown=False,
     )
 

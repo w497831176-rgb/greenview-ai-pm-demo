@@ -25,6 +25,18 @@ TERMINAL_STATUSES = ("已完成", "已关闭", "已取消")
 ALLOWED_STATUS_FILTERS = {"待派单", "处理中", "待处理", "已完成", "已关闭", "已取消"}
 
 
+# Host policy uses stable English enums while the demo database and console
+# display Chinese status labels. Accept both at the MCP boundary so a model
+# retry can never silently turn a filtered request into an all-record count.
+STATUS_FILTER_ALIASES = {
+    "pending": "待处理",
+    "processing": "处理中",
+    "assigned": "待派单",
+    "completed": "已完成",
+    "closed": "已关闭",
+    "cancelled": "已取消",
+}
+
 def _result(status: str, data: Any = None, message: str = "", *, scope: str = "") -> str:
     return json.dumps(
         {
@@ -126,7 +138,8 @@ def get_my_work_order_by_id(work_order_id: str) -> str:
 @mcp.tool()
 def count_work_orders(status: Optional[str] = None) -> str:
     """返回全小区的脱敏工单聚合数量，不返回工单明细。"""
-    normalized = (status or "").strip()
+    raw_status = (status or "").strip()
+    normalized = STATUS_FILTER_ALIASES.get(raw_status.lower(), raw_status)
     if normalized and normalized not in ALLOWED_STATUS_FILTERS:
         return _result("invalid_input", None, "status 仅支持演示系统定义的工单状态。", scope="community_aggregate")
     try:

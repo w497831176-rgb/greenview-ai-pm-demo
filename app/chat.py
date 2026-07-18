@@ -740,7 +740,11 @@ def _build_mcp_tools(
     return tools
 
 
-def _format_mcp_context(agent_id: Optional[str] = None, message: str = "") -> str:
+def _format_mcp_context(
+    agent_id: Optional[str] = None,
+    message: str = "",
+    excluded_servers: Optional[set] = None,
+) -> str:
     """Format MCP servers bound to the current agent, filtered by user message."""
     try:
         if agent_id == "router":
@@ -749,10 +753,12 @@ def _format_mcp_context(agent_id: Optional[str] = None, message: str = "") -> st
 
         bound_tools = get_agent_tools(agent_id) if agent_id else []
         bound_names = {t.get("tool_name") for t in bound_tools if t.get("tool_name")}
+        excluded_servers = excluded_servers or set()
         servers = [
             s for s in list_mcp_servers()
             if s.get("enabled")
             and s.get("name") in bound_names
+            and s.get("name") not in excluded_servers
             and (not is_builtin_policy_server(str(s.get("name") or "")) or _mcp_server_relevant(s.get("name", ""), message))
         ]
         if not servers:
@@ -827,6 +833,7 @@ def _policy_preinvoke_plan(server_name: str, message: str) -> List[Tuple[str, Di
         asks_system_total = any(word in message for word in (
             "系统当前", "全小区", "系统中", "系统当前待处理", "待处理工单数量", "总量", "总数",
         ))
+        asks_recent = asks_recent or ("\u6700\u8fd1" in message and ("\u7ef4\u4fee\u5de5\u5355" in message or "\u623f\u53f7" in message))
         if asks_recent:
             plan.append(("get_my_recent_work_orders", {"limit": 5}))
         if asks_open:
@@ -925,8 +932,11 @@ async def _preinvoke_readonly_mcp_tools(
             )
             tool.trace_id = trace_id
             tool.server_name = server_name
+            if hasattr(tool, "connect"):
+                await asyncio.wait_for(tool.connect(), timeout=5)
             await asyncio.wait_for(tool.build_tools(), timeout=8)
         except Exception as exc:
+            error_summary = str(exc)[:300]
             # A failed discovery is still evidence.  Do not silently fall back
             # to a second model-native connection that can hold the chat stream
             # open until the reverse-proxy timeout.
@@ -935,11 +945,15 @@ async def _preinvoke_readonly_mcp_tools(
                 "tool_name": "discovery",
                 "arguments": {},
                 "status": "upstream_error",
-                "result_summary": str(exc)[:300],
-                "error_summary": str(exc)[:300],
+                "result_summary": error_summary,
+                "error_summary": error_summary,
                 "latency_ms": None,
                 "invocation_mode": "policy_preinvoke",
             })
+            context_parts.append(
+                f"[{server_name}:discovery] policy_preinvoke outcome=upstream_error; "
+                f"{outcome_instruction('upstream_error')}; result={error_summary}"
+            )
             if tool and hasattr(tool, "close"):
                 try:
                     await asyncio.wait_for(tool.close(), timeout=3)
@@ -962,7 +976,7 @@ async def _preinvoke_readonly_mcp_tools(
             result_summary = ""
             error_summary = None
             try:
-                result = await asyncio.wait_for(entrypoint(arguments), timeout=8)
+                result = await asyncio.wait_for(entrypoint(**arguments), timeout=8)
                 result_summary = _summarize_tool_result(result)
                 status = extract_tool_outcome(result_summary)
                 if status in {"timeout", "upstream_error"}:
@@ -1001,7 +1015,7 @@ async def _preinvoke_readonly_mcp_tools(
                 pass
 
     if not context_parts:
-        return "", []
+        return "", call_records
 
     context_str = (
         "\n\n[以下 MCP 工具已由系统策略预先真实调用，结果已注入上下文；"
@@ -1277,7 +1291,7 @@ def _create_vertical_agent_for_id(
         add_datetime_to_context=True,
         add_history_to_context=True,
         read_chat_history=True,
-        num_history_runs=5,
+        num_history_runs=2,
         markdown=True,
     )
 
@@ -1654,11 +1668,14 @@ async def _stream_agent_response(
 
         # Build dynamic context and tools scoped to the current vertical agent.
         skill_context, activated_skills, skill_model_id = _build_skill_context(message, agent_id=current_agent_id)
+        rag_started_at = time.time()
         rag_context, citations = _build_rag_context(message_for_agent)
+        rag_latency_ms = int((time.time() - rag_started_at) * 1000)
         record_trace_event(
             trace_id,
             "rag_retrieval",
             "success" if citations else "empty",
+            latency_ms=rag_latency_ms,
             input_summary=message_for_agent[:240],
             output_summary=f"retrieved {len(citations)} candidate chunks",
             metadata={
@@ -1667,13 +1684,25 @@ async def _stream_agent_response(
                 "citation_chunks": [c.get("chunk_index") for c in citations],
             },
         )
-        mcp_context = _format_mcp_context(agent_id=current_agent_id, message=message)
         # V1.4.3: narrow policy pre-invocation for readonly MCP servers. Real
         # tool results are injected into context and recorded as policy_preinvoke.
         preinvoke_context, preinvoke_calls = await _preinvoke_readonly_mcp_tools(
             agent_id=current_agent_id,
             message=message,
             trace_id=trace_id,
+        )
+        # A formal server is executed through exactly one path per turn. Even
+        # a discovery failure remains visible evidence rather than triggering
+        # a silent second model-native connection.
+        policy_managed_servers = {
+            str(call.get("server_name"))
+            for call in preinvoke_calls
+            if call.get("server_name") and is_builtin_policy_server(str(call.get("server_name")))
+        }
+        mcp_context = _format_mcp_context(
+            agent_id=current_agent_id,
+            message=message,
+            excluded_servers=policy_managed_servers,
         )
         if preinvoke_context:
             mcp_context = f"{mcp_context}{preinvoke_context}"
@@ -1685,12 +1714,12 @@ async def _stream_agent_response(
         # model-native tools: that duplicate discovery was serial and could use
         # up the whole reverse-proxy timeout before the vertical answer began.
         # User-added dynamic MCP servers remain model-native and extensible.
-        preinvoked_servers = {
-            str(call.get("server_name"))
-            for call in preinvoke_calls
-            if call.get("server_name") and is_builtin_policy_server(str(call.get("server_name")))
-        }
-        mcp_tools = _build_mcp_tools(agent_id=current_agent_id, trace_id=trace_id, message=message, excluded_servers=preinvoked_servers)
+        mcp_tools = _build_mcp_tools(
+            agent_id=current_agent_id,
+            trace_id=trace_id,
+            message=message,
+            excluded_servers=policy_managed_servers,
+        )
         for tool in mcp_tools:
             if hasattr(tool, "connect"):
                 try:
@@ -1757,7 +1786,11 @@ async def _stream_agent_response(
             f"你必须主动提出转人工处理，不要强行回答。]"
             f"{knowledge_gap_note}"
         )
-        contextual_message = f"{system_context_prefix}{rag_context}{skill_context}{mcp_context}\n{message_for_agent}"
+        response_style = (
+            "\n\n[Answer style: lead with the conclusion; do not repeat the question or narrate progress. "
+            "Keep the default answer under 900 Chinese characters and retain only directly relevant facts.]"
+        )
+        contextual_message = f"{system_context_prefix}{rag_context}{skill_context}{mcp_context}{response_style}\n{message_for_agent}"
 
         full_content = ""
         token_count = 0
