@@ -27,6 +27,7 @@ from pydantic import BaseModel
 
 from app.observability import _check_budget
 from app.handoff_policy import HANDOFF_STATUS_LABELS, evaluate_handoff_policy, handoff_policy_summary
+from app.mcp_policy import allowed_tools_for_agent, extract_tool_outcome, outcome_instruction
 from app.settings import MODEL_ID, USE_THINKING, build_model
 from app.skill_runtime import activation_evidence, select_skills, skill_contract
 from app.utils.cost_utils import build_price_snapshot, compute_cost_cny, normalize_usage
@@ -103,17 +104,31 @@ if MCPTools is not None:
         """
 
         def __init__(self, *args: Any, **kwargs: Any):
+            # These are Host-side controls, not MCPTools constructor options.
+            # Pop them before calling the library so they cannot silently leak
+            # into a future MCPTools implementation.
+            self.invocation_mode: str = kwargs.pop("invocation_mode", "model_native")
+            allowed_names = kwargs.pop("allowed_function_names", None)
+            self.allowed_function_names = set(allowed_names or [])
             super().__init__(*args, **kwargs)
             self.recorded_calls: List[Dict[str, Any]] = []
             self.trace_id: Optional[str] = None
             self.server_name: str = "unknown"
-            self.invocation_mode: str = kwargs.pop("invocation_mode", "model_native")
 
         async def build_tools(self) -> None:
             # Build tools in the current event loop. MCPTools uses asyncio stdio
             # subprocess, so it is non-blocking and safe to await directly.
             await super(ObservableMCPTools, self).build_tools()
             functions = getattr(self, "functions", None) or {}
+            if self.allowed_function_names:
+                # Server discovery is not a permission grant.  The Host only
+                # exposes functions explicitly allowed for the current Agent.
+                functions = {
+                    name: function
+                    for name, function in functions.items()
+                    if name in self.allowed_function_names
+                }
+                self.functions = functions
             for fn_name, fn in functions.items():
                 original = getattr(fn, "entrypoint", None)
                 if original is None or getattr(original, "_observable_wrapped", False):
@@ -157,8 +172,10 @@ if MCPTools is not None:
                 # Audit failures must not break the chat flow.
                 pass
 
-            # Auto-capture MCP tool failures as badcases for ops governance.
-            if status == "failed":
+            # Auto-capture genuine service failures only.  An empty result,
+            # input validation failure, or a permission denial is an expected
+            # product outcome, not automatically a capability-gap Badcase.
+            if status in {"timeout", "upstream_error"}:
                 try:
                     sanitized_args = {
                         k: f"<{type(v).__name__}>" if not isinstance(v, (str, int, float, bool, type(None))) else v
@@ -169,7 +186,7 @@ if MCPTools is not None:
                     create_badcase(
                         title=f"MCP 工具失败：{fn_name}",
                         description=error_summary or result_summary or "MCP 工具调用失败，待排查能力缺口或配置问题。",
-                        category="mcp_capability" if "mcp" in self.server_name.lower() or "mcp" in fn_name.lower() else "tool_failure",
+                        category="mcp_capability",
                         evidence=f"server={self.server_name}, tool={fn_name}",
                         source_message_id=None,
                         session_id=None,
@@ -205,12 +222,12 @@ if MCPTools is not None:
                     try:
                         result = await original(*args, **kwargs)
                         result_summary = _summarize_tool_result(result)
-                        if "Error from MCP tool" in result_summary:
-                            status = "failed"
+                        status = extract_tool_outcome(result_summary)
+                        if status in {"timeout", "upstream_error"}:
                             error_summary = result_summary[:300]
                         return result
                     except Exception as exc:
-                        status = "failed"
+                        status = "upstream_error"
                         error_summary = str(exc)[:300]
                         raise
                     finally:
@@ -228,12 +245,12 @@ if MCPTools is not None:
                     loop = asyncio.get_event_loop()
                     result = await loop.run_in_executor(None, lambda: original(*args, **kwargs))
                     result_summary = _summarize_tool_result(result)
-                    if "Error from MCP tool" in result_summary:
-                        status = "failed"
+                    status = extract_tool_outcome(result_summary)
+                    if status in {"timeout", "upstream_error"}:
                         error_summary = result_summary[:300]
                     return result
                 except Exception as exc:
-                    status = "failed"
+                    status = "upstream_error"
                     error_summary = str(exc)[:300]
                     raise
                 finally:
@@ -602,6 +619,11 @@ def _build_mcp_tools(
                 continue
             if not _mcp_server_relevant(name, message):
                 continue
+            allowed_function_names = allowed_tools_for_agent(agent_id, name)
+            if not allowed_function_names:
+                # Database binding is not a permission grant; the Host-side
+                # contract must explicitly allow this Agent/server pair.
+                continue
             command = server.get("command")
             args = server.get("args") or []
             env = server.get("env") or {}
@@ -621,6 +643,7 @@ def _build_mcp_tools(
                     transport="stdio",
                     timeout_seconds=15,
                     invocation_mode="model_native",
+                    allowed_function_names=allowed_function_names,
                 )
                 tool.trace_id = trace_id
                 tool.server_name = name
@@ -654,7 +677,11 @@ def _format_mcp_context(agent_id: Optional[str] = None, message: str = "") -> st
         for server in servers:
             name = server.get("name", "")
             description = server.get("description", "")
+            allowed_function_names = sorted(allowed_tools_for_agent(agent_id, name))
+            if name and not allowed_function_names:
+                continue
             if name:
+                parts.append(f"- Host allowlist: {name} -> {', '.join(allowed_function_names)}")
                 parts.append(f"- {name}：{description or '无描述'}")
         if not parts:
             return ""
@@ -674,9 +701,45 @@ def _format_mcp_context(agent_id: Optional[str] = None, message: str = "") -> st
 # agent context and recorded in the trace as invocation_mode=policy_preinvoke.
 _READONLY_MCP_DEFAULT_TOOLS = {
     "weather-server": ["get_current_weather", "get_weather_advice"],
-    "workorder-server": ["count_work_orders", "list_recent_work_orders"],
+    "workorder-server": ["get_my_recent_work_orders", "count_my_open_work_orders", "count_work_orders"],
     "calendar-server": ["get_current_datetime"],
 }
+
+
+def _policy_preinvoke_plan(server_name: str, message: str) -> List[Tuple[str, Dict[str, Any]]]:
+    """Choose the smallest deterministic read-only MCP call set for one turn.
+
+    DeepSeek thinking mode cannot safely receive a forced ``tool_choice``.  A
+    narrow policy pre-invocation therefore covers only stable owner-facing
+    reads, while the Agent keeps its allowlisted tools for any extra work.
+    """
+    if server_name == "weather-server":
+        cities = ("北京", "上海", "广州", "深圳", "杭州", "成都", "武汉", "西安")
+        city = next((item for item in cities if item in message), None)
+        if not city:
+            return []
+        plan = [("get_current_weather", {"city": city})]
+        if any(word in message for word in ("建议", "风险", "上门", "户外", "暴雨", "台风", "下雨", "降雨")):
+            plan.append(("get_weather_advice", {"city": city}))
+        return plan
+
+    if server_name == "workorder-server":
+        plan: List[Tuple[str, Dict[str, Any]]] = []
+        asks_recent = any(word in message for word in ("最近工单", "我的工单", "我家工单", "相似工单", "维修记录", "工单进度"))
+        asks_open = any(word in message for word in ("待处理", "待派单", "未处理", "还有多少", "未关闭"))
+        asks_system_total = any(word in message for word in ("系统当前", "全小区", "系统中", "总量", "总数"))
+        if asks_recent:
+            plan.append(("get_my_recent_work_orders", {"limit": 5}))
+        if asks_open:
+            plan.append(("count_my_open_work_orders", {}))
+        if asks_system_total:
+            plan.append(("count_work_orders", {"status": "待处理"} if "待处理" in message else {}))
+        return plan
+
+    if server_name == "calendar-server":
+        if any(word in message for word in ("今天", "当前时间", "现在几点", "星期几", "几号", "日期")):
+            return [("get_current_datetime", {})]
+    return []
 
 
 def _policy_mcp_args(server_name: str, tool_name: str, message: str) -> Optional[Dict[str, Any]]:
@@ -734,7 +797,9 @@ async def _preinvoke_readonly_mcp_tools(
 
     for server_name, server in servers.items():
         default_tools = _READONLY_MCP_DEFAULT_TOOLS.get(server_name, [])
-        if not default_tools:
+        allowed_function_names = allowed_tools_for_agent(agent_id, server_name)
+        planned_calls = _policy_preinvoke_plan(server_name, message)
+        if not default_tools or not allowed_function_names or not planned_calls:
             continue
 
         command = server.get("command")
@@ -757,6 +822,7 @@ async def _preinvoke_readonly_mcp_tools(
                 transport="stdio",
                 timeout_seconds=15,
                 invocation_mode="policy_preinvoke",
+                allowed_function_names=allowed_function_names,
             )
             tool.trace_id = trace_id
             tool.server_name = server_name
@@ -770,11 +836,11 @@ async def _preinvoke_readonly_mcp_tools(
             continue
 
         functions = getattr(tool, "functions", None) or {}
-        for fn_name, fn in functions.items():
-            if fn_name not in default_tools:
+        for fn_name, arguments in planned_calls:
+            if fn_name not in default_tools or fn_name not in allowed_function_names:
                 continue
-            arguments = _policy_mcp_args(server_name, fn_name, message)
-            if arguments is None:
+            fn = functions.get(fn_name)
+            if fn is None:
                 continue
             entrypoint = getattr(fn, "entrypoint", None)
             if not entrypoint:
@@ -786,11 +852,11 @@ async def _preinvoke_readonly_mcp_tools(
             try:
                 result = await entrypoint(arguments)
                 result_summary = _summarize_tool_result(result)
-                if "Error from MCP tool" in result_summary:
-                    status = "failed"
+                status = extract_tool_outcome(result_summary)
+                if status in {"timeout", "upstream_error"}:
                     error_summary = result_summary[:300]
             except Exception as exc:
-                status = "failed"
+                status = "upstream_error"
                 error_summary = str(exc)[:300]
                 result_summary = error_summary
             finally:
@@ -806,7 +872,8 @@ async def _preinvoke_readonly_mcp_tools(
                     "invocation_mode": "policy_preinvoke",
                 })
                 context_parts.append(
-                    f"[{server_name}:{fn_name}] 策略预执行结果：{result_summary}"
+                    f"[{server_name}:{fn_name}] policy_preinvoke "
+                    f"outcome={status}; {outcome_instruction(status)}; result={result_summary}"
                 )
                 # Audit via wrapper if available; otherwise skip (we already recorded above).
                 if hasattr(tool, "_record_audit"):
@@ -1365,9 +1432,11 @@ async def _stream_agent_response(
 
         # Formal work-order writes have already been guarded by the workflow controller.
         # This model path is for consultation, RAG and read-only MCP only.
-        preinvoked_servers = {
-            call.get("server_name") for call in preinvoke_calls if call.get("status") == "success" and call.get("server_name")
-        }
+        # Keep the allowlisted server connected after a policy pre-invocation.
+        # A compound request may need another function from the same Server
+        # (for example current date plus date arithmetic).  Context tells the
+        # Agent not to repeat facts that are already available.
+        preinvoked_servers: set = set()
         mcp_tools = _build_mcp_tools(agent_id=current_agent_id, trace_id=trace_id, message=message, excluded_servers=preinvoked_servers)
         for tool in mcp_tools:
             if hasattr(tool, "connect"):
