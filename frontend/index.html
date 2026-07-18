@@ -527,9 +527,10 @@
       if (tools && tools.length) tags.push(`<span class="px-1.5 py-0.5 bg-gold-50 text-gold-600 rounded text-[10px]">已调用工具：${escapeHtml(tools.map(t => typeof t === 'string' ? t : (t.name || t.tool_name || JSON.stringify(t))).join('、'))}</span>`);
       if (mcpCalls && mcpCalls.length) {
         const okCount = mcpCalls.filter(c => c.status === 'success').length;
-        const failCount = mcpCalls.length - okCount;
-        const statusText = failCount > 0 ? `${okCount}成功/${failCount}失败` : `${okCount}次成功`;
-        const summary = mcpCalls.map(c => `[${escapeHtml(c.server_name || 'unknown')}] ${escapeHtml(c.tool_name || '')} ${c.status === 'success' ? '✓' : '✗'} ${c.latency_ms || 0}ms`).join('\n');
+        const expectedCount = mcpCalls.filter(c => ['empty', 'not_found', 'invalid_input', 'unauthorized'].includes(c.status)).length;
+        const issueCount = mcpCalls.filter(c => ['timeout', 'upstream_error', 'failed'].includes(c.status)).length;
+        const statusText = `success ${okCount} / expected ${expectedCount} / issue ${issueCount}`;
+        const summary = mcpCalls.map(c => `[${escapeHtml(c.server_name || 'unknown')}] ${escapeHtml(c.tool_name || '')} outcome=${escapeHtml(c.status || 'unknown')} ${c.latency_ms || 0}ms`).join('\n');
         tags.push(`<span class="px-1.5 py-0.5 bg-cyan-50 text-cyan-600 rounded text-[10px] cursor-help" title="${escapeHtml(summary)}">MCP 调用：${statusText}</span>`);
       }
       if (traceId) {
@@ -568,7 +569,8 @@
         }).join('') : '<p class="text-sm text-slate-400">本轮没有模型调用；如为规则工作流，这是预期行为。</p>';
         const workflowCalls = (assistantMsg.tool_calls || []).filter(call => (call.tool_name || call.name) === 'work_order_workflow');
         const workflowHtml = workflowCalls.length ? workflowCalls.map(call => `<div class="border border-emerald-200 bg-emerald-50 rounded-xl p-3 text-sm"><div class="font-medium text-emerald-800">维修工单工作流：${escapeHtml((call.arguments || {}).action || '已处理')}</div><div class="text-xs text-emerald-700 mt-1">${escapeHtml(call.result_summary || '')}</div>${call.work_order_id ? `<div class="text-xs text-emerald-700 mt-1">真实工单号：${escapeHtml(call.work_order_id)}</div>` : ''}</div>`).join('') : '';
-        const mcpHtml = mcpCalls.length ? mcpCalls.map(call => `<div class="border border-slate-200 rounded-xl p-3 text-sm"><div class="font-medium text-slate-900">${escapeHtml(call.server_name || 'unknown')} · ${escapeHtml(call.tool_name || '-')}</div><div class="text-xs text-slate-500 mt-1">${call.invocation_mode === 'policy_preinvoke' ? '系统策略预调用' : 'Agent 自主调用'} · ${call.status === 'success' ? '成功' : '失败'}</div><div class="text-xs text-slate-500 mt-1">参数：${escapeHtml(JSON.stringify(call.arguments || call.args || {}))}</div><div class="text-xs text-slate-600 mt-1">结果摘要：${escapeHtml((call.result_summary || call.error_summary || '无').slice(0, 240))}</div></div>`).join('') : '<p class="text-sm text-slate-400">本轮未调用 MCP 工具。</p>';
+        const mcpOutcomeLabel = { success: '成功', empty: '无匹配数据', not_found: '未找到', invalid_input: '参数不合法', unauthorized: '无权限', timeout: '调用超时', upstream_error: '上游异常', failed: '调用失败' };
+        const mcpHtml = mcpCalls.length ? mcpCalls.map(call => `<div class="border border-slate-200 rounded-xl p-3 text-sm"><div class="font-medium text-slate-900">${escapeHtml(call.server_name || 'unknown')} · ${escapeHtml(call.tool_name || '-')}</div><div class="text-xs text-slate-500 mt-1">${call.invocation_mode === 'policy_preinvoke' ? '系统策略预调用' : 'Agent 自主调用'} · ${escapeHtml(mcpOutcomeLabel[call.status] || call.status || '未知')}</div><div class="text-xs text-slate-500 mt-1">参数：${escapeHtml(JSON.stringify(call.arguments || call.args || {}))}</div><div class="text-xs text-slate-600 mt-1">结果摘要：${escapeHtml((call.result_summary || call.error_summary || '无').slice(0, 240))}</div></div>`).join('') : '<p class="text-sm text-slate-400">本轮未调用 MCP 工具。</p>';
         const citations = assistantMsg.citations || [];
         const usedCitations = citations.filter(c => c.used_in_answer === true);
         const candidateCitations = citations.filter(c => c.used_in_answer !== true);
@@ -4883,15 +4885,36 @@
       async function loadMcpServers() {
         $('#mcp-content').innerHTML = loadingState();
         try {
-          const data = await apiGet('/api/mcp-servers');
+          const [data, contractData] = await Promise.all([
+            apiGet('/api/mcp-servers'),
+            apiGet('/api/mcp-contracts'),
+          ]);
           const servers = data.mcp_servers || [];
+          const contractsByName = Object.fromEntries((contractData.servers || []).map(item => [item.server_name, item]));
+          const writeBoundary = contractData.write_boundary || null;
           if (servers.length === 0) {
             $('#mcp-content').innerHTML = emptyState('暂无 MCP Server');
             return;
           }
+          const contractOverview = `
+            <div class="rounded-2xl border border-cyan-200 bg-cyan-50 p-5 mb-4">
+              <div class="flex items-start gap-3">
+                <div class="w-9 h-9 rounded-xl bg-cyan-100 text-cyan-700 flex items-center justify-center shrink-0">MCP</div>
+                <div>
+                  <h3 class="font-semibold text-slate-900">当前 MCP 调用契约</h3>
+                  <p class="text-sm text-slate-600 mt-1">Server 发现的是“可提供的能力”；Host 侧 Agent 绑定 + 工具白名单决定“当前业主对话真正可调用的能力”。三个正式 Server 均为只读。</p>
+                  <p class="text-xs text-slate-500 mt-2">统一结果状态：${(contractData.tool_outcomes || []).map(item => `<span class="inline-block mr-2">${escapeHtml(item.code)}=${escapeHtml(item.label)}</span>`).join('')}</p>
+                  ${writeBoundary ? `<div class="mt-3 rounded-xl bg-white/80 border border-cyan-100 p-3 text-xs text-slate-600"><span class="font-medium text-slate-900">${escapeHtml(writeBoundary.mode_label || '写入边界')}：</span>${escapeHtml(writeBoundary.summary || '')}</div>` : ''}
+                </div>
+              </div>
+            </div>`;
           $('#mcp-content').innerHTML = `
+            ${contractOverview}
             <div class="space-y-3">
-              ${servers.map(server => `
+              ${servers.map(server => {
+                const contract = contractsByName[server.name] || {};
+                const boundAgents = (contract.bindings || []).filter(item => item.bound).map(item => item.agent_name).join('、') || '未绑定正式 Agent';
+                return `
                 <div class="bg-white rounded-2xl shadow-soft border border-slate-200 p-5 flex flex-col md:flex-row md:items-start gap-4 hover:shadow-md transition-shadow">
                   <div class="w-12 h-12 rounded-xl bg-gradient-to-br from-gold-50 to-gold-100 flex items-center justify-center shrink-0">
                     <svg class="w-6 h-6 text-gold-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 12h14M5 12a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v4a2 2 0 01-2 2M5 12a2 2 0 01-2 2v4a2 2 0 012 2h14a2 2 0 012-2v-4a2 2 0 01-2-2m-2-4h.01M17 16h.01"></path></svg>
@@ -4905,7 +4928,11 @@
                     <div class="flex flex-wrap gap-2 text-xs text-slate-500">
                       <span class="px-2 py-1 bg-slate-50 rounded-lg">args: ${escapeHtml(JSON.stringify(server.args || []))}</span>
                       <span class="px-2 py-1 bg-slate-50 rounded-lg">env: ${escapeHtml(JSON.stringify(server.env || {}))}</span>
+                      <span class="px-2 py-1 bg-cyan-50 text-cyan-700 rounded-lg">${escapeHtml(contract.mode_label || '未定义调用契约')}</span>
+                      <span class="px-2 py-1 bg-slate-50 rounded-lg">绑定 Agent：${escapeHtml(boundAgents)}</span>
                     </div>
+                    ${contract.data_scope ? `<p class="text-xs text-slate-500 mt-2">数据范围：${escapeHtml(contract.data_scope)}</p>` : ''}
+                    ${contract.source ? `<p class="text-xs text-slate-500 mt-1">数据来源：${escapeHtml(contract.source)}</p>` : ''}
                   </div>
                   <div class="flex flex-col items-end gap-3 shrink-0">
                     <label class="relative inline-flex items-center cursor-pointer">
@@ -4919,7 +4946,7 @@
                     </div>
                   </div>
                 </div>
-              `).join('')}
+              `; }).join('')}
             </div>
           `;
           bindMcpActions();
@@ -5013,9 +5040,14 @@
 
       async function viewMcpTools(serverId) {
         try {
-          const data = await apiGet(`/api/mcp-servers/${serverId}/tools`);
+          const [data, contractData] = await Promise.all([
+            apiGet(`/api/mcp-servers/${serverId}/tools`),
+            apiGet('/api/mcp-contracts'),
+          ]);
           const server = data.mcp_server || {};
           const tools = data.tools || [];
+          const contract = (contractData.servers || []).find(item => item.server_id === serverId) || {};
+          const contractTools = Object.fromEntries((contract.tools || []).map(item => [item.name, item]));
           const body = tools.length === 0
             ? '<p class="text-sm text-slate-500">该 MCP Server 暂未返回工具列表。</p>'
             : `<div class="space-y-3">${tools.map(t => `
@@ -5025,7 +5057,9 @@
                     <span class="text-xs px-2 py-0.5 bg-brand-50 text-brand-600 rounded-full">${escapeHtml(t.type || 'tool')}</span>
                   </div>
                   <p class="text-xs text-slate-600 mb-2">${escapeHtml(t.description || '暂无描述')}</p>
-                  ${t.parameters ? `<pre class="text-[10px] bg-white rounded-lg p-2 border border-slate-200 overflow-x-auto">${escapeHtml(JSON.stringify(t.parameters, null, 2))}</pre>` : ''}
+                  ${contractTools[t.name]?.policy?.purpose ? `<p class="text-xs text-slate-500 mb-2">调用目的：${escapeHtml(contractTools[t.name].policy.purpose)}</p>` : ''}
+                  <p class="text-xs text-slate-500 mb-2">允许 Agent：${escapeHtml((contractTools[t.name]?.allowed_by || []).join('、') || '当前无正式运行时授权')}</p>
+                  ${t.input_schema ? `<pre class="text-[10px] bg-white rounded-lg p-2 border border-slate-200 overflow-x-auto">${escapeHtml(JSON.stringify(t.input_schema, null, 2))}</pre>` : ''}
                 </div>
               `).join('')}</div>`;
           openDrawer(`${escapeHtml(server.name || 'MCP Server')} 工具列表`, body);

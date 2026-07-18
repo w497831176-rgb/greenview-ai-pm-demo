@@ -19,6 +19,7 @@ from app.agents import router as agents_router
 from app.badcases import router as badcases_router
 from app.chat import router as chat_router
 from app.knowledge import retrieval_router, router as knowledge_router
+from app.mcp_contracts import router as mcp_contracts_router
 from app.mcp import discover_all_mcp_tools, router as mcp_router
 from app.model_configs import router as model_configs_router
 from app.models_compat import router as models_compat_router
@@ -85,6 +86,7 @@ app.include_router(work_orders_router)
 app.include_router(knowledge_router)
 app.include_router(skills_router)
 app.include_router(mcp_router)
+app.include_router(mcp_contracts_router)
 # Compatibility layer for /api/models/* (frontend) and /api/model-configs/{model_id}/* (test cases).
 app.include_router(models_compat_router)
 app.include_router(model_configs_router)
