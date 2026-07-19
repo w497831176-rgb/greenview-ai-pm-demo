@@ -387,6 +387,33 @@ def test_bare_work_order_command_collects_real_issue_description():
     assert second["draft"]["issue_type"] == "水电"
 
 
+def test_natural_work_order_cancellation_rejects_without_write():
+    from app.work_order_workflow import (
+        advance_work_order_workflow,
+        is_cancel_request,
+    )
+
+    assert is_cancel_request("取消，不要提交这个工单。")
+    assert is_cancel_request("别创建了")
+    assert not is_cancel_request("不要取消这个工单")
+
+    session_id = "contract-natural-work-order-cancel"
+    drafted = advance_work_order_workflow(
+        session_id,
+        (
+            "请创建维修工单：房号 3-2-1201，卫生间天花板持续滴水，"
+            "紧急，联系人测试业主，电话 13800138000，明天上午上门。"
+        ),
+    )
+    assert drafted and drafted["action"] == "awaiting_confirmation"
+    rejected = advance_work_order_workflow(
+        session_id,
+        "取消，不要提交这个工单。",
+    )
+    assert rejected and rejected["action"] == "rejected"
+    assert "未创建正式工单" in rejected["reply"]
+
+
 def test_repeated_work_order_confirmation_replays_same_receipt():
     from app.runtime.coordinator import RuntimeCoordinator
     from app.work_order_workflow import advance_work_order_workflow
@@ -1207,6 +1234,7 @@ def main():
         test_agno_completed_metrics_are_extractable,
         test_action_gateway_receipt_and_idempotency,
         test_bare_work_order_command_collects_real_issue_description,
+        test_natural_work_order_cancellation_rejects_without_write,
         test_repeated_work_order_confirmation_replays_same_receipt,
         test_pending_dynamic_mcp_action_keeps_controlled_path,
         test_committed_dynamic_mcp_confirmation_replays_receipt,

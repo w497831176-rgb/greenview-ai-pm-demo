@@ -158,16 +158,25 @@ def _has_creation_negation(text: str) -> bool:
 
 def is_cancel_request(message: str) -> bool:
     normalized = (message or "").strip()
-    return any(word in normalized for word in (
+    compact = re.sub(r"[\s，。！？、,.!?；;：:]+", "", normalized)
+    if any(phrase in compact for phrase in ("不要取消", "别取消")):
+        return False
+    return any(word in compact for word in (
         "取消报修",
         "取消工单草稿",
+        "取消这个工单",
+        "取消该工单",
         "不报修了",
         "先不用报修",
         "拒绝创建",
         "拒绝提交",
+        "不要创建",
+        "不要提交",
+        "别创建",
+        "别提交",
         "不创建了",
         "不提交了",
-    )) or normalized in {"拒绝", "取消", "不提交", "不创建"}
+    )) or compact in {"拒绝", "取消", "不提交", "不创建"}
 
 
 def is_confirmation(message: str) -> bool:
