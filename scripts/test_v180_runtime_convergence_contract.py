@@ -1196,6 +1196,34 @@ def test_cost_strategy_claims_are_evidence_bound():
     assert '"provider_usage": None' in runtime_api
 
 
+def test_platform_navigation_serializes_async_page_renders():
+    frontend = (REPO_ROOT / "frontend" / "index.html").read_text(
+        encoding="utf-8"
+    )
+    assert "let navigationQueue = Promise.resolve();" in frontend
+    assert "function queueNavigation(" in frontend
+    assert "navigationQueue = navigationQueue" in frontend
+    assert "await renderContent();" in frontend
+    expected_async_dispatches = [
+        "await renderMyOrdersPage(main)",
+        "await renderStaffOrdersPage(main, '待派单', 'pending')",
+        "await renderProcessingOrdersPage(main)",
+        "await renderHandoffPage(main)",
+        "await renderRuntimePage(main)",
+        "await renderAgentsPage(main)",
+        "await renderModelsPage(main)",
+        "await renderSkillsPage(main)",
+        "await renderMcpPage(main)",
+        "await renderKnowledgePage(main)",
+        "await renderBadcasesPage(main)",
+        "await renderEvaluationsPage(main)",
+        "await renderCostGovernancePage(main)",
+        "await renderCostStrategyPage(main)",
+    ]
+    for dispatch in expected_async_dispatches:
+        assert dispatch in frontend
+
+
 def test_fixed_acceptance_matrix():
     keys = [case["case_key"] for case in ACCEPTANCE_CASES]
     assert keys == [
@@ -1254,6 +1282,7 @@ def main():
         test_runtime_summary_uses_actual_evidence,
         test_only_published_model_native_tools_enter_agno_loop,
         test_cost_strategy_claims_are_evidence_bound,
+        test_platform_navigation_serializes_async_page_renders,
         test_fixed_acceptance_matrix,
     ]
     try:

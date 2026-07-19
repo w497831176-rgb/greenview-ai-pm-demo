@@ -237,6 +237,7 @@
       badcases: [],
       badcaseDetailId: null
     };
+    let navigationQueue = Promise.resolve();
 
     const ROLES = {
       owner: { title: '业主工作台', subtitle: `${DEFAULT_ROOM_ID} · 王先生`, avatar: '业', color: 'from-gold-400 to-gold-600' },
@@ -773,10 +774,14 @@
 
       $$('#sub-menu button').forEach(btn => {
         btn.addEventListener('click', () => {
-          STATE.subTab = btn.dataset.sub;
-          renderSidebar();
-          renderContent();
-          if (window.innerWidth < 768) closeSidebar();
+          const topTab = STATE.topTab;
+          const subTab = btn.dataset.sub;
+          queueNavigation(
+            topTab,
+            subTab,
+            `切换 ${subTab} 页面`,
+            window.innerWidth < 768
+          );
         });
       });
     }
@@ -788,24 +793,44 @@
 
       switch (STATE.subTab) {
         case 'chat': await renderChatPage(main); break;
-        case 'my-orders': renderMyOrdersPage(main); break;
-        case 'pending-orders': renderStaffOrdersPage(main, '待派单', 'pending'); break;
-        case 'processing-orders': renderProcessingOrdersPage(main); break;
-        case 'history-orders': renderStaffOrdersPage(main, '已完成', 'history'); break;
-        case 'handoff-orders': renderHandoffPage(main); break;
+        case 'my-orders': await renderMyOrdersPage(main); break;
+        case 'pending-orders': await renderStaffOrdersPage(main, '待派单', 'pending'); break;
+        case 'processing-orders': await renderProcessingOrdersPage(main); break;
+        case 'history-orders': await renderStaffOrdersPage(main, '已完成', 'history'); break;
+        case 'handoff-orders': await renderHandoffPage(main); break;
         case 'runtime': await renderRuntimePage(main); break;
-        case 'agents': renderAgentsPage(main); break;
-        case 'models': renderModelsPage(main); break;
-        case 'model-ab': renderModelAbPage(main); break;
-        case 'skills': renderSkillsPage(main); break;
-        case 'mcp': renderMcpPage(main); break;
-        case 'knowledge': renderKnowledgePage(main); break;
-        case 'badcases': renderBadcasesPage(main); break;
-        case 'badcase-detail': renderBadcaseDetailPage(main); break;
+        case 'agents': await renderAgentsPage(main); break;
+        case 'models': await renderModelsPage(main); break;
+        case 'model-ab': await renderModelAbPage(main); break;
+        case 'skills': await renderSkillsPage(main); break;
+        case 'mcp': await renderMcpPage(main); break;
+        case 'knowledge': await renderKnowledgePage(main); break;
+        case 'badcases': await renderBadcasesPage(main); break;
+        case 'badcase-detail': await renderBadcaseDetailPage(main); break;
         case 'evaluations': await renderEvaluationsPage(main); break;
-        case 'cost-governance': renderCostGovernancePage(main); break;
-        case 'cost-strategy': renderCostStrategyPage(main); break;
+        case 'cost-governance': await renderCostGovernancePage(main); break;
+        case 'cost-strategy': await renderCostStrategyPage(main); break;
+        default: throw new Error(`renderContent: 未知页面 "${STATE.subTab}"`);
       }
+    }
+
+    function queueNavigation(topTab, subTab, context = '', closeMobile = false) {
+      navigationQueue = navigationQueue
+        .catch(() => {})
+        .then(async () => {
+          if (!MENU[topTab]) throw new Error(`未知顶层标签 "${topTab}"`);
+          if (!(MENU[topTab] || []).some(item => item.id === subTab)) {
+            throw new Error(`标签 "${topTab}" 不包含页面 "${subTab}"`);
+          }
+          STATE.topTab = topTab;
+          STATE.subTab = subTab;
+          renderTopTabs();
+          renderSidebar();
+          await renderContent();
+          if (closeMobile && window.innerWidth < 768) closeSidebar();
+        });
+      navigationQueue.catch(err => displayRenderError(err, context || '页面切换'));
+      return navigationQueue;
     }
 
     function pageHeader(title, desc) {
@@ -5899,18 +5924,24 @@
         await renderContent();
 
         $$('.top-tab, .top-tab-mobile').forEach(btn => {
-          btn.addEventListener('click', async () => {
-            try {
-              STATE.topTab = btn.dataset.top;
-              const firstSub = MENU[STATE.topTab][0].id;
-              STATE.subTab = firstSub;
-              renderTopTabs();
-              renderSidebar();
-              await renderContent();
-              if (window.innerWidth < 768) openSidebar();
-            } catch (err) {
-              displayRenderError(err, `切换 ${btn.dataset.top} 标签`);
+          btn.addEventListener('click', () => {
+            const topTab = btn.dataset.top;
+            const firstSub = (MENU[topTab] || [])[0];
+            if (!firstSub) {
+              displayRenderError(
+                new Error(`标签 "${topTab}" 没有可用页面`),
+                `切换 ${topTab} 标签`
+              );
+              return;
             }
+            queueNavigation(
+              topTab,
+              firstSub.id,
+              `切换 ${topTab} 标签`,
+              false
+            ).then(() => {
+              if (window.innerWidth < 768) openSidebar();
+            }).catch(() => {});
           });
         });
 
