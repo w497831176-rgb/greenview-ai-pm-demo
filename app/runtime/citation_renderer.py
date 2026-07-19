@@ -19,6 +19,42 @@ from app.runtime.contracts import (
 # regex itself allowed unknown values containing spaces to leak into the UI.
 EVIDENCE_MARKER = re.compile(r"\[\[evidence:([^\]\r\n]+)\]\]")
 LEGACY_MARKER = re.compile(r"【引用\s*(\d+)】|\[(\d+)\]")
+_GENERIC_BIGRAMS = {
+    "可以",
+    "需要",
+    "建议",
+    "相关",
+    "情况",
+    "根据",
+    "进行",
+    "服务",
+    "信息",
+    "数据",
+}
+
+
+def _semantic_bigrams(text: str) -> Set[str]:
+    chars = re.findall(r"[\u4e00-\u9fffA-Za-z0-9]", (text or "").lower())
+    return {
+        chars[index] + chars[index + 1]
+        for index in range(len(chars) - 1)
+        if chars[index] + chars[index + 1] not in _GENERIC_BIGRAMS
+    }
+
+
+def _citation_context(answer: str, match: re.Match) -> str:
+    line_start = answer.rfind("\n", 0, match.start()) + 1
+    line_end = answer.find("\n", match.end())
+    if line_end < 0:
+        line_end = len(answer)
+    return answer[line_start:line_end].strip()
+
+
+def _citation_is_supported(context: str, evidence: EvidenceItem) -> bool:
+    overlap = _semantic_bigrams(context) & _semantic_bigrams(
+        evidence.content_snapshot
+    )
+    return len(overlap) >= 2
 
 
 def build_evidence_set(
@@ -121,10 +157,20 @@ def render_citations(
     violations: List[Dict[str, Any]] = []
 
     def replace_id(match: re.Match) -> str:
-        evidence_id = match.group(1)
+        evidence_id = match.group(1).strip()
         if evidence_id not in by_id:
             violations.append(
                 {"code": "invalid_evidence_id", "evidence_id": evidence_id}
+            )
+            return ""
+        context = _citation_context(answer or "", match)
+        if not _citation_is_supported(context, by_id[evidence_id]):
+            violations.append(
+                {
+                    "code": "unsupported_evidence_citation",
+                    "evidence_id": evidence_id,
+                    "claim_context": context[:240],
+                }
             )
             return ""
         if evidence_id not in ordered_ids:
