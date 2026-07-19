@@ -540,6 +540,21 @@ def test_static_conflict_removal():
     assert '"used_in_answer": False' not in coordinator
 
 
+def test_cost_strategy_claims_are_evidence_bound():
+    repo = Path(__file__).resolve().parents[1]
+    frontend = (repo / "frontend" / "index.html").read_text(encoding="utf-8")
+    observability = (repo / "app" / "observability.py").read_text(
+        encoding="utf-8"
+    )
+    assert "/api/retrieval/search" not in frontend
+    assert "await apiPut('/api/knowledge/retrieval-settings'" not in frontend
+    assert "降低 80% 以上单轮成本" not in frontend
+    assert "节省约 800 Token" not in frontend
+    assert "约 2500 Token" not in frontend
+    assert "检索预估不等于模型账单" in observability
+    assert "质量下降或 Token 未降时拒绝候选" in observability
+
+
 def test_fixed_acceptance_matrix():
     keys = [case["case_key"] for case in ACCEPTANCE_CASES]
     assert keys == [
@@ -583,6 +598,7 @@ def main():
         test_citation_violation_recording_contract,
         test_v18_runtime_auto_badcase_contract,
         test_static_conflict_removal,
+        test_cost_strategy_claims_are_evidence_bound,
         test_fixed_acceptance_matrix,
     ]
     try:

@@ -4189,7 +4189,7 @@
               <div class="border border-slate-200 rounded-xl p-3">
                 <div class="text-sm font-medium text-slate-900 mb-2">COST-02：RAG Top-K（1 vs 5）</div>
                 <p class="text-xs text-slate-500 mb-2">对固定知识库问题分别以 Top-K=1 与 Top-K=5 执行，记录引用数量、Token、估算成本。测试后恢复原配置。</p>
-                <button id="cg-run-cost02" type="button" class="px-3 py-1.5 bg-brand-600 hover:bg-brand-700 text-white rounded-lg text-xs">执行对比</button>
+                <button id="cg-run-cost02" type="button" class="px-3 py-1.5 bg-brand-600 hover:bg-brand-700 text-white rounded-lg text-xs">运行检索上下文预估</button>
                 <div id="cost02-result" class="mt-2 text-xs text-slate-600"></div>
               </div>
             </div>
@@ -4222,25 +4222,39 @@
         const resultEl = $('#cost02-result');
         resultEl.innerHTML = '<span class="text-slate-400">执行中...</span>';
         try {
-          const original = await apiGet('/api/knowledge/retrieval-settings');
-          const origTopK = original.top_k;
-          const query = '维修收费标准是什么';
+          const current = await apiGet('/api/knowledge/retrieval-settings');
+          const settings = current.retrieval_settings || {};
+          const query = '一般漏水多久响应';
           const run = async (k) => {
-            await apiPut('/api/knowledge/retrieval-settings', { ...original, top_k: k });
-            const res = await apiPost('/api/retrieval/search', { query, top_k: k });
-            return { k, citations: res.citations || [], tokenCount: (res.citations || []).reduce((s, c) => s + (c.content || '').length, 0) };
+            const res = await apiPost('/api/retrieval/debug', {
+              query,
+              top_k: k,
+              keyword_weight: Number(settings.keyword_weight ?? 0.3),
+              semantic_weight: Number(settings.semantic_weight ?? 0.7),
+              rrf_k: Number(settings.rrf_k ?? 60),
+              enable_rerank: Boolean(settings.enable_rerank),
+              rerank_model: settings.rerank_model || null,
+              score_threshold: Number(settings.score_threshold ?? 0),
+              context_threshold: Number(settings.context_threshold ?? 0.2)
+            });
+            const results = res.results || [];
+            return {
+              k,
+              count: results.length,
+              contextChars: results.reduce((sum, item) => sum + String(item.content || item.chunk_content || '').length, 0),
+              titles: [...new Set(results.map(item => item.doc_title || item.title).filter(Boolean))].slice(0, 3)
+            };
           };
           const r1 = await run(1);
           const r5 = await run(5);
-          await apiPut('/api/knowledge/retrieval-settings', { ...original, top_k: origTopK });
           resultEl.innerHTML = `
-            <div>Top-K=1：引用 ${r1.citations.length} 条 · 文本长度 ${r1.tokenCount} 字</div>
-            <div>Top-K=5：引用 ${r5.citations.length} 条 · 文本长度 ${r5.tokenCount} 字</div>
-            <div class="text-slate-400">测试后已恢复 top_k=${origTopK}</div>
+            <div>Top-K=1：候选分片 ${r1.count} 条 · 上下文 ${r1.contextChars} 字 · 文档 ${escapeHtml(r1.titles.join('、') || '-')}</div>
+            <div>Top-K=5：候选分片 ${r5.count} 条 · 上下文 ${r5.contextChars} 字 · 文档 ${escapeHtml(r5.titles.join('、') || '-')}</div>
+            <div class="text-amber-700">这是无模型检索预估，没有修改发布配置，也不等于 Provider Token 或成本。真正优化需发布候选 Release 后用同题 Trace 通过质量门槛。</div>
           `;
           state.costCases.push({ id: 'COST-02', r1, r5 });
         } catch (err) {
-          resultEl.innerHTML = '<span class="text-red-600">执行失败</span>';
+          resultEl.innerHTML = '<span class="text-red-600">执行失败：' + escapeHtml(err.message || err) + '</span>';
         }
       }
 
@@ -4347,24 +4361,38 @@
         const resultEl = $('#strategy-cost02-result');
         resultEl.innerHTML = '<span class="text-slate-400">执行中...</span>';
         try {
-          const original = await apiGet('/api/knowledge/retrieval-settings');
-          const origTopK = original.top_k;
-          const query = '维修收费标准是什么';
+          const current = await apiGet('/api/knowledge/retrieval-settings');
+          const settings = current.retrieval_settings || {};
+          const query = '一般漏水多久响应';
           const run = async (k) => {
-            await apiPut('/api/knowledge/retrieval-settings', { ...original, top_k: k });
-            const res = await apiPost('/api/retrieval/search', { query, top_k: k });
-            return { k, citations: res.citations || [], tokenCount: (res.citations || []).reduce((s, c) => s + (c.content || '').length, 0) };
+            const res = await apiPost('/api/retrieval/debug', {
+              query,
+              top_k: k,
+              keyword_weight: Number(settings.keyword_weight ?? 0.3),
+              semantic_weight: Number(settings.semantic_weight ?? 0.7),
+              rrf_k: Number(settings.rrf_k ?? 60),
+              enable_rerank: Boolean(settings.enable_rerank),
+              rerank_model: settings.rerank_model || null,
+              score_threshold: Number(settings.score_threshold ?? 0),
+              context_threshold: Number(settings.context_threshold ?? 0.2)
+            });
+            const results = res.results || [];
+            return {
+              k,
+              count: results.length,
+              contextChars: results.reduce((sum, item) => sum + String(item.content || item.chunk_content || '').length, 0),
+              titles: [...new Set(results.map(item => item.doc_title || item.title).filter(Boolean))].slice(0, 3)
+            };
           };
           const r1 = await run(1);
           const r5 = await run(5);
-          await apiPut('/api/knowledge/retrieval-settings', { ...original, top_k: origTopK });
           resultEl.innerHTML = `
-            <div>Top-K=1：引用 ${r1.citations.length} 条 · 文本长度 ${r1.tokenCount} 字</div>
-            <div>Top-K=5：引用 ${r5.citations.length} 条 · 文本长度 ${r5.tokenCount} 字</div>
-            <div class="text-slate-400">测试后已恢复 top_k=${origTopK}</div>
+            <div>Top-K=1：候选分片 ${r1.count} 条 · 上下文 ${r1.contextChars} 字 · 文档 ${escapeHtml(r1.titles.join('、') || '-')}</div>
+            <div>Top-K=5：候选分片 ${r5.count} 条 · 上下文 ${r5.contextChars} 字 · 文档 ${escapeHtml(r5.titles.join('、') || '-')}</div>
+            <div class="text-amber-700">这是无模型检索预估，没有修改发布配置，也不等于 Provider Token 或成本。真正优化需发布候选 Release 后用同题 Trace 通过质量门槛。</div>
           `;
         } catch (err) {
-          resultEl.innerHTML = '<span class="text-red-600">执行失败</span>';
+          resultEl.innerHTML = '<span class="text-red-600">执行失败：' + escapeHtml(err.message || err) + '</span>';
         }
       }
 
@@ -4382,11 +4410,11 @@
                 <span class="px-2 py-1 bg-brand-50 text-brand-700 rounded-lg text-xs font-medium">COST-01</span>
                 <h3 class="font-semibold text-slate-900">模型分层：Flash 与 Pro 分流</h3>
               </div>
-              <p class="text-sm text-slate-600 mb-3">对同一固定投诉问题分别调用轻量模型（Flash）与重模型（Pro），比较 Token、耗时与估算成本。质量判断由人工记录，用于确定不同链路的默认模型。</p>
+              <p class="text-sm text-slate-600 mb-3">对同一固定投诉问题分别调用轻量模型（Flash）与重模型（Pro），比较 Provider Usage、耗时与可得成本。质量判断由人工记录；Usage 不完整时不计算精确节省。</p>
               <ul class="text-xs text-slate-500 list-disc list-inside mb-3 space-y-1">
-                <li>业主常规问答默认 Flash，降低 80% 以上单轮成本。</li>
+                <li>业主常规问答默认 Flash；收益幅度必须由同题实测决定。</li>
                 <li>Darwin 深度分析、A/B 测试使用 Pro。</li>
-                <li>不推荐在常规链路默认使用 Pro。</li>
+                <li>只有质量门槛通过且 Usage 可比较，候选策略才能发布。</li>
               </ul>
               <button id="strategy-cost01-run" type="button" class="px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white rounded-lg text-sm transition-colors">执行对比</button>
               <div id="strategy-cost01-result" class="mt-3 text-xs text-slate-600 space-y-1"></div>
@@ -4397,13 +4425,13 @@
                 <span class="px-2 py-1 bg-brand-50 text-brand-700 rounded-lg text-xs font-medium">COST-02</span>
                 <h3 class="font-semibold text-slate-900">RAG Top-K：精度与成本平衡</h3>
               </div>
-              <p class="text-sm text-slate-600 mb-3">对固定知识库问题分别以 Top-K=1 与 Top-K=5 检索，比较引用数量、上下文文本长度与 Token 成本。测试后自动恢复原配置。</p>
+              <p class="text-sm text-slate-600 mb-3">先用不改配置的检索预估比较 Top-K=1 与 Top-K=5 的候选上下文，再用已发布 baseline/candidate Release 的同题 Trace 判断质量与真实 Provider Token。</p>
               <ul class="text-xs text-slate-500 list-disc list-inside mb-3 space-y-1">
-                <li>Top-K 越大，RAG 上下文越长，模型成本越高。</li>
+                <li>Top-K 只控制候选上限，不保证模型总 Token 必然下降。</li>
                 <li>建议结合相关性阈值动态截断，而非固定高 K。</li>
-                <li>对于 FAQ 类问题，Top-K=1 通常足够。</li>
+                <li>任何事实或引用质量下降都应拒绝候选。</li>
               </ul>
-              <button id="strategy-cost02-run" type="button" class="px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white rounded-lg text-sm transition-colors">执行对比</button>
+              <button id="strategy-cost02-run" type="button" class="px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white rounded-lg text-sm transition-colors">运行检索上下文预估</button>
               <div id="strategy-cost02-result" class="mt-3 text-xs text-slate-600 space-y-1"></div>
             </div>
 
@@ -4471,7 +4499,7 @@
           </div>
           <div class="bg-green-50 rounded-lg p-3 border border-green-100">
             <div class="font-medium text-green-800 mb-1">未命中：不注入投诉处理 Skill</div>
-            <div>输入上下文仅保留 FAQ 回答，节省约 800 Token。</div>
+            <div>输入上下文不包含该 Skill；节省量需由同题 Trace 的上下文分解或 Provider Usage 实测，不能写固定数字。</div>
           </div>
           <div class="bg-amber-50 rounded-lg p-3 border border-amber-100">
             <div class="font-medium text-amber-800 mb-1">命中：注入投诉处理 Skill</div>
@@ -4482,11 +4510,11 @@
       $('#strategy-cost04-example').addEventListener('click', () => showExample('COST-04 示例：MCP 结果摘要', `
         <div class="space-y-3 text-sm text-slate-700">
           <div class="bg-slate-50 rounded-lg p-3 border border-slate-200">
-            <div class="font-medium text-slate-900 mb-1">原始工具结果（约 2500 Token）</div>
+            <div class="font-medium text-slate-900 mb-1">原始工具结果（长度必须由 MCP 审计实测）</div>
             <pre class="text-xs bg-white p-2 rounded border border-slate-200 overflow-x-auto">{ "orders": [ { "id": "O1001", "status": "pending", "items": [...], "logs": [...] }, ... ] }</pre>
           </div>
           <div class="bg-green-50 rounded-lg p-3 border border-green-100">
-            <div class="font-medium text-green-800 mb-1">摘要后进入上下文（约 200 Token）</div>
+            <div class="font-medium text-green-800 mb-1">摘要后进入上下文（长度必须由同一调用实测）</div>
             <div>查得 3 条未完成工单：O1001 维修待派单、O1002 保洁已分配、O1003 投诉处理中。</div>
           </div>
         </div>
