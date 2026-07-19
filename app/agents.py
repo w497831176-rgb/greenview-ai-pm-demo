@@ -8,7 +8,7 @@ REST endpoints for creating and managing Router and Vertical Agents.
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from db.property_db import (
     create_agent as db_create_agent,
@@ -44,7 +44,9 @@ class AgentCreate(BaseModel):
     available_skills: Optional[List[str]] = []  # frontend sends skill names
     tool_names: Optional[List[str]] = []
     available_mcp_tools: Optional[List[str]] = []  # frontend alias for tool_names
-    knowledge_doc_ids: Optional[List[int]] = None
+    # V1.8 vertical Agents always own an explicit RAG scope.  An omitted
+    # selection means "no RAG", never the legacy "all published docs" scope.
+    knowledge_doc_ids: List[int] = Field(default_factory=list)
 
 
 class AgentUpdate(BaseModel):
@@ -198,8 +200,10 @@ async def create_agent(request: AgentCreate):
     if tool_names:
         tools = [{"tool_name": name} for name in tool_names]
         set_agent_tools(agent_id, tools)
-    if request.knowledge_doc_ids is not None:
-        set_agent_knowledge_bindings(agent_id, request.knowledge_doc_ids)
+    # Persist an explicit binding row even when the selection is empty.  This
+    # prevents a newly created Agent from silently inheriting every legacy
+    # knowledge document.
+    set_agent_knowledge_bindings(agent_id, request.knowledge_doc_ids)
     return {"agent": _serialize_agent(agent)}
 
 
