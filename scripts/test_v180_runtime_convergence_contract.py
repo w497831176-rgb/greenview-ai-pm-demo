@@ -89,6 +89,20 @@ def test_citation_single_source_contract():
     assert "ev_not_allowed" not in rendered_bad
     assert not bad_citations
     assert bad_violations[0]["code"] == "invalid_evidence_id"
+    rendered_malformed, malformed_citations, malformed_violations = (
+        render_citations(
+            "天气工具结果 [[evidence:MCP weather-server]]",
+            evidence,
+        )
+    )
+    assert "[[evidence:" not in rendered_malformed
+    assert not malformed_citations
+    assert malformed_violations == [
+        {
+            "code": "invalid_evidence_id",
+            "evidence_id": "MCP weather-server",
+        }
+    ]
 
 
 def test_cost_availability_contract():

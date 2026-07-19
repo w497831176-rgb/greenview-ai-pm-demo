@@ -14,7 +14,10 @@ from app.runtime.contracts import (
 )
 
 
-EVIDENCE_MARKER = re.compile(r"\[\[evidence:([A-Za-z0-9_-]+)\]\]")
+# Match every evidence marker shape, including malformed/model-invented IDs.
+# Validation happens against the immutable EvidenceSet below; restricting the
+# regex itself allowed unknown values containing spaces to leak into the UI.
+EVIDENCE_MARKER = re.compile(r"\[\[evidence:([^\]\r\n]+)\]\]")
 LEGACY_MARKER = re.compile(r"【引用\s*(\d+)】|\[(\d+)\]")
 
 
