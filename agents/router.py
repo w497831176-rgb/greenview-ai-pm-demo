@@ -32,6 +32,17 @@ def _base_router_instructions(
             "description": agent.get("description", ""),
             "skills": [str(item.get("name")) for item in card.get("skills") or [] if item.get("name")],
             "mcp_servers": [str(item.get("name")) for item in card.get("mcp_servers") or [] if item.get("name")],
+            "mcp_intents": [
+                str(intent)
+                for server in card.get("mcp_servers") or []
+                for intent in server.get("natural_language_intents") or []
+                if str(intent).strip()
+            ],
+            "knowledge_docs": [
+                str(item.get("title"))
+                for item in card.get("knowledge_docs") or []
+                if item.get("title")
+            ],
         })
     if not valid_targets:
         valid_targets = [
@@ -44,6 +55,8 @@ def _base_router_instructions(
         f'- {t["agent_id"]}（{t["name"]}）：{t["description"] or "无描述"}'
         + (f'；Skill={"、".join(t["skills"])}' if t.get("skills") else "")
         + (f'；MCP={"、".join(t["mcp_servers"])}' if t.get("mcp_servers") else "")
+        + (f'；MCP意图={"、".join(t["mcp_intents"])}' if t.get("mcp_intents") else "")
+        + (f'；RAG={"、".join(t["knowledge_docs"])}' if t.get("knowledge_docs") else "")
         for t in valid_targets
     )
 
@@ -183,6 +196,13 @@ def _routing_terms(agent: Dict[str, Any]) -> List[tuple[str, str]]:
         sources.append(("MCP 说明", str(server.get("description") or "")))
         for tool_name in server.get("tools") or []:
             sources.append(("MCP 工具", str(tool_name)))
+        for intent in server.get("natural_language_intents") or []:
+            sources.append(("MCP 意图", str(intent)))
+        for trigger in server.get("trigger_keywords") or []:
+            sources.append(("MCP 触发词", str(trigger)))
+    for document in card.get("knowledge_docs") or []:
+        sources.append(("RAG 文档", str(document.get("title") or "")))
+        sources.append(("RAG 分类", str(document.get("category") or "")))
 
     terms: List[tuple[str, str]] = []
     seen: set[str] = set()
@@ -238,7 +258,14 @@ def _capability_fallback(message: str, vertical_agents: Optional[List[Dict[str, 
                 continue
             # Descriptions / Skill triggers are stronger than a bare tool name.
             weight = 35 + min(len(term), 8) * 4
-            if source in {"服务范围", "绑定 Skill", "Skill 触发词"}:
+            if source in {
+                "服务范围",
+                "绑定 Skill",
+                "Skill 触发词",
+                "MCP 意图",
+                "MCP 触发词",
+                "RAG 文档",
+            }:
                 weight += 15
             score += weight
             matches.append({"term": term, "source": source, "weight": weight})
@@ -290,10 +317,23 @@ async def classify_intent(
         card = agent.get("capability_card") or {}
         skills = [str(item.get("name")) for item in card.get("skills") or [] if item.get("name")]
         mcp_servers = [str(item.get("name")) for item in card.get("mcp_servers") or [] if item.get("name")]
+        mcp_intents = [
+            str(intent)
+            for server in card.get("mcp_servers") or []
+            for intent in server.get("natural_language_intents") or []
+            if str(intent).strip()
+        ]
+        knowledge_docs = [
+            str(item.get("title"))
+            for item in card.get("knowledge_docs") or []
+            if item.get("title")
+        ]
         valid_entries.append(
             f'- {agent.get("agent_id")}（{agent.get("name")}）：{agent.get("description") or "无描述"}'
             + (f'；绑定 Skill={"、".join(skills)}' if skills else "")
             + (f'；绑定 MCP={"、".join(mcp_servers)}' if mcp_servers else "")
+            + (f'；MCP 意图={"、".join(mcp_intents)}' if mcp_intents else "")
+            + (f'；绑定 RAG={"、".join(knowledge_docs)}' if knowledge_docs else "")
         )
     valid_lines = "\n".join(valid_entries) or "- maintenance（维修 Agent）\n- billing（费用 Agent）\n- complaint（投诉 Agent）\n- customer_service（客服 Agent）"
     prompt = (

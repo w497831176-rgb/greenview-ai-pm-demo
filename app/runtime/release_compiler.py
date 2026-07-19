@@ -14,6 +14,10 @@ from app.runtime.contracts import (
     ToolPolicy,
     content_hash,
 )
+from app.runtime.tool_planner import (
+    effective_tool_metadata,
+    validate_tool_metadata,
+)
 from db.property_db import (
     create_runtime_release,
     get_agent_skills,
@@ -36,41 +40,27 @@ from db.property_db import (
 )
 
 
-READ_PREFIXES = (
-    "get_",
-    "list_",
-    "search_",
-    "query_",
-    "fetch_",
-    "read_",
-    "check_",
-    "lookup_",
-    "weather",
-)
-CREATE_PREFIXES = ("create_", "add_", "insert_", "submit_", "book_", "schedule_")
-UPDATE_PREFIXES = ("update_", "set_", "edit_", "patch_", "assign_", "complete_")
-DELETE_PREFIXES = ("delete_", "remove_", "drop_", "purge_", "clear_")
-
-
 def _tool_effect(tool: Dict[str, Any]) -> ToolEffect:
     metadata = tool.get("tool_metadata") or {}
     declared = str(metadata.get("effect") or metadata.get("operation") or "").lower()
-    if declared in {item.value for item in ToolEffect}:
+    effect_source = str(metadata.get("effect_source") or "")
+    if (
+        declared in {item.value for item in ToolEffect}
+        and effect_source
+        in {
+            "operator_declared",
+            "operator_declared_legacy",
+            "builtin_compatibility",
+        }
+    ):
         return ToolEffect(declared)
-    name = str(tool.get("name") or "").lower().replace("-", "_")
-    if name.startswith(READ_PREFIXES) or any(term in name for term in ("status", "forecast", "detail")):
-        return ToolEffect.READ
-    if name.startswith(CREATE_PREFIXES):
-        return ToolEffect.CREATE
-    if name.startswith(UPDATE_PREFIXES):
-        return ToolEffect.UPDATE
-    if name.startswith(DELETE_PREFIXES):
-        return ToolEffect.DELETE
     return ToolEffect.UNKNOWN
 
 
 def compile_tool_policy(server: Dict[str, Any], tool: Dict[str, Any]) -> ToolPolicy:
     effect = _tool_effect(tool)
+    metadata = tool.get("tool_metadata") or {}
+    declared_risk = str(metadata.get("risk_level") or "")
     server_name = str(server.get("name") or "")
     tool_name = str(tool.get("name") or "")
     if effect == ToolEffect.READ:
@@ -79,7 +69,11 @@ def compile_tool_policy(server: Dict[str, Any], tool: Dict[str, Any]) -> ToolPol
             server_name=server_name,
             tool_name=tool_name,
             effect=effect,
-            risk_level=RiskLevel.L1,
+            risk_level=(
+                RiskLevel(declared_risk)
+                if declared_risk in {"L0", "L1"}
+                else RiskLevel.L1
+            ),
             allowed_paths=[RuntimePath.CONSULTATION, RuntimePath.EXTENSION_ACCEPTANCE],
             requires_confirmation=False,
             enabled=bool(server.get("enabled")),
@@ -91,7 +85,11 @@ def compile_tool_policy(server: Dict[str, Any], tool: Dict[str, Any]) -> ToolPol
             server_name=server_name,
             tool_name=tool_name,
             effect=effect,
-            risk_level=RiskLevel.L2,
+            risk_level=(
+                RiskLevel(declared_risk)
+                if declared_risk in {"L2", "L3"}
+                else RiskLevel.L2
+            ),
             allowed_paths=[RuntimePath.CONTROLLED_ACTION, RuntimePath.EXTENSION_ACCEPTANCE],
             requires_confirmation=True,
             enabled=bool(server.get("enabled")),
@@ -252,7 +250,18 @@ def _compile_graph() -> Tuple[Dict[str, Any], List[ToolPolicy]]:
         tools = [item for item in all_tools if int(item.get("server_id") or 0) == int(server["id"])]
         compiled_tools = []
         for tool in tools:
-            policy = compile_tool_policy(server, tool)
+            runtime_metadata = effective_tool_metadata(
+                str(server.get("name") or ""),
+                str(tool.get("name") or ""),
+                tool.get("tool_metadata") or {},
+            )
+            effective_tool = {**tool, "tool_metadata": runtime_metadata}
+            policy = compile_tool_policy(server, effective_tool)
+            if (
+                "execution_mode" not in (tool.get("tool_metadata") or {})
+                and policy.effect in {ToolEffect.CREATE, ToolEffect.UPDATE}
+            ):
+                runtime_metadata["execution_mode"] = "proposal"
             policies.append(policy)
             compiled_tools.append(
                 {
@@ -260,7 +269,7 @@ def _compile_graph() -> Tuple[Dict[str, Any], List[ToolPolicy]]:
                     "name": tool.get("name") or "",
                     "description": tool.get("description") or "",
                     "input_schema": tool.get("input_schema") or {},
-                    "tool_metadata": tool.get("tool_metadata") or {},
+                    "tool_metadata": runtime_metadata,
                     "policy": policy.model_dump(mode="json"),
                 }
             )
@@ -398,6 +407,39 @@ def validate_release_graph(graph: Dict[str, Any], policies: List[ToolPolicy]) ->
                     "tool_name": policy.tool_name,
                 }
             )
+
+    for server in servers:
+        for tool in server.get("tools") or []:
+            metadata = tool.get("tool_metadata") or {}
+            metadata_errors = validate_tool_metadata(
+                metadata,
+                tool.get("input_schema") or {},
+            )
+            for detail in metadata_errors:
+                errors.append(
+                    {
+                        "code": "tool_runtime_metadata_invalid",
+                        "server_name": server.get("name"),
+                        "tool_name": tool.get("name"),
+                        "detail": detail,
+                    }
+                )
+            policy = tool.get("policy") or {}
+            effect = str(policy.get("effect") or "unknown")
+            if effect in {"create", "update"} and not (
+                metadata.get("trigger_keywords") or []
+            ):
+                warnings.append(
+                    {
+                        "code": "write_tool_has_no_natural_language_trigger",
+                        "server_name": server.get("name"),
+                        "tool_name": tool.get("name"),
+                        "detail": (
+                            "工具仍保留在发布快照，但自然语言不会自动进入写路径；"
+                            "请在平台配置 trigger_keywords。"
+                        ),
+                    }
+                )
 
     return {
         "valid": not errors,

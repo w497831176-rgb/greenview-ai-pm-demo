@@ -5,21 +5,18 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import re
 import shlex
 import time
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from app.runtime.contracts import RuntimePath, ToolEffect, ToolInvocation
+from app.runtime.contracts import RuntimePath, ToolEffect, ToolInvocation, ToolPlan
 from app.runtime.tool_gateway import ToolGateway
+from app.runtime.tool_planner import plan_tools, validate_arguments
 
 try:
     from agno.tools.mcp import MCPTools
 except Exception:  # pragma: no cover
     MCPTools = None  # type: ignore
-
-
-DEMO_DEFAULT_CITY = os.getenv("YIAI_DEMO_CITY", "杭州")
 
 
 if MCPTools is not None:
@@ -30,6 +27,9 @@ if MCPTools is not None:
             self.server_name = str(kwargs.pop("server_name"))
             self.allowed_function_names: Set[str] = set(
                 kwargs.pop("allowed_function_names", [])
+            )
+            self.result_contracts: Dict[str, Dict[str, Any]] = dict(
+                kwargs.pop("result_contracts", {})
             )
             self.recorded_invocations: List[ToolInvocation] = []
             super().__init__(*args, **kwargs)
@@ -62,7 +62,10 @@ if MCPTools is not None:
                         result = await original(*args, **kwargs)
                     else:
                         result = await asyncio.to_thread(original, *args, **kwargs)
-                    business_status, result_summary = _business_status(result)
+                    business_status, result_summary = _business_status(
+                        result,
+                        self.result_contracts.get(function_name),
+                    )
                     self.recorded_invocations.append(
                         ToolInvocation(
                             server_name=self.server_name,
@@ -100,47 +103,22 @@ else:
     GovernedMCPTools = None  # type: ignore
 
 
-def _relevant(server_name: str, message: str) -> bool:
-    rules = {
-        "weather-server": ("天气", "气温", "下雨", "降雨", "湿度", "明天", "户外", "巡检"),
-        "workorder-server": ("工单进度", "查询工单", "我的工单", "工单状态", "维修进度", "工单数量"),
-        "calendar-server": ("今天", "明天", "日期", "星期", "几点", "预约"),
-    }
-    if server_name in rules:
-        return any(term in message for term in rules[server_name])
-    return server_name.lower() in message.lower()
-
-
-def _plan(server_name: str, message: str) -> List[Tuple[str, Dict[str, Any]]]:
-    if server_name == "weather-server":
-        cities = ("北京", "上海", "广州", "深圳", "杭州", "成都", "武汉", "西安")
-        city = next((item for item in cities if item in message), None)
-        if not city and "本小区" in message:
-            city = DEMO_DEFAULT_CITY
-        if not city:
-            return []
-        calls = [("get_current_weather", {"city": city})]
-        if any(term in message for term in ("建议", "风险", "户外", "巡检", "暴雨", "下雨", "降雨")):
-            calls.append(("get_weather_advice", {"city": city}))
-        return calls
-    if server_name == "workorder-server":
-        calls: List[Tuple[str, Dict[str, Any]]] = []
-        if any(term in message for term in ("最近工单", "我的工单", "我家工单", "维修记录", "工单进度")):
-            calls.append(("get_my_recent_work_orders", {"limit": 5}))
-        if any(term in message for term in ("待处理", "待派单", "未处理", "还有多少")):
-            calls.append(("count_my_open_work_orders", {}))
-        return calls
-    if server_name == "calendar-server":
-        if any(term in message for term in ("今天", "明天", "日期", "星期", "几点", "预约")):
-            return [("get_current_datetime", {})]
-    return []
-
-
-def _business_status(result: Any) -> Tuple[str, str]:
+def _business_status(
+    result: Any,
+    result_contract: Optional[Dict[str, Any]] = None,
+) -> Tuple[str, str]:
     parsed = _structured_result(result)
     if parsed is not None:
+        raw_status = str(parsed.get("status") or "unknown")
+        success_statuses = {
+            str(item).lower()
+            for item in (
+                (result_contract or {}).get("success_statuses")
+                or ["success"]
+            )
+        }
         return (
-            str(parsed.get("status") or "unknown"),
+            "success" if raw_status.lower() in success_statuses else raw_status,
             json.dumps(parsed, ensure_ascii=False, default=str)[:500],
         )
     text = result if isinstance(result, str) else str(result)
@@ -205,15 +183,55 @@ async def preinvoke_read_tools(
     gateway = ToolGateway(snapshot_config)
     invocations: List[ToolInvocation] = []
     context: List[str] = []
+    plans = plan_tools(
+        snapshot_config,
+        agent_id,
+        message,
+        RuntimePath.CONSULTATION,
+        effects=[ToolEffect.READ],
+        execution_modes=["auto_preinvoke"],
+    )
+    plans_by_server: Dict[str, List[ToolPlan]] = {}
+    for plan in plans:
+        plans_by_server.setdefault(plan.server_name, []).append(plan)
     for server in snapshot_config.get("mcp_servers") or []:
         server_name = str(server.get("name") or "")
-        if not server.get("enabled") or not _relevant(server_name, message):
+        if not server.get("enabled"):
             continue
-        allowed = set(
-            gateway.include_tools(agent_id, RuntimePath.CONSULTATION, server_name)
-        )
-        planned = [(name, args) for name, args in _plan(server_name, message) if name in allowed]
+        planned = plans_by_server.get(server_name) or []
         if not planned:
+            continue
+        executable_plans: List[ToolPlan] = []
+        for plan in planned:
+            if not plan.missing_required and not plan.schema_errors:
+                executable_plans.append(plan)
+                continue
+            invocations.append(
+                ToolInvocation(
+                    plan_id=plan.plan_id,
+                    server_name=server_name,
+                    tool_name=plan.tool_name,
+                    effect=plan.effect,
+                    arguments=plan.arguments,
+                    planner_source=plan.planner_source,
+                    match_reason=plan.match_reason,
+                    discovery_status="not_started",
+                    transport_status="not_started",
+                    invocation_status="not_started",
+                    business_status="invalid_input",
+                    error_summary=(
+                        "ToolPlan arguments failed schema validation: "
+                        + "; ".join(
+                            plan.schema_errors
+                            or [
+                                "missing required arguments: "
+                                + ", ".join(plan.missing_required)
+                            ]
+                        )
+                    ),
+                )
+            )
+        if not executable_plans:
             continue
         command = server.get("command")
         if not command:
@@ -258,7 +276,9 @@ async def preinvoke_read_tools(
                     pass
             continue
 
-        for tool_name, arguments in planned:
+        for plan in executable_plans:
+            tool_name = plan.tool_name
+            arguments = plan.arguments
             policy = gateway.assert_read_invocation(
                 agent_id,
                 RuntimePath.CONSULTATION,
@@ -269,10 +289,13 @@ async def preinvoke_read_tools(
             if function is None or not getattr(function, "entrypoint", None):
                 invocations.append(
                     ToolInvocation(
+                        plan_id=plan.plan_id,
                         server_name=server_name,
                         tool_name=tool_name,
                         effect=policy.effect,
                         arguments=arguments,
+                        planner_source=plan.planner_source,
+                        match_reason=plan.match_reason,
                         discovery_status=discovery_status,
                         transport_status="success",
                         invocation_status="failed",
@@ -287,13 +310,19 @@ async def preinvoke_read_tools(
                     function.entrypoint(**arguments),
                     timeout=8,
                 )
-                business_status, result_summary = _business_status(result)
+                business_status, result_summary = _business_status(
+                    result,
+                    plan.result_contract,
+                )
                 invocations.append(
                     ToolInvocation(
+                        plan_id=plan.plan_id,
                         server_name=server_name,
                         tool_name=tool_name,
                         effect=policy.effect,
                         arguments=arguments,
+                        planner_source=plan.planner_source,
+                        match_reason=plan.match_reason,
                         discovery_status=discovery_status,
                         transport_status="success",
                         invocation_status="success",
@@ -308,10 +337,13 @@ async def preinvoke_read_tools(
             except asyncio.TimeoutError:
                 invocations.append(
                     ToolInvocation(
+                        plan_id=plan.plan_id,
                         server_name=server_name,
                         tool_name=tool_name,
                         effect=policy.effect,
                         arguments=arguments,
+                        planner_source=plan.planner_source,
+                        match_reason=plan.match_reason,
                         discovery_status=discovery_status,
                         transport_status="timeout",
                         invocation_status="failed",
@@ -323,10 +355,13 @@ async def preinvoke_read_tools(
             except Exception as exc:
                 invocations.append(
                     ToolInvocation(
+                        plan_id=plan.plan_id,
                         server_name=server_name,
                         tool_name=tool_name,
                         effect=policy.effect,
                         arguments=arguments,
+                        planner_source=plan.planner_source,
+                        match_reason=plan.match_reason,
                         discovery_status=discovery_status,
                         transport_status="success",
                         invocation_status="failed",
@@ -357,32 +392,39 @@ def build_model_native_read_tools(
     snapshot_config: Dict[str, Any],
     agent_id: str,
     excluded_servers: Optional[Set[str]] = None,
+    excluded_tools: Optional[Set[Tuple[str, str]]] = None,
 ) -> List[Any]:
-    """Build published dynamic read MCP toolkits for Agno's native tool loop.
-
-    Formal built-in servers use deterministic pre-invocation. A user-added,
-    explicitly bound server is exposed here so a newly published MCP can
-    participate in the very next new session without hard-coded server names.
-    """
+    """Build every remaining published read tool for Agno's native tool loop."""
 
     if GovernedMCPTools is None:
         return []
     excluded = set(excluded_servers or set())
+    excluded_tool_keys = set(excluded_tools or set())
     gateway = ToolGateway(snapshot_config)
     toolkits: List[Any] = []
     for server in snapshot_config.get("mcp_servers") or []:
         server_name = str(server.get("name") or "")
         if (
             not server.get("enabled")
-            or server.get("is_builtin")
             or server_name in excluded
         ):
             continue
-        allowed = gateway.include_tools(
-            agent_id, RuntimePath.CONSULTATION, server_name
-        )
+        allowed = [
+            tool_name
+            for tool_name in gateway.include_tools(
+                agent_id, RuntimePath.CONSULTATION, server_name
+            )
+            if (server_name, tool_name) not in excluded_tool_keys
+        ]
         if not allowed or not server.get("command"):
             continue
+        result_contracts = {
+            str(tool.get("name") or ""): (
+                (tool.get("tool_metadata") or {}).get("result_contract") or {}
+            )
+            for tool in server.get("tools") or []
+            if str(tool.get("name") or "") in allowed
+        }
         full_command = shlex.join(
             [
                 str(server["command"]),
@@ -403,6 +445,7 @@ def build_model_native_read_tools(
                 name=server_name,
                 server_name=server_name,
                 allowed_function_names=allowed,
+                result_contracts=result_contracts,
                 transport="stdio",
                 timeout_seconds=15,
             )
@@ -433,6 +476,25 @@ async def invoke_confirmed_write(
     )
     if not server or not server.get("command"):
         raise RuntimeError("published MCP server has no executable command")
+    tool = next(
+        (
+            item
+            for item in server.get("tools") or []
+            if item.get("name") == tool_name
+        ),
+        None,
+    )
+    if not tool:
+        raise RuntimeError("published MCP tool is absent from snapshot")
+    schema_errors = validate_arguments(
+        arguments,
+        tool.get("input_schema") or {},
+    )
+    if schema_errors:
+        raise ValueError(
+            "MCP arguments failed published JSON Schema: "
+            + "; ".join(schema_errors)
+        )
     full_command = shlex.join(
         [
             str(server["command"]),
@@ -465,9 +527,12 @@ async def invoke_confirmed_write(
             function.entrypoint(**arguments),
             timeout=12,
         )
-        business_status, result_summary = _business_status(result)
+        business_status, result_summary = _business_status(
+            result,
+            (tool.get("tool_metadata") or {}).get("result_contract") or {},
+        )
         parsed = _structured_result(result) or {}
-        if business_status not in {"success", "unknown"}:
+        if business_status != "success":
             raise RuntimeError(
                 f"MCP business outcome is not successful: {business_status}"
             )

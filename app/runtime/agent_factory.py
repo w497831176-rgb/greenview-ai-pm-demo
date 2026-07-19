@@ -104,6 +104,10 @@ def vertical_agent_cards(config: Dict[str, Any]) -> List[Dict[str, Any]]:
         for item in config.get("mcp_servers") or []
         if item.get("enabled")
     }
+    knowledge_by_id = {
+        int(item["knowledge_doc_id"]): item
+        for item in config.get("knowledge") or []
+    }
     cards = []
     for agent in config.get("agents") or []:
         if not agent.get("enabled") or agent.get("category") in {"router", "orchestration"}:
@@ -117,6 +121,11 @@ def vertical_agent_cards(config: Dict[str, Any]) -> List[Dict[str, Any]]:
             server_by_name[name]
             for name in agent.get("mcp_server_names") or []
             if name in server_by_name
+        ]
+        bound_knowledge = [
+            knowledge_by_id[doc_id]
+            for doc_id in agent.get("knowledge_doc_ids") or []
+            if doc_id in knowledge_by_id
         ]
         skill_cards = [
             {
@@ -139,8 +148,38 @@ def vertical_agent_cards(config: Dict[str, Any]) -> List[Dict[str, Any]]:
                     for tool in item.get("tools") or []
                     if (tool.get("policy") or {}).get("enabled")
                 ],
+                "natural_language_intents": [
+                    str(intent)
+                    for tool in item.get("tools") or []
+                    for intent in (
+                        (tool.get("tool_metadata") or {}).get(
+                            "natural_language_intents"
+                        )
+                        or []
+                    )
+                    if str(intent).strip()
+                ],
+                "trigger_keywords": [
+                    str(trigger)
+                    for tool in item.get("tools") or []
+                    for trigger in (
+                        (tool.get("tool_metadata") or {}).get(
+                            "trigger_keywords"
+                        )
+                        or []
+                    )
+                    if str(trigger).strip()
+                ],
             }
             for item in bound_servers
+        ]
+        knowledge_cards = [
+            {
+                "id": item.get("knowledge_doc_id"),
+                "title": item.get("title") or "",
+                "category": item.get("category") or "",
+            }
+            for item in bound_knowledge
         ]
         cards.append(
             {
@@ -165,6 +204,7 @@ def vertical_agent_cards(config: Dict[str, Any]) -> List[Dict[str, Any]]:
                     "routing_hints": agent.get("instructions") or "",
                     "skills": skill_cards,
                     "mcp_servers": server_cards,
+                    "knowledge_docs": knowledge_cards,
                 },
             }
         )

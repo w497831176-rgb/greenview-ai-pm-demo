@@ -102,12 +102,16 @@ def _explicit_evidence_priority(query: str, content: str) -> float:
     return round(max(0.0, min(1.0, score)), 4)
 
 
-def _build_keyword_index() -> Dict[int, Dict[str, int]]:
+def _build_keyword_index(
+    allowed_document_ids: Optional[set[int]] = None,
+) -> Dict[int, Dict[str, int]]:
     """Build in-memory TF index for knowledge docs."""
     docs = db.list_knowledge_docs()
     index: Dict[int, Dict[str, int]] = {}
     for doc in docs:
         if not doc.get("is_indexed"):
+            continue
+        if allowed_document_ids is not None and int(doc["id"]) not in allowed_document_ids:
             continue
         text = f"{doc.get('title', '')} {doc.get('content', '')}"
         tokens = _tokenize(text)
@@ -118,7 +122,12 @@ def _build_keyword_index() -> Dict[int, Dict[str, int]]:
     return index
 
 
-def _keyword_search(query: str, top_k: int = 10, threshold: Optional[float] = None) -> List[Dict[str, Any]]:
+def _keyword_search(
+    query: str,
+    top_k: int = 10,
+    threshold: Optional[float] = None,
+    allowed_document_ids: Optional[set[int]] = None,
+) -> List[Dict[str, Any]]:
     """BM25-style keyword search over knowledge chunks.
 
     Documents are first matched by their full title+content TF index, then
@@ -133,7 +142,7 @@ def _keyword_search(query: str, top_k: int = 10, threshold: Optional[float] = No
     if not query_tokens:
         return []
 
-    index = _build_keyword_index()
+    index = _build_keyword_index(allowed_document_ids=allowed_document_ids)
     doc_list = db.list_knowledge_docs()
     doc_map = {d["id"]: d for d in doc_list}
 
@@ -225,7 +234,12 @@ def _keyword_search(query: str, top_k: int = 10, threshold: Optional[float] = No
     return results
 
 
-def _semantic_search(query: str, top_k: int = 10, threshold: Optional[float] = None) -> List[Dict[str, Any]]:
+def _semantic_search(
+    query: str,
+    top_k: int = 10,
+    threshold: Optional[float] = None,
+    allowed_document_ids: Optional[set[int]] = None,
+) -> List[Dict[str, Any]]:
     """Semantic search returning chunk-level results.
 
     Unlike the indexer wrapper, this does not deduplicate by document so that
@@ -234,7 +248,12 @@ def _semantic_search(query: str, top_k: int = 10, threshold: Optional[float] = N
     """
     effective_threshold = rag_indexer._effective_threshold(threshold)
     query_embedding = rag_embeddings.embed_text(query)
-    chunks = rag_store.search_chunks(query_embedding, top_k=top_k, threshold=effective_threshold)
+    chunks = rag_store.search_chunks(
+        query_embedding,
+        top_k=top_k,
+        threshold=effective_threshold,
+        allowed_document_ids=allowed_document_ids,
+    )
     results = []
     for chunk in chunks:
         doc = db.get_knowledge_doc(chunk.get("doc_id"))
@@ -418,13 +437,21 @@ def normalize_retrieval_settings(settings: Optional[Dict[str, Any]] = None) -> D
 def _single_query_search(
     query: str,
     settings: Dict[str, Any],
+    allowed_document_ids: Optional[set[int]] = None,
 ) -> List[Dict[str, Any]]:
     """Run hybrid retrieval and the same evidence gate used in production."""
     settings = normalize_retrieval_settings(settings)
     top_k = settings["top_k"]
-    keyword_results = _keyword_search(query, top_k=top_k * 2)
+    keyword_results = _keyword_search(
+        query,
+        top_k=top_k * 2,
+        allowed_document_ids=allowed_document_ids,
+    )
     semantic_results = _semantic_search(
-        query, top_k=top_k * 2, threshold=settings["score_threshold"]
+        query,
+        top_k=top_k * 2,
+        threshold=settings["score_threshold"],
+        allowed_document_ids=allowed_document_ids,
     )
     semantic_results = [result for result in semantic_results if result.get("is_indexed")]
     fused = _rrf_fusion(
@@ -461,6 +488,7 @@ def _title_boosted_results(
     query: str,
     title: str,
     settings: Dict[str, Any],
+    allowed_document_ids: Optional[set[int]] = None,
 ) -> List[Dict[str, Any]]:
     """Retrieve chunks from documents whose titles are explicitly cited.
 
@@ -473,7 +501,11 @@ def _title_boosted_results(
     context_threshold = settings.get("context_threshold", 0.2)
 
     # Find candidate docs by matching the cited title.
-    title_hits = _keyword_search(title, top_k=top_k * 2)
+    title_hits = _keyword_search(
+        title,
+        top_k=top_k * 2,
+        allowed_document_ids=allowed_document_ids,
+    )
     doc_ids = {r.get("doc_id") for r in title_hits if r.get("doc_id")}
 
     candidates = []
@@ -512,9 +544,33 @@ def _title_boosted_results(
 def advanced_search(
     query: str,
     settings: Optional[Dict[str, Any]] = None,
+    allowed_document_ids: Optional[List[int]] = None,
 ) -> Dict[str, Any]:
-    """Run composite-aware advanced RAG and retain evidence provenance."""
+    """Run composite-aware RAG inside an Agent's published document scope.
+
+    Scope is applied in keyword indexing and vector SQL before either channel
+    selects Top-K.  ``None`` preserves the global platform debug behavior;
+    an empty list means the Agent has no RAG capability.
+    """
     settings = normalize_retrieval_settings(settings)
+    scope = None if allowed_document_ids is None else {int(item) for item in allowed_document_ids}
+    if scope is not None and not scope:
+        return {
+            "query": query,
+            "mode": "advanced",
+            "settings": settings,
+            "keyword_count": 0,
+            "semantic_count": 0,
+            "count": 0,
+            "results": [],
+            "embedding_runtime": rag_embeddings.get_runtime_info(),
+            "scope": {"mode": "agent_bound", "allowed_document_ids": []},
+            "evidence_policy": {
+                "score_threshold": settings["score_threshold"],
+                "context_threshold": settings["context_threshold"],
+                "top_k": settings["top_k"],
+            },
+        }
     top_k = settings["top_k"]
     merged: Dict[tuple, Dict[str, Any]] = {}
 
@@ -545,19 +601,44 @@ def advanced_search(
                 if sources:
                     current["retrieval_sources"] = sources
 
-    add_results(_single_query_search(query, settings), "full_query")
+    add_results(
+        _single_query_search(query, settings, allowed_document_ids=scope),
+        "full_query",
+    )
     for title in _extract_quoted_titles(query):
-        add_results(_title_boosted_results(query, title, settings), "quoted_title")
+        add_results(
+            _title_boosted_results(
+                query,
+                title,
+                settings,
+                allowed_document_ids=scope,
+            ),
+            "quoted_title",
+        )
     for sub_query in _extract_sub_queries(query):
         if sub_query != query:
-            add_results(_single_query_search(sub_query, settings), "sub_query")
+            add_results(
+                _single_query_search(
+                    sub_query,
+                    settings,
+                    allowed_document_ids=scope,
+                ),
+                "sub_query",
+            )
 
     results = sorted(merged.values(), key=lambda item: item.get("score", 0), reverse=True)[:top_k]
-    keyword_results = _keyword_search(query, top_k=top_k * 2)
+    keyword_results = _keyword_search(
+        query,
+        top_k=top_k * 2,
+        allowed_document_ids=scope,
+    )
     semantic_results = [
         result
         for result in _semantic_search(
-            query, top_k=top_k * 2, threshold=settings["score_threshold"]
+            query,
+            top_k=top_k * 2,
+            threshold=settings["score_threshold"],
+            allowed_document_ids=scope,
         )
         if result.get("is_indexed")
     ]
@@ -570,6 +651,10 @@ def advanced_search(
         "count": len(results),
         "results": results,
         "embedding_runtime": rag_embeddings.get_runtime_info(),
+        "scope": {
+            "mode": "global_debug" if scope is None else "agent_bound",
+            "allowed_document_ids": None if scope is None else sorted(scope),
+        },
         "evidence_policy": {
             "score_threshold": settings["score_threshold"],
             "context_threshold": settings["context_threshold"],

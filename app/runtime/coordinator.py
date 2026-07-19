@@ -37,7 +37,7 @@ from app.runtime.mcp_executor import (
     preinvoke_read_tools,
 )
 from app.runtime.snapshot_resolver import resolve_snapshot
-from app.runtime.tool_gateway import ToolGateway
+from app.runtime.tool_planner import unique_write_plan
 from app.settings import MODEL_ID, USE_THINKING, build_model
 from app.work_order_workflow import (
     action_gateway,
@@ -518,39 +518,21 @@ class RuntimeCoordinator:
         snapshot_config: Dict[str, Any],
         message: str,
     ) -> Optional[Dict[str, Any]]:
-        normalized = (message or "").lower()
-        candidates: List[Dict[str, Any]] = []
-        gateway = ToolGateway(snapshot_config)
-        for agent in snapshot_config.get("agents") or []:
-            if not agent.get("enabled") or agent.get("category") in {"router", "orchestration"}:
-                continue
-            agent_id = str(agent.get("agent_id") or "")
-            bound = set(agent.get("mcp_server_names") or [])
-            for server in snapshot_config.get("mcp_servers") or []:
-                server_name = str(server.get("name") or "")
-                if not server.get("enabled") or server_name not in bound:
-                    continue
-                for tool in server.get("tools") or []:
-                    tool_name = str(tool.get("name") or "")
-                    if not tool_name or tool_name.lower() not in normalized:
-                        continue
-                    try:
-                        policy = gateway.write_policy(
-                            server_name, tool_name, agent_id=agent_id
-                        )
-                    except Exception:
-                        continue
-                    candidates.append(
-                        {
-                            "agent_id": agent_id,
-                            "agent_name": str(agent.get("name") or agent_id),
-                            "server_name": server_name,
-                            "tool_name": tool_name,
-                            "input_schema": tool.get("input_schema") or {},
-                            "policy": policy,
-                        }
-                    )
-        return candidates[0] if len(candidates) == 1 else None
+        plan = unique_write_plan(snapshot_config, message)
+        if not plan:
+            return None
+        agent = next(
+            (
+                item
+                for item in snapshot_config.get("agents") or []
+                if item.get("agent_id") == plan.agent_id
+            ),
+            {},
+        )
+        return {
+            **plan.model_dump(mode="json"),
+            "agent_name": str(agent.get("name") or plan.agent_id),
+        }
 
     async def _maybe_handoff(
         self,
@@ -674,6 +656,7 @@ class RuntimeCoordinator:
             if action_type.startswith("mcp."):
                 proposal_payload = (proposal_row or {}).get("payload") or {}
                 invocation = ToolInvocation(
+                    plan_id=proposal_payload.get("plan_id"),
                     server_name=str(
                         receipt_result.get("server_name")
                         or proposal_payload.get("server_name")
@@ -692,6 +675,8 @@ class RuntimeCoordinator:
                         or proposal_payload.get("arguments")
                         or {}
                     ),
+                    planner_source=proposal_payload.get("planner_source"),
+                    match_reason=proposal_payload.get("match_reason"),
                     discovery_status="success",
                     transport_status=(
                         "success" if receipt.may_claim_success else "failed"
@@ -950,37 +935,24 @@ class RuntimeCoordinator:
                 "reply": "未能在当前发布快照中唯一匹配允许的写工具，操作已拒绝。",
             }
 
-        arguments: Dict[str, Any] = {}
-        json_start = message.find("{")
-        if json_start >= 0:
-            try:
-                arguments, _ = json.JSONDecoder().raw_decode(message[json_start:])
-                if not isinstance(arguments, dict):
-                    raise ValueError("MCP arguments must be a JSON object")
-            except Exception:
-                return {
-                    "handled": True,
-                    "action": "awaiting_parameters",
-                    "action_type": f"mcp.{match['server_name']}.{match['tool_name']}",
-                    "agent_id": match["agent_id"],
-                    "agent_name": match["agent_name"],
-                    "route_reason": "动态写 MCP 参数收集。",
-                    "reply": "检测到写工具，但 JSON 参数无法解析。请按工具输入 Schema 提供合法 JSON。",
-                }
-        required = list((match.get("input_schema") or {}).get("required") or [])
-        missing = [key for key in required if key not in arguments]
-        if missing:
+        arguments = dict(match.get("arguments") or {})
+        missing = list(match.get("missing_required") or [])
+        schema_errors = list(match.get("schema_errors") or [])
+        if missing or schema_errors:
             return {
                 "handled": True,
                 "action": "awaiting_parameters",
                 "action_type": f"mcp.{match['server_name']}.{match['tool_name']}",
                 "agent_id": match["agent_id"],
                 "agent_name": match["agent_name"],
-                "route_reason": "动态写 MCP 参数收集。",
+                "route_reason": "发布快照 ToolPlan 已匹配写工具，但参数不完整。",
                 "reply": (
-                    "该写操作尚未生成 Proposal，缺少参数："
-                    + "、".join(missing)
-                    + "。请附带 JSON 参数重新提交。"
+                    "该写操作尚未生成 Proposal，参数不符合已发布 Schema："
+                    + "；".join(
+                        schema_errors
+                        or ["缺少参数 " + "、".join(missing)]
+                    )
+                    + "。请补充自然语言信息或附带 JSON 参数重新提交。"
                 ),
             }
         action_type = f"mcp.{match['server_name']}.{match['tool_name']}"
@@ -993,6 +965,9 @@ class RuntimeCoordinator:
                 "server_name": match["server_name"],
                 "tool_name": match["tool_name"],
                 "arguments": arguments,
+                "plan_id": match.get("plan_id"),
+                "planner_source": match.get("planner_source"),
+                "match_reason": match.get("match_reason"),
             },
             trace_id=trace_id,
             release_id=snapshot.release_id,
@@ -1005,7 +980,10 @@ class RuntimeCoordinator:
             "action_type": action_type,
             "agent_id": match["agent_id"],
             "agent_name": match["agent_name"],
-            "route_reason": "发布快照中的写 MCP 生成 Proposal，等待用户确认。",
+            "route_reason": (
+                "发布快照 ToolPlan 命中写 MCP 并生成 Proposal；"
+                + str(match.get("match_reason") or "")
+            ),
             "reply": (
                 f"已生成待确认 Proposal，尚未执行 {match['server_name']}/"
                 f"{match['tool_name']}。\n\n参数：{_json(arguments)}\n\n"
@@ -1152,6 +1130,7 @@ class RuntimeCoordinator:
                     rag_retrieval.advanced_search,
                     message,
                     snapshot.config.get("retrieval_policy") or {},
+                    allowed_document_ids=sorted(allowed_doc_ids),
                 )
                 results = list((retrieval or {}).get("results") or [])
                 results, used_snapshot_fallback = _results_from_snapshot(
@@ -1213,15 +1192,16 @@ class RuntimeCoordinator:
         mcp_context, invocations = await preinvoke_read_tools(
             snapshot.config, selected, message
         )
-        preinvoked_servers = {
-            invocation.server_name
+        preinvoked_tools = {
+            (invocation.server_name, invocation.tool_name)
             for invocation in invocations
             if invocation.tool_name != "discovery"
+            and invocation.invocation_status == "success"
         }
         model_native_toolkits = build_model_native_read_tools(
             snapshot.config,
             selected,
-            excluded_servers=preinvoked_servers,
+            excluded_tools=preinvoked_tools,
         )
         state.tool_invocations = list(invocations)
         for invocation in invocations:

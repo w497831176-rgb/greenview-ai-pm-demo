@@ -7,3 +7,11 @@ __pycache__/
 node_modules/
 logs/
 uploads/
+
+# NAS runtime bind-mount targets. Their contents live outside the source tree
+# and must not appear as untracked application code.
+/data/
+/enterprise/
+
+# NAS-local diagnostic helper retained outside releases.
+/check_db2.py
