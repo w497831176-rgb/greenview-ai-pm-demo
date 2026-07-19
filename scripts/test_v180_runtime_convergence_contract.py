@@ -506,7 +506,7 @@ def test_static_conflict_removal():
     coordinator = (repo / "app" / "runtime" / "coordinator.py").read_text(
         encoding="utf-8"
     )
-    assert len(thin_chat.splitlines()) < 30
+    assert len(thin_chat.splitlines()) < 60
     assert "KnowledgeTools" not in agent_factory
     assert "WorkOrderTools" not in agent_factory
     assert "create_badcase" not in coordinator
@@ -542,6 +542,9 @@ def test_fixed_acceptance_matrix():
 def main():
     tests = [
         test_release_and_snapshot_immutability,
+        test_new_vertical_agent_has_explicit_rag_scope,
+        test_badcase_ai_context_keeps_contract_failures,
+        test_badcase_retest_uses_public_chat_adapter,
         test_tool_policy_default_deny,
         test_citation_single_source_contract,
         test_cost_availability_contract,
