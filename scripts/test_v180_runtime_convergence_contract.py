@@ -62,6 +62,7 @@ def test_new_vertical_agent_has_explicit_rag_scope():
     )
     agent = created["agent"]
     assert agent["category"] == "vertical"
+    assert agent["instructions"] == "Contract-only vertical Agent."
     assert agent["knowledge_scope_mode"] == "explicit"
     assert agent["knowledge_doc_ids"] == []
 
@@ -236,11 +237,13 @@ def test_cost_availability_contract():
     )
     assert total_only.usage_source.value == "provider_reported_total_only"
     assert total_only.amount is None and total_only.formula is None
+    assert total_only.price_snapshot is not None
     estimated = build_cost_entry(
         "agent", "demo", "demo-model", "demo-model", "v1", None, price, 120
     )
     assert estimated.usage_source.value == "local_estimate"
     assert estimated.amount is None
+    assert estimated.price_snapshot is not None
     complete = build_cost_entry(
         "agent",
         "demo",
@@ -257,6 +260,30 @@ def test_cost_availability_contract():
     )
     assert complete.usage_source.value == "provider_reported_complete"
     assert complete.amount is not None and complete.formula
+
+
+def test_agno_completed_metrics_are_extractable():
+    from app.runtime.coordinator import _metrics_dict
+
+    class FakeRunMetrics:
+        input_tokens = 120
+        cached_tokens = 20
+        output_tokens = 40
+        reasoning_tokens = 5
+        total_tokens = 160
+
+    class FakeRunCompleted:
+        event = "RunCompleted"
+        content = "full answer"
+        metrics = FakeRunMetrics()
+
+    assert _metrics_dict(FakeRunCompleted()) == {
+        "input_tokens": 120,
+        "output_tokens": 40,
+        "reasoning_tokens": 5,
+        "cached_tokens": 20,
+        "total_tokens": 160,
+    }
 
 
 def test_action_gateway_receipt_and_idempotency():
@@ -548,6 +575,7 @@ def main():
         test_tool_policy_default_deny,
         test_citation_single_source_contract,
         test_cost_availability_contract,
+        test_agno_completed_metrics_are_extractable,
         test_action_gateway_receipt_and_idempotency,
         test_action_success_claim_contract,
         test_mcp_preinvoke_initializes_session,

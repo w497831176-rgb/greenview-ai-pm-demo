@@ -1292,9 +1292,14 @@ class RuntimeCoordinator:
             user_id=user_id,
             session_id=session_id,
             stream=True,
+            stream_events=True,
         ):
             content = getattr(chunk, "content", None) or getattr(chunk, "delta", None)
-            if content:
+            event_name = str(getattr(chunk, "event", "") or "").lower()
+            # RunCompleted carries the full answer again together with the
+            # final metrics.  Capture its metrics but do not append its content
+            # a second time.
+            if content and "completed" not in event_name:
                 full_content += str(content)
             for call in _extract_tool_calls(chunk):
                 if call not in tool_calls:
