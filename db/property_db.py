@@ -2369,6 +2369,14 @@ def _migrate_v1_8_runtime_convergence(cursor):
         """
     )
 
+_WORK_ORDER_PENDING_STATUSES = {"pending", "待处理", "待派单"}
+
+
+def _canonical_work_order_status(status: Any) -> str:
+    normalized = str(status or "").strip()
+    return "待派单" if normalized in _WORK_ORDER_PENDING_STATUSES else normalized
+
+
 def create_work_order(
     work_order_id: str,
     room_id: str,
@@ -2382,6 +2390,7 @@ def create_work_order(
     session_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     now = now_cn("%Y-%m-%d %H:%M")
+    status = _canonical_work_order_status(status)
     conn = _get_conn()
     cursor = conn.cursor()
     cursor.execute(
@@ -2460,7 +2469,11 @@ def get_work_order(work_order_id: str) -> Optional[Dict[str, Any]]:
     cursor.execute("SELECT * FROM work_orders WHERE id = ?", (work_order_id,))
     row = cursor.fetchone()
     conn.close()
-    return dict(row) if row else None
+    if not row:
+        return None
+    result = dict(row)
+    result["status"] = _canonical_work_order_status(result.get("status"))
+    return result
 
 
 def list_work_orders(
@@ -2474,8 +2487,13 @@ def list_work_orders(
     query = "SELECT * FROM work_orders WHERE 1=1"
     params = []
     if status:
-        query += " AND status = ?"
-        params.append(status)
+        canonical_status = _canonical_work_order_status(status)
+        if canonical_status == "待派单":
+            query += " AND status IN (?, ?, ?)"
+            params.extend(["pending", "待处理", "待派单"])
+        else:
+            query += " AND status = ?"
+            params.append(canonical_status)
     if room_id:
         query += " AND room_id = ?"
         params.append(room_id)
@@ -2487,7 +2505,10 @@ def list_work_orders(
     cursor.execute(query, params)
     rows = cursor.fetchall()
     conn.close()
-    return [dict(r) for r in rows]
+    results = [dict(r) for r in rows]
+    for result in results:
+        result["status"] = _canonical_work_order_status(result.get("status"))
+    return results
 
 
 def update_work_order_status(
@@ -2497,6 +2518,7 @@ def update_work_order_status(
     completion_note: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     now = now_cn("%Y-%m-%d %H:%M")
+    status = _canonical_work_order_status(status)
     conn = _get_conn()
     cursor = conn.cursor()
 

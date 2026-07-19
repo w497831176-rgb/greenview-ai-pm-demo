@@ -82,6 +82,48 @@ def _issue_type(text: str) -> str:
     return "其他"
 
 
+def _issue_description(text: str) -> str:
+    """Extract the reported problem, never the bare create command itself."""
+
+    candidate = (text or "").strip()
+    candidate = re.sub(
+        r"^(?:我要|我想|请|帮我|麻烦|需要)?"
+        r"(?:马上|现在|直接|尽快)?"
+        r"(?:报修|创建(?:一张|一个)?(?:维修)?工单|提交(?:一张|一个)?(?:维修)?工单)"
+        r"[\s，,。:：-]*",
+        "",
+        candidate,
+        count=1,
+        flags=re.IGNORECASE,
+    ).strip()
+    if not candidate or candidate in {
+        "工单",
+        "维修工单",
+        "帮我创建工单",
+        "创建工单",
+        "提交工单",
+        "我要报修",
+    }:
+        return ""
+    # A field-only follow-up must not accidentally become the fault
+    # description while the workflow is collecting missing values.
+    compact = re.sub(r"\s+", "", candidate)
+    phone = _phone(candidate)
+    room = _room_id(candidate)
+    if (
+        (phone and compact in {phone, f"电话{phone}", f"联系电话{phone}"})
+        or (room and compact in {room, f"房号{room}", f"我是{room}"})
+        or re.fullmatch(r"(?:紧急|高|中|低)", compact)
+        or re.fullmatch(
+            r"(?:尽快|今天|明天|后天|今晚|上午|下午|晚上|"
+            r"\d{1,2}月\d{1,2}日)(?:上门|维修|处理)?",
+            compact,
+        )
+    ):
+        return ""
+    return candidate
+
+
 def is_explicit_work_order_request(message: str) -> bool:
     """Return True only for an affirmative *command* to start a repair draft.
 
@@ -133,7 +175,10 @@ def is_confirmation(message: str) -> bool:
     return bool(re.search(r"^(确认创建|确认提交|确认|同意创建|好的.*创建|就.*创建|创建.*)$", normalized))
 
 
-def _is_draft_follow_up(message: str) -> bool:
+def _is_draft_follow_up(
+    message: str,
+    existing: Optional[Dict[str, Any]] = None,
+) -> bool:
     """Only let concise field-completion messages advance an existing draft.
 
     A stale draft must never hijack a later request for weather, RAG evidence,
@@ -158,7 +203,19 @@ def _is_draft_follow_up(message: str) -> bool:
     explicit_urgency = bool(re.fullmatch(r"(?:紧急|高|中|低)", compact))
     room_follow_up = len(compact) <= 24 and bool(_room_id(text))
     contact_follow_up = "联系人" in text and bool(_contact_name(text))
-    return bool(_phone(text) or room_follow_up or contact_follow_up or appointment_follow_up or explicit_urgency)
+    issue_follow_up = bool(
+        existing
+        and not str(existing.get("issue_desc") or "").strip()
+        and _issue_description(text)
+    )
+    return bool(
+        _phone(text)
+        or room_follow_up
+        or contact_follow_up
+        or appointment_follow_up
+        or explicit_urgency
+        or issue_follow_up
+    )
 
 
 def _missing(draft: Dict[str, Any]) -> List[str]:
@@ -242,7 +299,7 @@ def advance_work_order_workflow(
                 )
         if not is_explicit_work_order_request(message):
             return None
-    elif not _is_draft_follow_up(message):
+    elif not _is_draft_follow_up(message, existing):
         # Preserve the unconfirmed draft, but do not turn every subsequent
         # consultation into a stateful ticket interaction.
         return None
@@ -298,11 +355,16 @@ def advance_work_order_workflow(
         )
 
     base = dict(existing or {})
-    issue_desc = base.get("issue_desc") or message.strip()
+    issue_desc = base.get("issue_desc") or _issue_description(message)
     urgency = _urgency(message) or base.get("urgency") or ""
+    issue_type = (
+        _issue_type(issue_desc)
+        if not str(base.get("issue_desc") or "").strip()
+        else (base.get("issue_type") or _issue_type(issue_desc))
+    )
     draft = {
         "room_id": _room_id(message) or base.get("room_id") or DEFAULT_ROOM_ID,
-        "issue_type": base.get("issue_type") or _issue_type(issue_desc),
+        "issue_type": issue_type,
         "issue_desc": issue_desc,
         "urgency": urgency,
         "contact_name": _contact_name(message) or base.get("contact_name") or DEFAULT_OWNER_NAME,

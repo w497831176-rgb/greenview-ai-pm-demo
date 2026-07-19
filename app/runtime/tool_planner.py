@@ -101,7 +101,16 @@ BUILTIN_COMPATIBILITY_METADATA: Dict[Tuple[str, str], Dict[str, Any]] = {
     ("workorder-server", "get_my_recent_work_orders"): {
         "effect": "read",
         "natural_language_intents": ["查询我的最近工单或维修记录"],
-        "trigger_keywords": ["最近工单", "我的工单", "我家工单", "维修记录", "工单进度"],
+        "trigger_keywords": [
+            "最近工单",
+            "最近的工单",
+            "最近维修工单",
+            "最近的维修工单",
+            "我的工单",
+            "我家工单",
+            "维修记录",
+            "工单进度",
+        ],
         "trigger_mode": "any",
         "execution_mode": "auto_preinvoke",
         "argument_bindings": {"limit": {"source": "constant", "value": 5}},
@@ -109,7 +118,13 @@ BUILTIN_COMPATIBILITY_METADATA: Dict[Tuple[str, str], Dict[str, Any]] = {
     ("workorder-server", "count_my_open_work_orders"): {
         "effect": "read",
         "natural_language_intents": ["统计我的未关闭工单"],
-        "trigger_keywords": ["待处理", "待派单", "未处理", "还有多少"],
+        "trigger_keywords": [
+            "我的未关闭工单",
+            "我的待处理工单",
+            "我家未关闭工单",
+            "我家待处理工单",
+            "我有多少工单",
+        ],
         "trigger_mode": "any",
         "execution_mode": "auto_preinvoke",
         "argument_bindings": {},
@@ -124,11 +139,31 @@ BUILTIN_COMPATIBILITY_METADATA: Dict[Tuple[str, str], Dict[str, Any]] = {
     },
     ("workorder-server", "count_work_orders"): {
         "effect": "read",
-        "natural_language_intents": ["查询脱敏工单数量"],
-        "trigger_keywords": ["工单数量", "多少工单"],
+        "natural_language_intents": ["查询全小区或系统的脱敏工单数量"],
+        "trigger_keywords": [
+            "系统当前待处理工单数量",
+            "系统待处理工单数量",
+            "全小区待处理工单",
+            "当前待处理工单数量",
+            "工单数量",
+            "多少工单",
+        ],
         "trigger_mode": "any",
-        "execution_mode": "model_native",
-        "argument_bindings": {},
+        "execution_mode": "auto_preinvoke",
+        "argument_bindings": {
+            "status": {
+                "source": "keyword_map",
+                "mapping": {
+                    "待处理": "待派单",
+                    "待派单": "待派单",
+                    "未处理": "待派单",
+                    "处理中": "处理中",
+                    "已完成": "已完成",
+                    "已关闭": "已关闭",
+                    "已取消": "已取消",
+                },
+            }
+        },
     },
     ("calendar-server", "get_current_date"): {
         "effect": "read",

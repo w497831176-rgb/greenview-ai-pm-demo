@@ -52,6 +52,20 @@ def _citation_context(answer: str, match: re.Match) -> str:
     section_end = answer.find("\n\n", match.end())
     if section_end < 0 or section_end > max_end:
         section_end = max_end
+    first_section = answer[line_start:section_end].strip()
+    # Models often emit a short source-label line, then a blank line, then the
+    # actual supported Markdown list.  Treat that label plus the immediately
+    # following paragraph/list as one citation context.
+    if (
+        section_end < max_end
+        and any(marker in first_section for marker in ("引用来源", "依据", "参考文档"))
+        and len(first_section) <= 120
+    ):
+        next_start = section_end + 2
+        next_end = answer.find("\n\n", next_start)
+        if next_end < 0 or next_end > max_end:
+            next_end = max_end
+        section_end = next_end
     return answer[line_start:section_end].strip()
 
 
@@ -142,7 +156,9 @@ def prompt_evidence_allowlist(evidence: EvidenceSet) -> str:
     if not evidence.items:
         return "本次没有可引用的检索证据。不得生成引用标记。"
     lines = [
-        "只能使用以下 evidence_id 引用，格式为 [[evidence:ID]]；不得自行编造 ID："
+        "只能使用以下完整 evidence_id 引用，格式为 [[evidence:ev_xxx]]；"
+        "不得省略 `ev_` 前缀、不得自行编造 ID。凡使用证据中的事实，"
+        "必须在对应句末放置标记；用户明确要求引用时至少引用一条匹配证据："
     ]
     for item in evidence.items:
         lines.append(
@@ -163,6 +179,18 @@ def render_citations(
 
     def replace_id(match: re.Match) -> str:
         evidence_id = match.group(1).strip()
+        # Some providers preserve the stable hash but omit the readable
+        # ``ev_`` namespace prefix.  Accept that one unambiguous formatting
+        # variation, then immediately normalize it back to the immutable ID.
+        # A suffix that matches zero or multiple EvidenceItems stays invalid.
+        if evidence_id not in by_id:
+            suffix_matches = [
+                candidate
+                for candidate in by_id
+                if candidate == f"ev_{evidence_id}"
+            ]
+            if len(suffix_matches) == 1:
+                evidence_id = suffix_matches[0]
         if evidence_id not in by_id:
             violations.append(
                 {"code": "invalid_evidence_id", "evidence_id": evidence_id}

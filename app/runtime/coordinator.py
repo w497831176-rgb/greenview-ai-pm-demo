@@ -51,6 +51,7 @@ from db.property_db import (
     ensure_chat_session,
     get_chat_session,
     get_action_proposal,
+    get_action_receipt_by_idempotency_key,
     get_latest_action_proposal,
     get_pending_action_proposal,
     get_work_order_draft,
@@ -139,6 +140,87 @@ def _claims_business_success(text: str) -> bool:
             normalized,
             flags=re.IGNORECASE,
         )
+    )
+
+
+def _requires_rag_citations(message: str) -> bool:
+    compact = re.sub(r"\s+", "", message or "")
+    return any(
+        marker in compact
+        for marker in (
+            "可点击引用",
+            "给出引用",
+            "标注引用",
+            "知识库引用",
+            "依据《",
+            "根据《",
+            "根据手册",
+            "根据知识库",
+        )
+    )
+
+
+def _append_runtime_evidence_summary(
+    answer: str,
+    message: str,
+    tool_calls: List[Dict[str, Any]],
+    tool_invocations: List[ToolInvocation],
+    citations: List[Any],
+) -> str:
+    """Append the requested one-line summary from runtime evidence, not prose."""
+
+    compact = re.sub(r"\s+", "", message or "")
+    if not any(
+        marker in compact
+        for marker in ("一行汇总", "一行总结", "汇总实际调用", "汇总调用的工具")
+    ):
+        return answer
+
+    tool_names: List[str] = []
+    if any(
+        call.get("tool_name") == "get_skill_instructions"
+        for call in tool_calls
+    ):
+        tool_names.append("get_skill_instructions")
+    for invocation in tool_invocations:
+        name = f"{invocation.server_name}/{invocation.tool_name}"
+        if name not in tool_names:
+            tool_names.append(name)
+
+    document_titles: List[str] = []
+    for citation in citations:
+        title = str(getattr(citation, "title", "") or "").strip()
+        if title and title not in document_titles:
+            document_titles.append(title)
+
+    footer = (
+        "运行时核验汇总：本次实际调用工具："
+        + ("、".join(tool_names) if tool_names else "无")
+        + "；实际引用知识库文档："
+        + ("、".join(document_titles) if document_titles else "无")
+        + "。"
+    )
+    return (answer or "").rstrip() + "\n\n" + footer
+
+
+def _action_receipt_from_payload(payload: Dict[str, Any]) -> ActionReceipt:
+    """Project a database/API row onto the immutable public Receipt contract."""
+
+    field_names = set(getattr(ActionReceipt, "model_fields", {}).keys())
+    projected = {
+        key: value
+        for key, value in (payload or {}).items()
+        if key in field_names
+    }
+    return ActionReceipt.model_validate(projected)
+
+
+def _records_new_mcp_invocation(action_type: str, phase: Any) -> bool:
+    """A Receipt replay is evidence reuse, not another MCP invocation."""
+
+    return (
+        str(action_type or "").startswith("mcp.")
+        and str(phase or "") != "idempotent_replay"
     )
 
 
@@ -450,6 +532,28 @@ class RuntimeCoordinator:
                 started,
             ):
                 yield event
+        except asyncio.CancelledError:
+            # A reverse proxy timeout or closed browser used to leave a Trace
+            # permanently "in_progress".  Preserve a terminal transport fact
+            # even though no SSE event can be delivered to the disconnected
+            # client.
+            state.status = RunStatus.FAILED
+            state.next_step = None
+            ledger.violation(
+                "client_stream_cancelled",
+                "SSE client disconnected before the governed run completed.",
+            )
+            ledger.capture_state(state)
+            ledger.persist("failed")
+            update_chat_trace(trace_id, status="failed")
+            record_trace_event(
+                trace_id,
+                "client_stream_cancelled",
+                "failed",
+                latency_ms=int((time.time() - started) * 1000),
+                output_summary="SSE client disconnected before completion",
+            )
+            raise
         except Exception as exc:
             state.status = RunStatus.FAILED
             state.next_step = None
@@ -500,18 +604,54 @@ class RuntimeCoordinator:
         snapshot_config: Dict[str, Any],
     ) -> RuntimePath:
         if (
-            get_work_order_draft(session_id)
-            or get_pending_action_proposal(session_id)
-            or is_explicit_work_order_request(message)
-            or (
-                is_confirmation(message)
-                and get_latest_action_proposal(session_id, "work_order.create")
+            get_pending_action_proposal(session_id)
+            or RuntimeCoordinator._is_work_order_action_context(
+                session_id,
+                message,
+            )
+            or RuntimeCoordinator._latest_committed_dynamic_action(
+                session_id,
+                message,
             )
         ):
             return RuntimePath.CONTROLLED_ACTION
         if RuntimeCoordinator._match_write_tool(snapshot_config, message):
             return RuntimePath.CONTROLLED_ACTION
         return RuntimePath.CONSULTATION
+
+    @staticmethod
+    def _is_work_order_action_context(session_id: str, message: str) -> bool:
+        pending = get_pending_action_proposal(session_id)
+        latest = (
+            get_latest_action_proposal(session_id, "work_order.create")
+            if is_confirmation(message)
+            else None
+        )
+        return bool(
+            get_work_order_draft(session_id)
+            or (
+                pending
+                and pending.get("action_type") == "work_order.create"
+            )
+            or is_explicit_work_order_request(message)
+            or latest
+        )
+
+    @staticmethod
+    def _latest_committed_dynamic_action(
+        session_id: str,
+        message: str,
+    ) -> Optional[Dict[str, Any]]:
+        if not is_confirmation(message):
+            return None
+        latest = get_latest_action_proposal(session_id)
+        if (
+            latest
+            and str(latest.get("action_type") or "").startswith("mcp.")
+            and latest.get("status") == "committed"
+        ):
+            return latest
+        return None
 
     @staticmethod
     def _match_write_tool(
@@ -581,11 +721,9 @@ class RuntimeCoordinator:
         started: float,
     ) -> AsyncIterator[str]:
         state.next_step = "collect_or_resume_action"
-        pending = get_pending_action_proposal(session_id)
-        use_work_order = bool(
-            get_work_order_draft(session_id)
-            or (pending and pending.get("action_type") == "work_order.create")
-            or is_explicit_work_order_request(message)
+        use_work_order = self._is_work_order_action_context(
+            session_id,
+            message,
         )
         if use_work_order:
             result = advance_work_order_workflow(
@@ -650,10 +788,13 @@ class RuntimeCoordinator:
                     )
         receipt_data = result.get("receipt")
         if receipt_data:
-            receipt = ActionReceipt.model_validate(receipt_data)
+            receipt = _action_receipt_from_payload(receipt_data)
             state.action_receipts.append(receipt)
             receipt_result = receipt.result or {}
-            if action_type.startswith("mcp."):
+            if _records_new_mcp_invocation(
+                action_type,
+                result.get("action"),
+            ):
                 proposal_payload = (proposal_row or {}).get("payload") or {}
                 invocation = ToolInvocation(
                     plan_id=proposal_payload.get("plan_id"),
@@ -923,6 +1064,30 @@ class RuntimeCoordinator:
                 "receipt": receipt.model_dump(mode="json"),
             }
 
+        replay = self._latest_committed_dynamic_action(session_id, message)
+        if replay:
+            receipt = (
+                get_action_receipt_by_idempotency_key(
+                    str(replay.get("idempotency_key") or "")
+                )
+                or {}
+            )
+            payload = replay.get("payload") or {}
+            return {
+                "handled": True,
+                "proposal_id": replay.get("proposal_id"),
+                "action_type": replay.get("action_type"),
+                "agent_id": payload.get("agent_id"),
+                "agent_name": payload.get("agent_name") or payload.get("agent_id"),
+                "route_reason": "已提交动态 MCP 操作的幂等 Receipt 回放。",
+                "action": "idempotent_replay",
+                "reply": (
+                    "该操作已提交成功，资源 ID："
+                    f"{receipt.get('resource_id')}。本次重复确认未再次调用 MCP。"
+                ),
+                "receipt": receipt,
+            }
+
         match = self._match_write_tool(snapshot.config, message)
         if not match:
             return {
@@ -1112,6 +1277,10 @@ class RuntimeCoordinator:
         )
 
         state.next_step = "retrieve"
+        yield _sse(
+            "progress",
+            {"trace_id": trace_id, "stage": "rag.retrieve", "status": "running"},
+        )
         retrieval_started = time.time()
         allowed_doc_ids = {
             int(item) for item in state.selected_agent.get("knowledge_doc_ids") or []
@@ -1189,6 +1358,10 @@ class RuntimeCoordinator:
         )
 
         state.next_step = "readonly_mcp"
+        yield _sse(
+            "progress",
+            {"trace_id": trace_id, "stage": "mcp.invoke", "status": "running"},
+        )
         mcp_context, invocations = await preinvoke_read_tools(
             snapshot.config, selected, message
         )
@@ -1259,6 +1432,10 @@ class RuntimeCoordinator:
                 metadata=call,
             )
         state.next_step = "answer"
+        yield _sse(
+            "progress",
+            {"trace_id": trace_id, "stage": "model.invoke", "status": "running"},
+        )
         agent_started = time.time()
         contextual_message = (
             "[运行边界] 本轮是只读技术栈咨询路径，不得创建工单、草稿或任何待确认 Action。\n"
@@ -1267,6 +1444,7 @@ class RuntimeCoordinator:
         full_content = ""
         tool_calls: List[Dict[str, Any]] = list(build.skill_tool_calls)
         final_metrics: Dict[str, Optional[int]] = {}
+        last_progress_at = time.time()
         async for chunk in build.agent.arun(
             contextual_message,
             user_id=user_id,
@@ -1287,6 +1465,16 @@ class RuntimeCoordinator:
             metrics = _metrics_dict(chunk)
             if metrics:
                 final_metrics.update(metrics)
+            if time.time() - last_progress_at >= 12:
+                yield _sse(
+                    "progress",
+                    {
+                        "trace_id": trace_id,
+                        "stage": "model.invoke",
+                        "status": "running",
+                    },
+                )
+                last_progress_at = time.time()
 
         model_native_invocations = []
         for toolkit in model_native_toolkits:
@@ -1344,8 +1532,26 @@ class RuntimeCoordinator:
         rendered, citations, citation_violations = render_citations(
             full_content, evidence
         )
+        citation_required = _requires_rag_citations(message) and bool(evidence.items)
+        if citation_required and not citations:
+            citation_violations.append(
+                {
+                    "code": "required_citation_missing",
+                    "detail": (
+                        "The user explicitly requested RAG citations, but no "
+                        "validated EvidenceItem was linked in the answer."
+                    ),
+                }
+            )
         state.citations = citations
         _record_citation_violations(ledger, citation_violations)
+        rendered = _append_runtime_evidence_summary(
+            rendered,
+            message,
+            tool_calls,
+            state.tool_invocations,
+            citations,
+        )
 
         model_id = str(
             state.selected_agent.get("model_id")
@@ -1413,6 +1619,15 @@ class RuntimeCoordinator:
                 "case": "citation_allowlist",
                 "passed": not citation_violations,
                 "violations": citation_violations,
+            },
+        )
+        ledger.append(
+            "evaluation_results",
+            {
+                "case": "required_rag_citation",
+                "passed": (not citation_required) or bool(citations),
+                "required": citation_required,
+                "citation_count": len(citations),
             },
         )
         ledger.persist("complete")

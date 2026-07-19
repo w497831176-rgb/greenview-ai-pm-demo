@@ -234,7 +234,7 @@ class ActionGateway:
             contact_name=str(payload.get("contact_name") or "业主"),
             contact_phone=str(payload["contact_phone"]),
             appointment_time=str(payload["appointment_time"]),
-            status="pending",
+            status="待派单",
             session_id=session_id,
         )
         actual_id = str((created or {}).get("id") or "")
