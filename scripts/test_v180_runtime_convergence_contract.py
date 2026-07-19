@@ -267,6 +267,33 @@ def test_mcp_preinvoke_initializes_session():
     assert "weather-server/get_weather_advice" in context
 
 
+def test_mcp_business_result_unwrap_contract():
+    from app.runtime.mcp_executor import _business_status, _structured_result
+
+    class FakeAgnoResult:
+        def __init__(self):
+            self.content = (
+                '{"status":"success","data":{"city":"杭州","condition":"阴"}}'
+            )
+            self.metadata = {
+                "structured_content": {
+                    "result": (
+                        '{"status":"success","data":{"city":"杭州",'
+                        '"condition":"阴"}}'
+                    )
+                }
+            }
+
+    parsed = _structured_result(FakeAgnoResult())
+    status, summary = _business_status(FakeAgnoResult())
+    assert parsed == {
+        "status": "success",
+        "data": {"city": "杭州", "condition": "阴"},
+    }
+    assert status == "success"
+    assert '"status": "success"' in summary
+
+
 def test_citation_violation_recording_contract():
     from app.runtime.coordinator import _record_citation_violations
 
@@ -345,6 +372,7 @@ def main():
         test_action_gateway_receipt_and_idempotency,
         test_action_success_claim_contract,
         test_mcp_preinvoke_initializes_session,
+        test_mcp_business_result_unwrap_contract,
         test_citation_violation_recording_contract,
         test_static_conflict_removal,
         test_fixed_acceptance_matrix,
