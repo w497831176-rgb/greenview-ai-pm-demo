@@ -129,6 +129,17 @@ def test_citation_single_source_contract():
     assert "【引用1】" in section_supported
     assert len(section_citations) == 1
     assert not section_violations
+    unstructured, unstructured_citations, unstructured_violations = (
+        render_citations("天气条件适合维修 [[MCP天气建议]]", evidence)
+    )
+    assert "[[" not in unstructured
+    assert not unstructured_citations
+    assert unstructured_violations == [
+        {
+            "code": "unstructured_reference_marker",
+            "marker": "MCP天气建议",
+        }
+    ]
 
 
 def test_cost_availability_contract():

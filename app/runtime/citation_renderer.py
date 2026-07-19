@@ -18,6 +18,7 @@ from app.runtime.contracts import (
 # Validation happens against the immutable EvidenceSet below; restricting the
 # regex itself allowed unknown values containing spaces to leak into the UI.
 EVIDENCE_MARKER = re.compile(r"\[\[evidence:([^\]\r\n]+)\]\]")
+UNSTRUCTURED_MARKER = re.compile(r"\[\[([^\]\r\n]+)\]\]")
 LEGACY_MARKER = re.compile(r"【引用\s*(\d+)】|\[(\d+)\]")
 _GENERIC_BIGRAMS = {
     "可以",
@@ -196,6 +197,17 @@ def render_citations(
 
     normalized = LEGACY_MARKER.sub(replace_legacy, answer or "")
     rendered = EVIDENCE_MARKER.sub(replace_id, normalized)
+
+    def remove_unstructured_marker(match: re.Match) -> str:
+        violations.append(
+            {
+                "code": "unstructured_reference_marker",
+                "marker": match.group(1).strip()[:160],
+            }
+        )
+        return ""
+
+    rendered = UNSTRUCTURED_MARKER.sub(remove_unstructured_marker, rendered)
     citations: List[Citation] = []
     for index, evidence_id in enumerate(ordered_ids, start=1):
         item = by_id[evidence_id]
