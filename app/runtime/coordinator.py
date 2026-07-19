@@ -1440,9 +1440,7 @@ class RuntimeCoordinator:
         )
 
         citations_payload = []
-        cited_evidence_ids = set()
         for item in citations:
-            cited_evidence_ids.add(item.evidence_id)
             payload = item.model_dump(mode="json")
             payload.update(
                 {
@@ -1453,29 +1451,6 @@ class RuntimeCoordinator:
                 }
             )
             citations_payload.append(payload)
-        for item in evidence.items:
-            if item.evidence_id in cited_evidence_ids:
-                continue
-            citations_payload.append(
-                {
-                    "index": None,
-                    "evidence_id": item.evidence_id,
-                    "label": item.title,
-                    "title": item.title,
-                    "document_id": item.document_id,
-                    "doc_id": item.document_id,
-                    "doc_title": item.title,
-                    "document_version": item.document_version,
-                    "chunk_id": item.chunk_id,
-                    "chunk_index": item.chunk_index,
-                    "content_snapshot": item.content_snapshot,
-                    "content": item.content_snapshot,
-                    "retrieval_score": item.retrieval_score,
-                    "score": item.retrieval_score,
-                    "retrieval_mode": item.retrieval_mode,
-                    "used_in_answer": False,
-                }
-            )
         skills_payload = [
             item.model_dump(mode="json") for item in state.activated_skills
         ]

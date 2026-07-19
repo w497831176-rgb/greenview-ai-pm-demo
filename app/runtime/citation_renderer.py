@@ -44,10 +44,14 @@ def _semantic_bigrams(text: str) -> Set[str]:
 
 def _citation_context(answer: str, match: re.Match) -> str:
     line_start = answer.rfind("\n", 0, match.start()) + 1
-    line_end = answer.find("\n", match.end())
-    if line_end < 0:
-        line_end = len(answer)
-    return answer[line_start:line_end].strip()
+    # Models often place a marker on a short "依据" line and put the actual
+    # supported facts in the immediately following Markdown bullets. Validate
+    # the whole local paragraph/section, not only the marker's physical line.
+    max_end = min(len(answer), match.end() + 800)
+    section_end = answer.find("\n\n", match.end())
+    if section_end < 0 or section_end > max_end:
+        section_end = max_end
+    return answer[line_start:section_end].strip()
 
 
 def _citation_is_supported(context: str, evidence: EvidenceItem) -> bool:

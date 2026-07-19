@@ -118,6 +118,17 @@ def test_citation_single_source_contract():
         "unsupported_evidence_citation"
     )
     assert unsupported_violations[0]["evidence_id"] == evidence_id
+    section_supported, section_citations, section_violations = render_citations(
+        (
+            "#### 紧急维修\n"
+            f"- 依据 **[[evidence:{evidence_id}]]**\n"
+            "- 发现设施松动时应立即停用并联系工作人员。"
+        ),
+        evidence,
+    )
+    assert "【引用1】" in section_supported
+    assert len(section_citations) == 1
+    assert not section_violations
 
 
 def test_cost_availability_contract():
@@ -364,6 +375,7 @@ def test_static_conflict_removal():
     assert "KnowledgeTools" not in agent_factory
     assert "WorkOrderTools" not in agent_factory
     assert "create_badcase" not in coordinator
+    assert '"used_in_answer": False' not in coordinator
 
 
 def test_fixed_acceptance_matrix():
