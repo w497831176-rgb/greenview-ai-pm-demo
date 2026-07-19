@@ -1225,6 +1225,18 @@ class RuntimeCoordinator:
             tools=model_native_toolkits,
             evidence_prompt=evidence_prompt + mcp_context,
         )
+        state.activated_skills = build.activated_skills
+        for call in build.skill_tool_calls:
+            record_trace_event(
+                trace_id,
+                f"skill.{call['skill_id']}.get_skill_instructions",
+                "success",
+                output_summary=(
+                    f"loaded Skill {call['skill_id']} "
+                    f"version={call['skill_version']}"
+                ),
+                metadata=call,
+            )
         state.next_step = "answer"
         agent_started = time.time()
         contextual_message = (
@@ -1232,7 +1244,7 @@ class RuntimeCoordinator:
             + message
         )
         full_content = ""
-        tool_calls: List[Dict[str, Any]] = []
+        tool_calls: List[Dict[str, Any]] = list(build.skill_tool_calls)
         final_metrics: Dict[str, Optional[int]] = {}
         async for chunk in build.agent.arun(
             contextual_message,
@@ -1294,9 +1306,7 @@ class RuntimeCoordinator:
         loaded_skill_tool = any(
             call.get("tool_name") == "get_skill_instructions" for call in tool_calls
         )
-        if build.activated_skills and loaded_skill_tool:
-            state.activated_skills = build.activated_skills
-        elif build.activated_skills:
+        if build.activated_skills and not loaded_skill_tool:
             ledger.violation(
                 "skill_selected_not_loaded",
                 "Skill trigger matched, but Agno get_skill_instructions was not observed.",

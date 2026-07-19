@@ -186,7 +186,7 @@ async def preinvoke_read_tools(
                 transport="stdio",
                 timeout_seconds=15,
             )
-            await asyncio.wait_for(toolkit.build_tools(), timeout=8)
+            await asyncio.wait_for(toolkit.__aenter__(), timeout=8)
             functions = getattr(toolkit, "functions", None) or {}
             discovery_status = "success"
         except Exception as exc:
@@ -399,7 +399,7 @@ async def invoke_confirmed_write(
             transport="stdio",
             timeout_seconds=15,
         )
-        await asyncio.wait_for(toolkit.build_tools(), timeout=8)
+        await asyncio.wait_for(toolkit.__aenter__(), timeout=8)
         functions = getattr(toolkit, "functions", None) or {}
         function = functions.get(tool_name)
         if function is None or not getattr(function, "entrypoint", None):

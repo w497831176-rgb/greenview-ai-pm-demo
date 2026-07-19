@@ -72,6 +72,18 @@ def test_agent_factory_assembly() -> None:
     assert build.agent.model is not None
     assert build.agent.skills is not None
     assert [item.skill_id for item in build.activated_skills] == [8]
+    assert build.skill_tool_calls == [
+        {
+            "tool_name": "get_skill_instructions",
+            "arguments": {"skill_name": "skill-8"},
+            "status": "success",
+            "invocation_mode": "policy_preinvoke",
+            "skill_id": 8,
+            "skill_version": "1.0.0",
+            "skill_content_hash": "skill-eight",
+        }
+    ]
+    assert "先核实位置和风险。" in "\n".join(build.agent.instructions)
 
 
 def test_composite_workflow_assembly() -> None:

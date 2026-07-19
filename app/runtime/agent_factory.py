@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -26,6 +27,65 @@ class AgentBuild:
     agent_config: Dict[str, Any]
     activated_skills: List[SkillActivation]
     skill_decisions: List[Dict[str, Any]]
+    skill_tool_calls: List[Dict[str, Any]]
+
+
+def _preload_skill_instructions(
+    skills: Any,
+    activations: List[SkillActivation],
+) -> Tuple[List[str], List[Dict[str, Any]]]:
+    """Load selected Agno Skills deterministically before the model call.
+
+    Trigger selection belongs to the runtime control plane. Relying on the
+    model to optionally call ``get_skill_instructions`` made an otherwise
+    valid Skill disappear from real runs. We still use Agno's own Skill access
+    tool, but invoke it as a governed pre-invocation and preserve the evidence.
+    """
+
+    if skills is None or not activations:
+        return [], []
+    access_tool = next(
+        (
+            tool
+            for tool in skills.get_tools()
+            if getattr(tool, "name", "") == "get_skill_instructions"
+        ),
+        None,
+    )
+    if access_tool is None or not getattr(access_tool, "entrypoint", None):
+        raise RuntimeError("Agno get_skill_instructions tool is unavailable")
+
+    contexts: List[str] = []
+    calls: List[Dict[str, Any]] = []
+    for activation in activations:
+        skill_name = f"skill-{activation.skill_id}"
+        raw = access_tool.entrypoint(skill_name)
+        payload = json.loads(raw) if isinstance(raw, str) else dict(raw or {})
+        if payload.get("error"):
+            raise RuntimeError(
+                f"failed to load published Skill {activation.skill_id}: "
+                f"{payload['error']}"
+            )
+        contexts.append(
+            "\n".join(
+                [
+                    f"[已加载动态 Skill：{activation.name}]",
+                    str(payload.get("instructions") or ""),
+                ]
+            )
+        )
+        calls.append(
+            {
+                "tool_name": "get_skill_instructions",
+                "arguments": {"skill_name": skill_name},
+                "status": "success",
+                "invocation_mode": "policy_preinvoke",
+                "skill_id": activation.skill_id,
+                "skill_version": activation.version,
+                "skill_content_hash": activation.content_hash,
+            }
+        )
+    return contexts, calls
 
 
 def _find_agent(config: Dict[str, Any], agent_id: str) -> Dict[str, Any]:
@@ -158,6 +218,10 @@ def build_agent_from_snapshot(
     agno_skills = None
     if skills_root and Skills is not None and LocalSkills is not None:
         agno_skills = Skills(loaders=[LocalSkills(str(skills_root))])
+    skill_contexts, skill_tool_calls = _preload_skill_instructions(
+        agno_skills,
+        activations,
+    )
 
     instructions = [
         str(agent_config.get("instructions") or ""),
@@ -166,6 +230,7 @@ def build_agent_from_snapshot(
         "不得自行创建、更新、删除业务数据；写操作只能描述为待确认 Proposal。",
         "只有后端 ActionReceipt.status=committed 且包含真实 resource_id 时，才能声称操作成功。",
     ]
+    instructions.extend(skill_contexts)
     if evidence_prompt:
         instructions.append(evidence_prompt)
     snapshot_default_model = (
@@ -211,6 +276,7 @@ def build_agent_from_snapshot(
         agent_config=agent_config,
         activated_skills=activations,
         skill_decisions=decisions,
+        skill_tool_calls=skill_tool_calls,
     )
 
 
