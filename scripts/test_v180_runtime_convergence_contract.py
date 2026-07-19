@@ -177,7 +177,7 @@ def test_mcp_preinvoke_initializes_session():
     from app.runtime import mcp_executor
 
     class FakeFunction:
-        async def entrypoint(self, arguments):
+        async def entrypoint(self, **arguments):
             return {
                 "status": "success",
                 "arguments": arguments,
@@ -267,6 +267,34 @@ def test_mcp_preinvoke_initializes_session():
     assert "weather-server/get_weather_advice" in context
 
 
+def test_citation_violation_recording_contract():
+    from app.runtime.coordinator import _record_citation_violations
+
+    class FakeLedger:
+        def __init__(self):
+            self.calls = []
+
+        def violation(self, code, detail, **metadata):
+            self.calls.append(
+                {"code": code, "detail": detail, "metadata": metadata}
+            )
+
+    ledger = FakeLedger()
+    _record_citation_violations(
+        ledger,
+        [{"code": "invalid_evidence_id", "evidence_id": "ev_unknown"}],
+    )
+    assert ledger.calls == [
+        {
+            "code": "invalid_evidence_id",
+            "detail": (
+                "Model citation was not present in the immutable EvidenceSet."
+            ),
+            "metadata": {"evidence_id": "ev_unknown"},
+        }
+    ]
+
+
 def test_static_conflict_removal():
     repo = Path(__file__).resolve().parents[1]
     thin_chat = (repo / "app" / "chat.py").read_text(encoding="utf-8")
@@ -317,6 +345,7 @@ def main():
         test_action_gateway_receipt_and_idempotency,
         test_action_success_claim_contract,
         test_mcp_preinvoke_initializes_session,
+        test_citation_violation_recording_contract,
         test_static_conflict_removal,
         test_fixed_acceptance_matrix,
     ]
