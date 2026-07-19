@@ -103,6 +103,21 @@ def test_citation_single_source_contract():
             "evidence_id": "MCP weather-server",
         }
     ]
+    unsupported, unsupported_citations, unsupported_violations = (
+        render_citations(
+            (
+                "杭州明天天气阴，温度30度，适合户外作业 "
+                f"[[evidence:{evidence_id}]]"
+            ),
+            evidence,
+        )
+    )
+    assert "[[evidence:" not in unsupported
+    assert not unsupported_citations
+    assert unsupported_violations[0]["code"] == (
+        "unsupported_evidence_citation"
+    )
+    assert unsupported_violations[0]["evidence_id"] == evidence_id
 
 
 def test_cost_availability_contract():

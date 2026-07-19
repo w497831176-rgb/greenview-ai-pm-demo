@@ -344,7 +344,10 @@ async def preinvoke_read_tools(
         return "", invocations
     return (
         "\n\n以下为后端按 ToolPolicy 真实调用的只读 MCP 结果。"
-        "不得猜测或把调用成功等同于业务成功：\n" + "\n".join(context),
+        "不得猜测或把调用成功等同于业务成功。"
+        "MCP 结果只由 mcp_calls 展示来源，绝不能为 MCP 结果添加 "
+        "[[evidence:...]]、【引用N】或占用 RAG 引用编号：\n"
+        + "\n".join(context),
         invocations,
     )
 
