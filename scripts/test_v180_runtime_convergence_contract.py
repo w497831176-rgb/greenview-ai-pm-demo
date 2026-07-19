@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import sys
 import tempfile
@@ -172,6 +173,100 @@ def test_action_success_claim_contract():
     )
 
 
+def test_mcp_preinvoke_initializes_session():
+    from app.runtime import mcp_executor
+
+    class FakeFunction:
+        async def entrypoint(self, arguments):
+            return {
+                "status": "success",
+                "arguments": arguments,
+                "weather": "sunny",
+            }
+
+    class FakeMCPTools:
+        instances = []
+
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.functions = {}
+            self.entered = False
+            self.closed = False
+            self.__class__.instances.append(self)
+
+        async def __aenter__(self):
+            self.entered = True
+            self.functions = {
+                "get_current_weather": FakeFunction(),
+                "get_weather_advice": FakeFunction(),
+            }
+            return self
+
+        async def close(self):
+            self.closed = True
+
+    def policy(tool_name):
+        return {
+            "server_id": 1,
+            "server_name": "weather-server",
+            "tool_name": tool_name,
+            "effect": "read",
+            "risk_level": "L0",
+            "allowed_paths": ["consultation"],
+            "requires_confirmation": False,
+            "enabled": True,
+            "policy_reason": "contract fixture",
+        }
+
+    config = {
+        "agents": [
+            {
+                "agent_id": "maintenance",
+                "enabled": True,
+                "mcp_server_names": ["weather-server"],
+            }
+        ],
+        "mcp_servers": [
+            {
+                "id": 1,
+                "name": "weather-server",
+                "enabled": True,
+                "command": "fake-weather",
+                "args": [],
+                "tools": [
+                    {
+                        "name": "get_current_weather",
+                        "policy": policy("get_current_weather"),
+                    },
+                    {
+                        "name": "get_weather_advice",
+                        "policy": policy("get_weather_advice"),
+                    },
+                ],
+            }
+        ],
+    }
+    original = mcp_executor.MCPTools
+    mcp_executor.MCPTools = FakeMCPTools
+    try:
+        context, invocations = asyncio.run(
+            mcp_executor.preinvoke_read_tools(
+                config,
+                "maintenance",
+                "请查询本小区明天天气并给出风险建议。",
+            )
+        )
+    finally:
+        mcp_executor.MCPTools = original
+
+    assert FakeMCPTools.instances[0].entered
+    assert FakeMCPTools.instances[0].closed
+    assert len(invocations) == 2
+    assert all(item.invocation_status == "success" for item in invocations)
+    assert "weather-server/get_current_weather" in context
+    assert "weather-server/get_weather_advice" in context
+
+
 def test_static_conflict_removal():
     repo = Path(__file__).resolve().parents[1]
     thin_chat = (repo / "app" / "chat.py").read_text(encoding="utf-8")
@@ -221,6 +316,7 @@ def main():
         test_cost_availability_contract,
         test_action_gateway_receipt_and_idempotency,
         test_action_success_claim_contract,
+        test_mcp_preinvoke_initializes_session,
         test_static_conflict_removal,
         test_fixed_acceptance_matrix,
     ]
