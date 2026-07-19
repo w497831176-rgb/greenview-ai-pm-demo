@@ -129,12 +129,14 @@ def _estimate_tokens(text: str) -> Optional[int]:
 
 
 def _claims_business_success(text: str) -> bool:
-    normalized = (text or "").replace("未成功", "").replace("没有成功", "")
+    normalized = text or ""
     return bool(
         re.search(
-            r"(?:已|已经|正式)?(?:创建|提交|写入|更新|操作).{0,8}成功|"
-            r"(?:资源|工单)(?:\s*ID|号)?[：:]\s*[A-Za-z0-9_-]+",
+            r"(?:已|已经|正式).{0,6}(?:创建|提交|写入|更新|操作).{0,8}(?:成功|完成)|"
+            r"(?:创建|提交|写入|更新|操作).{0,8}(?:成功|已完成)|"
+            r"(?:资源\s*ID|工单号)[：:]\s*(?:WO|TICKET|ORDER)[-_][A-Za-z0-9_-]+",
             normalized,
+            flags=re.IGNORECASE,
         )
     )
 
