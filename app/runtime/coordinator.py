@@ -11,6 +11,7 @@ from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 
 from app.handoff_policy import evaluate_handoff_policy
 from app.runtime.agent_factory import build_agent_from_snapshot, vertical_agent_cards
+from app.runtime.badcase_capture import capture_runtime_badcase
 from app.runtime.citation_renderer import (
     build_evidence_set,
     prompt_evidence_allowlist,
@@ -455,6 +456,25 @@ class RuntimeCoordinator:
             ledger.violation("runtime_failure", str(exc))
             ledger.capture_state(state)
             ledger.persist("failed")
+            try:
+                auto_badcase = capture_runtime_badcase(
+                    ledger=ledger.contract,
+                    original_query=message,
+                    ai_response="",
+                    runtime_error=str(exc),
+                )
+                if auto_badcase:
+                    ledger.append(
+                        "badcase_links",
+                        {
+                            "badcase_id": auto_badcase.get("id"),
+                            "source": auto_badcase.get("source"),
+                            "trigger": "runtime_failure",
+                        },
+                    )
+                    ledger.persist("failed")
+            except Exception:
+                pass
             update_chat_trace(trace_id, status="failed")
             record_trace_event(
                 trace_id,
@@ -1503,6 +1523,22 @@ class RuntimeCoordinator:
             mcp_calls=mcp_payload or None,
             usage_source=vertical_cost.usage_source.value,
         )
+        auto_badcase = capture_runtime_badcase(
+            ledger=ledger.contract,
+            original_query=message,
+            ai_response=rendered,
+            source_message_id=saved.get("id"),
+        )
+        if auto_badcase:
+            ledger.append(
+                "badcase_links",
+                {
+                    "badcase_id": auto_badcase.get("id"),
+                    "source": auto_badcase.get("source"),
+                    "trigger": "runtime_evidence",
+                },
+            )
+            ledger.persist("complete")
 
         # Buffering until citation validation is intentional: the answer text,
         # final citations and clickable snapshots are emitted from one structure.
@@ -1539,6 +1575,8 @@ class RuntimeCoordinator:
                 "usage_source": vertical_cost.usage_source.value,
                 "token_count": token_count,
                 "round_token_count": (router_cost.total_tokens or 0) + token_count,
-                "auto_badcase_id": None,
+                "auto_badcase_id": (
+                    auto_badcase.get("id") if auto_badcase else None
+                ),
             },
         )

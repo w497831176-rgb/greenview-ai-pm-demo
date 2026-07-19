@@ -373,6 +373,57 @@ def test_citation_violation_recording_contract():
     ]
 
 
+def test_v18_runtime_auto_badcase_contract():
+    from app.runtime.badcase_capture import (
+        capture_runtime_badcase,
+        runtime_badcase_trigger,
+    )
+    from app.runtime.contracts import RunEvidenceLedger
+    from db.property_db import (
+        delete_badcase,
+        get_badcase,
+        list_badcase_actions,
+    )
+
+    ledger = RunEvidenceLedger(
+        trace_id="contract-auto-badcase-trace",
+        session_id="contract-auto-badcase-session",
+        config_snapshot={"snapshot_id": "snap-contract"},
+        evaluation_results=[
+            {
+                "case": "citation_allowlist",
+                "passed": False,
+            }
+        ],
+        contract_violations=[
+            {
+                "code": "invalid_evidence_id",
+                "detail": "unknown evidence",
+                "metadata": {"evidence_id": "ev_unknown"},
+            }
+        ],
+    )
+    trigger = runtime_badcase_trigger(ledger)
+    assert trigger and trigger["source"] == "runtime_contract"
+    created = capture_runtime_badcase(
+        ledger=ledger,
+        original_query="契约测试问题",
+        ai_response="契约测试回答",
+    )
+    assert created and created["trace_id"] == ledger.trace_id
+    duplicate = capture_runtime_badcase(
+        ledger=ledger,
+        original_query="契约测试问题",
+        ai_response="契约测试回答",
+    )
+    assert duplicate["id"] == created["id"]
+    stored = get_badcase(int(created["id"]))
+    assert stored["source"] == "runtime_contract"
+    actions = list_badcase_actions(int(created["id"]))
+    assert any(item["action_type"] == "auto-capture" for item in actions)
+    assert delete_badcase(int(created["id"]))
+
+
 def test_static_conflict_removal():
     repo = Path(__file__).resolve().parents[1]
     thin_chat = (repo / "app" / "chat.py").read_text(encoding="utf-8")
@@ -392,12 +443,12 @@ def test_static_conflict_removal():
 def test_fixed_acceptance_matrix():
     keys = [case["case_key"] for case in ACCEPTANCE_CASES]
     assert keys == [
-        "E2E-00",
-        "READ-01",
-        "MCP-R-01",
+        "HIT-01",
+        "HANDOFF-01",
         "ACTION-01",
         "EXT-ASR-01",
         "EXT-MCP-01",
+        "BADCASE-01",
         "COST-01",
         "FAIL-01",
     ]
@@ -426,6 +477,7 @@ def main():
         test_mcp_preinvoke_initializes_session,
         test_mcp_business_result_unwrap_contract,
         test_citation_violation_recording_contract,
+        test_v18_runtime_auto_badcase_contract,
         test_static_conflict_removal,
         test_fixed_acceptance_matrix,
     ]
