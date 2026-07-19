@@ -143,7 +143,7 @@ def build_agent_from_snapshot(
         for item in candidates
     ]
     selected_legacy, decisions = select_skills(selector_candidates, message)
-    selected_ids = {int(item["id"]) for item in selected_legacy}
+    selected_ids = {int(item["skill_id"]) for item in selected_legacy}
     selected = [item for item in candidates if int(item["skill_id"]) in selected_ids]
     reasons = {
         int(item["skill_id"]): str(item.get("match_reason") or item.get("outcome") or "trigger matched")
