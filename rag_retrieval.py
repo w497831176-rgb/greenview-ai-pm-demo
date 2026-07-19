@@ -369,7 +369,14 @@ def _extract_sub_queries(query: str) -> List[str]:
         line = line.strip()
         if not line:
             continue
-        if len(line) >= 5:
+        # Do not turn every operational line in a composite owner request into
+        # another embedding call.  Only knowledge-grounding clauses deserve an
+        # extra retrieval query; the complete user query is already searched
+        # once by ``advanced_search``.
+        if len(line) >= 5 and any(
+            marker in line
+            for marker in ("《", "知识库", "文档", "手册", "依据", "根据制度", "根据承诺")
+        ):
             segments.append(line)
         for part in re.split(r"(?:^|[\n：；;])\s*\d{1,2}[.、]\s*", line):
             part = part.strip()

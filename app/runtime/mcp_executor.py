@@ -394,7 +394,7 @@ def build_model_native_read_tools(
     excluded_servers: Optional[Set[str]] = None,
     excluded_tools: Optional[Set[Tuple[str, str]]] = None,
 ) -> List[Any]:
-    """Build every remaining published read tool for Agno's native tool loop."""
+    """Build published model-native read tools for Agno's native tool loop."""
 
     if GovernedMCPTools is None:
         return []
@@ -409,12 +409,27 @@ def build_model_native_read_tools(
             or server_name in excluded
         ):
             continue
-        allowed = [
+        policy_allowed = [
             tool_name
             for tool_name in gateway.include_tools(
                 agent_id, RuntimePath.CONSULTATION, server_name
             )
             if (server_name, tool_name) not in excluded_tool_keys
+        ]
+        tool_definitions = {
+            str(tool.get("name") or ""): tool
+            for tool in server.get("tools") or []
+        }
+        allowed = [
+            tool_name
+            for tool_name in policy_allowed
+            if (
+                (
+                    tool_definitions.get(tool_name, {}).get("tool_metadata")
+                    or {}
+                ).get("execution_mode")
+                == "model_native"
+            )
         ]
         if not allowed or not server.get("command"):
             continue

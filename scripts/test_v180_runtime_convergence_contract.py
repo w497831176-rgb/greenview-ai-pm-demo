@@ -25,6 +25,7 @@ from app.runtime.action_gateway import ActionGateway
 from app.runtime.citation_renderer import build_evidence_set, render_citations
 from app.runtime.contracts import RuntimePath, ToolEffect
 from app.runtime.cost_ledger import build_cost_entry
+from app.runtime.contracts import ToolInvocation
 from app.runtime.release_compiler import (
     compile_tool_policy,
     ensure_bootstrap_release,
@@ -190,6 +191,16 @@ def test_citation_single_source_contract():
     assert rendered.endswith("【引用1】。")
     assert citations[0].content_snapshot == evidence.items[0].content_snapshot
     assert not violations
+    rendered_suffix, suffix_citations, suffix_violations = render_citations(
+        (
+            "发现儿童受伤应立即停止设施使用并联系工作人员 "
+            f"[[evidence:{evidence_id.removeprefix('ev_')}]]。"
+        ),
+        evidence,
+    )
+    assert rendered_suffix.endswith("【引用1】。")
+    assert suffix_citations[0].evidence_id == evidence_id
+    assert not suffix_violations
     rendered_bad, bad_citations, bad_violations = render_citations(
         "错误引用 [[evidence:ev_not_allowed]]", evidence
     )
@@ -236,6 +247,17 @@ def test_citation_single_source_contract():
     assert "【引用1】" in section_supported
     assert len(section_citations) == 1
     assert not section_violations
+    source_line, source_line_citations, source_line_violations = render_citations(
+        (
+            f"> 引用来源：儿童游乐区安全制度 [[evidence:{evidence_id}]]\n\n"
+            "1. 发现儿童受伤应立即停止设施使用\n"
+            "2. 立即联系工作人员处理"
+        ),
+        evidence,
+    )
+    assert "【引用1】" in source_line
+    assert len(source_line_citations) == 1
+    assert not source_line_violations
     unstructured, unstructured_citations, unstructured_violations = (
         render_citations("天气条件适合维修 [[MCP天气建议]]", evidence)
     )
@@ -341,7 +363,243 @@ def test_action_gateway_receipt_and_idempotency():
     assert receipt_1.may_claim_success
     assert receipt_1.receipt_id == receipt_2.receipt_id
     assert receipt_1.resource_id == receipt_2.resource_id
-    assert get_work_order(receipt_1.resource_id) is not None
+    stored = get_work_order(receipt_1.resource_id)
+    assert stored is not None
+    assert stored["status"] == "待派单"
+
+
+def test_bare_work_order_command_collects_real_issue_description():
+    from app.work_order_workflow import advance_work_order_workflow
+
+    session_id = "contract-bare-work-order"
+    first = advance_work_order_workflow(session_id, "帮我创建工单")
+    assert first is not None
+    assert first["action"] == "draft_updated"
+    assert first["draft"]["issue_desc"] == ""
+    assert "维修问题描述" in first["missing_fields"]
+
+    second = advance_work_order_workflow(
+        session_id,
+        "卫生间天花板持续滴水",
+    )
+    assert second is not None
+    assert second["draft"]["issue_desc"] == "卫生间天花板持续滴水"
+    assert second["draft"]["issue_type"] == "水电"
+
+
+def test_repeated_work_order_confirmation_replays_same_receipt():
+    from app.runtime.coordinator import RuntimeCoordinator
+    from app.work_order_workflow import advance_work_order_workflow
+
+    session_id = "contract-work-order-replay"
+    draft = advance_work_order_workflow(
+        session_id,
+        (
+            "帮我创建维修工单：房号 3-2-1201，厨房水槽持续漏水，"
+            "紧急，联系人测试业主，电话 13800138000，尽快上门。"
+        ),
+    )
+    assert draft and draft["action"] == "awaiting_confirmation"
+    committed = advance_work_order_workflow(session_id, "确认提交")
+    replayed = advance_work_order_workflow(session_id, "确认提交")
+    assert committed and committed["action"] == "committed"
+    assert replayed and replayed["action"] == "idempotent_replay"
+    assert committed["work_order_id"] == replayed["work_order_id"]
+    assert RuntimeCoordinator._is_work_order_action_context(
+        session_id,
+        "确认提交",
+    )
+
+
+def test_pending_dynamic_mcp_action_keeps_controlled_path():
+    from app.runtime.coordinator import RuntimeCoordinator
+
+    session_id = "contract-dynamic-mcp-pending"
+    proposal = ActionGateway().propose(
+        session_id=session_id,
+        action_type="mcp.offdomain.create_record",
+        payload={
+            "agent_id": "offdomain",
+            "server_name": "offdomain-server",
+            "tool_name": "create_record",
+            "arguments": {"value": "contract"},
+        },
+    )
+    assert proposal.status == "pending_confirmation"
+    assert RuntimeCoordinator._select_path(
+        session_id,
+        "拒绝",
+        {},
+    ) == RuntimePath.CONTROLLED_ACTION
+    assert not RuntimeCoordinator._is_work_order_action_context(
+        session_id,
+        "拒绝",
+    )
+
+
+def test_committed_dynamic_mcp_confirmation_replays_receipt():
+    from types import SimpleNamespace
+
+    from app.runtime.coordinator import RuntimeCoordinator
+    from db.property_db import save_action_receipt
+
+    session_id = "contract-dynamic-mcp-replay"
+    proposal = ActionGateway().propose(
+        session_id=session_id,
+        action_type="mcp.offdomain.create_record",
+        payload={
+            "agent_id": "offdomain",
+            "agent_name": "Off-domain Agent",
+            "server_name": "offdomain-server",
+            "tool_name": "create_record",
+            "arguments": {"value": "contract"},
+        },
+    )
+    saved = save_action_receipt(
+        receipt_id="receipt-contract-dynamic-replay",
+        proposal_id=proposal.proposal_id,
+        idempotency_key=proposal.idempotency_key,
+        status="committed",
+        resource_type="mcp:offdomain-server:create_record",
+        resource_id="RESOURCE-CONTRACT-1",
+        result={
+            "resource_type": "mcp:offdomain-server:create_record",
+            "resource_id": "RESOURCE-CONTRACT-1",
+            "server_name": "offdomain-server",
+            "tool_name": "create_record",
+            "effect": "create",
+            "business_status": "success",
+        },
+    )
+    assert saved["status"] == "committed"
+    assert RuntimeCoordinator._select_path(
+        session_id,
+        "确认提交",
+        {},
+    ) == RuntimePath.CONTROLLED_ACTION
+    replay = asyncio.run(
+        RuntimeCoordinator()._advance_dynamic_mcp_action(
+            message="确认提交",
+            session_id=session_id,
+            trace_id="trace-contract-dynamic-replay",
+            snapshot=SimpleNamespace(config={}, release_id="release-contract"),
+        )
+    )
+    assert replay["action"] == "idempotent_replay"
+    assert replay["receipt"]["receipt_id"] == saved["receipt_id"]
+    assert replay["receipt"]["resource_id"] == "RESOURCE-CONTRACT-1"
+
+
+def test_database_receipt_row_projects_to_public_contract():
+    from app.runtime.coordinator import _action_receipt_from_payload
+
+    receipt = _action_receipt_from_payload(
+        {
+            "receipt_id": "receipt-contract-projection",
+            "proposal_id": "proposal-contract-projection",
+            "idempotency_key": "idem-contract-projection",
+            "status": "committed",
+            "resource_type": "mcp:test:create",
+            "resource_id": "RESOURCE-PROJECTION-1",
+            "result": {"resource_id": "RESOURCE-PROJECTION-1"},
+            "committed_at": "2026-07-19 16:00:00",
+            "created_at": "internal-database-field",
+        }
+    )
+    assert receipt.receipt_id == "receipt-contract-projection"
+    assert receipt.resource_id == "RESOURCE-PROJECTION-1"
+    assert not hasattr(receipt, "created_at")
+
+
+def test_idempotent_replay_is_not_a_new_mcp_invocation():
+    from app.runtime.coordinator import _records_new_mcp_invocation
+
+    assert _records_new_mcp_invocation(
+        "mcp.offdomain.create_record",
+        "committed",
+    )
+    assert not _records_new_mcp_invocation(
+        "mcp.offdomain.create_record",
+        "idempotent_replay",
+    )
+    assert not _records_new_mcp_invocation(
+        "work_order.create",
+        "committed",
+    )
+
+
+def test_composite_work_order_query_plans_exact_read_tools():
+    from app.runtime.tool_planner import plan_tools
+
+    def policy(tool_name):
+        return {
+            "server_id": 7,
+            "server_name": "workorder-server",
+            "tool_name": tool_name,
+            "effect": "read",
+            "risk_level": "L0",
+            "allowed_paths": ["consultation"],
+            "requires_confirmation": False,
+            "enabled": True,
+            "policy_reason": "contract fixture",
+        }
+
+    tools = [
+        {
+            "name": "get_my_recent_work_orders",
+            "input_schema": {
+                "type": "object",
+                "properties": {"limit": {"type": "integer"}},
+            },
+            "policy": policy("get_my_recent_work_orders"),
+        },
+        {
+            "name": "count_my_open_work_orders",
+            "input_schema": {"type": "object", "properties": {}},
+            "policy": policy("count_my_open_work_orders"),
+        },
+        {
+            "name": "count_work_orders",
+            "input_schema": {
+                "type": "object",
+                "properties": {"status": {"type": "string"}},
+            },
+            "policy": policy("count_work_orders"),
+        },
+    ]
+    config = {
+        "agents": [
+            {
+                "agent_id": "maintenance",
+                "enabled": True,
+                "mcp_server_names": ["workorder-server"],
+            }
+        ],
+        "mcp_servers": [
+            {
+                "id": 7,
+                "name": "workorder-server",
+                "enabled": True,
+                "tools": tools,
+            }
+        ],
+    }
+    message = "查询我房号最近的维修工单，以及系统当前待处理工单数量"
+    plans = plan_tools(
+        config,
+        "maintenance",
+        message,
+        RuntimePath.CONSULTATION,
+        effects=[ToolEffect.READ],
+        execution_modes=["auto_preinvoke"],
+    )
+    by_name = {item.tool_name: item for item in plans}
+    assert set(by_name) == {
+        "get_my_recent_work_orders",
+        "count_work_orders",
+    }
+    assert by_name["get_my_recent_work_orders"].arguments == {"limit": 5}
+    assert by_name["count_work_orders"].arguments == {"status": "待派单"}
 
 
 def test_action_success_claim_contract():
@@ -848,6 +1106,45 @@ def test_static_conflict_removal():
     assert '"used_in_answer": False' not in coordinator
 
 
+def test_runtime_summary_uses_actual_evidence():
+    from app.runtime.coordinator import _append_runtime_evidence_summary
+
+    rendered = _append_runtime_evidence_summary(
+        "业务回答。",
+        "最后用一行汇总实际调用的工具和知识库。",
+        [{"tool_name": "get_skill_instructions", "arguments": {"skill_id": 8}}],
+        [
+            ToolInvocation(
+                invocation_id="inv-test",
+                server_name="weather-server",
+                tool_name="get_current_weather",
+                effect=ToolEffect.READ,
+                invocation_status="success",
+                transport_status="success",
+                business_status="success",
+            )
+        ],
+        [
+            type("Citation", (), {"title": "常见维修问题 FAQ"})(),
+            type("Citation", (), {"title": "常见维修问题 FAQ"})(),
+            type("Citation", (), {"title": "物业维修服务承诺"})(),
+        ],
+    )
+    footer = rendered.splitlines()[-1]
+    assert "get_skill_instructions" in footer
+    assert "weather-server/get_current_weather" in footer
+    assert footer.count("常见维修问题 FAQ") == 1
+    assert "物业维修服务承诺" in footer
+
+
+def test_only_published_model_native_tools_enter_agno_loop():
+    source = (
+        REPO_ROOT / "app" / "runtime" / "mcp_executor.py"
+    ).read_text(encoding="utf-8")
+    assert '.get("execution_mode")' in source
+    assert '== "model_native"' in source
+
+
 def test_cost_strategy_claims_are_evidence_bound():
     repo = Path(__file__).resolve().parents[1]
     frontend = (repo / "frontend" / "index.html").read_text(encoding="utf-8")
@@ -909,6 +1206,13 @@ def main():
         test_cost_availability_contract,
         test_agno_completed_metrics_are_extractable,
         test_action_gateway_receipt_and_idempotency,
+        test_bare_work_order_command_collects_real_issue_description,
+        test_repeated_work_order_confirmation_replays_same_receipt,
+        test_pending_dynamic_mcp_action_keeps_controlled_path,
+        test_committed_dynamic_mcp_confirmation_replays_receipt,
+        test_database_receipt_row_projects_to_public_contract,
+        test_idempotent_replay_is_not_a_new_mcp_invocation,
+        test_composite_work_order_query_plans_exact_read_tools,
         test_action_success_claim_contract,
         test_mcp_preinvoke_initializes_session,
         test_mcp_business_result_unwrap_contract,
@@ -919,6 +1223,8 @@ def main():
         test_citation_violation_recording_contract,
         test_v18_runtime_auto_badcase_contract,
         test_static_conflict_removal,
+        test_runtime_summary_uses_actual_evidence,
+        test_only_published_model_native_tools_enter_agno_loop,
         test_cost_strategy_claims_are_evidence_bound,
         test_fixed_acceptance_matrix,
     ]

@@ -23,19 +23,13 @@ DB_PATH = Path(os.getenv("PROPERTY_DATA_DIR", "/app/data")) / "property_demo.db"
 DEMO_OWNER_ROOM_ID = os.getenv("DEMO_OWNER_ROOM_ID", "3-2-1201")
 TERMINAL_STATUSES = ("已完成", "已关闭", "已取消")
 ALLOWED_STATUS_FILTERS = {"待派单", "处理中", "待处理", "已完成", "已关闭", "已取消"}
+PENDING_STATUS_ALIASES = {"pending", "待处理", "待派单"}
 
 
-# Host policy uses stable English enums while the demo database and console
-# display Chinese status labels. Accept both at the MCP boundary so a model
-# retry can never silently turn a filtered request into an all-record count.
-STATUS_FILTER_ALIASES = {
-    "pending": "待处理",
-    "processing": "处理中",
-    "assigned": "待派单",
-    "completed": "已完成",
-    "closed": "已关闭",
-    "cancelled": "已取消",
-}
+def _canonical_status(status: Any) -> str:
+    normalized = str(status or "").strip()
+    return "待派单" if normalized in PENDING_STATUS_ALIASES else normalized
+
 
 def _result(status: str, data: Any = None, message: str = "", *, scope: str = "") -> str:
     return json.dumps(
@@ -75,7 +69,10 @@ def _safe_row(row: sqlite3.Row) -> Dict[str, Any]:
         "assigned_to",
         "completion_note",
     )
-    return {key: raw.get(key) for key in allowed if key in raw}
+    result = {key: raw.get(key) for key in allowed if key in raw}
+    if "status" in result:
+        result["status"] = _canonical_status(result["status"])
+    return result
 
 
 def _rows_to_data(rows: Iterable[sqlite3.Row]) -> List[Dict[str, Any]]:
@@ -138,14 +135,22 @@ def get_my_work_order_by_id(work_order_id: str) -> str:
 @mcp.tool()
 def count_work_orders(status: Optional[str] = None) -> str:
     """返回全小区的脱敏工单聚合数量，不返回工单明细。"""
-    raw_status = (status or "").strip()
-    normalized = STATUS_FILTER_ALIASES.get(raw_status.lower(), raw_status)
-    if normalized and normalized not in ALLOWED_STATUS_FILTERS:
+    normalized = (status or "").strip()
+    if normalized and normalized not in ALLOWED_STATUS_FILTERS and normalized != "pending":
         return _result("invalid_input", None, "status 仅支持演示系统定义的工单状态。", scope="community_aggregate")
+    canonical = _canonical_status(normalized)
     try:
         conn = _get_conn()
-        if normalized:
-            row = conn.execute("SELECT COUNT(*) AS cnt FROM work_orders WHERE status = ?", (normalized,)).fetchone()
+        if canonical == "待派单":
+            row = conn.execute(
+                "SELECT COUNT(*) AS cnt FROM work_orders WHERE status IN (?, ?, ?)",
+                ("pending", "待处理", "待派单"),
+            ).fetchone()
+        elif canonical:
+            row = conn.execute(
+                "SELECT COUNT(*) AS cnt FROM work_orders WHERE status = ?",
+                (canonical,),
+            ).fetchone()
         else:
             row = conn.execute("SELECT COUNT(*) AS cnt FROM work_orders").fetchone()
         conn.close()
@@ -153,7 +158,7 @@ def count_work_orders(status: Optional[str] = None) -> str:
         return _result("upstream_error", None, f"统计工单失败：{type(exc).__name__}", scope="community_aggregate")
     return _result(
         "success",
-        {"count": int(row["cnt"] if row else 0), "status_filter": normalized or None},
+        {"count": int(row["cnt"] if row else 0), "status_filter": canonical or None},
         "这是全小区脱敏聚合数量，不包含其他业主工单明细。",
         scope="community_aggregate",
     )
