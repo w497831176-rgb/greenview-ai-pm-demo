@@ -159,6 +159,19 @@ def test_action_gateway_receipt_and_idempotency():
     assert get_work_order(receipt_1.resource_id) is not None
 
 
+def test_action_success_claim_contract():
+    from app.runtime.coordinator import _claims_business_success
+
+    assert not _claims_business_success(
+        "维修工单草稿已完整，尚未创建正式工单。"
+        "问题描述：请帮我创建维修工单：3-2-1201卫生间漏水。"
+    )
+    assert not _claims_business_success("已拒绝本次操作，业务数据未写入。")
+    assert _claims_business_success(
+        "正式维修工单已创建成功，工单号：WO-20260719-DEMO。"
+    )
+
+
 def test_static_conflict_removal():
     repo = Path(__file__).resolve().parents[1]
     thin_chat = (repo / "app" / "chat.py").read_text(encoding="utf-8")
@@ -207,6 +220,7 @@ def main():
         test_citation_single_source_contract,
         test_cost_availability_contract,
         test_action_gateway_receipt_and_idempotency,
+        test_action_success_claim_contract,
         test_static_conflict_removal,
         test_fixed_acceptance_matrix,
     ]
