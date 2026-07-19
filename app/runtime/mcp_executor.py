@@ -137,13 +137,62 @@ def _plan(server_name: str, message: str) -> List[Tuple[str, Dict[str, Any]]]:
 
 
 def _business_status(result: Any) -> Tuple[str, str]:
-    text = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False, default=str)
-    try:
-        parsed = json.loads(text)
-        status = str(parsed.get("status") or "unknown")
-    except Exception:
-        status = "unknown"
-    return status, text[:500]
+    parsed = _structured_result(result)
+    if parsed is not None:
+        return (
+            str(parsed.get("status") or "unknown"),
+            json.dumps(parsed, ensure_ascii=False, default=str)[:500],
+        )
+    text = result if isinstance(result, str) else str(result)
+    return "unknown", text[:500]
+
+
+def _structured_result(value: Any, depth: int = 0) -> Optional[Dict[str, Any]]:
+    """Unwrap Agno/MCP result envelopes into the server's business payload."""
+
+    if value is None or depth > 6:
+        return None
+    if hasattr(value, "model_dump"):
+        try:
+            value = value.model_dump()
+        except Exception:
+            pass
+    if isinstance(value, str):
+        try:
+            return _structured_result(json.loads(value), depth + 1)
+        except Exception:
+            return None
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            parsed = _structured_result(item, depth + 1)
+            if parsed is not None:
+                return parsed
+        return None
+    if not isinstance(value, dict):
+        for attribute in ("structured_content", "metadata", "content", "text"):
+            if hasattr(value, attribute):
+                parsed = _structured_result(
+                    getattr(value, attribute),
+                    depth + 1,
+                )
+                if parsed is not None:
+                    return parsed
+        return None
+    if value.get("status") is not None:
+        return value
+    for key in (
+        "structured_content",
+        "result",
+        "content",
+        "text",
+        "metadata",
+        "data",
+    ):
+        if key in value:
+            parsed = _structured_result(value[key], depth + 1)
+            if parsed is not None:
+                return parsed
+    return None
 
 
 async def preinvoke_read_tools(
@@ -413,14 +462,7 @@ async def invoke_confirmed_write(
             timeout=12,
         )
         business_status, result_summary = _business_status(result)
-        try:
-            parsed = (
-                result
-                if isinstance(result, dict)
-                else json.loads(result if isinstance(result, str) else json.dumps(result, default=str))
-            )
-        except Exception:
-            parsed = {}
+        parsed = _structured_result(result) or {}
         if business_status not in {"success", "unknown"}:
             raise RuntimeError(
                 f"MCP business outcome is not successful: {business_status}"
