@@ -269,3 +269,4 @@ class RunEvidenceLedger(BaseModel):
     cost_entries: List[Dict[str, Any]] = Field(default_factory=list)
     evaluation_results: List[Dict[str, Any]] = Field(default_factory=list)
     contract_violations: List[Dict[str, Any]] = Field(default_factory=list)
+    badcase_links: List[Dict[str, Any]] = Field(default_factory=list)
