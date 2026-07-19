@@ -4222,35 +4222,30 @@
         const resultEl = $('#cost02-result');
         resultEl.innerHTML = '<span class="text-slate-400">执行中...</span>';
         try {
-          const current = await apiGet('/api/knowledge/retrieval-settings');
-          const settings = current.retrieval_settings || {};
           const query = '一般漏水多久响应';
           const run = async (k) => {
-            const res = await apiPost('/api/retrieval/debug', {
+            const res = await apiPost('/api/runtime/cost-preview/retrieval', {
               query,
-              top_k: k,
-              keyword_weight: Number(settings.keyword_weight ?? 0.3),
-              semantic_weight: Number(settings.semantic_weight ?? 0.7),
-              rrf_k: Number(settings.rrf_k ?? 60),
-              enable_rerank: Boolean(settings.enable_rerank),
-              rerank_model: settings.rerank_model || null,
-              score_threshold: Number(settings.score_threshold ?? 0),
-              context_threshold: Number(settings.context_threshold ?? 0.2)
+              agent_id: 'maintenance',
+              top_k: k
             });
-            const results = res.results || [];
+            const preview = res.preview || {};
+            const results = preview.results || [];
             return {
               k,
               count: results.length,
-              contextChars: results.reduce((sum, item) => sum + String(item.content || item.chunk_content || '').length, 0),
-              titles: [...new Set(results.map(item => item.doc_title || item.title).filter(Boolean))].slice(0, 3)
+              contextChars: Number(preview.context_characters || 0),
+              titles: [...new Set(results.map(item => item.document_title).filter(Boolean))].slice(0, 3),
+              fallback: Boolean(preview.used_snapshot_fallback),
+              releaseId: preview.release_id
             };
           };
           const r1 = await run(1);
           const r5 = await run(5);
           resultEl.innerHTML = `
-            <div>Top-K=1：候选分片 ${r1.count} 条 · 上下文 ${r1.contextChars} 字 · 文档 ${escapeHtml(r1.titles.join('、') || '-')}</div>
-            <div>Top-K=5：候选分片 ${r5.count} 条 · 上下文 ${r5.contextChars} 字 · 文档 ${escapeHtml(r5.titles.join('、') || '-')}</div>
-            <div class="text-amber-700">这是无模型检索预估，没有修改发布配置，也不等于 Provider Token 或成本。真正优化需发布候选 Release 后用同题 Trace 通过质量门槛。</div>
+            <div>Top-K=1：证据 ${r1.count} 条 · 上下文 ${r1.contextChars} 字 · 文档 ${escapeHtml(r1.titles.join('、') || '-')} · 快照回退 ${r1.fallback ? '是' : '否'}</div>
+            <div>Top-K=5：证据 ${r5.count} 条 · 上下文 ${r5.contextChars} 字 · 文档 ${escapeHtml(r5.titles.join('、') || '-')} · 快照回退 ${r5.fallback ? '是' : '否'}</div>
+            <div class="text-amber-700">基于 Release ${escapeHtml(r5.releaseId || '-')} 与 maintenance Agent 的显式 RAG 绑定；没有修改配置，也不等于 Provider Token 或成本。真正优化需发布候选 Release 后用同题 Trace 通过质量门槛。</div>
           `;
           state.costCases.push({ id: 'COST-02', r1, r5 });
         } catch (err) {
@@ -4361,35 +4356,30 @@
         const resultEl = $('#strategy-cost02-result');
         resultEl.innerHTML = '<span class="text-slate-400">执行中...</span>';
         try {
-          const current = await apiGet('/api/knowledge/retrieval-settings');
-          const settings = current.retrieval_settings || {};
           const query = '一般漏水多久响应';
           const run = async (k) => {
-            const res = await apiPost('/api/retrieval/debug', {
+            const res = await apiPost('/api/runtime/cost-preview/retrieval', {
               query,
-              top_k: k,
-              keyword_weight: Number(settings.keyword_weight ?? 0.3),
-              semantic_weight: Number(settings.semantic_weight ?? 0.7),
-              rrf_k: Number(settings.rrf_k ?? 60),
-              enable_rerank: Boolean(settings.enable_rerank),
-              rerank_model: settings.rerank_model || null,
-              score_threshold: Number(settings.score_threshold ?? 0),
-              context_threshold: Number(settings.context_threshold ?? 0.2)
+              agent_id: 'maintenance',
+              top_k: k
             });
-            const results = res.results || [];
+            const preview = res.preview || {};
+            const results = preview.results || [];
             return {
               k,
               count: results.length,
-              contextChars: results.reduce((sum, item) => sum + String(item.content || item.chunk_content || '').length, 0),
-              titles: [...new Set(results.map(item => item.doc_title || item.title).filter(Boolean))].slice(0, 3)
+              contextChars: Number(preview.context_characters || 0),
+              titles: [...new Set(results.map(item => item.document_title).filter(Boolean))].slice(0, 3),
+              fallback: Boolean(preview.used_snapshot_fallback),
+              releaseId: preview.release_id
             };
           };
           const r1 = await run(1);
           const r5 = await run(5);
           resultEl.innerHTML = `
-            <div>Top-K=1：候选分片 ${r1.count} 条 · 上下文 ${r1.contextChars} 字 · 文档 ${escapeHtml(r1.titles.join('、') || '-')}</div>
-            <div>Top-K=5：候选分片 ${r5.count} 条 · 上下文 ${r5.contextChars} 字 · 文档 ${escapeHtml(r5.titles.join('、') || '-')}</div>
-            <div class="text-amber-700">这是无模型检索预估，没有修改发布配置，也不等于 Provider Token 或成本。真正优化需发布候选 Release 后用同题 Trace 通过质量门槛。</div>
+            <div>Top-K=1：证据 ${r1.count} 条 · 上下文 ${r1.contextChars} 字 · 文档 ${escapeHtml(r1.titles.join('、') || '-')} · 快照回退 ${r1.fallback ? '是' : '否'}</div>
+            <div>Top-K=5：证据 ${r5.count} 条 · 上下文 ${r5.contextChars} 字 · 文档 ${escapeHtml(r5.titles.join('、') || '-')} · 快照回退 ${r5.fallback ? '是' : '否'}</div>
+            <div class="text-amber-700">基于 Release ${escapeHtml(r5.releaseId || '-')} 与 maintenance Agent 的显式 RAG 绑定；没有修改配置，也不等于 Provider Token 或成本。真正优化需发布候选 Release 后用同题 Trace 通过质量门槛。</div>
           `;
         } catch (err) {
           resultEl.innerHTML = '<span class="text-red-600">执行失败：' + escapeHtml(err.message || err) + '</span>';

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import uuid
 from typing import Any, Dict, List, Optional
@@ -54,6 +55,12 @@ class ContractAcceptanceRequest(BaseModel):
     expected_skill_ids: List[int] = Field(default_factory=list)
     expected_mcp_servers: List[str] = Field(default_factory=list)
     expected_knowledge_doc_ids: List[int] = Field(default_factory=list)
+
+
+class RetrievalCostPreviewRequest(BaseModel):
+    query: str = Field(min_length=1)
+    agent_id: str
+    top_k: int = Field(ge=1, le=10)
 
 
 @router.get("/acceptance/cases")
@@ -177,6 +184,101 @@ async def trace_evidence(trace_id: str):
     if not ledger:
         raise HTTPException(status_code=404, detail="evidence ledger not found")
     return {"evidence": ledger, "ledger": ledger.get("ledger") or {}}
+
+
+@router.post("/cost-preview/retrieval")
+async def retrieval_cost_preview(request: RetrievalCostPreviewRequest):
+    """Preview the exact published retrieval boundary without calling a model.
+
+    This uses the current immutable RuntimeRelease, the selected vertical
+    Agent's explicit RAG bindings, live retrieval verification and the same
+    deterministic snapshot fallback as owner chat.  ``top_k`` is a simulation
+    override only: it never mutates draft settings or publishes a release.
+    """
+    release = get_current_runtime_release()
+    if not release:
+        raise HTTPException(status_code=503, detail="no published RuntimeRelease")
+    config = release.get("config") or {}
+    agent = next(
+        (
+            item
+            for item in config.get("agents") or []
+            if item.get("agent_id") == request.agent_id
+            and item.get("enabled")
+            and item.get("category") not in {"router", "orchestration"}
+        ),
+        None,
+    )
+    if not agent:
+        raise HTTPException(status_code=404, detail="vertical agent not found")
+
+    allowed_document_ids = {
+        int(item) for item in (agent.get("knowledge_doc_ids") or [])
+    }
+    knowledge_versions = {
+        int(item["knowledge_doc_id"]): item
+        for item in (config.get("knowledge") or [])
+        if int(item.get("knowledge_doc_id") or 0) in allowed_document_ids
+    }
+    policy = dict(config.get("retrieval_policy") or {})
+    policy["top_k"] = request.top_k
+    live_results: List[Dict[str, Any]] = []
+    live_status = "completed"
+    try:
+        import rag_retrieval
+
+        retrieval = await asyncio.to_thread(
+            rag_retrieval.advanced_search,
+            request.query,
+            policy,
+        )
+        live_results = list((retrieval or {}).get("results") or [])
+    except Exception as exc:
+        live_status = f"failed:{type(exc).__name__}"
+
+    from app.runtime.coordinator import _results_from_snapshot
+
+    results, used_snapshot_fallback = _results_from_snapshot(
+        request.query,
+        live_results,
+        knowledge_versions,
+        allowed_document_ids,
+        request.top_k,
+    )
+    preview_results = [
+        {
+            "document_id": item.get("doc_id", item.get("document_id")),
+            "document_title": item.get("doc_title") or item.get("title") or "",
+            "chunk_index": item.get("chunk_index"),
+            "content": item.get("content") or item.get("chunk_text") or "",
+            "score": item.get("score"),
+            "retrieval_sources": item.get("retrieval_sources") or [],
+        }
+        for item in results
+    ]
+    return {
+        "preview": {
+            "release_id": release.get("release_id"),
+            "agent_id": request.agent_id,
+            "bound_document_ids": sorted(allowed_document_ids),
+            "simulated_top_k": request.top_k,
+            "retrieval_status": live_status,
+            "used_snapshot_fallback": used_snapshot_fallback,
+            "results": preview_results,
+            "evidence_count": len(preview_results),
+            "context_characters": sum(
+                len(item["content"]) for item in preview_results
+            ),
+            "provider_usage": None,
+            "estimated_cost": None,
+            "claim_policy": (
+                "无模型预估不等于 Provider Token 或成本；必须发布候选 Release，"
+                "用同题真实 Trace 通过质量门槛后才能宣称收益。"
+            ),
+        },
+        "configuration_mutated": False,
+        "model_called": False,
+    }
 
 
 @router.put("/agents/{agent_id}/knowledge-bindings")

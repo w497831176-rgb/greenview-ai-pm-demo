@@ -551,8 +551,17 @@ def test_cost_strategy_claims_are_evidence_bound():
     assert "降低 80% 以上单轮成本" not in frontend
     assert "节省约 800 Token" not in frontend
     assert "约 2500 Token" not in frontend
+    assert frontend.count(
+        "apiPost('/api/runtime/cost-preview/retrieval'"
+    ) == 2
     assert "检索预估不等于模型账单" in observability
     assert "质量下降或 Token 未降时拒绝候选" in observability
+    runtime_api = (repo / "app" / "runtime" / "api.py").read_text(
+        encoding="utf-8"
+    )
+    assert '"configuration_mutated": False' in runtime_api
+    assert '"model_called": False' in runtime_api
+    assert '"provider_usage": None' in runtime_api
 
 
 def test_fixed_acceptance_matrix():
