@@ -25,20 +25,53 @@ from db.property_db import init_db
 
 
 def test_agent_factory_assembly() -> None:
-    from app.runtime.agent_factory import build_runtime_agent
+    from app.runtime.agent_factory import build_agent_from_snapshot
+    from app.runtime.contracts import RunConfigSnapshot
 
-    agent = build_runtime_agent(
-        RequestContext(
-            session_id="factory-agent",
-            user_id="contract",
-            input={
-                "agent_id": "customer_service",
-                "message": "物业服务电话是多少？",
-            },
-        )
+    snapshot = RunConfigSnapshot(
+        snapshot_id="snap_factory_contract",
+        release_id="release_factory_contract",
+        snapshot_hash="factory-contract",
+        session_id="factory-agent",
+        created_at="2026-07-19T00:00:00+08:00",
+        config={
+            "agents": [
+                {
+                    "agent_id": "maintenance",
+                    "name": "维修 Agent",
+                    "enabled": True,
+                    "category": "maintenance",
+                    "instructions": "处理维修咨询。",
+                    "skill_ids": [8],
+                    "mcp_server_names": [],
+                    "knowledge_doc_ids": [],
+                }
+            ],
+            "skills": [
+                {
+                    "skill_id": 8,
+                    "name": "维修工单处理",
+                    "description": "维修咨询方法",
+                    "version": "1.0.0",
+                    "enabled": True,
+                    "trigger_condition": "漏水,维修",
+                    "metadata": {"positive_triggers": ["漏水", "维修"]},
+                    "content_hash": "skill-eight",
+                    "reference_snapshots": [],
+                    "instructions_fallback": "先核实位置和风险。",
+                }
+            ],
+        },
     )
-    assert agent.id == "customer_service"
-    assert agent.model is not None
+    build = build_agent_from_snapshot(
+        snapshot,
+        "maintenance",
+        "只咨询漏水维修服务承诺，不创建工单。",
+    )
+    assert build.agent.id == "maintenance"
+    assert build.agent.model is not None
+    assert build.agent.skills is not None
+    assert [item.skill_id for item in build.activated_skills] == [8]
 
 
 def test_composite_workflow_assembly() -> None:
