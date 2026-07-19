@@ -363,6 +363,51 @@ def _extract_json(text: str) -> Optional[Dict[str, Any]]:
         return None
 
 
+def _focused_badcase_model_context(context: Dict[str, Any]) -> Dict[str, Any]:
+    """Keep authoritative failure evidence visible to AI diagnosis.
+
+    Retrieval chunks can be very large and previously pushed evaluation and
+    contract failures beyond a blunt prompt slice.  The diagnosis stages need
+    the failure evidence itself, while the full immutable context remains
+    available on the Badcase and Trace detail pages.
+    """
+    focused_keys = (
+        "trace_id",
+        "session_id",
+        "message_id",
+        "feedback_type",
+        "route_decision",
+        "route_intent",
+        "route_reason",
+        "current_agent",
+        "activated_skills",
+        "citations",
+        "tool_invocations",
+        "tool_calls",
+        "mcp_calls",
+        "evaluation_results",
+        "contract_violations",
+    )
+    focused = {
+        key: context.get(key)
+        for key in focused_keys
+        if context.get(key) not in (None, "", [], {})
+    }
+    retrieval = context.get("retrieval_evidence") or []
+    if retrieval:
+        focused["retrieval_evidence_summary"] = [
+            {
+                "evidence_id": item.get("evidence_id"),
+                "document_id": item.get("document_id"),
+                "chunk_id": item.get("chunk_id"),
+                "title": item.get("title"),
+            }
+            for item in retrieval[:8]
+        ]
+        focused["retrieval_evidence_count"] = len(retrieval)
+    return focused
+
+
 def _find_darwin_skill() -> Optional[Dict[str, Any]]:
     """Find the Darwin optimization skill by name."""
     for name in ("达尔文", "darwin", "Darwin"):
@@ -506,6 +551,7 @@ async def classify_badcase(case_id: int, request: ClassifyRequest = ClassifyRequ
             context_obj = {}
     else:
         context_obj = context or {}
+    focused_context = _focused_badcase_model_context(context_obj)
 
     classify_trace_id = uuid.uuid4().hex[:16]
     model_id = "deepseek-v4-flash"
@@ -553,7 +599,12 @@ async def classify_badcase(case_id: int, request: ClassifyRequest = ClassifyRequ
             f"反馈原因：{case.get('feedback_reason', '')}\n"
             f"原问题：{case.get('original_query', '')}\n"
             f"原回答：{case.get('ai_response', '')[:500]}\n"
-            f"上下文：{json.dumps(context_obj, ensure_ascii=False)[:800]}\n\n"
+            f"关键证据：{json.dumps(focused_context, ensure_ascii=False)[:4000]}\n\n"
+            "证据优先规则：若来源是 runtime_contract、evaluation 或 tool_failure，"
+            "必须以 contract_violations、evaluation_results、失败 Tool 证据为事实，"
+            "不得只根据已经过安全渲染的最终回答反推根因。"
+            "unstructured_reference_marker 表示模型原始输出尝试生成 EvidenceSet 外标记；"
+            "最终回答没有该标记通常是 CitationRenderer 正确拦截，不是漏答。\n"
             "输出字段：suggested_category, root_cause_hypothesis, repair_path_suggestion, priority。"
             "repair_path_suggestion 应从 knowledge、skill_prompt、mcp_capability、ops_only 中选择。"
             "另输出 root_cause_domain，只能是 routing、knowledge_rag、model_instruction、tool_mcp、"
@@ -1222,6 +1273,7 @@ async def darwin_fix(case_id: int, request: DarwinFixRequest = DarwinFixRequest(
             context_obj = {}
     else:
         context_obj = context or {}
+    focused_context = _focused_badcase_model_context(context_obj)
 
     darwin = _find_darwin_skill()
     darwin_instructions = darwin.get("instructions", "") if darwin else ""
@@ -1238,7 +1290,10 @@ async def darwin_fix(case_id: int, request: DarwinFixRequest = DarwinFixRequest(
         f"反馈原因：{case.get('feedback_reason', '')}\n"
         f"原问题：{case.get('original_query', '')}\n"
         f"原回答：{case.get('ai_response', '')[:600]}\n"
-        f"上下文：{json.dumps(context_obj, ensure_ascii=False)[:1000]}\n\n"
+        f"关键证据：{json.dumps(focused_context, ensure_ascii=False)[:5000]}\n\n"
+        "证据优先规则：contract_violations、evaluation_results 和 Tool 分阶段失败证据"
+        "高于经过安全渲染的最终回答；不得把 CitationRenderer 正确剥离未授权标记"
+        "误判为模型未满足用户格式要求。\n\n"
         "请严格输出 JSON（不要 Markdown 代码块）：\n"
         "{\n"
         '  "phenomenon_impact": "<问题现象与业务影响>",\n'
@@ -1665,11 +1720,11 @@ async def mark_duplicate(case_id: int, request: DuplicateRequest):
 async def _consume_chat_stream(message: str, session_id: str, user_id: str = "retest") -> Dict[str, Any]:
     """Run a real chat stream and return the final answer + done context."""
     # Lazy import to avoid circular dependency between routers.
-    from app.chat import _stream_agent_response
+    from app.chat import stream_chat_response
 
     final_answer = ""
     done_payload: Dict[str, Any] = {}
-    async for chunk in _stream_agent_response(message, session_id, user_id):
+    async for chunk in stream_chat_response(message, session_id, user_id):
         for line in chunk.splitlines():
             if line.startswith("data:"):
                 data = line[5:].strip()
@@ -1858,6 +1913,4 @@ async def check_tools_badcase(case_id: int):
     )
     _record_action(case_id, "check-tools", {"analysis": analysis}, before, new_status)
     return {"badcase": _enrich_badcase(updated), "analysis": analysis}
-
-
 

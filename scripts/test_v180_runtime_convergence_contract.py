@@ -48,6 +48,79 @@ def test_release_and_snapshot_immutability():
     assert snapshot_new.release_id == release_2["release_id"]
 
 
+def test_new_vertical_agent_has_explicit_rag_scope():
+    from app.agents import AgentCreate, create_agent
+
+    created = asyncio.run(
+        create_agent(
+            AgentCreate(
+                agent_id="contract-explicit-rag-agent",
+                name="Contract Explicit RAG Agent",
+                instructions="Contract-only vertical Agent.",
+            )
+        )
+    )
+    agent = created["agent"]
+    assert agent["category"] == "vertical"
+    assert agent["knowledge_scope_mode"] == "explicit"
+    assert agent["knowledge_doc_ids"] == []
+
+    release = publish_compiled_release(created_by="explicit-rag-contract")
+    node = next(
+        item
+        for item in release["config"]["agents"]
+        if item["agent_id"] == agent["agent_id"]
+    )
+    assert node["knowledge_doc_ids"] == []
+
+
+def test_badcase_ai_context_keeps_contract_failures():
+    from app.badcases import _focused_badcase_model_context
+
+    focused = _focused_badcase_model_context(
+        {
+            "trace_id": "trace-contract-failure",
+            "retrieval_evidence": [
+                {
+                    "evidence_id": f"ev-{index}",
+                    "document_id": index,
+                    "chunk_id": f"chunk-{index}",
+                    "title": f"doc-{index}",
+                    "content_snapshot": "large content " * 500,
+                }
+                for index in range(12)
+            ],
+            "evaluation_results": [
+                {
+                    "case": "citation_allowlist",
+                    "passed": False,
+                    "violations": [{"code": "unstructured_reference_marker"}],
+                }
+            ],
+            "contract_violations": [
+                {
+                    "code": "unstructured_reference_marker",
+                    "detail": "Model marker was outside EvidenceSet.",
+                }
+            ],
+        }
+    )
+    assert focused["trace_id"] == "trace-contract-failure"
+    assert focused["contract_violations"][0]["code"] == (
+        "unstructured_reference_marker"
+    )
+    assert focused["evaluation_results"][0]["passed"] is False
+    assert focused["retrieval_evidence_count"] == 12
+    assert len(focused["retrieval_evidence_summary"]) == 8
+    assert "content_snapshot" not in focused["retrieval_evidence_summary"][0]
+
+
+def test_badcase_retest_uses_public_chat_adapter():
+    from app.chat import stream_chat_response
+
+    assert callable(stream_chat_response)
+
+
 def test_tool_policy_default_deny():
     server = {"id": 1, "name": "demo", "enabled": True}
     read = compile_tool_policy(server, {"name": "get_status", "tool_metadata": {}})

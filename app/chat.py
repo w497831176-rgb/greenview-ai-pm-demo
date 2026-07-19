@@ -7,6 +7,35 @@ No routing, RAG, Skill, Tool, business-write, citation or cost decisions live
 in this transport module.
 """
 
-from app.runtime.legacy_chat import _policy_mcp_args, _unique_rag_results, router
+from typing import AsyncIterator, List, Optional
 
-__all__ = ["router", "_policy_mcp_args", "_unique_rag_results"]
+from app.runtime.legacy_chat import (
+    _policy_mcp_args,
+    _stream_agent_response,
+    _unique_rag_results,
+    router,
+)
+
+
+async def stream_chat_response(
+    message: str,
+    session_id: str,
+    user_id: str,
+    image_analysis_ids: Optional[List[str]] = None,
+) -> AsyncIterator[str]:
+    """Public in-process adapter for chat retest and evaluation consumers."""
+    async for chunk in _stream_agent_response(
+        message,
+        session_id,
+        user_id,
+        image_analysis_ids,
+    ):
+        yield chunk
+
+
+__all__ = [
+    "router",
+    "stream_chat_response",
+    "_policy_mcp_args",
+    "_unique_rag_results",
+]
