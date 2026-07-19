@@ -15,6 +15,11 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from pydantic import BaseModel, Field
 
+from app.runtime.tool_planner import (
+    DEFAULT_RESULT_CONTRACT,
+    effective_tool_metadata,
+    validate_tool_metadata,
+)
 from db.property_db import (
     create_mcp_server as db_create_mcp_server,
     delete_mcp_server as db_delete_mcp_server,
@@ -73,6 +78,59 @@ class McpServerToggle(BaseModel):
 
 class McpToolPolicyUpdate(BaseModel):
     effect: str
+
+
+class McpToolRuntimePolicyUpdate(BaseModel):
+    effect: str
+    risk_level: str = "L1"
+    result_contract: Dict[str, Any] = Field(
+        default_factory=lambda: dict(DEFAULT_RESULT_CONTRACT)
+    )
+    natural_language_intents: List[str] = Field(default_factory=list)
+    trigger_keywords: List[str] = Field(default_factory=list)
+    trigger_mode: str = "any"
+    execution_mode: str = "model_native"
+    argument_bindings: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
+
+
+def _save_tool_runtime_policy(
+    server: Dict[str, Any],
+    tool: Dict[str, Any],
+    payload: Dict[str, Any],
+) -> Dict[str, Any]:
+    effect = str(payload.get("effect") or "").strip().lower()
+    if effect not in {"read", "create", "update", "delete", "unknown"}:
+        raise HTTPException(status_code=400, detail="invalid tool effect")
+    metadata = dict(tool.get("tool_metadata") or {})
+    metadata.update(payload)
+    metadata["effect"] = effect
+    metadata["effect_source"] = "operator_declared"
+    risk_level = str(metadata.get("risk_level") or "").upper()
+    if effect in {"create", "update"} and risk_level in {"L0", "L1"}:
+        risk_level = "L2"
+    if effect in {"delete", "unknown"}:
+        risk_level = "L3"
+    metadata["risk_level"] = risk_level or (
+        "L1" if effect == "read" else "L2"
+    )
+    metadata.setdefault("result_contract", dict(DEFAULT_RESULT_CONTRACT))
+    if effect in {"create", "update"}:
+        metadata["execution_mode"] = "proposal"
+    elif effect != "read":
+        metadata["execution_mode"] = "model_native"
+    errors = validate_tool_metadata(metadata, tool.get("input_schema") or {})
+    if errors:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "invalid_tool_runtime_policy", "errors": errors},
+        )
+    return save_mcp_tool(
+        server_id=int(server["id"]),
+        name=str(tool["name"]),
+        description=str(tool.get("description") or ""),
+        input_schema=tool.get("input_schema") or {},
+        tool_metadata=metadata,
+    )
 
 
 @router.get("")
@@ -147,6 +205,12 @@ async def get_mcp_server_tools(server_id: str):
     """List cached tools for an MCP server."""
     server = _resolve_server(server_id)
     tools = list_mcp_tools(server_id=server["id"])
+    for tool in tools:
+        tool["effective_runtime_metadata"] = effective_tool_metadata(
+            str(server.get("name") or ""),
+            str(tool.get("name") or ""),
+            tool.get("tool_metadata") or {},
+        )
     return {"mcp_server": server, "tools": tools, "count": len(tools)}
 
 
@@ -160,22 +224,44 @@ async def update_mcp_tool_policy(
     tool = get_mcp_tool(tool_id)
     if not tool or int(tool.get("server_id") or 0) != int(server["id"]):
         raise HTTPException(status_code=404, detail="mcp tool not found")
-    effect = request.effect.strip().lower()
-    if effect not in {"read", "create", "update", "delete", "unknown"}:
-        raise HTTPException(status_code=400, detail="invalid tool effect")
-    metadata = dict(tool.get("tool_metadata") or {})
-    metadata["effect"] = effect
-    metadata["effect_source"] = "operator_declared"
-    updated = save_mcp_tool(
-        server_id=int(server["id"]),
-        name=str(tool["name"]),
-        description=str(tool.get("description") or ""),
-        input_schema=tool.get("input_schema") or {},
-        tool_metadata=metadata,
+    updated = _save_tool_runtime_policy(
+        server,
+        tool,
+        {
+            **dict(tool.get("tool_metadata") or {}),
+            "effect": request.effect,
+        },
     )
     return {
         "mcp_tool": updated,
         "runtime_effective_on": "after_runtime_release_publish",
+    }
+
+
+@router.put("/{server_id}/tools/{tool_id}/runtime-policy")
+async def update_mcp_tool_runtime_policy(
+    server_id: str,
+    tool_id: int,
+    request: McpToolRuntimePolicyUpdate,
+):
+    """Save the generic natural-language ToolPlan contract as Draft."""
+
+    server = _resolve_server(server_id)
+    tool = get_mcp_tool(tool_id)
+    if not tool or int(tool.get("server_id") or 0) != int(server["id"]):
+        raise HTTPException(status_code=404, detail="mcp tool not found")
+    updated = _save_tool_runtime_policy(
+        server,
+        tool,
+        request.model_dump(),
+    )
+    return {
+        "mcp_tool": updated,
+        "runtime_effective_on": "after_runtime_release_publish_new_session",
+        "contract": {
+            "planner": "configuration_driven",
+            "writes": "proposal_confirmation_receipt",
+        },
     }
 
 

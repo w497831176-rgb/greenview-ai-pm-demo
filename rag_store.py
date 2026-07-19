@@ -91,25 +91,51 @@ def delete_chunks_for_doc(doc_id: int):
         conn.commit()
 
 
-def search_chunks(query_embedding: List[float], top_k: int = 3, threshold: float = 0.7) -> List[Dict[str, Any]]:
-    """Semantic search using cosine similarity."""
+def search_chunks(
+    query_embedding: List[float],
+    top_k: int = 3,
+    threshold: float = 0.7,
+    allowed_document_ids: Optional[List[int]] = None,
+) -> List[Dict[str, Any]]:
+    """Semantic search with optional document scope applied before Top-K."""
+    scope = None if allowed_document_ids is None else sorted({int(item) for item in allowed_document_ids})
+    if scope is not None and not scope:
+        return []
     with _get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT
-                    kc.id,
-                    kc.doc_id,
-                    kc.chunk_index,
-                    kc.content,
-                    1 - (kc.embedding <=> %s::vector) AS score
-                FROM knowledge_chunks kc
-                WHERE kc.embedding IS NOT NULL
-                ORDER BY kc.embedding <=> %s::vector
-                LIMIT %s
-                """,
-                (query_embedding, query_embedding, top_k),
-            )
+            if scope is None:
+                cur.execute(
+                    """
+                    SELECT
+                        kc.id,
+                        kc.doc_id,
+                        kc.chunk_index,
+                        kc.content,
+                        1 - (kc.embedding <=> %s::vector) AS score
+                    FROM knowledge_chunks kc
+                    WHERE kc.embedding IS NOT NULL
+                    ORDER BY kc.embedding <=> %s::vector
+                    LIMIT %s
+                    """,
+                    (query_embedding, query_embedding, top_k),
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT
+                        kc.id,
+                        kc.doc_id,
+                        kc.chunk_index,
+                        kc.content,
+                        1 - (kc.embedding <=> %s::vector) AS score
+                    FROM knowledge_chunks kc
+                    WHERE kc.embedding IS NOT NULL
+                      AND kc.doc_id = ANY(%s)
+                    ORDER BY kc.embedding <=> %s::vector
+                    LIMIT %s
+                    """,
+                    (query_embedding, scope, query_embedding, top_k),
+                )
             rows = cur.fetchall()
 
     results = []

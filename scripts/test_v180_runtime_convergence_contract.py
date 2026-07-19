@@ -23,7 +23,7 @@ os.environ["RUNTIME_ENGINE"] = "v18"
 from app.runtime.acceptance import ACCEPTANCE_CASES
 from app.runtime.action_gateway import ActionGateway
 from app.runtime.citation_renderer import build_evidence_set, render_citations
-from app.runtime.contracts import ToolEffect
+from app.runtime.contracts import RuntimePath, ToolEffect
 from app.runtime.cost_ledger import build_cost_entry
 from app.runtime.release_compiler import (
     compile_tool_policy,
@@ -124,14 +124,47 @@ def test_badcase_retest_uses_public_chat_adapter():
 
 def test_tool_policy_default_deny():
     server = {"id": 1, "name": "demo", "enabled": True}
-    read = compile_tool_policy(server, {"name": "get_status", "tool_metadata": {}})
-    write = compile_tool_policy(server, {"name": "create_record", "tool_metadata": {}})
-    delete = compile_tool_policy(server, {"name": "delete_record", "tool_metadata": {}})
+    read = compile_tool_policy(
+        server,
+        {
+            "name": "opaque_read_name",
+            "tool_metadata": {
+                "effect": "read",
+                "effect_source": "operator_declared",
+            },
+        },
+    )
+    write = compile_tool_policy(
+        server,
+        {
+            "name": "opaque_write_name",
+            "tool_metadata": {
+                "effect": "create",
+                "effect_source": "operator_declared",
+            },
+        },
+    )
+    delete = compile_tool_policy(
+        server,
+        {
+            "name": "opaque_delete_name",
+            "tool_metadata": {
+                "effect": "delete",
+                "effect_source": "operator_declared",
+            },
+        },
+    )
     unknown = compile_tool_policy(server, {"name": "do_magic", "tool_metadata": {}})
+    misleading_name = compile_tool_policy(
+        server,
+        {"name": "create_record", "tool_metadata": {}},
+    )
     assert read.effect == ToolEffect.READ and read.enabled
     assert write.effect == ToolEffect.CREATE and write.requires_confirmation
     assert delete.effect == ToolEffect.DELETE and not delete.enabled
     assert unknown.effect == ToolEffect.UNKNOWN and not unknown.enabled
+    assert misleading_name.effect == ToolEffect.UNKNOWN
+    assert not misleading_name.enabled
 
 
 def test_citation_single_source_contract():
@@ -445,6 +478,281 @@ def test_mcp_business_result_unwrap_contract():
     assert '"status": "success"' in summary
 
 
+def _off_domain_runtime_config():
+    def policy(tool_name, effect, paths, requires_confirmation=False):
+        return {
+            "server_id": 91,
+            "server_name": "astronomy-server",
+            "tool_name": tool_name,
+            "effect": effect,
+            "risk_level": "L2" if requires_confirmation else "L1",
+            "allowed_paths": paths,
+            "requires_confirmation": requires_confirmation,
+            "enabled": True,
+            "policy_reason": "off-domain contract fixture",
+        }
+
+    return {
+        "agents": [
+            {
+                "agent_id": "exoplanet_agent",
+                "name": "系外行星观测 Agent",
+                "description": "处理系外行星凌日、观测窗口和观测申请",
+                "category": "vertical",
+                "enabled": True,
+                "skill_ids": [991],
+                "mcp_server_names": ["astronomy-server"],
+                "knowledge_doc_ids": [771],
+            }
+        ],
+        "skills": [
+            {
+                "skill_id": 991,
+                "name": "凌日观测计划",
+                "description": "规划系外行星凌日观测",
+                "enabled": True,
+                "metadata": {"positive_triggers": ["系外行星", "凌日观测"]},
+            }
+        ],
+        "knowledge": [
+            {
+                "knowledge_doc_id": 771,
+                "title": "GVX-42 观测手册",
+                "category": "天文演示",
+            }
+        ],
+        "mcp_servers": [
+            {
+                "server_id": 91,
+                "name": "astronomy-server",
+                "description": "查询和登记系外行星观测任务",
+                "enabled": True,
+                "is_builtin": False,
+                "command": "fake-astronomy",
+                "args": [],
+                "tools": [
+                    {
+                        "name": "lookup_window",
+                        "description": "查询目标观测窗口",
+                        "input_schema": {
+                            "type": "object",
+                            "properties": {
+                                "target": {"type": "string"},
+                                "time_range": {"type": "string"},
+                            },
+                            "required": ["target", "time_range"],
+                        },
+                        "tool_metadata": {
+                            "effect": "read",
+                            "effect_source": "operator_declared",
+                            "risk_level": "L1",
+                            "result_contract": {
+                                "success_statuses": ["success"],
+                                "non_success_statuses": ["not_found", "invalid_input"],
+                            },
+                            "natural_language_intents": ["查询系外行星观测窗口"],
+                            "trigger_keywords": ["观测窗口"],
+                            "trigger_mode": "any",
+                            "execution_mode": "auto_preinvoke",
+                            "argument_bindings": {
+                                "target": {
+                                    "source": "regex",
+                                    "pattern": r"\b(GVX-\d+)\b",
+                                    "group": 1,
+                                },
+                                "time_range": {
+                                    "source": "keyword_map",
+                                    "mapping": {"明晚": "tomorrow_evening"},
+                                },
+                            },
+                        },
+                        "policy": policy(
+                            "lookup_window",
+                            "read",
+                            ["consultation", "extension_acceptance"],
+                        ),
+                    },
+                    {
+                        "name": "register_request",
+                        "description": "登记观测申请",
+                        "input_schema": {
+                            "type": "object",
+                            "properties": {
+                                "target": {"type": "string"},
+                                "time_range": {"type": "string"},
+                            },
+                            "required": ["target", "time_range"],
+                        },
+                        "tool_metadata": {
+                            "effect": "create",
+                            "effect_source": "operator_declared",
+                            "risk_level": "L2",
+                            "result_contract": {
+                                "success_statuses": ["success"],
+                                "non_success_statuses": ["invalid_input", "upstream_error"],
+                            },
+                            "natural_language_intents": ["登记新的观测申请"],
+                            "trigger_keywords": ["登记观测申请"],
+                            "trigger_mode": "any",
+                            "execution_mode": "proposal",
+                            "argument_bindings": {
+                                "target": {
+                                    "source": "regex",
+                                    "pattern": r"\b(GVX-\d+)\b",
+                                    "group": 1,
+                                },
+                                "time_range": {
+                                    "source": "keyword_map",
+                                    "mapping": {"明晚": "tomorrow_evening"},
+                                },
+                            },
+                        },
+                        "policy": policy(
+                            "register_request",
+                            "create",
+                            ["controlled_action", "extension_acceptance"],
+                            requires_confirmation=True,
+                        ),
+                    },
+                ],
+            }
+        ],
+    }
+
+
+def test_configuration_driven_off_domain_tool_plan():
+    from app.runtime.tool_planner import plan_tools, unique_write_plan
+
+    config = _off_domain_runtime_config()
+    read_query = "请查询 GVX-42 明晚的观测窗口。"
+    read_plans = plan_tools(
+        config,
+        "exoplanet_agent",
+        read_query,
+        RuntimePath.CONSULTATION,
+        effects=[ToolEffect.READ],
+        execution_modes=["auto_preinvoke"],
+    )
+    assert len(read_plans) == 1
+    assert read_plans[0].tool_name == "lookup_window"
+    assert read_plans[0].arguments == {
+        "target": "GVX-42",
+        "time_range": "tomorrow_evening",
+    }
+    assert not read_plans[0].missing_required
+    # The owner never has to know or type the internal tool name.
+    assert "lookup_window" not in read_query
+
+    write_query = "请为 GVX-42 登记观测申请，时间是明晚。"
+    write_plan = unique_write_plan(config, write_query)
+    assert write_plan is not None
+    assert write_plan.tool_name == "register_request"
+    assert write_plan.execution_mode == "proposal"
+    assert write_plan.arguments["target"] == "GVX-42"
+    assert "register_request" not in write_query
+
+    # Trigger keywords improve determinism but are not a hidden hard
+    # dependency: an operator-declared intent/description can still select one
+    # unambiguous write tool.
+    write_tool = config["mcp_servers"][0]["tools"][1]
+    write_tool["tool_metadata"]["trigger_keywords"] = []
+    description_plan = unique_write_plan(
+        config,
+        "请为 GVX-42 登记观测申请，时间是明晚。",
+    )
+    assert description_plan is not None
+    assert description_plan.tool_name == "register_request"
+
+
+def test_off_domain_router_uses_published_capabilities():
+    from agents.router import _capability_fallback
+    from app.runtime.agent_factory import vertical_agent_cards
+
+    cards = vertical_agent_cards(_off_domain_runtime_config())
+    selected, reason, scores = _capability_fallback(
+        "请按《GVX-42 观测手册》查询系外行星观测窗口。",
+        cards,
+    )
+    assert selected == "exoplanet_agent"
+    assert any(
+        item["agent_id"] == "exoplanet_agent" and item["score"] > 0
+        for item in scores
+    )
+    assert any(term in reason for term in ("GVX", "系外行星", "观测"))
+
+
+def test_scoped_rag_is_applied_before_top_k():
+    import rag_retrieval
+
+    original_list_docs = rag_retrieval.db.list_knowledge_docs
+    original_get_doc = rag_retrieval.db.get_knowledge_doc
+    original_embed = rag_retrieval.rag_embeddings.embed_text
+    original_threshold = rag_retrieval.rag_indexer._effective_threshold
+    original_search_chunks = rag_retrieval.rag_store.search_chunks
+    seen = {}
+
+    docs = [
+        {"id": 771, "title": "GVX-42", "content": "观测窗口", "is_indexed": 1},
+        {"id": 999, "title": "物业维修", "content": "漏水天气", "is_indexed": 1},
+    ]
+
+    def fake_search_chunks(
+        query_embedding,
+        top_k,
+        threshold,
+        allowed_document_ids=None,
+    ):
+        seen["allowed_document_ids"] = set(allowed_document_ids or [])
+        return [
+            {
+                "id": 1,
+                "doc_id": 771,
+                "chunk_index": 0,
+                "content": "GVX-42 明晚观测窗口",
+                "score": 0.99,
+            }
+        ]
+
+    try:
+        rag_retrieval.db.list_knowledge_docs = lambda: docs
+        rag_retrieval.db.get_knowledge_doc = lambda doc_id: next(
+            item for item in docs if item["id"] == doc_id
+        )
+        rag_retrieval.rag_embeddings.embed_text = lambda query: [0.0] * 512
+        rag_retrieval.rag_indexer._effective_threshold = lambda value: 0.0
+        rag_retrieval.rag_store.search_chunks = fake_search_chunks
+        keyword_index = rag_retrieval._build_keyword_index({771})
+        semantic = rag_retrieval._semantic_search(
+            "GVX-42 观测窗口",
+            top_k=1,
+            threshold=0.0,
+            allowed_document_ids={771},
+        )
+    finally:
+        rag_retrieval.db.list_knowledge_docs = original_list_docs
+        rag_retrieval.db.get_knowledge_doc = original_get_doc
+        rag_retrieval.rag_embeddings.embed_text = original_embed
+        rag_retrieval.rag_indexer._effective_threshold = original_threshold
+        rag_retrieval.rag_store.search_chunks = original_search_chunks
+
+    assert set(keyword_index) == {771}
+    assert seen["allowed_document_ids"] == {771}
+    assert {item["doc_id"] for item in semantic} == {771}
+
+
+def test_dynamic_mcp_runtime_has_no_domain_branching():
+    source = (
+        Path(__file__).resolve().parents[1]
+        / "app"
+        / "runtime"
+        / "mcp_executor.py"
+    ).read_text(encoding="utf-8")
+    assert "def _relevant(" not in source
+    assert "def _plan(" not in source
+    assert 'if server_name == "weather-server"' not in source
+    assert "plan_tools(" in source
+
+
 def test_citation_violation_recording_contract():
     from app.runtime.coordinator import _record_citation_violations
 
@@ -570,7 +878,7 @@ def test_fixed_acceptance_matrix():
         "HIT-01",
         "HANDOFF-01",
         "ACTION-01",
-        "EXT-ASR-01",
+        "EXT-OFFDOMAIN-01",
         "EXT-MCP-01",
         "BADCASE-01",
         "COST-01",
@@ -604,6 +912,10 @@ def main():
         test_action_success_claim_contract,
         test_mcp_preinvoke_initializes_session,
         test_mcp_business_result_unwrap_contract,
+        test_configuration_driven_off_domain_tool_plan,
+        test_off_domain_router_uses_published_capabilities,
+        test_scoped_rag_is_applied_before_top_k,
+        test_dynamic_mcp_runtime_has_no_domain_branching,
         test_citation_violation_recording_contract,
         test_v18_runtime_auto_badcase_contract,
         test_static_conflict_removal,

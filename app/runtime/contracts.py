@@ -94,12 +94,33 @@ class ToolPolicy(ImmutableModel):
     policy_reason: str = ""
 
 
+class ToolPlan(ImmutableModel):
+    """Deterministic plan compiled from published tool metadata."""
+
+    plan_id: str = Field(default_factory=lambda: f"plan_{uuid.uuid4().hex}")
+    agent_id: str
+    server_name: str
+    tool_name: str
+    effect: ToolEffect
+    execution_mode: str
+    arguments: Dict[str, Any] = Field(default_factory=dict)
+    missing_required: List[str] = Field(default_factory=list)
+    schema_errors: List[str] = Field(default_factory=list)
+    match_score: float = 0.0
+    match_reason: str = ""
+    planner_source: str = "published_tool_metadata"
+    result_contract: Dict[str, Any] = Field(default_factory=dict)
+
+
 class ToolInvocation(ImmutableModel):
     invocation_id: str = Field(default_factory=lambda: f"tool_{uuid.uuid4().hex}")
+    plan_id: Optional[str] = None
     server_name: str
     tool_name: str
     effect: ToolEffect
     arguments: Dict[str, Any] = Field(default_factory=dict)
+    planner_source: Optional[str] = None
+    match_reason: Optional[str] = None
     discovery_status: str = "not_applicable"
     transport_status: str = "not_started"
     invocation_status: str = "not_started"

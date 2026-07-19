@@ -4573,6 +4573,47 @@
                 <h3 class="text-sm font-semibold text-slate-700 mb-2">当前 Published RuntimeRelease</h3>
                 ${renderRelease(current, current.release_id)}
               </div>
+              <details class="bg-white rounded-2xl border border-indigo-200 p-5" open>
+                <summary class="font-semibold text-slate-900 cursor-pointer">目标 1：验收真实聊天 Trace</summary>
+                <p class="text-xs text-slate-500 mt-2">只读取已有证据，不再次调用模型。复杂场景可以拆成多个 Trace，再用组合验收聚合。</p>
+                <div class="grid md:grid-cols-2 gap-2 mt-3">
+                  <input id="runtime-trace-id" class="border rounded-lg px-3 py-2 text-sm font-mono" placeholder="trace_id">
+                  <input id="runtime-trace-agent" class="border rounded-lg px-3 py-2 text-sm" placeholder="预期 Agent ID（可空）">
+                  <input id="runtime-trace-skills" class="border rounded-lg px-3 py-2 text-sm" placeholder="Skill ID，逗号分隔">
+                  <input id="runtime-trace-mcp" class="border rounded-lg px-3 py-2 text-sm" placeholder="server:tool，逗号分隔">
+                  <input id="runtime-trace-docs" class="border rounded-lg px-3 py-2 text-sm" placeholder="RAG 文档 ID，逗号分隔">
+                </div>
+                <div class="flex flex-wrap gap-3 mt-3 text-xs">
+                  <label><input id="runtime-require-skill" type="checkbox" checked> Skill</label>
+                  <label><input id="runtime-require-rag" type="checkbox" checked> RAG+引用</label>
+                  <label><input id="runtime-require-mcp" type="checkbox" checked> MCP</label>
+                  <label><input id="runtime-require-eval" type="checkbox" checked> Evaluation</label>
+                  <label><input id="runtime-require-cost" type="checkbox" checked> Trace/成本</label>
+                  <label><input id="runtime-require-handoff" type="checkbox"> 转人工</label>
+                  <label><input id="runtime-require-receipt" type="checkbox"> committed Receipt</label>
+                  <label><input id="runtime-require-badcase" type="checkbox"> Badcase</label>
+                  <label><input id="runtime-forbid-write" type="checkbox" checked> 禁止业务写入</label>
+                </div>
+                <button id="runtime-trace-accept-btn" class="mt-3 px-4 py-2 bg-indigo-600 text-white rounded-xl text-sm">验收 Trace</button>
+                <textarea id="runtime-composite-cases" class="mt-3 w-full border rounded-lg p-2 font-mono text-[10px]" rows="4" placeholder='可选：粘贴多个 TraceAcceptanceRequest 的 JSON 数组'></textarea>
+                <button id="runtime-composite-accept-btn" class="mt-2 px-3 py-1.5 bg-slate-800 text-white rounded-lg text-xs">生成父 Acceptance Run</button>
+              </details>
+              <details class="bg-white rounded-2xl border border-cyan-200 p-5">
+                <summary class="font-semibold text-slate-900 cursor-pointer">目标 2：验收新增能力包</summary>
+                <p class="text-xs text-slate-500 mt-2">新增并绑定 Agent / Skill / MCP / RAG，发布后填写一个全新 session_id 和固定问题。</p>
+                <div class="grid md:grid-cols-2 gap-2 mt-3">
+                  <input id="runtime-ext-session" class="border rounded-lg px-3 py-2 text-sm font-mono" placeholder="全新 Session ID">
+                  <input id="runtime-ext-agent" class="border rounded-lg px-3 py-2 text-sm" placeholder="预期 Agent ID">
+                  <textarea id="runtime-ext-query" class="md:col-span-2 border rounded-lg px-3 py-2 text-sm" rows="3" placeholder="固定自然语言问题，不写 Agent/Server/Tool 内部名"></textarea>
+                  <input id="runtime-ext-skills" class="border rounded-lg px-3 py-2 text-sm" placeholder="Skill ID，逗号分隔">
+                  <input id="runtime-ext-docs" class="border rounded-lg px-3 py-2 text-sm" placeholder="RAG 文档 ID，逗号分隔">
+                  <input id="runtime-ext-mcp" class="md:col-span-2 border rounded-lg px-3 py-2 text-sm" placeholder="预期 server:tool，逗号分隔">
+                  <input id="runtime-ext-baseline-session" class="border rounded-lg px-3 py-2 text-sm font-mono" placeholder="发布前旧 Session ID（可空）">
+                  <input id="runtime-ext-baseline-hash" class="border rounded-lg px-3 py-2 text-sm font-mono" placeholder="旧 Snapshot Hash（可空）">
+                </div>
+                <label class="block mt-2 text-xs"><input id="runtime-ext-retrieval" type="checkbox"> 同时运行 scoped RAG（不调用大模型）</label>
+                <button id="runtime-extension-accept-btn" class="mt-3 px-4 py-2 bg-cyan-600 text-white rounded-xl text-sm">验收新增能力包</button>
+              </details>
               <div class="bg-white rounded-2xl border border-slate-200 p-5">
                 <h3 class="font-semibold text-slate-900 mb-3">固定验收矩阵（${cases.length}）</h3>
                 <div class="grid md:grid-cols-2 gap-2">
@@ -4600,6 +4641,69 @@
                 showToast('回滚失败：' + (err.message || err), 'error');
               }
             });
+          });
+          const parseCsv = value => value.split(/[,，、\n]+/).map(item => item.trim()).filter(Boolean);
+          const parseIds = value => parseCsv(value).map(Number).filter(Number.isInteger);
+          const renderAcceptance = result => `
+            <div class="space-y-2">
+              <div class="rounded-xl p-3 ${result.passed ? 'bg-emerald-50 text-emerald-800' : 'bg-red-50 text-red-800'} font-semibold">${result.passed ? '验收通过' : '验收失败'} · ${escapeHtml(result.acceptance_run_id || '')}</div>
+              ${(result.assertions || []).map(item => `<div class="rounded-xl border p-3 text-xs ${item.passed ? 'border-emerald-100' : 'border-red-100'}"><div class="font-semibold">${item.passed ? '✓' : '✗'} ${escapeHtml(item.name)}</div><div class="mt-1">expected: ${escapeHtml(JSON.stringify(item.expected))}</div><div>actual: ${escapeHtml(JSON.stringify(item.actual))}</div></div>`).join('')}
+            </div>`;
+          $('#runtime-trace-accept-btn').addEventListener('click', async () => {
+            const traceId = $('#runtime-trace-id').value.trim();
+            if (!traceId) return showToast('请填写 trace_id', 'error');
+            try {
+              const result = await apiPost('/api/runtime/acceptance/trace', {
+                case_key: 'HIT-TRACE-01',
+                trace_id: traceId,
+                expected_agent_id: $('#runtime-trace-agent').value.trim() || null,
+                expected_skill_ids: parseIds($('#runtime-trace-skills').value),
+                expected_mcp_tools: parseCsv($('#runtime-trace-mcp').value),
+                expected_knowledge_doc_ids: parseIds($('#runtime-trace-docs').value),
+                require_skill: $('#runtime-require-skill').checked,
+                require_rag: $('#runtime-require-rag').checked,
+                require_mcp: $('#runtime-require-mcp').checked,
+                require_handoff: $('#runtime-require-handoff').checked,
+                require_action_receipt: $('#runtime-require-receipt').checked,
+                require_badcase: $('#runtime-require-badcase').checked,
+                require_evaluation: $('#runtime-require-eval').checked,
+                require_cost: $('#runtime-require-cost').checked,
+                forbid_business_write: $('#runtime-forbid-write').checked
+              });
+              openDrawer('Trace 验收结果', renderAcceptance(result));
+            } catch (err) { showToast('Trace 验收失败：' + (err.message || err), 'error'); }
+          });
+          $('#runtime-extension-accept-btn').addEventListener('click', async () => {
+            const query = $('#runtime-ext-query').value.trim();
+            const agentId = $('#runtime-ext-agent').value.trim();
+            if (!query || !agentId) return showToast('请填写固定问题和预期 Agent', 'error');
+            try {
+              const result = await apiPost('/api/runtime/acceptance/extension', {
+                case_key: 'EXT-OFFDOMAIN-01',
+                session_id: $('#runtime-ext-session').value.trim() || `ext-${Date.now()}`,
+                query,
+                expected_agent_id: agentId,
+                expected_skill_ids: parseIds($('#runtime-ext-skills').value),
+                expected_mcp_tools: parseCsv($('#runtime-ext-mcp').value),
+                expected_knowledge_doc_ids: parseIds($('#runtime-ext-docs').value),
+                run_scoped_retrieval: $('#runtime-ext-retrieval').checked,
+                baseline_session_id: $('#runtime-ext-baseline-session').value.trim() || null,
+                expected_baseline_snapshot_hash: $('#runtime-ext-baseline-hash').value.trim() || null
+              });
+              openDrawer('新增能力包验收结果', renderAcceptance(result));
+            } catch (err) { showToast('新增能力包验收失败：' + (err.message || err), 'error'); }
+          });
+          $('#runtime-composite-accept-btn').addEventListener('click', async () => {
+            try {
+              const childCases = JSON.parse($('#runtime-composite-cases').value.trim() || '[]');
+              if (!Array.isArray(childCases) || !childCases.length) throw new Error();
+              const result = await apiPost('/api/runtime/acceptance/composite', {
+                case_key: 'HIT-COMPOSITE-01',
+                child_cases: childCases,
+                expected_child_case_keys: childCases.map(item => item.case_key).filter(Boolean)
+              });
+              openDrawer('组合 Acceptance Run', renderAcceptance(result));
+            } catch (err) { showToast('组合验收 JSON 或子 Trace 无效', 'error'); }
           });
         } catch (err) {
           $('#runtime-content').innerHTML = emptyState('运行时发布信息加载失败');
@@ -5668,7 +5772,21 @@
           const body = tools.length === 0
             ? '<p class="text-sm text-slate-500">该 MCP Server 暂未返回工具列表。</p>'
               : `<div class="space-y-3">${tools.map(t => {
-                const effect = (t.tool_metadata || {}).effect || 'unknown';
+                const metadata = t.effective_runtime_metadata || t.tool_metadata || {};
+                const editableContract = {
+                  effect: metadata.effect || 'unknown',
+                  risk_level: metadata.risk_level || 'L1',
+                  result_contract: metadata.result_contract || {
+                    success_statuses: ['success'],
+                    non_success_statuses: ['empty','not_found','invalid_input','unauthorized','timeout','upstream_error','unknown'],
+                    claim_rule: 'Only an explicit success business status may be described as success.'
+                  },
+                  natural_language_intents: metadata.natural_language_intents || [],
+                  trigger_keywords: metadata.trigger_keywords || [],
+                  trigger_mode: metadata.trigger_mode || 'any',
+                  execution_mode: metadata.execution_mode || 'model_native',
+                  argument_bindings: metadata.argument_bindings || {}
+                };
                 return `
                 <div class="bg-slate-50 rounded-xl p-3 border border-slate-200">
                   <div class="flex items-center justify-between mb-1">
@@ -5678,26 +5796,33 @@
                   <p class="text-xs text-slate-600 mb-2">${escapeHtml(t.description || '暂无描述')}</p>
                   ${contractTools[t.name]?.policy?.purpose ? `<p class="text-xs text-slate-500 mb-2">调用目的：${escapeHtml(contractTools[t.name].policy.purpose)}</p>` : ''}
                   <p class="text-xs text-slate-500 mb-2">允许 Agent：${escapeHtml((contractTools[t.name]?.allowed_by || []).join('、') || '当前无正式运行时授权')}</p>
-                  <div class="flex items-center gap-2 mb-2">
-                    <label class="text-xs text-slate-500">ToolEffect</label>
-                    <select class="mcp-effect-select text-xs border border-slate-200 rounded-lg px-2 py-1 bg-white" data-tool-id="${t.id}">
-                      ${['read','create','update','delete','unknown'].map(value => `<option value="${value}" ${value === effect ? 'selected' : ''}>${value}</option>`).join('')}
-                    </select>
-                    <button class="mcp-effect-save text-xs px-2 py-1 rounded-lg bg-slate-800 text-white" data-tool-id="${t.id}">保存分类</button>
+                  <label class="block text-xs text-slate-500 mb-2">运行契约 JSON（effect / risk / 意图 / 触发词 / 参数映射 / 结果契约）
+                    <textarea class="mcp-runtime-contract mt-1 w-full font-mono text-[10px] border border-slate-200 rounded-lg p-2 bg-white" rows="12" data-tool-id="${t.id}">${escapeHtml(JSON.stringify(editableContract, null, 2))}</textarea>
+                  </label>
+                  <div class="flex items-center justify-between gap-2 mb-2">
+                    <span class="text-[10px] text-slate-500">read 可 model_native/auto_preinvoke；create/update 保存时强制 Proposal。</span>
+                    <button class="mcp-runtime-policy-save text-xs px-3 py-1.5 rounded-lg bg-slate-800 text-white" data-tool-id="${t.id}">保存运行契约</button>
                   </div>
                   ${t.input_schema ? `<pre class="text-[10px] bg-white rounded-lg p-2 border border-slate-200 overflow-x-auto">${escapeHtml(JSON.stringify(t.input_schema, null, 2))}</pre>` : ''}
                 </div>
               `}).join('')}</div>`;
           openDrawer(`${escapeHtml(server.name || 'MCP Server')} 工具列表`, body);
-          $$('.mcp-effect-save').forEach(button => {
+          $$('.mcp-runtime-policy-save').forEach(button => {
             button.addEventListener('click', async () => {
               const toolId = Number(button.dataset.toolId);
-              const select = document.querySelector(`.mcp-effect-select[data-tool-id="${toolId}"]`);
+              const input = document.querySelector(`.mcp-runtime-contract[data-tool-id="${toolId}"]`);
+              let payload;
               try {
-                await apiPut(`/api/mcp-servers/${serverId}/tools/${toolId}/policy`, { effect: select.value });
-                showToast('ToolEffect Draft 已保存；发布 RuntimeRelease 后生效');
+                payload = JSON.parse(input.value);
               } catch (err) {
-                showToast('ToolEffect 保存失败：' + (err.message || err), 'error');
+                showToast('运行契约必须是合法 JSON', 'error');
+                return;
+              }
+              try {
+                await apiPut(`/api/mcp-servers/${serverId}/tools/${toolId}/runtime-policy`, payload);
+                showToast('MCP 运行契约 Draft 已保存；发布后在下一新会话生效');
+              } catch (err) {
+                showToast('MCP 运行契约保存失败：' + (err.message || err), 'error');
               }
             });
           });
