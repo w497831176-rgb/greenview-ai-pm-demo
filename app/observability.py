@@ -913,8 +913,18 @@ async def cost_strategies():
                 "description": (
                     "业主-facing 对话始终使用 deepseek-v4-flash，控制常规流量成本；"
                     "deepseek-v4-pro 仅用于 Darwin 深度运营分析、A/B 测试等后台评估场景，"
-                    "避免高单价模型进入普通问答路径。"
+                    "避免高单价模型进入普通问答路径。实际节省只在同题质量门槛通过且"
+                    "Provider Usage 可比较时成立。"
                 ),
+                "mechanism": "published model policy",
+                "evidence_required": [
+                    "same question set",
+                    "quality baseline",
+                    "per-stage Provider Usage",
+                    "published price snapshot",
+                ],
+                "claim_policy": "Usage 不完整时只展示模型选择与单价差，不宣称精确节省。",
+                "status": "runtime_enforced_measurement_required",
                 "links": [
                     {"label": "模型配置", "href": "/platform/models"},
                     {"label": "A/B 测试", "href": "/platform/models/ab"},
@@ -925,8 +935,18 @@ async def cost_strategies():
                 "title": "RAG Top-K 与重排序控制上下文规模",
                 "description": (
                     "通过 retrieval_settings.top_k 限制召回片段数量，关闭不必要的重排序，"
-                    "减少输入到模型的上下文 token 量，从而降低单次调用估算成本。"
+                    "可以减少候选上下文；但只有答案质量不下降且 Provider Token 实测降低，"
+                    "候选配置才可以发布，不能把片段数下降直接写成成本下降。"
                 ),
+                "mechanism": "immutable retrieval policy in RuntimeRelease",
+                "evidence_required": [
+                    "baseline and candidate releases",
+                    "same question set",
+                    "citation and answer quality gate",
+                    "per-stage Provider Usage",
+                ],
+                "claim_policy": "检索预估不等于模型账单；质量下降或 Token 未降时拒绝候选。",
+                "status": "experiment_required",
                 "links": [
                     {"label": "检索设置", "href": "/platform/knowledge"},
                 ],
@@ -938,6 +958,14 @@ async def cost_strategies():
                     "只有被 Agent 显式绑定且触发条件命中的 Skill 才会注入到系统提示中；"
                     "未触发或未绑定的 Skill 不占用上下文，避免无意义 token 开销。"
                 ),
+                "mechanism": "bound-and-triggered progressive Skill loading",
+                "evidence_required": [
+                    "snapshot binding",
+                    "Skill activation Trace",
+                    "context composition or Provider Usage comparison",
+                ],
+                "claim_policy": "可证明未注入，但没有实测 Token 对照时不写固定节省量。",
+                "status": "runtime_enforced_measurement_required",
                 "links": [
                     {"label": "Agent 绑定", "href": "/platform/agents"},
                     {"label": "Skill 管理", "href": "/platform/skills"},
@@ -949,8 +977,18 @@ async def cost_strategies():
                 "description": (
                     "仅当用户问题命中 MCP 工具绑定的能力域时才初始化对应 Server；"
                     "每次调用进入 mcp_call_audits 并自动捕获失败 badcase，便于识别"
-                    "无效/高频失败工具，避免重复调用浪费 token。"
+                    "无效/高频失败工具。摘要收益必须用同一工具响应的原始长度、摘要长度"
+                    "和后续模型 Usage 验证。"
                 ),
+                "mechanism": "bound on-demand invocation plus audited summary",
+                "evidence_required": [
+                    "MCP invocation audit",
+                    "raw and summarized result sizes",
+                    "downstream Provider Usage",
+                    "answer quality gate",
+                ],
+                "claim_policy": "没有同一响应的实测对照时，不展示虚构的摘要 Token 节省。",
+                "status": "runtime_enforced_measurement_required",
                 "links": [
                     {"label": "MCP 审计", "href": "/platform/observability"},
                     {"label": "Badcase", "href": "/platform/badcases"},
