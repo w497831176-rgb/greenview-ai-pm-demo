@@ -234,7 +234,10 @@ async def preinvoke_read_tools(
                 continue
             started = time.time()
             try:
-                result = await asyncio.wait_for(function.entrypoint(arguments), timeout=8)
+                result = await asyncio.wait_for(
+                    function.entrypoint(**arguments),
+                    timeout=8,
+                )
                 business_status, result_summary = _business_status(result)
                 invocations.append(
                     ToolInvocation(
@@ -405,7 +408,10 @@ async def invoke_confirmed_write(
         if function is None or not getattr(function, "entrypoint", None):
             raise RuntimeError("approved MCP function was not exposed by discovery")
         started = time.time()
-        result = await asyncio.wait_for(function.entrypoint(arguments), timeout=12)
+        result = await asyncio.wait_for(
+            function.entrypoint(**arguments),
+            timeout=12,
+        )
         business_status, result_summary = _business_status(result)
         try:
             parsed = (

@@ -141,6 +141,27 @@ def _claims_business_success(text: str) -> bool:
     )
 
 
+def _record_citation_violations(
+    ledger: EvidenceLedger,
+    violations: List[Dict[str, Any]],
+) -> None:
+    for violation in violations:
+        code = str(violation.get("code") or "citation_violation")
+        metadata = {
+            key: value
+            for key, value in violation.items()
+            if key not in {"code", "detail"}
+        }
+        ledger.violation(
+            code,
+            str(
+                violation.get("detail")
+                or "Model citation was not present in the immutable EvidenceSet."
+            ),
+            **metadata,
+        )
+
+
 def _price_for_snapshot(snapshot_config: Dict[str, Any], model_id: str) -> Optional[Dict[str, Any]]:
     candidates = [
         item
@@ -1319,12 +1340,7 @@ class RuntimeCoordinator:
             full_content, evidence
         )
         state.citations = citations
-        for violation in citation_violations:
-            ledger.violation(
-                str(violation.get("code") or "citation_violation"),
-                "Model citation was not present in the immutable EvidenceSet.",
-                **violation,
-            )
+        _record_citation_violations(ledger, citation_violations)
 
         model_id = str(
             state.selected_agent.get("model_id")
