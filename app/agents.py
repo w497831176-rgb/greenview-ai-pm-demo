@@ -35,7 +35,8 @@ class AgentCreate(BaseModel):
     name: str
     description: str = ""
     instructions: Optional[str] = ""
-    system_prompt: Optional[str] = ""  # frontend alias for instructions
+    # Alias is optional; when omitted it must not erase ``instructions``.
+    system_prompt: Optional[str] = None
     category: Optional[str] = "vertical"  # "router" or "vertical"
     is_router: Optional[bool] = False  # frontend alias for category
     enabled: Optional[bool] = True

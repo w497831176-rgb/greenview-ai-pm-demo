@@ -58,28 +58,41 @@ def build_cost_entry(
     availability_note: str
     currency: Optional[str] = None
 
+    # A published price snapshot is evidence even when Usage is incomplete.
+    # Preserve it for audit while keeping amount/formula unavailable.
+    if price_row:
+        price_data = {
+            "price_snapshot_id": stable_id(
+                "price",
+                {
+                    "model_id": price_row.get("model_id"),
+                    "effective_date": price_row.get("effective_date"),
+                    "source_note": price_row.get("source_note"),
+                },
+            ),
+            "model_id": str(
+                price_row.get("model_id")
+                or response_model
+                or requested_model
+                or ""
+            ),
+            "currency": price_row.get("currency"),
+            "effective_date": price_row.get("effective_date"),
+            "input_price_per_1m": price_row.get("input_price_per_1m"),
+            "cached_input_price_per_1m": price_row.get(
+                "cached_input_price_per_1m"
+            ),
+            "output_price_per_1m": price_row.get("output_price_per_1m"),
+            "reasoning_price_per_1m": price_row.get(
+                "reasoning_price_per_1m"
+            ),
+            "source_note": price_row.get("source_note"),
+        }
+        price = PriceSnapshot.model_validate(price_data)
+
     if complete:
         source = UsageSource.PROVIDER_REPORTED_COMPLETE
-        if price_row:
-            price_data = {
-                "price_snapshot_id": stable_id(
-                    "price",
-                    {
-                        "model_id": price_row.get("model_id"),
-                        "effective_date": price_row.get("effective_date"),
-                        "source_note": price_row.get("source_note"),
-                    },
-                ),
-                "model_id": str(price_row.get("model_id") or response_model or requested_model or ""),
-                "currency": price_row.get("currency"),
-                "effective_date": price_row.get("effective_date"),
-                "input_price_per_1m": price_row.get("input_price_per_1m"),
-                "cached_input_price_per_1m": price_row.get("cached_input_price_per_1m"),
-                "output_price_per_1m": price_row.get("output_price_per_1m"),
-                "reasoning_price_per_1m": price_row.get("reasoning_price_per_1m"),
-                "source_note": price_row.get("source_note"),
-            }
-            price = PriceSnapshot.model_validate(price_data)
+        if price:
             required_prices = (
                 price.input_price_per_1m,
                 price.cached_input_price_per_1m,
@@ -105,10 +118,16 @@ def build_cost_entry(
             availability_note = "Provider usage 完整，但没有匹配的价格快照，金额不可得。"
     elif total_tokens is not None:
         source = UsageSource.PROVIDER_REPORTED_TOTAL_ONLY
-        availability_note = "Provider 仅返回总 Token；不推导输入/输出拆分，也不计算精确金额。"
+        availability_note = (
+            "Provider 仅返回总 Token；保留发布时价格快照，但不推导"
+            "输入/输出拆分，也不计算精确金额。"
+        )
     elif local_estimate_tokens is not None:
         source = UsageSource.LOCAL_ESTIMATE
-        availability_note = "仅有本地 Token 估算；用于容量观察，不作为实际 Usage 或金额。"
+        availability_note = (
+            "仅有本地 Token 估算；保留发布时价格快照，用于容量观察，"
+            "不作为实际 Usage 或金额。"
+        )
     elif provider_usage is None:
         source = UsageSource.UNAVAILABLE
         availability_note = "Provider 未返回 Usage，且没有本地估算；成本不可得。"
