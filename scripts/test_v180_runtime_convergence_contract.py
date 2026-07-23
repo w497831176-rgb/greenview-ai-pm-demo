@@ -18,7 +18,6 @@ TEMP_DIR = tempfile.TemporaryDirectory(
     ignore_cleanup_errors=True,
 )
 os.environ["PROPERTY_DATA_DIR"] = TEMP_DIR.name
-os.environ["RUNTIME_ENGINE"] = "v18"
 
 from app.runtime.acceptance import ACCEPTANCE_CASES
 from app.runtime.action_gateway import ActionGateway
@@ -1297,6 +1296,41 @@ def test_fixed_acceptance_matrix():
     assert all(required.issubset(case) for case in ACCEPTANCE_CASES)
 
 
+
+def test_owner_chat_runtime_is_single_track():
+    """Only RuntimeCoordinator may execute owner-chat business capabilities."""
+    legacy = (REPO_ROOT / "app" / "runtime" / "legacy_chat.py").read_text(
+        encoding="utf-8"
+    )
+    chat = (REPO_ROOT / "app" / "chat.py").read_text(encoding="utf-8")
+    settings = (REPO_ROOT / "app" / "settings.py").read_text(encoding="utf-8")
+    compose = (REPO_ROOT / "compose.yaml").read_text(encoding="utf-8")
+
+    assert "RuntimeCoordinator().stream" in legacy
+    for marker in (
+        "RUNTIME_ENGINE",
+        "_stream_v17_response",
+        "create_maintenance_agent",
+        "create_billing_agent",
+        "create_complaint_agent",
+        "create_customer_service_agent",
+        "ObservableMCPTools",
+    ):
+        assert marker not in legacy
+    assert "RUNTIME_ENGINE" not in settings
+    assert "RUNTIME_ENGINE" not in compose
+    assert "_policy_mcp_args" not in chat
+    assert "_unique_rag_results" not in chat
+
+    for retired in (
+        "maintenance.py",
+        "billing.py",
+        "complaint.py",
+        "customer_service.py",
+    ):
+        assert not (REPO_ROOT / "agents" / retired).exists()
+
+
 def main():
     tests = [
         test_release_and_snapshot_immutability,
@@ -1331,6 +1365,7 @@ def main():
         test_cost_strategy_claims_are_evidence_bound,
         test_platform_navigation_serializes_async_page_renders,
         test_multimodal_capability_is_retired,
+        test_owner_chat_runtime_is_single_track,
         test_fixed_acceptance_matrix,
     ]
     try:

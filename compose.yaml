@@ -33,9 +33,6 @@ services:
       - /volume3/docker/volumes/agno-demo-os/property-data:/app/data
     environment:
       - RUNTIME_ENV=dev
-      # One-switch rollback.  v18 is the converged runtime; v17 keeps the
-      # isolated frozen adapter available during the acceptance window.
-      - RUNTIME_ENGINE=${RUNTIME_ENGINE:-v18}
       - AGNO_DEBUG=True
       - PYTHONPATH=/app
       - AGENTOS_URL=http://127.0.0.1:8000
