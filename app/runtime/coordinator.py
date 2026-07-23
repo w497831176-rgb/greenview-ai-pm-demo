@@ -1456,7 +1456,20 @@ class RuntimeCoordinator:
             # final metrics.  Capture its metrics but do not append its content
             # a second time.
             if content and "completed" not in event_name:
-                full_content += str(content)
+                content_delta = str(content)
+                full_content += content_delta
+                # Stream model text immediately as provisional UI content.
+                # Citation validation still happens against the complete answer
+                # below; the authoritative final event replaces this text.
+                yield _sse(
+                    "delta",
+                    {
+                        "content": content_delta,
+                        "provisional": True,
+                        "current_agent": state.selected_agent.get("name"),
+                        "current_agent_id": selected,
+                    },
+                )
             for call in _extract_tool_calls(chunk):
                 if call not in tool_calls:
                     tool_calls.append(call)
@@ -1738,12 +1751,14 @@ class RuntimeCoordinator:
             )
             ledger.persist("complete")
 
-        # Buffering until citation validation is intentional: the answer text,
-        # final citations and clickable snapshots are emitted from one structure.
+        # Replace provisional stream text with the citation-validated answer.
+        # This preserves one authoritative EvidenceSet for final text,
+        # citations, clickable snapshots and Trace retrieval evidence.
         yield _sse(
-            "delta",
+            "final",
             {
                 "content": rendered,
+                "citations": citations_payload,
                 "current_agent": state.selected_agent.get("name"),
                 "current_agent_id": selected,
             },
@@ -1763,6 +1778,7 @@ class RuntimeCoordinator:
                 "current_agent_id": selected,
                 "route_intent": selected,
                 "route_reason": route.reason,
+                "content": rendered,
                 "citations": citations_payload,
                 "activated_skills": skills_payload,
                 "tool_calls": tool_calls,
