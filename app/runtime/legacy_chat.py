@@ -33,7 +33,6 @@ from app.mcp_policy import (
     is_builtin_policy_server,
     outcome_instruction,
 )
-from app.multimodal import get_analysis_context, normalise_analysis_ids
 from app.settings import MODEL_ID, USE_THINKING, build_model
 from app.skill_runtime import activation_evidence, select_skills, skill_contract
 from app.utils.cost_utils import build_price_snapshot, compute_cost_cny, normalize_usage
@@ -1345,7 +1344,6 @@ class ChatRequest(BaseModel):
     message: str
     session_id: Optional[str] = None
     user_id: Optional[str] = None
-    image_analysis_ids: List[str] = []
 
 
 class FeedbackRequest(BaseModel):
@@ -1403,7 +1401,6 @@ async def _stream_v17_response(
     message: str,
     session_id: str,
     user_id: str,
-    image_analysis_ids: Optional[List[str]] = None,
 ) -> AsyncIterator[str]:
     """Run the agent with streaming and yield SSE events."""
 
@@ -1437,13 +1434,7 @@ async def _stream_v17_response(
         # Persist the user message before invoking the agent.
         save_chat_message(session_id=session_id, role="user", content=message, trace_id=trace_id)
 
-        # Kimi is invoked by the dedicated image endpoint before this text chain.
-        # Only its compact structured output is injected here; the Flash router
-        # and vertical Agent never receive raw image bytes or get to treat OCR as
-        # a system instruction.  A missing/invalid id simply contributes no
-        # image context, rather than inventing visual evidence.
-        image_context = get_analysis_context(normalise_analysis_ids(image_analysis_ids))
-        message_for_agent = f"{message}{image_context}"
+        message_for_agent = message
 
         # Human collaboration is controlled by deterministic policy, not by a
         # model sentence.  It makes the accountability boundary explainable and
@@ -2190,7 +2181,6 @@ async def _stream_agent_response(
     message: str,
     session_id: str,
     user_id: str,
-    image_analysis_ids: Optional[List[str]] = None,
 ) -> AsyncIterator[str]:
     """Select the runtime engine once at the transport boundary.
 
@@ -2198,17 +2188,13 @@ async def _stream_agent_response(
     authority and never branches back into individual legacy helpers.
     """
     if os.getenv("RUNTIME_ENGINE", "v18").strip().lower() == "v17":
-        async for event in _stream_v17_response(
-            message, session_id, user_id, image_analysis_ids
-        ):
+        async for event in _stream_v17_response(message, session_id, user_id):
             yield event
         return
 
     from app.runtime.coordinator import RuntimeCoordinator
 
-    async for event in RuntimeCoordinator().stream(
-        message, session_id, user_id, image_analysis_ids
-    ):
+    async for event in RuntimeCoordinator().stream(message, session_id, user_id):
         yield event
 
 
@@ -2220,7 +2206,7 @@ async def chat_stream(request: ChatRequest):
     user_id = request.user_id or "web-user"
 
     return StreamingResponse(
-        _stream_agent_response(request.message, session_id, user_id, request.image_analysis_ids),
+        _stream_agent_response(request.message, session_id, user_id),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
@@ -2242,7 +2228,7 @@ async def chat_stream_get(
     user_id = user_id or "web-user"
 
     return StreamingResponse(
-        _stream_agent_response(message, session_id, user_id, None),
+        _stream_agent_response(message, session_id, user_id),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",

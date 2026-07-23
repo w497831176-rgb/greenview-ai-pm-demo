@@ -1,5 +1,8 @@
 # YIAI物业 V1.2｜AI 能力矩阵与演示证据计划
 
+> 历史说明：本文保留 V1.2 能力演进记录。当前面试范围以 V1.8 四目标文档和
+> ADR-0005 为准；图片上传、Vision/OCR 与多模态报修已主动退役，不再规划或演示。
+>
 > 本文档用于面试准备和版本验收，明确每项能力的用户入口、涉及模块、技术原理、固定测试案例、演示证据和当前状态。  
 > 状态说明：
 > - `implemented_pending`：已实现，待环境修复后跑固定案例验证
@@ -14,13 +17,10 @@
 |------|------|------------|----------|
 | `deepseek-v4-flash` | 默认文本 Router 与常规垂直 Agent 主力模型；低成本、低延迟、开 reasoning | `app/settings.py` 默认 `MODEL`；`app/model_configs.py` 默认配置 | 已接入 |
 | `deepseek-v4-pro` | 复杂文本任务、Badcase/Darwin 深度分析、Flash/Pro A/B 对比 | `app/model_configs.py` `/ab-test` 默认 `model_b`；`badcases.py` 的 `switch-model-retry` | 已接入 |
-| `kimi-k2.6` | 仅用于图片/视频理解，不作为默认聊天模型 | 当前代码中 **未接入** | next_version |
 
 **关键约束**：
-- Flash Router 不接收图片；V1.3 多模态链路中，图片先由媒体网关判断 `has_image` + MIME=image/*，再送入 `kimi-k2.5`/`kimi-k2.6` 视觉模型。
-- 视觉模型输出结构化 `vision_result`（故障物、故障类型、位置、严重程度、置信度、route_intent、待补充字段）。
-- Flash Router 接收的是「用户文本 + vision_result 文本摘要」，再统一路由到维修/费用/投诉/客服/物业 Agent。
-- 仅当消息带图片附件时才调用视觉模型；图片压缩、分辨率上限、低置信度追问均为 V1.3 成本与体验控制策略。
+- 当前业主聊天只接受文本输入。
+- 模型分层、Token 与成本治理只覆盖四目标所需的文本运行链。
 
 ---
 
@@ -132,16 +132,14 @@
 
 ---
 
-## 9. 多模态报修（V1.3 规划）
+## 9. 已退役范围：多模态 Vision
 
 | 项目 | 说明 |
 |------|------|
-| **用户入口** | 业主 Tab → AI 助手 → 图片上传按钮（V1.3 实现） |
-| **涉及模块/API** | 前端图片上传组件、媒体网关、`kimi-k2.6` 视觉模型、`app/chat.py`、工单创建工具 |
-| **技术原理** | 媒体网关（非 LLM）根据 `has_image` 与 MIME=image/* 判断是否进入视觉链路；图片经压缩后送入 `kimi-k2.6` 输出结构化 `vision_result`；Flash Router 接收用户文本 + vision_result 文本摘要，统一路由到对应垂直 Agent；维修 Agent 依据 vision_result 预填工单字段。 |
-| **固定测试案例 ID** | V-01 ~ V-03 |
-| **演示证据** | V1.3 验收：上传吊灯不亮照片 → AI 返回「检测到客厅主灯不亮，可能为灯泡/线路故障，已预填工单」→ 用户确认后创建工单。 |
-| **状态** | next_version |
+| **决策** | ADR-0005：从当前产品、运行时和面试演示范围退役 |
+| **已移除** | 图片上传/预览、Kimi Vision API、聊天图片上下文、相关环境变量 |
+| **数据处理** | 历史表和资产非破坏性保留，但应用不再创建、读取或暴露 |
+| **状态** | retired |
 
 ---
 
@@ -157,10 +155,10 @@
 | MCP / Tool | implemented_pending | tool_calls 节点 | 模型调用超时待修复；当前仅 stdio 方式 |
 | Badcase 闭环 | implemented_pending | Badcase 库 + 复测按钮 | 模型调用超时待修复 |
 | 人机协同与状态持久化 | implemented_pending | 工单状态流转、handoff 会话 | 模型调用超时待修复 |
-| 多模态报修 | next_version | — | V1.3 规划；kimi-k2.6 当前未接入 |
+| 多模态 Vision | retired | ADR-0005 | 不属于当前四目标，不再演示 |
 
 ---
 
 ## 面试表述建议
 
-> "V1.2 已经实现了前 8 项能力，覆盖了物业 AI 助手所需的核心 Agent、Skill、RAG、MCP、模型 A/B、Badcase 和工单协同；多模态报修明确放到 V1.3。当前唯一阻塞是测试环境的模型调用超时，修复后跑一遍固定测试集，8 项能力均可验证。"
+> "当前演示聚焦四个可验证目标：能力实时命中、能力实时新增、能力优化闭环和能力成本治理。多模态 Vision 已主动退役，以减少与四目标无关的复杂度。"
