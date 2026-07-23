@@ -219,7 +219,7 @@
     // ==========================================
     const API_BASE = '';
     const DEFAULT_ROOM_ID = '3-2-1201';
-    const APP_VERSION = 'V1.8.1-rc.1';
+    const APP_VERSION = 'V1.8.1-rc.3';
 
     const STATE = {
       topTab: 'owner',
@@ -1512,11 +1512,17 @@
         const reader = response.body.getReader();
         const decoder = new TextDecoder();
         let buffer = '';
+        let receivedDone = false;
 
         while (true) {
           const { done, value } = await reader.read();
-          if (done) break;
-          buffer += decoder.decode(value, { stream: true });
+          if (value) buffer += decoder.decode(value, { stream: !done });
+          if (done) buffer += decoder.decode();
+          buffer = buffer.replace(/\r\n/g, '\n');
+          // Some proxies close immediately after the final SSE record and may
+          // omit the last empty line. Treat the remaining complete record as a
+          // final event instead of leaving the typing indicator forever.
+          if (done && buffer.trim() && !buffer.endsWith('\n\n')) buffer += '\n\n';
 
           // Extract complete SSE events split by double newlines.
           const events = [];
@@ -1557,10 +1563,25 @@
               };
               const statusEl = placeholder.querySelector('.ai-message-route-status');
               if (statusEl) statusEl.textContent = `路由：${data.reason || data.intent || ''} → ${data.current_agent || ''}`;
+            } else if (eventType === 'progress') {
+              const progressLabels = {
+                'rag.retrieve': '正在检索知识库…',
+                'mcp.invoke': '正在调用已绑定工具…',
+                'model.invoke': '正在生成回复…'
+              };
+              const statusEl = placeholder.querySelector('.ai-message-tool-status');
+              if (statusEl) statusEl.textContent = progressLabels[data.stage] || '正在处理…';
             } else if (eventType === 'delta') {
               if (data.current_agent && STATE.currentRoute) STATE.currentRoute.current_agent = data.current_agent;
               if (data.current_agent_id && STATE.currentRoute) STATE.currentRoute.current_agent_id = data.current_agent_id;
               accumulated += (data.content || '');
+              updateAiMessage(accumulated);
+            } else if (eventType === 'final') {
+              if (data.current_agent && STATE.currentRoute) STATE.currentRoute.current_agent = data.current_agent;
+              if (data.current_agent_id && STATE.currentRoute) STATE.currentRoute.current_agent_id = data.current_agent_id;
+              if (typeof data.content === 'string') accumulated = data.content;
+              const statusEl = placeholder.querySelector('.ai-message-tool-status');
+              if (statusEl) statusEl.textContent = '';
               updateAiMessage(accumulated);
             } else if (eventType === 'tool_calls') {
               if (data.current_agent && STATE.currentRoute) STATE.currentRoute.current_agent = data.current_agent;
@@ -1569,6 +1590,10 @@
               const statusEl = placeholder.querySelector('.ai-message-tool-status');
               if (statusEl) statusEl.textContent = toolNames ? `调用工具：${toolNames}` : '';
             } else if (eventType === 'done') {
+              receivedDone = true;
+              if (typeof data.content === 'string') accumulated = data.content;
+              const statusEl = placeholder.querySelector('.ai-message-tool-status');
+              if (statusEl && !statusEl.textContent.startsWith('调用工具：')) statusEl.textContent = '';
               updateAiMessage(
                 accumulated,
                 true,
@@ -1597,10 +1622,16 @@
               loadChatSessions().then(() => refreshSidebar());
               STATE.currentTraceId = null;
             } else if (eventType === 'error') {
+              receivedDone = true;
               accumulated += `\n\n[错误: ${data.error}]`;
               updateAiMessage(accumulated, true);
             }
           }
+          if (done) break;
+        }
+
+        if (!receivedDone) {
+          throw new Error('流式连接提前结束，回复未完整送达，请重试');
         }
       } catch (err) {
         console.error('Chat error:', err);
