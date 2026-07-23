@@ -219,7 +219,7 @@
     // ==========================================
     const API_BASE = '';
     const DEFAULT_ROOM_ID = '3-2-1201';
-    const APP_VERSION = 'V1.8.1-rc.4';
+    const APP_VERSION = 'V1.8.1-rc.5';
 
     const STATE = {
       topTab: 'owner',
@@ -1485,6 +1485,68 @@
       if (container) container.scrollTop = container.scrollHeight;
     }
 
+    function finalizeCurrentAiMessage(data = {}) {
+      const route = STATE.currentRoute || {};
+      STATE.currentRoute = {
+        intent: data.route_intent || route.intent || '',
+        reason: data.route_reason || route.reason || '',
+        current_agent: data.current_agent || route.current_agent || '',
+        current_agent_id: data.current_agent_id || route.current_agent_id || ''
+      };
+      const current = STATE.currentAiMessage;
+      if (current) {
+        const progressEl = current.querySelector('.ai-message-tool-status');
+        if (progressEl) progressEl.textContent = '';
+        // The live route line is a running-state aid.  Once completed, the
+        // same route reason is rendered in the durable footer tags and Trace,
+        // which makes live and restored history visually consistent.
+        const routeEl = current.querySelector('.ai-message-route-status');
+        if (routeEl) routeEl.textContent = '';
+      }
+      updateAiMessage(
+        data.content || '',
+        true,
+        data.token_count || 0,
+        data.round_token_count || data.token_count || 0,
+        data.message_id || data.id || null,
+        data.token_detail || null,
+        data.citations || null,
+        data.activated_skills || null,
+        data.tool_calls || null,
+        data.current_agent || STATE.currentRoute.current_agent || null,
+        data.model_id || '',
+        data.thinking_enabled || false,
+        data.model_selection_reason || '',
+        data.trace_id || STATE.currentTraceId || '',
+        data.mcp_calls || null,
+        data.usage_source || '',
+        data.current_agent_id || STATE.currentRoute.current_agent_id || ''
+      );
+    }
+
+    async function recoverPersistedAssistantMessage(traceId) {
+      if (!STATE.chatSessionId) return null;
+      const delays = [0, 250, 750];
+      for (const delay of delays) {
+        if (delay) await new Promise(resolve => setTimeout(resolve, delay));
+        try {
+          const res = await fetch(`${API_BASE}/api/chat/history?session_id=${encodeURIComponent(STATE.chatSessionId)}`, {
+            cache: 'no-store'
+          });
+          if (!res.ok) continue;
+          const payload = await res.json();
+          const assistants = (payload.messages || []).filter(msg => msg.role === 'assistant');
+          const matched = traceId
+            ? assistants.slice().reverse().find(msg => msg.trace_id === traceId)
+            : assistants[assistants.length - 1];
+          if (matched && matched.content && matched.status !== 'failed') return matched;
+        } catch (err) {
+          console.warn('Stream reconciliation attempt failed:', err);
+        }
+      }
+      return null;
+    }
+
     async function sendChatMessage(text) {
       appendUserMessage(text);
       STATE.chatStreaming = true;
@@ -1513,6 +1575,7 @@
         const decoder = new TextDecoder();
         let buffer = '';
         let receivedDone = false;
+        let finalPayload = null;
 
         while (true) {
           const { done, value } = await reader.read();
@@ -1580,6 +1643,7 @@
               if (data.current_agent && STATE.currentRoute) STATE.currentRoute.current_agent = data.current_agent;
               if (data.current_agent_id && STATE.currentRoute) STATE.currentRoute.current_agent_id = data.current_agent_id;
               if (typeof data.content === 'string') accumulated = data.content;
+              finalPayload = data;
               const statusEl = placeholder.querySelector('.ai-message-tool-status');
               if (statusEl) statusEl.textContent = '';
               updateAiMessage(accumulated);
@@ -1592,27 +1656,7 @@
             } else if (eventType === 'done') {
               receivedDone = true;
               if (typeof data.content === 'string') accumulated = data.content;
-              const statusEl = placeholder.querySelector('.ai-message-tool-status');
-              if (statusEl && !statusEl.textContent.startsWith('调用工具：')) statusEl.textContent = '';
-              updateAiMessage(
-                accumulated,
-                true,
-                data.token_count || 0,
-                data.round_token_count || data.token_count || 0,
-                data.message_id || null,
-                data.token_detail || null,
-                data.citations || null,
-                data.activated_skills || null,
-                data.tool_calls || null,
-                data.current_agent || (STATE.currentRoute && STATE.currentRoute.current_agent) || null,
-                data.model_id || '',
-                data.thinking_enabled || false,
-                data.model_selection_reason || '',
-                data.trace_id || STATE.currentTraceId || '',
-                data.mcp_calls || null,
-                data.usage_source || '',
-                data.current_agent_id || (STATE.currentRoute && STATE.currentRoute.current_agent_id) || ''
-              );
+              finalizeCurrentAiMessage({ ...data, content: accumulated });
               if (data.handoff) {
                 const handoffStatus = data.handoff_state || data.handoff_status || 'requested';
                 STATE.chatHandoff = ['requested', 'active', 'waiting_user'].includes(handoffStatus);
@@ -1631,7 +1675,25 @@
         }
 
         if (!receivedDone) {
-          throw new Error('流式连接提前结束，回复未完整送达，请重试');
+          const recovered = await recoverPersistedAssistantMessage(STATE.currentTraceId);
+          if (recovered) {
+            accumulated = recovered.content || accumulated;
+            finalizeCurrentAiMessage(recovered);
+            receivedDone = true;
+            loadChatSessions().then(() => refreshSidebar());
+            STATE.currentTraceId = null;
+          } else if (finalPayload && typeof finalPayload.content === 'string') {
+            accumulated = finalPayload.content;
+            finalizeCurrentAiMessage({
+              ...finalPayload,
+              content: accumulated,
+              trace_id: STATE.currentTraceId || ''
+            });
+            receivedDone = true;
+            STATE.currentTraceId = null;
+          } else {
+            throw new Error('流式连接提前结束，且未找到已持久化的完整回复，请重试');
+          }
         }
       } catch (err) {
         console.error('Chat error:', err);

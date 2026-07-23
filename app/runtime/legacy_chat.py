@@ -199,6 +199,12 @@ async def _stream_agent_response(
 
     async for event in RuntimeCoordinator().stream(message, session_id, user_id):
         yield event
+    # Keep the semantic terminal event away from the physical end of the HTTP
+    # response. Synology's TLS reverse proxy has been observed to discard the
+    # final upstream chunk even with proxy_buffering disabled. SSE comments are
+    # ignored by clients, so this padding absorbs that transport quirk without
+    # inventing another business event.
+    yield ": transport-flush " + (" " * 4096) + "\n\n"
 
 
 @router.post("/stream")
