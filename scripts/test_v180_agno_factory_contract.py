@@ -17,7 +17,6 @@ TEMP_DIR = tempfile.TemporaryDirectory(
     ignore_cleanup_errors=True,
 )
 os.environ["PROPERTY_DATA_DIR"] = TEMP_DIR.name
-os.environ["RUNTIME_ENGINE"] = "v18"
 
 from agno.factory import RequestContext
 

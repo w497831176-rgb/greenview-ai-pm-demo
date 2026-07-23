@@ -1,7 +1,7 @@
 """No-model contract test for V1.5 Agent workflow and MCP argument policy."""
 
 from app import work_order_workflow as workflow
-from app.chat import _policy_mcp_args
+from app.runtime.legacy_contract_helpers import _policy_mcp_args
 
 
 drafts = {}

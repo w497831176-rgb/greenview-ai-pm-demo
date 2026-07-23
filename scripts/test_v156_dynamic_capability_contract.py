@@ -6,7 +6,7 @@ Run inside demo-os-api.  It never opens an SSE stream or calls a provider.
 from pathlib import Path
 
 from agents.router import _capability_fallback
-from app.chat import _unique_rag_results
+from app.runtime.legacy_contract_helpers import _unique_rag_results
 from app.mcp_policy import allowed_tools_for_agent
 
 

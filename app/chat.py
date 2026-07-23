@@ -1,20 +1,14 @@
 """Thin owner-chat transport adapter.
 
-All compatibility endpoints and the SSE wire format remain in the isolated
-legacy adapter during the V1.8 migration.  Runtime authority is selected once
-there and delegated to :class:`app.runtime.coordinator.RuntimeCoordinator`.
+The SSE wire format and compatibility endpoints remain stable while all
+business execution delegates to :class:`app.runtime.coordinator.RuntimeCoordinator`.
 No routing, RAG, Skill, Tool, business-write, citation or cost decisions live
 in this transport module.
 """
 
 from typing import AsyncIterator
 
-from app.runtime.legacy_chat import (
-    _policy_mcp_args,
-    _stream_agent_response,
-    _unique_rag_results,
-    router,
-)
+from app.runtime.legacy_chat import _stream_agent_response, router
 
 
 async def stream_chat_response(
@@ -31,9 +25,4 @@ async def stream_chat_response(
         yield chunk
 
 
-__all__ = [
-    "router",
-    "stream_chat_response",
-    "_policy_mcp_args",
-    "_unique_rag_results",
-]
+__all__ = ["router", "stream_chat_response"]
