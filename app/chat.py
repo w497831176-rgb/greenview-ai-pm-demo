@@ -7,7 +7,7 @@ No routing, RAG, Skill, Tool, business-write, citation or cost decisions live
 in this transport module.
 """
 
-from typing import AsyncIterator, List, Optional
+from typing import AsyncIterator
 
 from app.runtime.legacy_chat import (
     _policy_mcp_args,
@@ -21,14 +21,12 @@ async def stream_chat_response(
     message: str,
     session_id: str,
     user_id: str,
-    image_analysis_ids: Optional[List[str]] = None,
 ) -> AsyncIterator[str]:
     """Public in-process adapter for chat retest and evaluation consumers."""
     async for chunk in _stream_agent_response(
         message,
         session_id,
         user_id,
-        image_analysis_ids,
     ):
         yield chunk
 

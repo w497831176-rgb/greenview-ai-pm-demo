@@ -400,9 +400,7 @@ class RuntimeCoordinator:
         message: str,
         session_id: str,
         user_id: str,
-        image_analysis_ids: Optional[List[str]] = None,
     ) -> AsyncIterator[str]:
-        del image_analysis_ids  # V1.8 multimodal stays on its dedicated endpoint.
         trace_id = uuid.uuid4().hex[:16]
         run_id = f"run_{uuid.uuid4().hex}"
         started = time.time()

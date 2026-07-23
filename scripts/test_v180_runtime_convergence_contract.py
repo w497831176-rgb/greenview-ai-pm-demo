@@ -1206,8 +1206,7 @@ def test_platform_navigation_serializes_async_page_renders():
     assert "await renderContent();" in frontend
     expected_async_dispatches = [
         "await renderMyOrdersPage(main)",
-        "await renderStaffOrdersPage(main, '待派单', 'pending')",
-        "await renderProcessingOrdersPage(main)",
+        "await renderStaffWorkOrdersPage(main)",
         "await renderHandoffPage(main)",
         "await renderRuntimePage(main)",
         "await renderAgentsPage(main)",
@@ -1222,6 +1221,54 @@ def test_platform_navigation_serializes_async_page_renders():
     ]
     for dispatch in expected_async_dispatches:
         assert dispatch in frontend
+    assert "{ id: 'work-orders', label: '工单管理'" in frontend
+    assert "data-order-view=" in frontend
+    assert "const STAFF_ORDER_VIEWS =" in frontend
+    assert "{ id: 'pending-orders'" not in frontend
+    assert "{ id: 'processing-orders'" not in frontend
+    assert "{ id: 'history-orders'" not in frontend
+    for capability_menu in ("agents", "skills", "mcp", "knowledge"):
+        assert f"{{ id: '{capability_menu}'" in frontend
+    assert "{ id: 'capabilities'" not in frontend
+
+
+def test_multimodal_capability_is_retired():
+    """Vision must not remain as a hidden API, chat field or UI path."""
+    assert not (REPO_ROOT / "app" / "multimodal.py").exists()
+    sources = {
+        "main": (REPO_ROOT / "app" / "main.py").read_text(encoding="utf-8"),
+        "chat": (REPO_ROOT / "app" / "chat.py").read_text(encoding="utf-8"),
+        "legacy": (
+            REPO_ROOT / "app" / "runtime" / "legacy_chat.py"
+        ).read_text(encoding="utf-8"),
+        "coordinator": (
+            REPO_ROOT / "app" / "runtime" / "coordinator.py"
+        ).read_text(encoding="utf-8"),
+        "frontend": (
+            REPO_ROOT / "frontend" / "index.html"
+        ).read_text(encoding="utf-8"),
+        "compose": (REPO_ROOT / "compose.yaml").read_text(encoding="utf-8"),
+    }
+    forbidden = {
+        "main": ["app.multimodal", "multimodal_router"],
+        "chat": ["image_analysis_ids"],
+        "legacy": ["image_analysis_ids", "get_analysis_context"],
+        "coordinator": ["image_analysis_ids"],
+        "frontend": [
+            "/api/multimodal",
+            "chat-image-picker",
+            "chat-image-input",
+            "image_analysis_ids",
+            "Kimi",
+        ],
+        "compose": ["KIMI_API_KEY", "KIMI_BASE_URL", "KIMI_MODEL_ID"],
+    }
+    for source_name, markers in forbidden.items():
+        for marker in markers:
+            assert marker not in sources[source_name], (
+                source_name,
+                marker,
+            )
 
 
 def test_fixed_acceptance_matrix():
@@ -1283,6 +1330,7 @@ def main():
         test_only_published_model_native_tools_enter_agno_loop,
         test_cost_strategy_claims_are_evidence_bound,
         test_platform_navigation_serializes_async_page_renders,
+        test_multimodal_capability_is_retired,
         test_fixed_acceptance_matrix,
     ]
     try:
