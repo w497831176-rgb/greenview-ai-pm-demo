@@ -32,6 +32,10 @@ _GENERIC_BIGRAMS = {
     "信息",
     "数据",
 }
+_CRITICAL_VALUE = re.compile(
+    r"(?:\d+(?:\.\d+)?|[一二三四五六七八九十百千万两半]+)\s*"
+    r"(?:分钟|小时|工作日|天|元|万元|%|次|年|个月|月|日)"
+)
 
 
 def _semantic_bigrams(text: str) -> Set[str]:
@@ -41,6 +45,39 @@ def _semantic_bigrams(text: str) -> Set[str]:
         for index in range(len(chars) - 1)
         if chars[index] + chars[index + 1] not in _GENERIC_BIGRAMS
     }
+
+
+def _critical_values(text: str) -> Set[str]:
+    """Extract policy-sensitive time, money, percentage and count values."""
+    return {
+        re.sub(r"\s+", "", match.group(0)).lower()
+        for match in _CRITICAL_VALUE.finditer(text or "")
+    }
+
+
+def _is_structural_content(content: str, title: str = "") -> bool:
+    raw = (content or "").strip()
+    if (
+        "\n" not in raw
+        and len(raw) <= 40
+        and raw.endswith(("：", ":"))
+        and not re.search(r"\d", raw)
+        and not re.search(r"[。！？；]", raw)
+    ):
+        return True
+    normalized = re.sub(r"[^\u4e00-\u9fffA-Za-z0-9]", "", raw).lower()
+    title_normalized = re.sub(r"[^\u4e00-\u9fffA-Za-z0-9]", "", title or "").lower()
+    if not normalized:
+        return True
+    if title_normalized and normalized == title_normalized:
+        return True
+    return bool(
+        "\n" not in raw
+        and re.fullmatch(
+            r"第[0-9一二三四五六七八九十百]+[章节篇部].{0,24}|[总附]则",
+            normalized,
+        )
+    )
 
 
 def _citation_context(answer: str, match: re.Match) -> str:
@@ -70,10 +107,11 @@ def _citation_context(answer: str, match: re.Match) -> str:
 
 
 def _citation_is_supported(context: str, evidence: EvidenceItem) -> bool:
-    overlap = _semantic_bigrams(context) & _semantic_bigrams(
-        evidence.content_snapshot
-    )
-    return len(overlap) >= 2
+    context_terms = _semantic_bigrams(context)
+    evidence_terms = _semantic_bigrams(evidence.content_snapshot)
+    overlap = context_terms & evidence_terms
+    denominator = max(1, min(len(context_terms), len(evidence_terms)))
+    return len(overlap) >= 2 and len(overlap) / denominator >= 0.12
 
 
 def build_evidence_set(
@@ -96,6 +134,9 @@ def build_evidence_set(
             continue
         content = str(result.get("content") or result.get("chunk_text") or "")
         if not content:
+            continue
+        title = str(result.get("doc_title") or result.get("title") or "")
+        if _is_structural_content(content, title):
             continue
         chunk_index = int(result.get("chunk_index") or 0)
         chunk_digest = str(result.get("chunk_hash") or content_hash(content))
@@ -146,7 +187,7 @@ def build_evidence_set(
                     float(result["score"]) if result.get("score") is not None else None
                 ),
                 retrieval_mode=retrieval_mode or "unknown",
-                title=str(result.get("doc_title") or result.get("title") or ""),
+                title=title,
             )
         )
     return EvidenceSet(items=items, query=query, retrieval_status=retrieval_status)
@@ -154,11 +195,18 @@ def build_evidence_set(
 
 def prompt_evidence_allowlist(evidence: EvidenceSet) -> str:
     if not evidence.items:
-        return "本次没有可引用的检索证据。不得生成引用标记。"
+        return (
+            "本次没有可引用的检索证据。不得生成引用标记。"
+            "对于制度、时效、收费、权限、流程和安全责任，不得给出确定性结论，"
+            "不得将“未检索到”说成“文档没有规定”，也不得补充行业经验、数字或步骤。"
+        )
     lines = [
         "只能使用以下完整 evidence_id 引用，格式为 [[evidence:ev_xxx]]；"
         "不得省略 `ev_` 前缀、不得自行编造 ID。凡使用证据中的事实，"
-        "必须在对应句末放置标记；用户明确要求引用时至少引用一条匹配证据："
+        "必须在对应句末放置标记；用户明确要求引用时至少引用一条匹配证据。",
+        "制度、时效、收费、权限、流程和安全责任只能依据下列证据回答；"
+        "数字、时间、金额、条件和规则必须由同一句末的引用直接支持。"
+        "证据未覆盖的部分必须明确说无法确认，不得用行业常识补全：",
     ]
     for item in evidence.items:
         lines.append(
@@ -176,6 +224,7 @@ def render_citations(
     by_id = evidence.by_id()
     ordered_ids: List[str] = []
     violations: List[Dict[str, Any]] = []
+    grounded_critical_values: Set[str] = set()
 
     def replace_id(match: re.Match) -> str:
         evidence_id = match.group(1).strip()
@@ -206,6 +255,20 @@ def render_citations(
                 }
             )
             return ""
+        context_values = _critical_values(context)
+        evidence_values = _critical_values(by_id[evidence_id].content_snapshot)
+        unsupported_values = sorted(context_values - evidence_values)
+        if unsupported_values:
+            violations.append(
+                {
+                    "code": "unsupported_critical_value",
+                    "evidence_id": evidence_id,
+                    "values": unsupported_values,
+                    "claim_context": context[:240],
+                }
+            )
+            return ""
+        grounded_critical_values.update(context_values)
         if evidence_id not in ordered_ids:
             ordered_ids.append(evidence_id)
         return f"【引用{ordered_ids.index(evidence_id) + 1}】"
@@ -236,6 +299,16 @@ def render_citations(
         return ""
 
     rendered = UNSTRUCTURED_MARKER.sub(remove_unstructured_marker, rendered)
+    ungrounded_values = sorted(
+        _critical_values(answer or "") - grounded_critical_values
+    )
+    if ungrounded_values:
+        violations.append(
+            {
+                "code": "ungrounded_critical_value",
+                "values": ungrounded_values,
+            }
+        )
     citations: List[Citation] = []
     for index, evidence_id in enumerate(ordered_ids, start=1):
         item = by_id[evidence_id]
