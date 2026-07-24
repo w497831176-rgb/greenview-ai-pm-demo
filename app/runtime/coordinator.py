@@ -78,6 +78,26 @@ PROVIDER_FAILURE_MARKERS = (
     "authentication fails",
 )
 PROVIDER_FAILURE_PUBLIC_MESSAGE = "模型服务暂时不可用，请稍后重试或检查模型账户状态。"
+STRUCTURED_WORKORDER_TOOLS = {
+    "get_my_work_order_by_id",
+    "get_my_recent_work_orders",
+    "count_my_open_work_orders",
+    "count_work_orders",
+}
+KNOWLEDGE_EVIDENCE_TERMS = (
+    "规定",
+    "制度",
+    "流程",
+    "时效",
+    "承诺",
+    "标准",
+    "依据",
+    "引用",
+    "怎么办",
+    "如何处理",
+    "允许",
+    "收费",
+)
 
 
 class ProviderFailureError(RuntimeError):
@@ -107,6 +127,29 @@ def _provider_failure_prefix(text: str) -> bool:
     if not normalized:
         return False
     return any(marker.startswith(normalized) for marker in PROVIDER_FAILURE_MARKERS)
+
+
+def _is_structured_realtime_query(
+    message: str,
+    read_tool_plans: List[Any],
+) -> bool:
+    """Identify a Tool-only realtime query without building a generic planner."""
+
+    has_workorder_tool = any(
+        str(getattr(plan, "server_name", "")) == "workorder-server"
+        and str(getattr(plan, "tool_name", "")) in STRUCTURED_WORKORDER_TOOLS
+        for plan in read_tool_plans
+    )
+    needs_knowledge = any(
+        term in str(message or "") for term in KNOWLEDGE_EVIDENCE_TERMS
+    )
+    return has_workorder_tool and not needs_knowledge
+
+
+def _decision(status: str, reason: str, **details: Any) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {"status": status, "reason": reason}
+    payload.update({key: value for key, value in details.items() if value is not None})
+    return payload
 
 
 def _extract_tool_calls(value: Any) -> List[Dict[str, Any]]:
@@ -504,7 +547,22 @@ class RuntimeCoordinator:
                 message, session_id, trace_id, snapshot.release_id
             )
             if handoff:
-                reply, handoff_state = handoff
+                reply, handoff_state, handoff_policy = handoff
+                handoff_reason = str(
+                    handoff_policy.get("reason_code") or "user_requested"
+                )
+                decision_summary = {
+                    "agent": _decision("skipped", "handoff_preempted"),
+                    "skill": _decision("skipped", "handoff_preempted"),
+                    "rag": _decision("skipped", "handoff_preempted"),
+                    "tool": _decision("skipped", "handoff_preempted"),
+                    "handoff": _decision(
+                        "selected",
+                        handoff_reason,
+                        level=handoff_policy.get("level"),
+                        matched_signals=handoff_policy.get("matched_signals") or [],
+                    ),
+                }
                 state.status = RunStatus.COMPLETED
                 state.next_step = None
                 ledger.capture_state(state)
@@ -512,7 +570,22 @@ class RuntimeCoordinator:
                     "evaluation_results",
                     {"case": "handoff_policy", "passed": True, "state": handoff_state},
                 )
+                ledger.append(
+                    "evaluation_results",
+                    {
+                        "case": "capability_decision",
+                        "passed": True,
+                        "decision_summary": decision_summary,
+                    },
+                )
                 ledger.persist("complete")
+                record_trace_event(
+                    trace_id,
+                    "capability_decision",
+                    "success",
+                    output_summary=f"handoff selected: {handoff_reason}",
+                    metadata={"decision_summary": decision_summary},
+                )
                 saved = save_chat_message(
                     session_id=session_id,
                     role="assistant",
@@ -539,6 +612,8 @@ class RuntimeCoordinator:
                         "trace_id": trace_id,
                         "handoff": True,
                         "handoff_state": handoff_state,
+                        "handoff_reason": handoff_reason,
+                        "decision_summary": decision_summary,
                         "release_id": snapshot.release_id,
                         "snapshot_id": snapshot.snapshot_id,
                         "usage_source": "not_applicable",
@@ -742,7 +817,7 @@ class RuntimeCoordinator:
         session_id: str,
         trace_id: str,
         release_id: str,
-    ) -> Optional[Tuple[str, str]]:
+    ) -> Optional[Tuple[str, str, Dict[str, Any]]]:
         policy = evaluate_handoff_policy(message)
         if policy.get("should_request_handoff"):
             session = request_handoff(
@@ -762,14 +837,31 @@ class RuntimeCoordinator:
                 "已为您发起人工协同处理。AI 不会代替工作人员作出后续处理决定；"
                 "您可以继续补充信息，内容会进入接管包。",
                 str(session.get("handoff_status") or "requested"),
+                policy,
             )
         current = get_chat_session(session_id) or {}
         status = str(current.get("handoff_status") or "none")
         if status == "waiting_user":
             resumed = resume_handoff_after_owner_message(session_id)
-            return "已将补充信息同步给接管工作人员，人工处理已恢复。", str(resumed.get("handoff_status") or "active")
+            return (
+                "已将补充信息同步给接管工作人员，人工处理已恢复。",
+                str(resumed.get("handoff_status") or "active"),
+                {
+                    "level": "L3",
+                    "reason_code": "handoff_active",
+                    "matched_signals": ["waiting_user"],
+                },
+            )
         if status in {"requested", "active"}:
-            return "当前会话正在人工协同处理中。补充信息已保存，AI 不会重复作出处理决定。", status
+            return (
+                "当前会话正在人工协同处理中。补充信息已保存，AI 不会重复作出处理决定。",
+                status,
+                {
+                    "level": "L3",
+                    "reason_code": "handoff_active",
+                    "matched_signals": [status],
+                },
+            )
         return None
 
     async def _stream_controlled_action(
@@ -1338,11 +1430,20 @@ class RuntimeCoordinator:
             usage_normalized=_usage_for_observability(router_cost),
         )
 
-        state.next_step = "retrieve"
-        yield _sse(
-            "progress",
-            {"trace_id": trace_id, "stage": "rag.retrieve", "status": "running"},
+        handoff_policy = evaluate_handoff_policy(message)
+        read_tool_plans = plan_tools(
+            snapshot.config,
+            selected,
+            message,
+            RuntimePath.CONSULTATION,
+            effects=[ToolEffect.READ],
+            execution_modes=["auto_preinvoke", "model_native"],
         )
+        structured_realtime_query = _is_structured_realtime_query(
+            message,
+            read_tool_plans,
+        )
+        state.next_step = "retrieve"
         retrieval_started = time.time()
         allowed_doc_ids = {
             int(item) for item in state.selected_agent.get("knowledge_doc_ids") or []
@@ -1352,8 +1453,17 @@ class RuntimeCoordinator:
             for item in snapshot.config.get("knowledge") or []
         }
         results: List[Dict[str, Any]] = []
-        retrieval_status = "not_requested"
-        if allowed_doc_ids:
+        retrieval_status = (
+            "skipped_structured_realtime_query"
+            if structured_realtime_query
+            else "not_requested"
+        )
+        if not structured_realtime_query:
+            yield _sse(
+                "progress",
+                {"trace_id": trace_id, "stage": "rag.retrieve", "status": "running"},
+            )
+        if allowed_doc_ids and not structured_realtime_query:
             try:
                 import rag_retrieval
 
@@ -1409,25 +1519,30 @@ class RuntimeCoordinator:
         record_trace_event(
             trace_id,
             "retrieval",
-            "failed" if retrieval_status == "failed" else "success",
+            (
+                "failed"
+                if retrieval_status == "failed"
+                else (
+                    "skipped"
+                    if retrieval_status == "skipped_structured_realtime_query"
+                    else "success"
+                )
+            ),
             latency_ms=int((time.time() - retrieval_started) * 1000),
             output_summary=f"{len(evidence.items)} evidence items",
             metadata={
                 "snapshot_id": snapshot.snapshot_id,
                 "allowed_document_ids": sorted(allowed_doc_ids),
                 "evidence_ids": [item.evidence_id for item in evidence.items],
+                "decision_reason": (
+                    "structured_realtime_query"
+                    if structured_realtime_query
+                    else "knowledge_evidence_required"
+                ),
             },
         )
 
         state.next_step = "readonly_mcp"
-        read_tool_plans = plan_tools(
-            snapshot.config,
-            selected,
-            message,
-            RuntimePath.CONSULTATION,
-            effects=[ToolEffect.READ],
-            execution_modes=["auto_preinvoke", "model_native"],
-        )
         if read_tool_plans:
             yield _sse(
                 "progress",
@@ -1490,6 +1605,7 @@ class RuntimeCoordinator:
             message,
             tools=model_native_toolkits,
             evidence_prompt=evidence_prompt + mcp_context,
+            enable_skills=not structured_realtime_query,
         )
         state.activated_skills = build.activated_skills
         for call in build.skill_tool_calls:
@@ -1503,6 +1619,90 @@ class RuntimeCoordinator:
                 ),
                 metadata=call,
             )
+        handoff_reason_code = str(
+            handoff_policy.get("reason_code") or "ai_direct"
+        )
+        decision_summary = {
+            "agent": _decision(
+                "selected",
+                "matched_intent",
+                agent_id=selected,
+            ),
+            "skill": _decision(
+                "skipped" if not build.activated_skills else "selected",
+                (
+                    "structured_realtime_query"
+                    if structured_realtime_query
+                    else (
+                        "matched_intent"
+                        if build.activated_skills
+                        else "no_match"
+                    )
+                ),
+                skill_ids=[
+                    item.skill_id for item in build.activated_skills
+                ],
+            ),
+            "rag": _decision(
+                (
+                    "skipped"
+                    if structured_realtime_query or not allowed_doc_ids
+                    else "selected"
+                ),
+                (
+                    "structured_realtime_query"
+                    if structured_realtime_query
+                    else (
+                        "knowledge_evidence_required"
+                        if allowed_doc_ids
+                        else "no_bound_knowledge"
+                    )
+                ),
+                retrieval_status=retrieval_status,
+            ),
+            "tool": _decision(
+                "selected" if read_tool_plans else "skipped",
+                (
+                    "exact_workorder_lookup"
+                    if structured_realtime_query
+                    else ("matched_intent" if read_tool_plans else "not_required")
+                ),
+                tools=[
+                    f"{plan.server_name}/{plan.tool_name}"
+                    for plan in read_tool_plans
+                ],
+            ),
+            "handoff": _decision(
+                "skipped",
+                (
+                    "negated_by_user"
+                    if handoff_reason_code == "negated_by_user"
+                    else "no_handoff_intent"
+                ),
+                policy_reason=handoff_reason_code,
+            ),
+        }
+        ledger.append(
+            "evaluation_results",
+            {
+                "case": "capability_decision",
+                "passed": True,
+                "decision_summary": decision_summary,
+            },
+        )
+        record_trace_event(
+            trace_id,
+            "capability_decision",
+            "success",
+            output_summary=(
+                f"agent={selected}; "
+                f"skill={decision_summary['skill']['status']}; "
+                f"rag={decision_summary['rag']['status']}; "
+                f"tool={decision_summary['tool']['status']}; "
+                "handoff=skipped"
+            ),
+            metadata={"decision_summary": decision_summary},
+        )
         state.next_step = "answer"
         yield _sse(
             "progress",
@@ -1764,6 +1964,7 @@ class RuntimeCoordinator:
                 "mcp_invocation_ids": [
                     item.invocation_id for item in state.tool_invocations
                 ],
+                "decision_summary": decision_summary,
             },
         )
 
@@ -1880,6 +2081,7 @@ class RuntimeCoordinator:
                 "activated_skills": skills_payload,
                 "tool_calls": tool_calls,
                 "mcp_calls": mcp_payload,
+                "decision_summary": decision_summary,
                 "cost_entries": [
                     item.model_dump(mode="json") for item in state.cost_entries
                 ],

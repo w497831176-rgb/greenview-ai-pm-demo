@@ -217,17 +217,22 @@ def build_agent_from_snapshot(
     message: str,
     tools: Optional[List[Any]] = None,
     evidence_prompt: str = "",
+    enable_skills: bool = True,
 ) -> AgentBuild:
     config = snapshot.config
     agent_config = _find_agent(config, agent_id)
     skills_by_id = {
         int(item["skill_id"]): item for item in config.get("skills") or []
     }
-    candidates = [
-        skills_by_id[skill_id]
-        for skill_id in agent_config.get("skill_ids") or []
-        if skill_id in skills_by_id and skills_by_id[skill_id].get("enabled")
-    ]
+    candidates = (
+        [
+            skills_by_id[skill_id]
+            for skill_id in agent_config.get("skill_ids") or []
+            if skill_id in skills_by_id and skills_by_id[skill_id].get("enabled")
+        ]
+        if enable_skills
+        else []
+    )
     # Reuse the deterministic runtime selector.  Adapt the compiled field names
     # to its legacy-compatible input contract.
     selector_candidates = [

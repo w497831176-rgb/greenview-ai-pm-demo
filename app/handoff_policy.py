@@ -72,8 +72,52 @@ def evaluate_handoff_policy(
             "matched_signals": ["owner_requested"],
         }
 
+    safety_terms = [
+        "燃气泄漏",
+        "煤气泄漏",
+        "起火",
+        "火灾",
+        "触电",
+        "电梯困人",
+        "电梯里有人被困",
+        "被困电梯",
+        "困在电梯",
+        "电梯被困",
+        "人身受伤",
+        "有人受伤",
+    ]
+    safety_matched = _contains_any(text, safety_terms)
+    negated_terms = [
+        "暂时不用转人工",
+        "不用转人工",
+        "不需要转人工",
+        "不要转人工",
+        "无需人工",
+        "不转人工",
+    ]
+    negated = _contains_any(text, negated_terms)
+    if safety_matched:
+        return {
+            "level": "L3",
+            "reason_code": "safety_risk",
+            "reason": "检测到人身或公共安全风险，需要人工承担处置责任",
+            "queue": "emergency_dispatch",
+            "should_request_handoff": True,
+            "human_task": "核实现场风险、通知应急责任人，并在会话中记录实际处置结果。",
+            "matched_signals": [
+                *safety_matched,
+                *(["safety_override"] if negated else []),
+            ],
+        }
+
+    # Remove only explicit negated phrases, then evaluate any remaining request.
+    # This keeps “不用转人工，但后来请帮我转人工” explainable without treating
+    # the first occurrence of the three characters as a positive request.
     explicit_terms = ["转人工", "人工客服", "找人工", "人工处理", "我要人工", "人工介入", "接人工", "人工服务"]
-    matched = _contains_any(text, explicit_terms)
+    positive_text = text
+    for phrase in negated_terms:
+        positive_text = positive_text.replace(phrase, "")
+    matched = _contains_any(positive_text, explicit_terms)
     if matched:
         return {
             "level": "L3",
@@ -85,17 +129,15 @@ def evaluate_handoff_policy(
             "matched_signals": matched,
         }
 
-    safety_terms = ["燃气泄漏", "煤气泄漏", "起火", "火灾", "触电", "电梯困人", "人身受伤", "有人受伤"]
-    matched = _contains_any(text, safety_terms)
-    if matched:
+    if negated:
         return {
-            "level": "L3",
-            "reason_code": "safety_emergency",
-            "reason": "检测到人身或公共安全风险，需要人工承担处置责任",
-            "queue": "emergency_dispatch",
-            "should_request_handoff": True,
-            "human_task": "核实现场风险、通知应急责任人，并在会话中记录实际处置结果。",
-            "matched_signals": matched,
+            "level": "L0",
+            "reason_code": "negated_by_user",
+            "reason": "业主明确表示当前不需要人工，继续由 AI 在只读边界内回答",
+            "queue": None,
+            "should_request_handoff": False,
+            "human_task": "无需人工接管；如后续出现安全风险，安全规则仍优先。",
+            "matched_signals": negated,
         }
 
     escalation_terms = ["投诉到住建", "投诉到媒体", "起诉", "律师函", "仲裁", "报警", "曝光"]
