@@ -14,6 +14,7 @@ AUTO_SOURCES = {
     "evaluation",
     "tool_failure",
     "runtime_failure",
+    "provider_failure",
 }
 
 
@@ -31,20 +32,56 @@ def _failed_tools(ledger: RunEvidenceLedger) -> list[Dict[str, Any]]:
         for item in ledger.tool_invocations
         if item.get("transport_status") in {"failed", "timeout"}
         or item.get("invocation_status") == "failed"
-        or item.get("business_status") in {"failed", "rejected"}
+        or item.get("business_status")
+        in {
+            "failed",
+            "rejected",
+            "timeout",
+            "upstream_error",
+            "unauthorized",
+            "invalid_input",
+        }
     ]
 
 
 def runtime_badcase_trigger(
     ledger: RunEvidenceLedger,
+    *,
+    runtime_error: Optional[str] = None,
+    runtime_error_type: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """Return one deterministic capture decision, or None for a healthy run."""
+
+    if runtime_error and runtime_error_type == "provider_failure":
+        return {
+            "source": "provider_failure",
+            "category": "provider_failure",
+            "root_cause_domain": "model_provider",
+            "reason": "模型 Provider 调用失败",
+            "contract_violations": [
+                {"code": "provider_failure", "detail": runtime_error[:500]}
+            ],
+            "failed_evaluations": [],
+            "failed_tools": [],
+        }
 
     violations = list(ledger.contract_violations)
     failed_evaluations = _failed_evaluations(ledger)
     failed_tools = _failed_tools(ledger)
     if not violations and not failed_evaluations and not failed_tools:
-        return None
+        if not runtime_error:
+            return None
+        return {
+            "source": "runtime_failure",
+            "category": "other",
+            "root_cause_domain": "external_dependency",
+            "reason": "V1.8 运行时异常",
+            "contract_violations": [
+                {"code": "runtime_failure", "detail": runtime_error[:500]}
+            ],
+            "failed_evaluations": [],
+            "failed_tools": [],
+        }
 
     if failed_tools:
         source = "tool_failure"
@@ -88,22 +125,15 @@ def capture_runtime_badcase(
     ai_response: str,
     source_message_id: Optional[int] = None,
     runtime_error: Optional[str] = None,
+    runtime_error_type: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """Persist one idempotent Badcase for a failed V1.8 Trace."""
 
-    trigger = runtime_badcase_trigger(ledger)
-    if runtime_error and trigger is None:
-        trigger = {
-            "source": "runtime_failure",
-            "category": "other",
-            "root_cause_domain": "external_dependency",
-            "reason": "V1.8 运行时异常",
-            "contract_violations": [
-                {"code": "runtime_failure", "detail": runtime_error[:500]}
-            ],
-            "failed_evaluations": [],
-            "failed_tools": [],
-        }
+    trigger = runtime_badcase_trigger(
+        ledger,
+        runtime_error=runtime_error,
+        runtime_error_type=runtime_error_type,
+    )
     if trigger is None:
         return None
 

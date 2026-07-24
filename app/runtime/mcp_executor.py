@@ -121,8 +121,36 @@ def _business_status(
             "success" if raw_status.lower() in success_statuses else raw_status,
             json.dumps(parsed, ensure_ascii=False, default=str)[:500],
         )
+    if result is None:
+        return "empty", ""
     text = result if isinstance(result, str) else str(result)
-    return "unknown", text[:500]
+    summary = text.strip()[:500]
+    if not summary or summary.lower() in {"none", "null"}:
+        return "empty", summary
+    lowered = summary.lower()
+    if any(marker in lowered for marker in ("not found", "未找到", "不存在")):
+        return "not_found", summary
+    if any(marker in lowered for marker in ("timeout", "timed out", "超时")):
+        return "timeout", summary
+    if any(marker in lowered for marker in ("unauthorized", "forbidden", "无权限")):
+        return "unauthorized", summary
+    if any(
+        marker in lowered
+        for marker in (
+            "error",
+            "failed",
+            "failure",
+            "invalid",
+            "错误",
+            "失败",
+            "参数不合法",
+        )
+    ):
+        return "upstream_error", summary
+    # A read Tool may validly return a scalar or plain text without a business
+    # status field. Reaching here means discovery, transport and invocation all
+    # succeeded and the result is non-empty, so it is a real success.
+    return "success", summary
 
 
 def _structured_result(value: Any, depth: int = 0) -> Optional[Dict[str, Any]]:

@@ -67,12 +67,46 @@ from db.property_db import (
 )
 
 
+PROVIDER_FAILURE_MARKERS = (
+    "insufficient balance",
+    "insufficient_quota",
+    "quota exceeded",
+    "rate limit exceeded",
+    "invalid api key",
+    "incorrect api key",
+    "authentication failed",
+    "authentication fails",
+)
+PROVIDER_FAILURE_PUBLIC_MESSAGE = "模型服务暂时不可用，请稍后重试或检查模型账户状态。"
+
+
+class ProviderFailureError(RuntimeError):
+    """A Provider failure returned as model text instead of an exception."""
+
+
 def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, default=str)
 
 
 def _sse(event: str, payload: Dict[str, Any]) -> str:
     return f"event: {event}\ndata: {_json(payload)}\n\n"
+
+
+def _provider_failure_reason(text: str) -> Optional[str]:
+    normalized = re.sub(r"\s+", " ", str(text or "")).strip().lower()
+    if not normalized or len(normalized) > 800:
+        return None
+    for marker in PROVIDER_FAILURE_MARKERS:
+        if marker in normalized:
+            return marker
+    return None
+
+
+def _provider_failure_prefix(text: str) -> bool:
+    normalized = re.sub(r"\s+", " ", str(text or "")).strip().lower()
+    if not normalized:
+        return False
+    return any(marker.startswith(normalized) for marker in PROVIDER_FAILURE_MARKERS)
 
 
 def _extract_tool_calls(value: Any) -> List[Dict[str, Any]]:
@@ -553,9 +587,20 @@ class RuntimeCoordinator:
             )
             raise
         except Exception as exc:
+            auto_badcase = None
+            failure_code = (
+                "provider_failure"
+                if isinstance(exc, ProviderFailureError)
+                else "runtime_failure"
+            )
+            public_error = (
+                PROVIDER_FAILURE_PUBLIC_MESSAGE
+                if failure_code == "provider_failure"
+                else str(exc)
+            )
             state.status = RunStatus.FAILED
             state.next_step = None
-            ledger.violation("runtime_failure", str(exc))
+            ledger.violation(failure_code, str(exc))
             ledger.capture_state(state)
             ledger.persist("failed")
             try:
@@ -564,6 +609,7 @@ class RuntimeCoordinator:
                     original_query=message,
                     ai_response="",
                     runtime_error=str(exc),
+                    runtime_error_type=failure_code,
                 )
                 if auto_badcase:
                     ledger.append(
@@ -571,7 +617,7 @@ class RuntimeCoordinator:
                         {
                             "badcase_id": auto_badcase.get("id"),
                             "source": auto_badcase.get("source"),
-                            "trigger": "runtime_failure",
+                            "trigger": failure_code,
                         },
                     )
                     ledger.persist("failed")
@@ -580,7 +626,7 @@ class RuntimeCoordinator:
             update_chat_trace(trace_id, status="failed")
             record_trace_event(
                 trace_id,
-                "runtime_failure",
+                failure_code,
                 "failed",
                 latency_ms=int((time.time() - started) * 1000),
                 output_summary=str(exc)[:240],
@@ -588,10 +634,28 @@ class RuntimeCoordinator:
             yield _sse(
                 "error",
                 {
-                    "error": str(exc),
+                    "error": public_error,
+                    "error_code": failure_code,
+                    "status": "failed",
                     "trace_id": trace_id,
                     "release_id": snapshot.release_id,
                     "snapshot_id": snapshot.snapshot_id,
+                    "auto_badcase_id": (
+                        auto_badcase.get("id") if auto_badcase else None
+                    ),
+                },
+            )
+            yield _sse(
+                "done",
+                {
+                    "status": "failed",
+                    "error_code": failure_code,
+                    "trace_id": trace_id,
+                    "release_id": snapshot.release_id,
+                    "snapshot_id": snapshot.snapshot_id,
+                    "auto_badcase_id": (
+                        auto_badcase.get("id") if auto_badcase else None
+                    ),
                 },
             )
 
@@ -1450,6 +1514,7 @@ class RuntimeCoordinator:
             + message
         )
         full_content = ""
+        provisional_buffer = ""
         tool_calls: List[Dict[str, Any]] = list(build.skill_tool_calls)
         final_metrics: Dict[str, Optional[int]] = {}
         last_progress_at = time.time()
@@ -1468,18 +1533,23 @@ class RuntimeCoordinator:
             if content and "completed" not in event_name:
                 content_delta = str(content)
                 full_content += content_delta
-                # Stream model text immediately as provisional UI content.
-                # Citation validation still happens against the complete answer
-                # below; the authoritative final event replaces this text.
-                yield _sse(
-                    "delta",
-                    {
-                        "content": content_delta,
-                        "provisional": True,
-                        "current_agent": state.selected_agent.get("name"),
-                        "current_agent_id": selected,
-                    },
-                )
+                provisional_buffer += content_delta
+                # Some OpenAI-compatible Providers return account/auth errors
+                # as ordinary assistant text. Hold only a possible error prefix;
+                # normal model text still streams immediately.
+                if not _provider_failure_reason(
+                    provisional_buffer
+                ) and not _provider_failure_prefix(provisional_buffer):
+                    yield _sse(
+                        "delta",
+                        {
+                            "content": provisional_buffer,
+                            "provisional": True,
+                            "current_agent": state.selected_agent.get("name"),
+                            "current_agent_id": selected,
+                        },
+                    )
+                    provisional_buffer = ""
             for call in _extract_tool_calls(chunk):
                 if call not in tool_calls:
                     tool_calls.append(call)
@@ -1496,6 +1566,18 @@ class RuntimeCoordinator:
                     },
                 )
                 last_progress_at = time.time()
+
+        provider_failure_reason = _provider_failure_reason(full_content)
+        if provisional_buffer and not provider_failure_reason:
+            yield _sse(
+                "delta",
+                {
+                    "content": provisional_buffer,
+                    "provisional": True,
+                    "current_agent": state.selected_agent.get("name"),
+                    "current_agent_id": selected,
+                },
+            )
 
         model_native_invocations = []
         for toolkit in model_native_toolkits:
@@ -1536,6 +1618,11 @@ class RuntimeCoordinator:
                 error_summary=invocation.error_summary,
                 latency_ms=invocation.latency_ms,
                 invocation_mode="model_native",
+            )
+
+        if provider_failure_reason:
+            raise ProviderFailureError(
+                f"model Provider returned failure text: {provider_failure_reason}"
             )
 
         loaded_skill_tool = any(
