@@ -173,6 +173,13 @@ def init_db():
             description TEXT,
             enabled INTEGER DEFAULT 1,
             is_builtin INTEGER DEFAULT 0,
+            source_type TEXT DEFAULT 'manual',
+            source_url TEXT,
+            runtime_type TEXT,
+            install_status TEXT DEFAULT 'ready',
+            install_detail TEXT,
+            package_path TEXT,
+            detected_entrypoint TEXT,
             created_at TEXT,
             updated_at TEXT
         )
@@ -496,6 +503,23 @@ def init_db():
         cursor.execute("ALTER TABLE mcp_servers ADD COLUMN is_builtin INTEGER DEFAULT 0")
     except sqlite3.OperationalError:
         pass
+
+    # Migration: persist productized MCP import provenance and readiness.
+    # These fields are control-plane evidence only; they do not grant Tool
+    # permissions or change an already published RuntimeRelease.
+    for col, dtype in [
+        ("source_type", "TEXT DEFAULT 'manual'"),
+        ("source_url", "TEXT"),
+        ("runtime_type", "TEXT"),
+        ("install_status", "TEXT DEFAULT 'ready'"),
+        ("install_detail", "TEXT"),
+        ("package_path", "TEXT"),
+        ("detected_entrypoint", "TEXT"),
+    ]:
+        try:
+            cursor.execute(f"ALTER TABLE mcp_servers ADD COLUMN {col} {dtype}")
+        except sqlite3.OperationalError:
+            pass
 
     # Migration: add evidence / source fields to existing badcases table.
     for col, dtype in [
@@ -3928,12 +3952,26 @@ def create_mcp_server(
     env: Optional[Dict[str, str]],
     description: str,
     enabled: bool = True,
+    source_type: str = "manual",
+    source_url: Optional[str] = None,
+    runtime_type: Optional[str] = None,
+    install_status: str = "ready",
+    install_detail: Optional[str] = None,
+    package_path: Optional[str] = None,
+    detected_entrypoint: Optional[str] = None,
 ) -> Dict[str, Any]:
     now = now_cn("%Y-%m-%d %H:%M")
     conn = _get_conn()
     cursor = conn.cursor()
     cursor.execute(
-        "INSERT INTO mcp_servers (name, command, args, env, description, enabled, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        """
+        INSERT INTO mcp_servers (
+            name, command, args, env, description, enabled,
+            source_type, source_url, runtime_type, install_status,
+            install_detail, package_path, detected_entrypoint,
+            created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
         (
             name,
             command,
@@ -3941,6 +3979,13 @@ def create_mcp_server(
             json.dumps(env) if env is not None else None,
             description,
             1 if enabled else 0,
+            source_type,
+            source_url,
+            runtime_type,
+            install_status,
+            install_detail,
+            package_path,
+            detected_entrypoint,
             now,
             now,
         ),
@@ -3993,6 +4038,51 @@ def update_mcp_server(
             now,
             server_id,
         ),
+    )
+    conn.commit()
+    conn.close()
+    return get_mcp_server(server_id)
+
+
+def update_mcp_server_import_metadata(
+    server_id: int,
+    *,
+    source_type: Optional[str] = None,
+    source_url: Optional[str] = None,
+    runtime_type: Optional[str] = None,
+    install_status: Optional[str] = None,
+    install_detail: Optional[str] = None,
+    package_path: Optional[str] = None,
+    detected_entrypoint: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Update MCP import evidence without rewriting operator launch fields."""
+
+    values = {
+        "source_type": source_type,
+        "source_url": source_url,
+        "runtime_type": runtime_type,
+        "install_status": install_status,
+        "install_detail": install_detail,
+        "package_path": package_path,
+        "detected_entrypoint": detected_entrypoint,
+    }
+    assignments = []
+    parameters: List[Any] = []
+    for column, value in values.items():
+        if value is None:
+            continue
+        assignments.append(f"{column} = ?")
+        parameters.append(value)
+    if not assignments:
+        return get_mcp_server(server_id)
+    assignments.append("updated_at = ?")
+    parameters.append(now_cn("%Y-%m-%d %H:%M"))
+    parameters.append(server_id)
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute(
+        f"UPDATE mcp_servers SET {', '.join(assignments)} WHERE id = ?",
+        tuple(parameters),
     )
     conn.commit()
     conn.close()

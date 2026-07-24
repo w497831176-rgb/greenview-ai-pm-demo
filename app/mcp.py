@@ -5,6 +5,7 @@ MCP Server Management API
 REST endpoints for MCP server configuration CRUD and tool discovery.
 """
 
+import asyncio
 import json
 import os
 import traceback
@@ -20,6 +21,11 @@ from app.runtime.tool_planner import (
     effective_tool_metadata,
     validate_tool_metadata,
 )
+from app.runtime.mcp_importer import (
+    McpImportError,
+    prepare_git_mcp_package,
+    suggest_tool_effect,
+)
 from db.property_db import (
     create_mcp_server as db_create_mcp_server,
     delete_mcp_server as db_delete_mcp_server,
@@ -31,6 +37,7 @@ from db.property_db import (
     save_mcp_tool,
     toggle_mcp_server_enabled,
     update_mcp_server as db_update_mcp_server,
+    update_mcp_server_import_metadata,
 )
 
 router = APIRouter(prefix="/api/mcp-servers", tags=["mcp-servers"])
@@ -74,6 +81,14 @@ class McpServerUpdate(BaseModel):
 
 class McpServerToggle(BaseModel):
     enabled: bool
+
+
+class McpGitImportRequest(BaseModel):
+    git_url: str
+    name: str = ""
+    description: str = ""
+    runtime_type: str = "auto"
+    env: Dict[str, str] = Field(default_factory=dict)
 
 
 class McpToolPolicyUpdate(BaseModel):
@@ -159,6 +174,109 @@ async def create_mcp_server(request: McpServerCreate):
         enabled=request.enabled,
     )
     return {"mcp_server": server}
+
+
+@router.post("/import-git")
+async def import_mcp_server_from_git(request: McpGitImportRequest):
+    """Prepare, connect and discover a public Python/Node MCP repository.
+
+    Import is Draft-only.  A successful connection does not grant any Tool
+    permission and does not affect existing sessions; the operator still
+    classifies tools, binds an Agent and publishes a RuntimeRelease.
+    """
+
+    try:
+        prepared = await asyncio.to_thread(
+            prepare_git_mcp_package,
+            request.git_url,
+            requested_name=request.name,
+            requested_runtime=request.runtime_type,
+        )
+    except McpImportError as exc:
+        raise HTTPException(status_code=422, detail=exc.as_dict()) from exc
+
+    if any(
+        str(item.get("name") or "").casefold() == prepared.name.casefold()
+        for item in db_list_mcp_servers()
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "mcp_name_exists",
+                "message": "已存在同名 MCP Server，请修改显示名称后重试",
+                "name": prepared.name,
+            },
+        )
+
+    server = db_create_mcp_server(
+        name=prepared.name,
+        command=prepared.command,
+        args=prepared.args,
+        env=request.env,
+        description=(
+            request.description.strip()
+            or f"从 Git 导入的 {prepared.runtime_type} MCP Server"
+        ),
+        enabled=True,
+        source_type=prepared.source_type,
+        source_url=prepared.source_url,
+        runtime_type=prepared.runtime_type,
+        install_status="discovering",
+        install_detail="代码与依赖已准备，正在连接并发现 Tool",
+        package_path=prepared.package_path,
+        detected_entrypoint=prepared.detected_entrypoint,
+    )
+    try:
+        discovered = await discover_server_tools(server)
+    except Exception as exc:
+        update_mcp_server_import_metadata(
+            int(server["id"]),
+            install_status="failed",
+            install_detail=f"连接或工具发现失败：{type(exc).__name__}: {str(exc)[:500]}",
+        )
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "mcp_discovery_failed",
+                "message": "仓库已准备，但 MCP 连接或工具发现失败",
+                "server_id": server["id"],
+                "detail": str(exc)[:500],
+                "steps": prepared.steps,
+            },
+        ) from exc
+    if not discovered:
+        update_mcp_server_import_metadata(
+            int(server["id"]),
+            install_status="failed",
+            install_detail="连接成功，但 Server 没有返回任何 Tool",
+        )
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "mcp_no_tools",
+                "message": "连接成功，但该 MCP Server 没有返回任何 Tool",
+                "server_id": server["id"],
+                "steps": prepared.steps,
+            },
+        )
+
+    server = update_mcp_server_import_metadata(
+        int(server["id"]),
+        install_status="ready",
+        install_detail=f"连接成功，已发现 {len(discovered)} 个 Tool",
+    )
+    return {
+        "mcp_server": server,
+        "prepared_package": prepared.as_dict(),
+        "discovered": discovered,
+        "count": len(discovered),
+        "next_steps": [
+            "确认每个 Tool 是只读查询还是需要确认的写操作",
+            "把 MCP Server 绑定到垂直 Agent",
+            "校验并发布 RuntimeRelease",
+            "在下一新会话用自然语言验收并查看 Trace",
+        ],
+    }
 
 
 @router.put("/{server_id}")
@@ -271,8 +389,22 @@ async def discover_mcp_server_tools(server_id: str):
     server = _resolve_server(server_id)
     try:
         discovered = await discover_server_tools(server)
+        update_mcp_server_import_metadata(
+            int(server["id"]),
+            install_status="ready" if discovered else "failed",
+            install_detail=(
+                f"连接成功，已发现 {len(discovered)} 个 Tool"
+                if discovered
+                else "连接成功，但 Server 没有返回任何 Tool"
+            ),
+        )
         return {"mcp_server": server, "discovered": discovered, "count": len(discovered)}
     except Exception as e:
+        update_mcp_server_import_metadata(
+            int(server["id"]),
+            install_status="failed",
+            install_detail=f"连接或工具发现失败：{type(e).__name__}: {str(e)[:500]}",
+        )
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"discover failed: {e}")
 
@@ -315,7 +447,11 @@ async def discover_server_tools(server: Dict[str, Any]) -> List[Dict[str, Any]]:
                     prior_metadata = (
                         existing_by_name.get(str(name), {}).get("tool_metadata") or {}
                     )
-                    tool_metadata = {**prior_metadata, "source": "discovered"}
+                    tool_metadata = {
+                        **prior_metadata,
+                        "source": "discovered",
+                        "effect_suggestion": suggest_tool_effect(name, description),
+                    }
                     save_mcp_tool(
                         server_id=server_id,
                         name=name,

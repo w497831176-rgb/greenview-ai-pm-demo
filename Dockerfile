@@ -6,25 +6,19 @@
 #   /app    - application code
 # ===========================================================================
 
+FROM node:20-bookworm-slim AS node-runtime
+
 FROM python:3.12-slim
 
-# ---------------------------------------------------------------------------
-# Environment
-# ---------------------------------------------------------------------------
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONPATH=/app
 
-# ---------------------------------------------------------------------------
-# Create non-root user
-# ---------------------------------------------------------------------------
 RUN groupadd -r app && useradd -r -g app -m -s /bin/bash app
 
-# ---------------------------------------------------------------------------
-# System libraries + uv
-# ---------------------------------------------------------------------------
-# docling pulls in opencv, which needs a few native shared libs not present in
-# the slim base image (otherwise: "libxcb.so.1: cannot open shared object file").
+# Git/uv prepare Python MCP repositories. Node/npm are copied from the
+# official Node image so the MCP wizard supports Node repositories without
+# pulling Debian's very large npm dependency graph into the final image.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         libgl1 \
@@ -40,9 +34,13 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && pip install --no-cache-dir uv
 
-# ---------------------------------------------------------------------------
-# Application code
-# ---------------------------------------------------------------------------
+COPY --from=node-runtime /usr/local/bin/node /usr/local/bin/node
+COPY --from=node-runtime /usr/local/lib/node_modules /usr/local/lib/node_modules
+RUN ln -sf /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
+    && ln -sf /usr/local/lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx \
+    && node --version \
+    && npm --version
+
 WORKDIR /app
 COPY requirements.txt .
 RUN uv pip sync requirements.txt --system \
@@ -50,26 +48,12 @@ RUN uv pip sync requirements.txt --system \
     --index-strategy unsafe-best-match
 COPY . .
 
-# ---------------------------------------------------------------------------
-# Directory setup & permissions
-# ---------------------------------------------------------------------------
 RUN chmod 755 /app
-
-# ---------------------------------------------------------------------------
-# Entrypoint
-# ---------------------------------------------------------------------------
 RUN chmod +x /app/scripts/entrypoint.sh
 ENTRYPOINT ["/app/scripts/entrypoint.sh"]
 
-# ---------------------------------------------------------------------------
-# Switch to non-root user
-# ---------------------------------------------------------------------------
 USER app
 WORKDIR /app
 
 EXPOSE 8000
-
-# ---------------------------------------------------------------------------
-# Default command (overridden by compose)
-# ---------------------------------------------------------------------------
 CMD ["chill"]

@@ -219,7 +219,7 @@
     // ==========================================
     const API_BASE = '';
     const DEFAULT_ROOM_ID = '3-2-1201';
-    const APP_VERSION = 'V1.8.1-rc.5';
+    const APP_VERSION = 'V1.8.1-rc.6';
 
     const STATE = {
       topTab: 'owner',
@@ -384,6 +384,11 @@
       try {
         const data = await res.json();
         detail = data.detail || data.message || data.error || (typeof data === 'string' ? data : null);
+        if (detail && typeof detail === 'object') {
+          detail = detail.message
+            ? `${detail.message}${detail.detail ? `：${detail.detail}` : ''}`
+            : JSON.stringify(detail);
+        }
       } catch (e) {
         try {
           detail = await res.text();
@@ -5640,12 +5645,15 @@
           <div class="max-w-6xl mx-auto pb-4 flex items-end justify-between">
             <div>
               <h2 class="text-xl font-semibold text-slate-900">MCP Server 管理</h2>
-              <p class="text-sm text-slate-500 mt-1">管理 Model Context Protocol 服务连接</p>
+              <p class="text-sm text-slate-500 mt-1">从 Git 导入、连接测试、发现 Tool，再绑定 Agent 并发布</p>
             </div>
-            <button id="mcp-add-btn" class="px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white rounded-xl text-sm transition-colors flex items-center gap-1.5">
-              <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"></path></svg>
-              新增
-            </button>
+            <div class="flex gap-2">
+              <button id="mcp-advanced-add-btn" class="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl text-sm transition-colors">高级手动配置</button>
+              <button id="mcp-git-import-btn" class="px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white rounded-xl text-sm transition-colors flex items-center gap-1.5">
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"></path></svg>
+                从 Git 导入
+              </button>
+            </div>
           </div>
           <div id="mcp-content">${loadingState()}</div>
         </div>
@@ -5671,7 +5679,7 @@
                 <div class="w-9 h-9 rounded-xl bg-cyan-100 text-cyan-700 flex items-center justify-center shrink-0">MCP</div>
                 <div>
                   <h3 class="font-semibold text-slate-900">当前 MCP 调用契约</h3>
-                  <p class="text-sm text-slate-600 mt-1">Server 发现的是“可提供的能力”；Host 侧 Agent 绑定 + 工具白名单决定“当前业主对话真正可调用的能力”。三个正式 Server 均为只读。</p>
+                  <p class="text-sm text-slate-600 mt-1">Git 导入只负责准备运行环境和发现 Tool；选择读/写模板、Agent 绑定与 RuntimeRelease 决定下一新会话真正可调用的能力。</p>
                   <p class="text-xs text-slate-500 mt-2">统一结果状态：${(contractData.tool_outcomes || []).map(item => `<span class="inline-block mr-2">${escapeHtml(item.code)}=${escapeHtml(item.label)}</span>`).join('')}</p>
                   ${writeBoundary ? `<div class="mt-3 rounded-xl bg-white/80 border border-cyan-100 p-3 text-xs text-slate-600"><span class="font-medium text-slate-900">${escapeHtml(writeBoundary.mode_label || '写入边界')}：</span>${escapeHtml(writeBoundary.summary || '')}</div>` : ''}
                 </div>
@@ -5683,6 +5691,13 @@
               ${servers.map(server => {
                 const contract = contractsByName[server.name] || {};
                 const boundAgents = (contract.bindings || []).filter(item => item.bound).map(item => item.agent_name).join('、') || '未绑定正式 Agent';
+                const installStatus = server.install_status || (server.is_builtin ? 'ready' : 'manual');
+                const statusMeta = {
+                  ready: ['已连接', 'bg-emerald-50 text-emerald-700'],
+                  failed: ['连接失败', 'bg-red-50 text-red-700'],
+                  discovering: ['发现中', 'bg-amber-50 text-amber-700'],
+                  manual: ['手动配置', 'bg-slate-100 text-slate-600']
+                }[installStatus] || [installStatus, 'bg-slate-100 text-slate-600'];
                 return `
                 <div class="bg-white rounded-2xl shadow-soft border border-slate-200 p-5 flex flex-col md:flex-row md:items-start gap-4 hover:shadow-md transition-shadow">
                   <div class="w-12 h-12 rounded-xl bg-gradient-to-br from-gold-50 to-gold-100 flex items-center justify-center shrink-0">
@@ -5691,17 +5706,27 @@
                   <div class="flex-1 min-w-0">
                     <div class="flex items-center gap-3 mb-1">
                       <h3 class="font-semibold text-slate-900">${escapeHtml(server.name)}</h3>
-                      <span class="text-xs px-2 py-0.5 bg-slate-100 text-slate-600 rounded-full">${escapeHtml(server.command || '未配置')}</span>
+                      <span class="text-xs px-2 py-0.5 rounded-full ${statusMeta[1]}">${escapeHtml(statusMeta[0])}</span>
+                      ${server.runtime_type ? `<span class="text-xs px-2 py-0.5 bg-indigo-50 text-indigo-700 rounded-full">${escapeHtml(server.runtime_type)}</span>` : ''}
                     </div>
                     <p class="text-sm text-slate-600 mb-2">${escapeHtml(server.description)}</p>
                     <div class="flex flex-wrap gap-2 text-xs text-slate-500">
-                      <span class="px-2 py-1 bg-slate-50 rounded-lg">args: ${escapeHtml(JSON.stringify(server.args || []))}</span>
-                      <span class="px-2 py-1 bg-slate-50 rounded-lg">env: ${escapeHtml(JSON.stringify(server.env || {}))}</span>
+                      <span class="px-2 py-1 bg-slate-50 rounded-lg">${server.source_type === 'git' ? 'Git 导入' : (server.is_builtin ? '系统内置' : '手动配置')}</span>
                       <span class="px-2 py-1 bg-cyan-50 text-cyan-700 rounded-lg">${escapeHtml(contract.mode_label || '未定义调用契约')}</span>
                       <span class="px-2 py-1 bg-slate-50 rounded-lg">绑定 Agent：${escapeHtml(boundAgents)}</span>
                     </div>
+                    ${server.source_url ? `<p class="text-xs text-slate-500 mt-2 truncate" title="${escapeHtml(server.source_url)}">来源：${escapeHtml(server.source_url)}</p>` : ''}
+                    ${server.install_detail ? `<p class="text-xs ${installStatus === 'failed' ? 'text-red-600' : 'text-slate-500'} mt-1">${escapeHtml(server.install_detail)}</p>` : ''}
                     ${contract.data_scope ? `<p class="text-xs text-slate-500 mt-2">数据范围：${escapeHtml(contract.data_scope)}</p>` : ''}
                     ${contract.source ? `<p class="text-xs text-slate-500 mt-1">数据来源：${escapeHtml(contract.source)}</p>` : ''}
+                    <details class="mt-2 text-xs text-slate-500">
+                      <summary class="cursor-pointer">高级启动信息</summary>
+                      <div class="mt-2 space-y-1 font-mono bg-slate-50 rounded-lg p-2">
+                        <div>command: ${escapeHtml(server.command || '-')}</div>
+                        <div>args: ${escapeHtml(JSON.stringify(server.args || []))}</div>
+                        <div>env keys: ${escapeHtml(Object.keys(server.env || {}).join('、') || '无')}</div>
+                      </div>
+                    </details>
                   </div>
                   <div class="flex flex-col items-end gap-3 shrink-0">
                     <label class="relative inline-flex items-center cursor-pointer">
@@ -5709,7 +5734,8 @@
                       <div class="w-9 h-5 bg-slate-200 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-brand-600"></div>
                     </label>
                     <div class="flex gap-2">
-                      <button data-id="${server.id}" class="mcp-tools-btn text-xs px-3 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg transition-colors">查看工具</button>
+                      <button data-id="${server.id}" class="mcp-discover-btn text-xs px-3 py-1.5 bg-brand-50 hover:bg-brand-100 text-brand-700 rounded-lg transition-colors">连接并刷新 Tool</button>
+                      <button data-id="${server.id}" class="mcp-tools-btn text-xs px-3 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg transition-colors">查看 Tool</button>
                       <button data-id="${server.id}" class="mcp-edit-btn text-xs px-3 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg transition-colors">编辑</button>
                       <button data-id="${server.id}" class="mcp-delete-btn text-xs px-3 py-1.5 border border-red-200 hover:bg-red-50 text-red-600 rounded-lg transition-colors">删除</button>
                     </div>
@@ -5725,6 +5751,26 @@
       }
 
       function bindMcpActions() {
+        $$('.mcp-discover-btn').forEach(btn => {
+          btn.addEventListener('click', async () => {
+            const serverId = Number(btn.dataset.id);
+            const original = btn.textContent;
+            btn.disabled = true;
+            btn.textContent = '连接中…';
+            try {
+              const result = await apiPost(`/api/mcp-servers/${serverId}/discover`, {});
+              showToast(`连接成功，已发现 ${result.count || 0} 个 Tool`, 'success');
+              await loadMcpServers();
+              await viewMcpTools(serverId);
+            } catch (err) {
+              showToast('连接或工具发现失败：' + (err.message || err), 'error');
+              await loadMcpServers();
+            } finally {
+              btn.disabled = false;
+              btn.textContent = original;
+            }
+          });
+        });
         $$('.mcp-tools-btn').forEach(btn => {
           btn.addEventListener('click', () => viewMcpTools(Number(btn.dataset.id)));
         });
@@ -5761,8 +5807,11 @@
 
       function openMcpModal(server = null) {
         const isEdit = !!server;
-        const title = isEdit ? '编辑 MCP Server' : '新增 MCP Server';
+        const title = isEdit ? '编辑 MCP Server 高级设置' : '高级手动配置 MCP Server';
         const body = `
+          <div class="rounded-xl border border-amber-200 bg-amber-50 p-3 text-xs text-amber-900">
+            这里只用于已有启动命令的 MCP。普通新增请返回使用“从 Git 导入”，系统会自动识别运行环境、连接并发现 Tool。
+          </div>
           ${formInput('名称', 'mcp-name', server ? server.name : '', '如：weather-server')}
           ${formInput('启动命令', 'mcp-command', server ? server.command : '', '如：python、npx、node')}
           ${formInput('参数 (JSON 数组)', 'mcp-args', server ? JSON.stringify(server.args || []) : '[]', '如：["-m", "mcp_server_weather"]')}
@@ -5794,17 +5843,88 @@
           try {
             if (isEdit) {
               await apiPut(`/api/mcp-servers/${server.id}`, payload);
-               showToast('MCP Server Draft 已更新；发现工具并发布 RuntimeRelease 后生效');
+              showToast('MCP Server Draft 已更新；正在重新连接并发现 Tool');
+              await apiPost(`/api/mcp-servers/${server.id}/discover`, {});
             } else {
-              await apiPost('/api/mcp-servers', payload);
-               showToast('MCP Server Draft 已创建；发现工具、绑定 Agent 并发布 RuntimeRelease');
+              const created = await apiPost('/api/mcp-servers', payload);
+              const createdId = (created.mcp_server || {}).id;
+              if (!createdId) throw new Error('创建结果缺少 Server ID');
+              showToast('MCP Server Draft 已创建；正在连接并发现 Tool');
+              await apiPost(`/api/mcp-servers/${createdId}/discover`, {});
             }
             closeModal();
+            showToast('连接成功；请确认 Tool 的只读/写入模板', 'success');
             await loadMcpServers();
           } catch (err) {
-            showToast('保存失败，请重试', 'error');
+            showToast('保存或连接失败：' + (err.message || err), 'error');
           }
         });
+      }
+
+      function openMcpGitImportModal() {
+        const body = `
+          <div class="space-y-4">
+            <div class="rounded-xl border border-brand-100 bg-brand-50 p-3 text-sm text-brand-900">
+              <div class="font-semibold">一键导入流程</div>
+              <div class="text-xs mt-1">下载仓库 → 识别 Python/Node → 安装依赖 → 识别 stdio 入口 → 连接测试 → 自动发现 Tool。成功后仍需确认 Tool 读写类型、绑定 Agent 并发布。</div>
+            </div>
+            ${formInput('公开 Git 仓库地址', 'mcp-git-url', '', 'https://github.com/owner/mcp-server.git')}
+            ${formInput('显示名称（可选）', 'mcp-git-name', '', '留空则使用仓库名称')}
+            ${formInput('用途描述（可选）', 'mcp-git-description', '', '例如：查询天文观测窗口')}
+            <div>
+              <label class="block text-sm font-medium text-slate-700 mb-1.5">运行类型</label>
+              <select id="mcp-git-runtime" class="w-full px-3 py-2.5 border border-slate-200 rounded-xl text-sm">
+                <option value="auto">自动识别（推荐）</option>
+                <option value="python">Python</option>
+                <option value="node">Node</option>
+              </select>
+            </div>
+            <details class="rounded-xl border border-slate-200 p-3">
+              <summary class="text-sm font-medium text-slate-700 cursor-pointer">高级设置：运行所需环境变量</summary>
+              <div class="mt-3">${formTextarea('环境变量 JSON（可选）', 'mcp-git-env', '{}', '只有仓库明确要求 API Key 时才填写', 4)}</div>
+            </details>
+            <div id="mcp-git-progress" class="hidden rounded-xl border border-indigo-100 bg-indigo-50 p-3 text-xs text-indigo-800"></div>
+          </div>
+        `;
+        openModal('从 Git 导入 MCP', body, async () => {
+          const gitUrl = $('#mcp-git-url').value.trim();
+          if (!gitUrl) {
+            showToast('请粘贴公开 Git 仓库地址', 'error');
+            return;
+          }
+          let env;
+          try {
+            env = JSON.parse($('#mcp-git-env').value.trim() || '{}');
+          } catch (_) {
+            showToast('环境变量必须是 JSON 对象', 'error');
+            return;
+          }
+          const progress = $('#mcp-git-progress');
+          const confirmButton = $('#modal-confirm');
+          progress.classList.remove('hidden');
+          progress.textContent = '正在下载仓库、识别运行环境并安装依赖；首次导入可能需要几十秒，请不要关闭页面。';
+          confirmButton.disabled = true;
+          confirmButton.textContent = '正在导入…';
+          try {
+            const result = await apiPost('/api/mcp-servers/import-git', {
+              git_url: gitUrl,
+              name: $('#mcp-git-name').value.trim(),
+              description: $('#mcp-git-description').value.trim(),
+              runtime_type: $('#mcp-git-runtime').value,
+              env
+            });
+            const server = result.mcp_server || {};
+            closeModal();
+            await loadMcpServers();
+            showToast(`导入成功：${server.name || 'MCP'}，已发现 ${result.count || 0} 个 Tool`, 'success');
+            if (server.id) await viewMcpTools(Number(server.id));
+          } catch (err) {
+            progress.className = 'rounded-xl border border-red-200 bg-red-50 p-3 text-xs text-red-700';
+            progress.textContent = err.message || String(err);
+            confirmButton.disabled = false;
+            confirmButton.textContent = '重试导入';
+          }
+        }, '开始导入');
       }
 
       async function viewMcpTools(serverId) {
@@ -5817,10 +5937,24 @@
           const tools = data.tools || [];
           const contract = (contractData.servers || []).find(item => item.server_id === serverId) || {};
           const contractTools = Object.fromEntries((contract.tools || []).map(item => [item.name, item]));
-          const body = tools.length === 0
-            ? '<p class="text-sm text-slate-500">该 MCP Server 暂未返回工具列表。</p>'
+          const nextStepActions = `
+            <div class="sticky top-0 z-10 mb-3 rounded-xl border border-brand-100 bg-white/95 p-3 shadow-sm backdrop-blur">
+              <div class="text-xs font-medium text-slate-700 mb-2">完成 Tool 模板后继续</div>
+              <div class="grid grid-cols-2 gap-2">
+                <button id="mcp-go-bind-agent" class="text-xs px-3 py-2 rounded-lg bg-brand-600 text-white">下一步：绑定 Agent</button>
+                <button id="mcp-go-runtime-publish" class="text-xs px-3 py-2 rounded-lg bg-indigo-600 text-white">最后：校验并发布</button>
+              </div>
+              <p class="mt-2 text-[10px] text-slate-500">绑定时编辑目标垂直 Agent 并勾选此 MCP；发布只影响下一次新会话。</p>
+            </div>`;
+          const body = nextStepActions + (tools.length === 0
+            ? '<p class="text-sm text-slate-500">该 MCP Server 暂未返回工具列表，请先返回列表点击“连接并刷新 Tool”。</p>'
               : `<div class="space-y-3">${tools.map(t => {
                 const metadata = t.effective_runtime_metadata || t.tool_metadata || {};
+                const suggestedEffect = metadata.effect && metadata.effect !== 'unknown'
+                  ? metadata.effect
+                  : (metadata.effect_suggestion || 'read');
+                const defaultIntent = (metadata.natural_language_intents || []).join('、') || t.description || t.name;
+                const defaultTriggers = (metadata.trigger_keywords || []).join('、') || t.name.replace(/[_-]+/g, ' ');
                 const editableContract = {
                   effect: metadata.effect || 'unknown',
                   risk_level: metadata.risk_level || 'L1',
@@ -5844,17 +5978,77 @@
                   <p class="text-xs text-slate-600 mb-2">${escapeHtml(t.description || '暂无描述')}</p>
                   ${contractTools[t.name]?.policy?.purpose ? `<p class="text-xs text-slate-500 mb-2">调用目的：${escapeHtml(contractTools[t.name].policy.purpose)}</p>` : ''}
                   <p class="text-xs text-slate-500 mb-2">允许 Agent：${escapeHtml((contractTools[t.name]?.allowed_by || []).join('、') || '当前无正式运行时授权')}</p>
-                  <label class="block text-xs text-slate-500 mb-2">运行契约 JSON（effect / risk / 意图 / 触发词 / 参数映射 / 结果契约）
-                    <textarea class="mcp-runtime-contract mt-1 w-full font-mono text-[10px] border border-slate-200 rounded-lg p-2 bg-white" rows="12" data-tool-id="${t.id}">${escapeHtml(JSON.stringify(editableContract, null, 2))}</textarea>
-                  </label>
-                  <div class="flex items-center justify-between gap-2 mb-2">
-                    <span class="text-[10px] text-slate-500">read 可 model_native/auto_preinvoke；create/update 保存时强制 Proposal。</span>
-                    <button class="mcp-runtime-policy-save text-xs px-3 py-1.5 rounded-lg bg-slate-800 text-white" data-tool-id="${t.id}">保存运行契约</button>
+                  <div class="rounded-xl border border-white bg-white p-3 space-y-3 mb-2">
+                    <div>
+                      <label class="block text-xs font-medium text-slate-700 mb-1">这个 Tool 是什么类型？</label>
+                      <select class="mcp-template-effect w-full border border-slate-200 rounded-lg px-3 py-2 text-sm" data-tool-id="${t.id}">
+                        <option value="read" ${suggestedEffect === 'read' ? 'selected' : ''}>只读查询（可直接调用）</option>
+                        <option value="create" ${suggestedEffect === 'create' ? 'selected' : ''}>新增/写入（必须确认）</option>
+                        <option value="update" ${suggestedEffect === 'update' ? 'selected' : ''}>更新（必须确认）</option>
+                        <option value="unknown" ${suggestedEffect === 'unknown' ? 'selected' : ''}>暂不授权</option>
+                      </select>
+                    </div>
+                    <div>
+                      <label class="block text-xs font-medium text-slate-700 mb-1">用户通常会怎么说？</label>
+                      <input class="mcp-template-intents w-full border border-slate-200 rounded-lg px-3 py-2 text-sm" data-tool-id="${t.id}" value="${escapeHtml(defaultIntent)}" placeholder="例如：查询目标星体的观测窗口">
+                    </div>
+                    <div>
+                      <label class="block text-xs font-medium text-slate-700 mb-1">触发词（逗号分隔）</label>
+                      <input class="mcp-template-triggers w-full border border-slate-200 rounded-lg px-3 py-2 text-sm" data-tool-id="${t.id}" value="${escapeHtml(defaultTriggers)}" placeholder="例如：观测窗口、明晚、凌日">
+                    </div>
+                    <button class="mcp-template-save w-full text-xs px-3 py-2 rounded-lg bg-brand-600 text-white" data-tool-id="${t.id}">保存此 Tool 模板</button>
                   </div>
+                  <details class="mb-2">
+                    <summary class="text-xs text-slate-500 cursor-pointer">高级运行契约 JSON</summary>
+                    <label class="block text-xs text-slate-500 mt-2">
+                      <textarea class="mcp-runtime-contract mt-1 w-full font-mono text-[10px] border border-slate-200 rounded-lg p-2 bg-white" rows="12" data-tool-id="${t.id}">${escapeHtml(JSON.stringify(editableContract, null, 2))}</textarea>
+                    </label>
+                    <button class="mcp-runtime-policy-save mt-2 text-xs px-3 py-1.5 rounded-lg bg-slate-800 text-white" data-tool-id="${t.id}">保存高级 JSON</button>
+                  </details>
+                  <p class="text-[10px] text-slate-500 mb-2">只读 Tool 可由模型调用；新增/更新 Tool 会被后端强制改为 Proposal，用户确认前不会执行。</p>
                   ${t.input_schema ? `<pre class="text-[10px] bg-white rounded-lg p-2 border border-slate-200 overflow-x-auto">${escapeHtml(JSON.stringify(t.input_schema, null, 2))}</pre>` : ''}
                 </div>
-              `}).join('')}</div>`;
+              `}).join('')}</div>`);
           openDrawer(`${escapeHtml(server.name || 'MCP Server')} 工具列表`, body);
+          $('#mcp-go-bind-agent')?.addEventListener('click', () => {
+            closeDrawer();
+            queueNavigation('platform', 'agents', '前往 Agent 绑定');
+          });
+          $('#mcp-go-runtime-publish')?.addEventListener('click', () => {
+            closeDrawer();
+            queueNavigation('platform', 'runtime', '前往运行时发布');
+          });
+          const splitTerms = value => String(value || '').split(/[，、,;；|]+/).map(item => item.trim()).filter(Boolean);
+          $$('.mcp-template-save').forEach(button => {
+            button.addEventListener('click', async () => {
+              const toolId = Number(button.dataset.toolId);
+              const effect = document.querySelector(`.mcp-template-effect[data-tool-id="${toolId}"]`).value;
+              const intents = splitTerms(document.querySelector(`.mcp-template-intents[data-tool-id="${toolId}"]`).value);
+              const triggers = splitTerms(document.querySelector(`.mcp-template-triggers[data-tool-id="${toolId}"]`).value);
+              const payload = {
+                effect,
+                risk_level: effect === 'read' ? 'L1' : effect === 'unknown' ? 'L3' : 'L2',
+                result_contract: {
+                  success_statuses: ['success'],
+                  non_success_statuses: ['empty','not_found','invalid_input','unauthorized','timeout','upstream_error','unknown'],
+                  claim_rule: 'Only an explicit success business status may be described as success.'
+                },
+                natural_language_intents: intents,
+                trigger_keywords: triggers,
+                trigger_mode: 'any',
+                execution_mode: effect === 'read' ? 'model_native' : effect === 'unknown' ? 'model_native' : 'proposal',
+                argument_bindings: {}
+              };
+              try {
+                await apiPut(`/api/mcp-servers/${serverId}/tools/${toolId}/runtime-policy`, payload);
+                showToast(effect === 'read' ? '只读 Tool 模板已保存' : effect === 'unknown' ? 'Tool 保持未授权' : '写 Tool 模板已保存，运行时将强制确认', 'success');
+                const advanced = document.querySelector(`.mcp-runtime-contract[data-tool-id="${toolId}"]`);
+                if (advanced) advanced.value = JSON.stringify(payload, null, 2);
+              } catch (err) {
+                showToast('Tool 模板保存失败：' + (err.message || err), 'error');
+              }
+            });
+          });
           $$('.mcp-runtime-policy-save').forEach(button => {
             button.addEventListener('click', async () => {
               const toolId = Number(button.dataset.toolId);
@@ -5899,7 +6093,8 @@
         }
       }
 
-      $('#mcp-add-btn').addEventListener('click', () => openMcpModal());
+      $('#mcp-git-import-btn').addEventListener('click', openMcpGitImportModal);
+      $('#mcp-advanced-add-btn').addEventListener('click', () => openMcpModal());
       await loadMcpServers();
     }
 
