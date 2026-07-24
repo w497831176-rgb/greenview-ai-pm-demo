@@ -7,6 +7,7 @@ import json
 import re
 import time
 import uuid
+from types import SimpleNamespace
 from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 
 from app.handoff_policy import evaluate_handoff_policy
@@ -98,6 +99,42 @@ KNOWLEDGE_EVIDENCE_TERMS = (
     "允许",
     "收费",
 )
+KNOWLEDGE_GOVERNED_TERMS = (
+    "规定",
+    "制度",
+    "流程",
+    "时效",
+    "响应",
+    "承诺",
+    "标准",
+    "依据",
+    "引用",
+    "收费",
+    "费用",
+    "价格",
+    "权限",
+    "允许",
+    "禁止",
+    "不得",
+    "必须",
+    "责任",
+    "安全",
+    "维修",
+    "保修",
+    "到场",
+    "上门",
+    "多久",
+    "多长时间",
+    "几分钟",
+    "几小时",
+    "怎么办",
+    "如何处理",
+)
+KNOWLEDGE_INSUFFICIENT_RESPONSE = (
+    "当前知识依据不足，无法确认具体结论。我不能将“未检索到”表述为"
+    "“文档没有规定”，也不会补充知识库之外的行业经验、时间范围或处理步骤。"
+    "你可以补充问题，或选择转人工核实。"
+)
 
 
 class ProviderFailureError(RuntimeError):
@@ -110,6 +147,11 @@ def _json(value: Any) -> str:
 
 def _sse(event: str, payload: Dict[str, Any]) -> str:
     return f"event: {event}\ndata: {_json(payload)}\n\n"
+
+
+async def _static_response_stream(content: str) -> AsyncIterator[Any]:
+    """Yield one deterministic answer without invoking a model Provider."""
+    yield SimpleNamespace(content=content, event="RunContent", metrics={})
 
 
 def _provider_failure_reason(text: str) -> Optional[str]:
@@ -235,6 +277,11 @@ def _requires_rag_citations(message: str) -> bool:
             "根据知识库",
         )
     )
+
+
+def _requires_direct_knowledge_evidence(message: str) -> bool:
+    compact = re.sub(r"\s+", "", message or "")
+    return any(marker in compact for marker in KNOWLEDGE_GOVERNED_TERMS)
 
 
 def _append_runtime_evidence_summary(
@@ -383,25 +430,16 @@ def _usage_for_observability(cost: Any) -> Dict[str, Any]:
     }
 
 
-def _lexical_terms(text: str) -> set[str]:
-    terms: set[str] = set()
-    for token in re.findall(r"[\u4e00-\u9fff]+|[a-zA-Z0-9_-]+", (text or "").lower()):
-        if re.fullmatch(r"[\u4e00-\u9fff]+", token):
-            for size in (2, 3, 4):
-                for index in range(max(0, len(token) - size + 1)):
-                    terms.add(token[index : index + size])
-        elif len(token) >= 2:
-            terms.add(token)
-    return terms
-
-
 def _results_from_snapshot(
     query: str,
     live_results: List[Dict[str, Any]],
     knowledge_versions: Dict[int, Dict[str, Any]],
     allowed_document_ids: set[int],
     top_k: int,
+    context_threshold: float = 0.2,
 ) -> Tuple[List[Dict[str, Any]], bool]:
+    import rag_retrieval
+
     published_chunks: Dict[Tuple[int, int], Dict[str, Any]] = {}
     for doc_id in allowed_document_ids:
         document = knowledge_versions.get(doc_id) or {}
@@ -427,6 +465,11 @@ def _results_from_snapshot(
         ):
             continue
         document = snapshot_chunk["document"]
+        if rag_retrieval._is_structural_chunk(
+            snapshot_chunk.get("content") or content,
+            document.get("title") or "",
+        ):
+            continue
         verified.append(
             {
                 **result,
@@ -442,15 +485,22 @@ def _results_from_snapshot(
     if verified:
         return verified[:top_k], False
 
-    query_terms = _lexical_terms(query)
     fallback: List[Dict[str, Any]] = []
     for (doc_id, chunk_index), snapshot_chunk in published_chunks.items():
         document = snapshot_chunk["document"]
         content = str(snapshot_chunk.get("content") or "")
-        overlap = query_terms & _lexical_terms(
-            f"{document.get('title') or ''} {content}"
-        )
-        if not overlap:
+        if rag_retrieval._is_structural_chunk(
+            content,
+            document.get("title") or "",
+        ):
+            continue
+        query_values = rag_retrieval._critical_values(query)
+        if query_values and not query_values.issubset(
+            rag_retrieval._critical_values(content)
+        ):
+            continue
+        context_score = rag_retrieval._context_relevance_score(query, content)
+        if context_score < context_threshold:
             continue
         fallback.append(
             {
@@ -461,11 +511,14 @@ def _results_from_snapshot(
                 "chunk_hash": snapshot_chunk.get("chunk_hash"),
                 "document_hash": document.get("document_hash"),
                 "document_version": document.get("document_version"),
-                "score": round(len(overlap) / max(1, len(query_terms)), 6),
+                "score": round(context_score, 6),
+                "context_score": round(context_score, 6),
+                "evidence_status": "accepted",
+                "evidence_reason": "accepted_snapshot_lexical",
                 "retrieval_sources": ["runtime_release_snapshot_lexical"],
             }
         )
-    fallback.sort(key=lambda item: float(item.get("score") or 0), reverse=True)
+    fallback.sort(key=lambda item: float(item.get("context_score") or 0), reverse=True)
     return fallback[:top_k], True
 
 
@@ -1453,6 +1506,8 @@ class RuntimeCoordinator:
             for item in snapshot.config.get("knowledge") or []
         }
         results: List[Dict[str, Any]] = []
+        retrieval: Dict[str, Any] = {}
+        used_snapshot_fallback = False
         retrieval_status = (
             "skipped_structured_realtime_query"
             if structured_realtime_query
@@ -1483,6 +1538,12 @@ class RuntimeCoordinator:
                         (snapshot.config.get("retrieval_policy") or {}).get("top_k")
                         or 5
                     ),
+                    float(
+                        (snapshot.config.get("retrieval_policy") or {}).get(
+                            "context_threshold"
+                        )
+                        or 0.2
+                    ),
                 )
                 retrieval_status = (
                     "completed_snapshot_fallback"
@@ -1498,6 +1559,12 @@ class RuntimeCoordinator:
                     int(
                         (snapshot.config.get("retrieval_policy") or {}).get("top_k")
                         or 5
+                    ),
+                    float(
+                        (snapshot.config.get("retrieval_policy") or {}).get(
+                            "context_threshold"
+                        )
+                        or 0.2
                     ),
                 )
                 retrieval_status = (
@@ -1534,6 +1601,20 @@ class RuntimeCoordinator:
                 "snapshot_id": snapshot.snapshot_id,
                 "allowed_document_ids": sorted(allowed_doc_ids),
                 "evidence_ids": [item.evidence_id for item in evidence.items],
+                "evidence": [
+                    {
+                        "evidence_id": item.evidence_id,
+                        "document_id": item.document_id,
+                        "chunk_index": item.chunk_index,
+                        "retrieval_score": item.retrieval_score,
+                        "retrieval_mode": item.retrieval_mode,
+                    }
+                    for item in evidence.items
+                ],
+                "retrieval_status": retrieval_status,
+                "snapshot_fallback": used_snapshot_fallback,
+                "evidence_policy": (retrieval or {}).get("evidence_policy"),
+                "filter_summary": (retrieval or {}).get("filter_summary"),
                 "decision_reason": (
                     "structured_realtime_query"
                     if structured_realtime_query
@@ -1598,6 +1679,14 @@ class RuntimeCoordinator:
                 invocation_mode="policy_preinvoke",
             )
 
+        direct_knowledge_required = bool(
+            allowed_doc_ids
+            and not structured_realtime_query
+            and _requires_direct_knowledge_evidence(message)
+        )
+        knowledge_evidence_blocked = bool(
+            direct_knowledge_required and not evidence.items
+        )
         evidence_prompt = prompt_evidence_allowlist(evidence)
         build = build_agent_from_snapshot(
             snapshot,
@@ -1659,6 +1748,12 @@ class RuntimeCoordinator:
                     )
                 ),
                 retrieval_status=retrieval_status,
+                evidence_count=len(evidence.items),
+                evidence_decision=(
+                    "rejected_insufficient"
+                    if knowledge_evidence_blocked
+                    else ("accepted" if evidence.items else "not_available")
+                ),
             ),
             "tool": _decision(
                 "selected" if read_tool_plans else "skipped",
@@ -1704,10 +1799,32 @@ class RuntimeCoordinator:
             metadata={"decision_summary": decision_summary},
         )
         state.next_step = "answer"
-        yield _sse(
-            "progress",
-            {"trace_id": trace_id, "stage": "model.invoke", "status": "running"},
-        )
+        model_invoked = not knowledge_evidence_blocked
+        if knowledge_evidence_blocked:
+            record_trace_event(
+                trace_id,
+                "evidence_gate",
+                "success",
+                output_summary="knowledge evidence insufficient; vertical model skipped",
+                metadata={
+                    "decision": "rejected_insufficient",
+                    "retrieval_status": retrieval_status,
+                    "evidence_count": 0,
+                },
+            )
+            yield _sse(
+                "progress",
+                {
+                    "trace_id": trace_id,
+                    "stage": "evidence.gate",
+                    "status": "completed",
+                },
+            )
+        else:
+            yield _sse(
+                "progress",
+                {"trace_id": trace_id, "stage": "model.invoke", "status": "running"},
+            )
         agent_started = time.time()
         contextual_message = (
             "[运行边界] 本轮是只读技术栈咨询路径，不得创建工单、草稿或任何待确认 Action。\n"
@@ -1718,13 +1835,18 @@ class RuntimeCoordinator:
         tool_calls: List[Dict[str, Any]] = list(build.skill_tool_calls)
         final_metrics: Dict[str, Optional[int]] = {}
         last_progress_at = time.time()
-        async for chunk in build.agent.arun(
-            contextual_message,
-            user_id=user_id,
-            session_id=session_id,
-            stream=True,
-            stream_events=True,
-        ):
+        response_stream = (
+            build.agent.arun(
+                contextual_message,
+                user_id=user_id,
+                session_id=session_id,
+                stream=True,
+                stream_events=True,
+            )
+            if model_invoked
+            else _static_response_stream(KNOWLEDGE_INSUFFICIENT_RESPONSE)
+        )
+        async for chunk in response_stream:
             content = getattr(chunk, "content", None) or getattr(chunk, "delta", None)
             event_name = str(getattr(chunk, "event", "") or "").lower()
             # RunCompleted carries the full answer again together with the
@@ -1737,7 +1859,7 @@ class RuntimeCoordinator:
                 # Some OpenAI-compatible Providers return account/auth errors
                 # as ordinary assistant text. Hold only a possible error prefix;
                 # normal model text still streams immediately.
-                if not _provider_failure_reason(
+                if not direct_knowledge_required and not _provider_failure_reason(
                     provisional_buffer
                 ) and not _provider_failure_prefix(provisional_buffer):
                     yield _sse(
@@ -1768,7 +1890,11 @@ class RuntimeCoordinator:
                 last_progress_at = time.time()
 
         provider_failure_reason = _provider_failure_reason(full_content)
-        if provisional_buffer and not provider_failure_reason:
+        if (
+            provisional_buffer
+            and not direct_knowledge_required
+            and not provider_failure_reason
+        ):
             yield _sse(
                 "delta",
                 {
@@ -1840,7 +1966,13 @@ class RuntimeCoordinator:
         rendered, citations, citation_violations = render_citations(
             full_content, evidence
         )
-        citation_required = _requires_rag_citations(message) and bool(evidence.items)
+        citation_required = bool(
+            evidence.items
+            and (
+                direct_knowledge_required
+                or _requires_rag_citations(message)
+            )
+        )
         if citation_required and not citations:
             citation_violations.append(
                 {
@@ -1851,6 +1983,12 @@ class RuntimeCoordinator:
                     ),
                 }
             )
+        knowledge_grounding_failed = bool(
+            direct_knowledge_required and citation_violations
+        )
+        if knowledge_grounding_failed:
+            rendered = KNOWLEDGE_INSUFFICIENT_RESPONSE
+            citations = []
         state.citations = citations
         _record_citation_violations(ledger, citation_violations)
         rendered = _append_runtime_evidence_summary(
@@ -1868,48 +2006,52 @@ class RuntimeCoordinator:
             ).get("model_id")
             or MODEL_ID
         )
-        vertical_cost = build_cost_entry(
-            stage="vertical_agent",
-            provider=_model_provider(snapshot.config, model_id),
-            requested_model=model_id,
-            response_model=model_id,
-            model_policy_version=str(
-                (snapshot.config.get("model_policy") or {}).get("version") or "v1.8"
-            ),
-            provider_usage=final_metrics if final_metrics else None,
-            price_row=_price_for_snapshot(snapshot.config, model_id),
-            local_estimate_tokens=_estimate_tokens(contextual_message + rendered),
-        )
-        state.cost_entries.append(vertical_cost)
-        state.model_calls.append(
-            {
-                "stage": "vertical_agent",
-                "model_id": model_id,
-                "latency_ms": int((time.time() - agent_started) * 1000),
-                "usage": final_metrics,
-                "usage_source": vertical_cost.usage_source.value,
-            }
-        )
-        record_model_call(
-            trace_id=trace_id,
-            stage="vertical_agent",
-            model_id=model_id,
-            model_selection_reason=f"agent model from snapshot:{selected}",
-            latency_ms=int((time.time() - agent_started) * 1000),
-            input_tokens=vertical_cost.input_tokens,
-            output_tokens=vertical_cost.output_tokens,
-            reasoning_tokens=vertical_cost.reasoning_tokens,
-            cached_tokens=vertical_cost.cached_input_tokens,
-            total_tokens=vertical_cost.total_tokens,
-            usage_source=vertical_cost.usage_source.value,
-            price_snapshot=(
-                vertical_cost.price_snapshot.model_dump(mode="json")
-                if vertical_cost.price_snapshot
-                else None
-            ),
-            estimated_cost_cny=vertical_cost.amount,
-            usage_normalized=_usage_for_observability(vertical_cost),
-        )
+        vertical_cost = None
+        vertical_usage_source = "not_invoked"
+        if model_invoked:
+            vertical_cost = build_cost_entry(
+                stage="vertical_agent",
+                provider=_model_provider(snapshot.config, model_id),
+                requested_model=model_id,
+                response_model=model_id,
+                model_policy_version=str(
+                    (snapshot.config.get("model_policy") or {}).get("version") or "v1.8"
+                ),
+                provider_usage=final_metrics if final_metrics else None,
+                price_row=_price_for_snapshot(snapshot.config, model_id),
+                local_estimate_tokens=_estimate_tokens(contextual_message + rendered),
+            )
+            vertical_usage_source = vertical_cost.usage_source.value
+            state.cost_entries.append(vertical_cost)
+            state.model_calls.append(
+                {
+                    "stage": "vertical_agent",
+                    "model_id": model_id,
+                    "latency_ms": int((time.time() - agent_started) * 1000),
+                    "usage": final_metrics,
+                    "usage_source": vertical_usage_source,
+                }
+            )
+            record_model_call(
+                trace_id=trace_id,
+                stage="vertical_agent",
+                model_id=model_id,
+                model_selection_reason=f"agent model from snapshot:{selected}",
+                latency_ms=int((time.time() - agent_started) * 1000),
+                input_tokens=vertical_cost.input_tokens,
+                output_tokens=vertical_cost.output_tokens,
+                reasoning_tokens=vertical_cost.reasoning_tokens,
+                cached_tokens=vertical_cost.cached_input_tokens,
+                total_tokens=vertical_cost.total_tokens,
+                usage_source=vertical_usage_source,
+                price_snapshot=(
+                    vertical_cost.price_snapshot.model_dump(mode="json")
+                    if vertical_cost.price_snapshot
+                    else None
+                ),
+                estimated_cost_cny=vertical_cost.amount,
+                usage_normalized=_usage_for_observability(vertical_cost),
+            )
 
         state.status = RunStatus.COMPLETED
         state.next_step = None
@@ -1936,6 +2078,25 @@ class RuntimeCoordinator:
                 "passed": (not citation_required) or bool(citations),
                 "required": citation_required,
                 "citation_count": len(citations),
+            },
+        )
+        ledger.append(
+            "evaluation_results",
+            {
+                "case": "knowledge_evidence_gate",
+                "passed": (
+                    not direct_knowledge_required
+                    or bool(citations)
+                    or rendered.startswith("当前知识依据不足")
+                ),
+                "required": direct_knowledge_required,
+                "evidence_count": len(evidence.items),
+                "model_invoked": model_invoked,
+                "decision": (
+                    "rejected_insufficient"
+                    if rendered.startswith("当前知识依据不足")
+                    else "answered_with_evidence"
+                ),
             },
         )
         ledger.persist("complete")
@@ -1965,6 +2126,13 @@ class RuntimeCoordinator:
                     item.invocation_id for item in state.tool_invocations
                 ],
                 "decision_summary": decision_summary,
+                "evidence_decision": (
+                    "rejected_insufficient"
+                    if rendered.startswith("当前知识依据不足")
+                    else "answered_with_evidence"
+                ),
+                "citation_violations": citation_violations,
+                "model_invoked": model_invoked,
             },
         )
 
@@ -2001,21 +2169,39 @@ class RuntimeCoordinator:
                 else "policy_preinvoke"
             )
             mcp_payload.append(payload)
-        token_count = vertical_cost.total_tokens or 0
-        saved = save_chat_message(
-            session_id=session_id,
-            role="assistant",
-            content=rendered,
-            token_count=token_count,
-            round_token_count=(router_cost.total_tokens or 0) + token_count,
-            token_detail={
+        token_count = (
+            vertical_cost.total_tokens or 0
+            if vertical_cost is not None
+            else 0
+        )
+        vertical_token_detail = (
+            {
                 "input_tokens": vertical_cost.input_tokens,
                 "output_tokens": vertical_cost.output_tokens,
                 "reasoning_tokens": vertical_cost.reasoning_tokens,
                 "cached_tokens": vertical_cost.cached_input_tokens,
                 "total_tokens": vertical_cost.total_tokens,
                 "local_estimate_tokens": vertical_cost.local_estimate_tokens,
-            },
+                "model_invoked": True,
+            }
+            if vertical_cost is not None
+            else {
+                "input_tokens": None,
+                "output_tokens": None,
+                "reasoning_tokens": None,
+                "cached_tokens": None,
+                "total_tokens": 0,
+                "local_estimate_tokens": None,
+                "model_invoked": False,
+            }
+        )
+        saved = save_chat_message(
+            session_id=session_id,
+            role="assistant",
+            content=rendered,
+            token_count=token_count,
+            round_token_count=(router_cost.total_tokens or 0) + token_count,
+            token_detail=vertical_token_detail,
             citations=citations_payload,
             activated_skills=skills_payload,
             route_intent=selected,
@@ -2030,7 +2216,7 @@ class RuntimeCoordinator:
             status="success",
             latency_ms=int((time.time() - agent_started) * 1000),
             mcp_calls=mcp_payload or None,
-            usage_source=vertical_cost.usage_source.value,
+            usage_source=vertical_usage_source,
         )
         auto_badcase = capture_runtime_badcase(
             ledger=ledger.contract,
@@ -2085,7 +2271,7 @@ class RuntimeCoordinator:
                 "cost_entries": [
                     item.model_dump(mode="json") for item in state.cost_entries
                 ],
-                "usage_source": vertical_cost.usage_source.value,
+                "usage_source": vertical_usage_source,
                 "token_count": token_count,
                 "round_token_count": (router_cost.total_tokens or 0) + token_count,
                 "auto_badcase_id": (

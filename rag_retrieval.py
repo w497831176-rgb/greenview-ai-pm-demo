@@ -16,6 +16,12 @@ import rag_indexer
 import rag_store
 
 
+_CRITICAL_VALUE = re.compile(
+    r"(?:\d+(?:\.\d+)?|[一二三四五六七八九十百千万两半]+)\s*"
+    r"(?:分钟|小时|工作日|天|元|万元|%|次|年|个月|月|日)"
+)
+
+
 def _tokenize(text: str) -> List[str]:
     """Tokenize Chinese/English/number text into searchable terms.
 
@@ -60,13 +66,66 @@ def _context_relevance_score(query: str, content: str) -> float:
     return round(overlap / len(query_tokens), 4)
 
 
+def _critical_values(text: str) -> set[str]:
+    return {
+        re.sub(r"\s+", "", match.group(0)).lower()
+        for match in _CRITICAL_VALUE.finditer(text or "")
+    }
+
+
+def _evidence_relevance(
+    query: str,
+    result: Dict[str, Any],
+    settings: Dict[str, Any],
+) -> tuple[float, str]:
+    """Apply one content gate across keyword, vector and fused candidates."""
+    content = result.get("content", "")
+    query_values = _critical_values(query)
+    if query_values and not query_values.issubset(_critical_values(content)):
+        return 0.0, "filtered_unsupported_critical_value"
+
+    lexical_score = _context_relevance_score(query, content)
+    try:
+        semantic_score = float(result.get("semantic_score") or 0.0)
+    except (TypeError, ValueError):
+        semantic_score = 0.0
+    result["lexical_context_score"] = round(lexical_score, 4)
+    result["semantic_context_score"] = round(semantic_score, 4)
+    channels = set(result.get("retrieval_sources") or [])
+    agreement_bonus = (
+        0.06 if {"keyword", "semantic"}.issubset(channels) else 0.0
+    )
+    result["channel_agreement_bonus"] = agreement_bonus
+    if lexical_score >= settings["context_threshold"]:
+        return min(1.0, lexical_score + agreement_bonus), "accepted_lexical"
+    if semantic_score >= settings["semantic_context_threshold"]:
+        calibrated_semantic = settings["context_threshold"] + min(
+            0.1,
+            max(0.0, semantic_score - settings["semantic_context_threshold"]) * 0.5,
+        )
+        return (
+            min(1.0, calibrated_semantic + agreement_bonus),
+            "accepted_semantic",
+        )
+    return lexical_score, "filtered_low_relevance"
+
+
 def _is_structural_chunk(content: str, doc_title: str = "") -> bool:
     """Return True for title-only and heading-only chunks.
 
     These fragments may help index navigation, but they cannot support an
     owner-facing factual answer or a clickable citation on their own.
     """
-    normalized = re.sub(r"[^\u4e00-\u9fa5a-z0-9]", "", (content or "").lower())
+    raw = (content or "").strip()
+    if (
+        "\n" not in raw
+        and len(raw) <= 40
+        and raw.endswith(("：", ":"))
+        and not re.search(r"\d", raw)
+        and not re.search(r"[。！？；]", raw)
+    ):
+        return True
+    normalized = re.sub(r"[^\u4e00-\u9fa5a-z0-9]", "", raw.lower())
     title_normalized = re.sub(r"[^\u4e00-\u9fa5a-z0-9]", "", (doc_title or "").lower())
     if not normalized:
         return True
@@ -76,30 +135,35 @@ def _is_structural_chunk(content: str, doc_title: str = "") -> bool:
         or (title_normalized.endswith(normalized) and len(title_normalized) - len(normalized) <= 8)
     ):
         return True
-    return bool(re.fullmatch(r"第[0-9一二三四五六七八九十百]+[章节].{0,24}|[总附]则", normalized))
+    return bool(
+        "\n" not in raw
+        and re.fullmatch(
+            r"第[0-9一二三四五六七八九十百]+[章节篇部].{0,24}|[总附]则",
+            normalized,
+        )
+    )
 
 
-def _explicit_evidence_priority(query: str, content: str) -> float:
-    """Rank supporting chunks for an explicitly named source.
-
-    It is a transparent property-domain evidence policy, not a document-name
-    rule: owner symptoms and service-time intents must outrank a generic
-    complaint or title sentence when the owner asks for repair guidance.
-    """
-    q = query or ""
-    text = content or ""
-    score = _context_relevance_score(q, text)
-    water_query = any(term in q for term in ("漏水", "滴水", "渗水"))
-    water_evidence = any(term in text for term in ("漏水", "滴水", "渗水", "水管", "水阀"))
-    timing_query = any(term in q for term in ("时效", "响应", "多久", "到场", "上门", "紧急"))
-    timing_evidence = any(term in text for term in ("紧急维修", "一般维修", "到场", "上门", "派单", "受理"))
-    if water_query and water_evidence:
-        score += 0.30
-    if timing_query and timing_evidence:
-        score += 0.18
-    if "投诉" in text and not any(term in q for term in ("投诉", "纠纷", "12345")):
-        score -= 0.50
-    return round(max(0.0, min(1.0, score)), 4)
+def _content_query(query: str, cited_title: str = "") -> str:
+    """Remove citation boilerplate without changing the user's factual intent."""
+    value = query or ""
+    if cited_title:
+        value = value.replace(f"《{cited_title}》", " ").replace(cited_title, " ")
+    for marker in (
+        "请依据",
+        "请根据",
+        "依据",
+        "根据",
+        "请说明",
+        "说明",
+        "请回答",
+        "回答",
+        "给出引用",
+        "可点击引用",
+    ):
+        value = value.replace(marker, " ")
+    value = re.sub(r"\s+", " ", value).strip(" ，。！？；：:,.!?;")
+    return value or query
 
 
 def _build_keyword_index(
@@ -184,13 +248,13 @@ def _keyword_search(
         chunks = rag_store.list_chunks_for_doc(doc["id"])
         if not chunks:
             continue
-        title_tokens = _tokenize(doc.get("title") or "")
         for chunk in chunks:
             if _is_structural_chunk(chunk.get("content", ""), doc.get("title") or ""):
                 continue
             chunk_tokens = _tokenize(chunk.get("content", ""))
-            # Inject title terms into each chunk so the document title still contributes.
-            tokens = title_tokens + chunk_tokens
+            # The title may select a document, but cannot make every unrelated
+            # chunk inside that document look relevant.
+            tokens = chunk_tokens
             tf_chunk: Dict[str, int] = {}
             for t in tokens:
                 tf_chunk[t] = tf_chunk.get(t, 0) + 1
@@ -248,9 +312,12 @@ def _semantic_search(
     """
     effective_threshold = rag_indexer._effective_threshold(threshold)
     query_embedding = rag_embeddings.embed_text(query)
+    # Structural chunks are filtered after the vector store returns rows.
+    # Over-fetch before filtering so headings cannot consume all visible Top-K
+    # slots and crowd factual evidence out.
     chunks = rag_store.search_chunks(
         query_embedding,
-        top_k=top_k,
+        top_k=max(top_k * 3, top_k + 10),
         threshold=effective_threshold,
         allowed_document_ids=allowed_document_ids,
     )
@@ -274,6 +341,8 @@ def _semantic_search(
             "is_indexed": bool(doc.get("is_indexed")),
             "source": "semantic",
         })
+        if len(results) >= top_k:
+            break
     return results
 
 
@@ -401,6 +470,7 @@ DEFAULT_RETRIEVAL_SETTINGS = {
     "rerank_model": None,
     "score_threshold": 0.0,
     "context_threshold": 0.2,
+    "semantic_context_threshold": 0.67,
 }
 
 
@@ -432,7 +502,11 @@ def normalize_retrieval_settings(settings: Optional[Dict[str, Any]] = None) -> D
     else:
         result["keyword_weight"] = round(result["keyword_weight"] / weight_sum, 4)
         result["semantic_weight"] = round(result["semantic_weight"] / weight_sum, 4)
-    for key in ("score_threshold", "context_threshold"):
+    for key in (
+        "score_threshold",
+        "context_threshold",
+        "semantic_context_threshold",
+    ):
         try:
             result[key] = max(0.0, min(1.0, float(result[key])))
         except (TypeError, ValueError):
@@ -477,18 +551,37 @@ def _single_query_search(
             context_score = result.get("rerank_score", 0.0)
             result["score"] = round(context_score, 4)
         else:
-            context_score = _context_relevance_score(
-                query, f"{result.get('title', '')} {result.get('content', '')}"
+            context_score, evidence_reason = _evidence_relevance(
+                query,
+                result,
+                settings,
             )
             result["score"] = round(context_score, 4)
         result["context_score"] = round(context_score, 4)
+        result["evidence_reason"] = (
+            "accepted_rerank"
+            if settings["enable_rerank"]
+            and context_score >= settings["context_threshold"]
+            else (
+                "filtered_low_relevance"
+                if settings["enable_rerank"]
+                else evidence_reason
+            )
+        )
         result["evidence_status"] = (
             "accepted"
-            if context_score >= settings["context_threshold"]
-            else "filtered_low_relevance"
+            if result["evidence_reason"].startswith("accepted")
+            else result["evidence_reason"]
         )
         if result["evidence_status"] == "accepted":
             grounded.append(result)
+    grounded.sort(
+        key=lambda item: (
+            float(item.get("context_score") or 0),
+            float(item.get("rrf_score") or 0),
+        ),
+        reverse=True,
+    )
     return grounded[:top_k]
 
 def _title_boosted_results(
@@ -507,15 +600,25 @@ def _title_boosted_results(
     top_k = settings.get("top_k", 5)
     context_threshold = settings.get("context_threshold", 0.2)
 
-    # Find candidate docs by matching the cited title.
-    title_hits = _keyword_search(
-        title,
-        top_k=top_k * 2,
-        allowed_document_ids=allowed_document_ids,
-    )
-    doc_ids = {r.get("doc_id") for r in title_hits if r.get("doc_id")}
+    # Resolve the explicitly cited document directly. Candidate discovery may
+    # use the title, but Evidence acceptance below uses chunk content only.
+    normalized_title = re.sub(r"\s+", "", title or "").lower()
+    doc_ids = {
+        int(doc["id"])
+        for doc in db.list_knowledge_docs()
+        if doc.get("is_indexed")
+        and (
+            allowed_document_ids is None
+            or int(doc["id"]) in allowed_document_ids
+        )
+        and (
+            re.sub(r"\s+", "", str(doc.get("title") or "")).lower()
+            == normalized_title
+        )
+    }
 
     candidates = []
+    evidence_query = _content_query(query, title)
     for doc_id in doc_ids:
         doc = db.get_knowledge_doc(doc_id)
         if not doc:
@@ -526,7 +629,14 @@ def _title_boosted_results(
             content = c.get("content", "")
             if _is_structural_chunk(content, doc_title):
                 continue
-            ctx_score = _explicit_evidence_priority(query, content)
+            ctx_score = _context_relevance_score(evidence_query, content)
+            if (
+                _critical_values(evidence_query)
+                and not _critical_values(evidence_query).issubset(
+                    _critical_values(content)
+                )
+            ):
+                continue
             if ctx_score < context_threshold:
                 continue
             candidates.append({
@@ -538,8 +648,11 @@ def _title_boosted_results(
                 "doc_category": doc.get("category"),
                 "chunk_index": c.get("chunk_index"),
                 "content": content,
-                "score": round(ctx_score, 4),
+                "score": round(min(1.0, ctx_score + 0.12), 4),
                 "context_score": round(ctx_score, 4),
+                "document_scope_bonus": 0.12,
+                "evidence_status": "accepted",
+                "evidence_reason": "accepted_named_document_content",
                 "source": "title_boost",
             })
 
@@ -704,12 +817,32 @@ def debug_search(
         reranked_results = [dict(result) for result in fused]
     primary_accepted = []
     for result in fused:
-        context_score = result.get("rerank_score", 0.0) if settings["enable_rerank"] else _context_relevance_score(
-            query, f"{result.get('title', '')} {result.get('content', '')}")
+        if settings["enable_rerank"]:
+            context_score = result.get("rerank_score", 0.0)
+            evidence_reason = (
+                "accepted_rerank"
+                if context_score >= settings["context_threshold"]
+                else "filtered_low_relevance"
+            )
+        else:
+            context_score, evidence_reason = _evidence_relevance(
+                query,
+                result,
+                settings,
+            )
         result["context_score"] = round(context_score, 4)
-        result["evidence_status"] = "accepted" if context_score >= settings["context_threshold"] else "filtered_low_relevance"
+        result["evidence_reason"] = evidence_reason
+        result["evidence_status"] = (
+            "accepted"
+            if evidence_reason.startswith("accepted")
+            else evidence_reason
+        )
         if result["evidence_status"] == "accepted":
             primary_accepted.append(result)
+    primary_accepted.sort(
+        key=lambda item: float(item.get("context_score") or 0),
+        reverse=True,
+    )
     composite = advanced_search(query, settings=settings)
     results = composite.get("results", [])
     titles = [result.get("title") for result in results]
