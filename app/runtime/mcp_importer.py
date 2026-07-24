@@ -27,6 +27,7 @@ from urllib.parse import urlparse
 DEFAULT_PACKAGE_ROOT = "/app/data/mcp_packages"
 IGNORED_DIRECTORIES = {
     ".git",
+    ".venv",
     ".yiai-venv",
     "__pycache__",
     "node_modules",
@@ -363,9 +364,34 @@ def _venv_script(venv: Path, name: str) -> Path:
     return venv / "bin" / name
 
 
+def _python_launch_spec(
+    project_root: Path,
+    entry_kind: str,
+    entrypoint: str,
+) -> tuple[str, List[str]]:
+    """Return an Agno-compatible launch command for a prepared Python MCP.
+
+    Agno intentionally accepts a small executable allowlist for stdio MCP
+    servers.  Persisting an absolute virtualenv script passed raw MCP discovery
+    but failed later when the same server was attached to an Agno Agent.  Use
+    the allowlisted ``uv`` launcher and the already-prepared project ``.venv``
+    for both discovery and runtime execution.
+    """
+
+    prefix = [
+        "run",
+        "--directory",
+        str(project_root),
+        "--no-sync",
+    ]
+    if entry_kind == "console_script":
+        return "uv", [*prefix, entrypoint]
+    return "uv", [*prefix, "python", entrypoint]
+
+
 def _prepare_python(project_root: Path, steps: List[Dict[str, str]]) -> tuple[str, List[str], str]:
     entry_kind, entrypoint = _python_entrypoint(project_root)
-    venv = project_root / ".yiai-venv"
+    venv = project_root / ".venv"
     _run(["uv", "venv", "--system-site-packages", str(venv)], cwd=project_root)
     python = _venv_python(venv)
     _step(steps, "prepare_runtime", "passed", "已创建隔离的 Python 运行环境")
@@ -407,8 +433,8 @@ def _prepare_python(project_root: Path, steps: List[Dict[str, str]]) -> tuple[st
                 detail=entrypoint,
                 steps=steps,
             )
-        return str(script), [], entrypoint
-    return str(python), [entrypoint], entrypoint
+    command, args = _python_launch_spec(project_root, entry_kind, entrypoint)
+    return command, args, entrypoint
 
 
 def _read_package_json(project_root: Path) -> Dict[str, Any]:

@@ -9,11 +9,13 @@ from pathlib import Path
 from app.runtime.mcp_importer import (
     McpImportError,
     _node_entrypoint,
+    _python_launch_spec,
     _python_entrypoint,
     _select_project_root,
     _validate_git_url,
     suggest_tool_effect,
 )
+from app.runtime.mcp_executor import build_model_native_read_tools
 
 
 def ensure(condition: bool, message: str) -> None:
@@ -62,6 +64,95 @@ if __name__ == "__main__":
         ensure(runtime == "python", "Python runtime detected")
         ensure(kind == "file", "Python file entrypoint detected")
         ensure(Path(entrypoint).name == server.name, "correct Python entrypoint")
+
+
+def test_python_runtime_uses_agno_compatible_launcher() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        command, args = _python_launch_spec(
+            root,
+            "console_script",
+            "demo-mcp",
+        )
+        ensure(command == "uv", "Python MCP uses Agno allowlisted uv launcher")
+        ensure(args[:3] == ["run", "--directory", str(root)], "project root retained")
+        ensure("--no-sync" in args, "prepared virtualenv is reused")
+        ensure(args[-1] == "demo-mcp", "console script retained")
+
+
+def _model_native_fixture() -> dict:
+    return {
+        "agents": [
+            {
+                "agent_id": "chaos_agent",
+                "enabled": True,
+                "mcp_server_names": ["calculator-server"],
+            }
+        ],
+        "mcp_servers": [
+            {
+                "server_id": 1,
+                "name": "calculator-server",
+                "enabled": True,
+                "command": "python",
+                "args": ["/tmp/calculator.py"],
+                "tools": [
+                    {
+                        "name": "calculate",
+                        "description": "Calculate a mathematical expression",
+                        "input_schema": {
+                            "type": "object",
+                            "properties": {"expression": {"type": "string"}},
+                            "required": ["expression"],
+                        },
+                        "tool_metadata": {
+                            "effect": "read",
+                            "risk_level": "L1",
+                            "execution_mode": "model_native",
+                            "natural_language_intents": ["精确计算数学表达式"],
+                            "trigger_keywords": ["计算", "calculate"],
+                            "trigger_mode": "any",
+                            "argument_bindings": {},
+                            "result_contract": {
+                                "success_statuses": ["success"],
+                                "non_success_statuses": ["invalid_input"],
+                            },
+                        },
+                        "policy": {
+                            "server_id": 1,
+                            "server_name": "calculator-server",
+                            "tool_name": "calculate",
+                            "effect": "read",
+                            "risk_level": "L1",
+                            "allowed_paths": ["consultation", "extension_acceptance"],
+                            "requires_confirmation": False,
+                            "enabled": True,
+                            "policy_reason": "test fixture",
+                        },
+                    }
+                ],
+            }
+        ],
+    }
+
+
+def test_model_native_tools_are_message_gated() -> None:
+    config = _model_native_fixture()
+    ensure(
+        build_model_native_read_tools(
+            config,
+            "chaos_agent",
+            "先只回复你被路由到的 Agent 名称，不调用其他能力。",
+        )
+        == [],
+        "route-only prompt must not attach or start a bound MCP server",
+    )
+    matched = build_model_native_read_tools(
+        config,
+        "chaos_agent",
+        "请调用 calculate 工具计算表达式。",
+    )
+    ensure(len(matched) == 1, "matching prompt attaches the published MCP tool")
 
 
 def test_node_detection() -> None:
@@ -133,6 +224,8 @@ def test_frontend_contract() -> None:
 def main() -> None:
     test_git_url_contract()
     test_python_detection()
+    test_python_runtime_uses_agno_compatible_launcher()
+    test_model_native_tools_are_message_gated()
     test_node_detection()
     test_tool_effect_suggestions()
     test_frontend_contract()

@@ -391,15 +391,35 @@ async def preinvoke_read_tools(
 def build_model_native_read_tools(
     snapshot_config: Dict[str, Any],
     agent_id: str,
+    message: str,
     excluded_servers: Optional[Set[str]] = None,
     excluded_tools: Optional[Set[Tuple[str, str]]] = None,
 ) -> List[Any]:
-    """Build published model-native read tools for Agno's native tool loop."""
+    """Build only message-matched model-native tools for Agno's tool loop.
+
+    A published binding makes a tool eligible; it does not mean every request
+    should start that MCP server.  Matching the immutable Tool metadata before
+    Agent construction both preserves the control-plane contract and prevents
+    unrelated route-only prompts from being coupled to external tool startup.
+    """
 
     if GovernedMCPTools is None:
         return []
     excluded = set(excluded_servers or set())
     excluded_tool_keys = set(excluded_tools or set())
+    planned_tool_keys = {
+        (plan.server_name, plan.tool_name)
+        for plan in plan_tools(
+            snapshot_config,
+            agent_id,
+            message,
+            RuntimePath.CONSULTATION,
+            effects=[ToolEffect.READ],
+            execution_modes=["model_native"],
+        )
+    }
+    if not planned_tool_keys:
+        return []
     gateway = ToolGateway(snapshot_config)
     toolkits: List[Any] = []
     for server in snapshot_config.get("mcp_servers") or []:
@@ -424,6 +444,8 @@ def build_model_native_read_tools(
             tool_name
             for tool_name in policy_allowed
             if (
+                (server_name, tool_name) in planned_tool_keys
+                and
                 (
                     tool_definitions.get(tool_name, {}).get("tool_metadata")
                     or {}

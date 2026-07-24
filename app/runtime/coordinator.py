@@ -37,7 +37,7 @@ from app.runtime.mcp_executor import (
     preinvoke_read_tools,
 )
 from app.runtime.snapshot_resolver import resolve_snapshot
-from app.runtime.tool_planner import unique_write_plan
+from app.runtime.tool_planner import plan_tools, unique_write_plan
 from app.settings import MODEL_ID, USE_THINKING, build_model
 from app.work_order_workflow import (
     action_gateway,
@@ -1356,10 +1356,19 @@ class RuntimeCoordinator:
         )
 
         state.next_step = "readonly_mcp"
-        yield _sse(
-            "progress",
-            {"trace_id": trace_id, "stage": "mcp.invoke", "status": "running"},
+        read_tool_plans = plan_tools(
+            snapshot.config,
+            selected,
+            message,
+            RuntimePath.CONSULTATION,
+            effects=[ToolEffect.READ],
+            execution_modes=["auto_preinvoke", "model_native"],
         )
+        if read_tool_plans:
+            yield _sse(
+                "progress",
+                {"trace_id": trace_id, "stage": "mcp.invoke", "status": "running"},
+            )
         mcp_context, invocations = await preinvoke_read_tools(
             snapshot.config, selected, message
         )
@@ -1372,6 +1381,7 @@ class RuntimeCoordinator:
         model_native_toolkits = build_model_native_read_tools(
             snapshot.config,
             selected,
+            message,
             excluded_tools=preinvoked_tools,
         )
         state.tool_invocations = list(invocations)
