@@ -130,7 +130,7 @@ def test_trace_does_not_render_full_proposal_payload() -> None:
 
 def test_trace_masks_mobile_phone_numbers() -> None:
     source = _source()
-    assert "1[3-9]\\\\d{9}" in source
+    assert "1[3-9]\\d{9}" in source
     assert "phone.slice(0, 3)}****${phone.slice(-4)" in source
     assert "safeTraceJson(call.arguments" in source
     assert "safeTraceJson(event.metadata)" in source
