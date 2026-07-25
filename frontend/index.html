@@ -4926,6 +4926,292 @@
           </div>`;
       };
 
+      const releaseVersionFromId = releaseId => {
+        const match = String(releaseId || '').match(/^rr_(\d+)_/);
+        return match ? String(Number(match[1])) : '';
+      };
+
+      const historicalDiffSide = (item, side, changeType) => {
+        const value = item?.[side];
+        if ((value === null || value === undefined) && side === 'old' && changeType === 'added') {
+          return { text: '不存在', placeholder: true };
+        }
+        if ((value === null || value === undefined) && side === 'new' && changeType === 'deleted') {
+          return { text: '已删除', placeholder: true };
+        }
+        return { text: displayDiffValue(value), placeholder: false };
+      };
+
+      const renderHistoricalValue = (item, side, changeType) => {
+        const label = side === 'old' ? '修改前' : '修改后';
+        const value = historicalDiffSide(item, side, changeType);
+        const tone = side === 'old'
+          ? 'bg-slate-50 border-slate-200 text-slate-700'
+          : 'bg-indigo-50/70 border-indigo-100 text-indigo-900';
+        const placeholderTone = value.placeholder ? 'italic text-slate-400' : '';
+        if (item.field === 'instructions' && !value.placeholder) {
+          const preview = value.text.split(/\r?\n/).slice(0, 3).join('\n').slice(0, 240);
+          return `
+            <div class="min-w-0">
+              <div class="md:hidden text-[11px] font-semibold text-slate-500 mb-1">${label}</div>
+              <details class="group rounded-xl border ${tone}">
+                <summary class="cursor-pointer list-none p-3">
+                  <pre class="whitespace-pre-wrap break-words text-xs font-sans">${escapeHtml(preview || '（空）')}${value.text.length > preview.length ? '…' : ''}</pre>
+                  <span class="inline-flex mt-2 text-[11px] font-medium text-indigo-600 group-open:hidden">展开完整 Prompt</span>
+                  <span class="hidden mt-2 text-[11px] font-medium text-indigo-600 group-open:inline-flex">收起完整 Prompt</span>
+                </summary>
+                <pre class="mx-3 mb-3 max-h-80 overflow-auto whitespace-pre-wrap break-words rounded-lg bg-white/70 border border-slate-200 p-3 text-xs text-slate-700">${escapeHtml(value.text || '（空）')}</pre>
+              </details>
+            </div>`;
+        }
+        return `
+          <div class="min-w-0">
+            <div class="md:hidden text-[11px] font-semibold text-slate-500 mb-1">${label}</div>
+            <pre class="h-full whitespace-pre-wrap break-words rounded-xl border p-3 text-xs font-sans ${tone} ${placeholderTone}">${escapeHtml(value.text)}</pre>
+          </div>`;
+      };
+
+      const renderHistoricalFieldTable = (fields, changeType) => {
+        if (!fields?.length) {
+          return '<div class="rounded-xl border border-dashed border-slate-200 p-3 text-xs text-slate-500">没有字段级参数变化。</div>';
+        }
+        return `
+          <div class="overflow-hidden rounded-xl border border-slate-200">
+            <div class="hidden md:grid md:grid-cols-[160px_minmax(0,1fr)_minmax(0,1fr)] gap-3 bg-slate-100 px-4 py-2 text-xs font-semibold text-slate-600">
+              <div>变更项</div>
+              <div>修改前</div>
+              <div>修改后</div>
+            </div>
+            <div class="divide-y divide-slate-100">
+              ${fields.map(item => `
+                <div class="grid md:grid-cols-[160px_minmax(0,1fr)_minmax(0,1fr)] gap-3 p-3 md:p-4 bg-white">
+                  <div class="text-sm font-semibold text-slate-800">${escapeHtml(item.label || item.field || '参数')}</div>
+                  ${renderHistoricalValue(item, 'old', changeType)}
+                  ${renderHistoricalValue(item, 'new', changeType)}
+                </div>`).join('')}
+            </div>
+          </div>`;
+      };
+
+      const collectHistoricalCapabilities = agent => {
+        const types = [
+          ['Skill', agent.capabilities?.skills],
+          ['RAG 文档', agent.capabilities?.knowledge],
+          ['MCP', agent.capabilities?.mcp_servers]
+        ];
+        const result = { added: [], removed: [] };
+        types.forEach(([type, values]) => {
+          (values?.added || []).forEach(item => result.added.push({ type, name: item.name || item.id || '-' }));
+          (values?.removed || []).forEach(item => result.removed.push({ type, name: item.name || item.id || '-' }));
+        });
+        return result;
+      };
+
+      const renderCapabilityChangeZone = (title, items, added) => `
+        <div class="rounded-xl border ${added ? 'border-emerald-200 bg-emerald-50/60' : 'border-red-200 bg-red-50/60'} p-3">
+          <div class="text-xs font-semibold ${added ? 'text-emerald-800' : 'text-red-800'}">${title}</div>
+          <div class="mt-2 space-y-1.5">
+            ${items.length ? items.map(item => `
+              <div class="flex items-start gap-2 text-sm ${added ? 'text-emerald-800' : 'text-red-800'}">
+                <span class="font-bold">${added ? '+' : '−'}</span>
+                <span><span class="text-[11px] font-semibold opacity-70">${escapeHtml(item.type)}</span> ${escapeHtml(item.name)}</span>
+              </div>`).join('') : `<div class="text-xs ${added ? 'text-emerald-700' : 'text-red-700'} opacity-70">无</div>`}
+          </div>
+        </div>`;
+
+      const renderHistoricalAgentChange = agent => {
+        const capabilities = collectHistoricalCapabilities(agent);
+        return `
+          <article class="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
+            <div class="flex flex-wrap items-center justify-between gap-3 px-4 md:px-5 py-4 border-b border-slate-100">
+              <div>
+                <div class="flex items-center gap-2">
+                  <h4 class="font-semibold text-slate-900">${escapeHtml(agent.name || agent.agent_id)}</h4>
+                  <span class="px-2 py-1 rounded-full border text-xs ${changeStyles[agent.change_type] || changeStyles.modified}">${changeLabels[agent.change_type] || agent.change_type}</span>
+                </div>
+                <div class="text-[11px] font-mono text-slate-400 mt-1">${escapeHtml(agent.agent_id || '')}</div>
+              </div>
+              <div class="text-xs text-slate-500">${(agent.fields || []).length} 项参数变化 · ${capabilities.added.length + capabilities.removed.length} 项挂载变化</div>
+            </div>
+            <div class="p-4 md:p-5 space-y-5">
+              <section>
+                <h5 class="text-sm font-semibold text-slate-800 mb-2">A. Agent 参数变化</h5>
+                ${renderHistoricalFieldTable(agent.fields || [], agent.change_type)}
+              </section>
+              <section>
+                <h5 class="text-sm font-semibold text-slate-800 mb-2">B. 挂载能力变化</h5>
+                <div class="grid md:grid-cols-2 gap-3">
+                  ${renderCapabilityChangeZone('新增能力', capabilities.added, true)}
+                  ${renderCapabilityChangeZone('移除能力', capabilities.removed, false)}
+                </div>
+              </section>
+            </div>
+          </article>`;
+      };
+
+      const historicalOtherGroups = diff => [
+        ['Skill', diff?.skills || []],
+        ['RAG 文档', diff?.knowledge || []],
+        ['MCP Server', diff?.mcp_servers || []],
+        ['MCP Tool 与读写策略', diff?.mcp_tools || []]
+      ];
+
+      const historicalOtherCount = diff => (
+        historicalOtherGroups(diff).reduce((total, [, items]) => total + items.length, 0)
+        + (diff?.policies || []).length
+      );
+
+      const renderHistoricalOtherChanges = diff => {
+        const count = historicalOtherCount(diff);
+        if (!count) return '';
+        const entityHtml = historicalOtherGroups(diff).map(([title, items]) => {
+          if (!items.length) return '';
+          return `
+            <section>
+              <h5 class="text-sm font-semibold text-slate-800 mb-2">${escapeHtml(title)}</h5>
+              <div class="space-y-3">
+                ${items.map(item => `
+                  <div class="rounded-xl border border-slate-200 bg-white overflow-hidden">
+                    <div class="flex items-center justify-between gap-2 px-4 py-3 bg-slate-50">
+                      <span class="text-sm font-medium text-slate-800">${escapeHtml(item.name || item.id)}</span>
+                      <span class="text-xs px-2 py-1 rounded-full border ${changeStyles[item.change_type] || changeStyles.modified}">${changeLabels[item.change_type] || item.change_type}</span>
+                    </div>
+                    <div class="p-3">${renderHistoricalFieldTable(item.fields || [], item.change_type)}</div>
+                  </div>`).join('')}
+              </div>
+            </section>`;
+        }).join('');
+        const policies = (diff?.policies || []).length ? `
+          <section>
+            <h5 class="text-sm font-semibold text-slate-800 mb-2">模型、检索与预算策略</h5>
+            ${renderHistoricalFieldTable(
+              diff.policies.map(item => ({ ...item, label: `${item.label} · ${item.field}` })),
+              'modified'
+            )}
+          </section>` : '';
+        return `
+          <details class="rounded-2xl border border-slate-200 bg-slate-50/70">
+            <summary class="cursor-pointer px-4 md:px-5 py-4 font-semibold text-sm text-slate-800">其他配置变化（${count}项）</summary>
+            <div class="px-4 md:px-5 pb-5 space-y-5">${entityHtml}${policies}</div>
+          </details>`;
+      };
+
+      const buildHistoricalDiffNarrative = diff => {
+        if (!diff?.has_changes) return '该版本配置与上一版本相同，属于历史重复快照。';
+        const agentPhrases = (diff.agents || []).map(agent => {
+          const name = agent.name || agent.agent_id || '未命名 Agent';
+          if (agent.change_type === 'added') return `新增了 ${name}`;
+          if (agent.change_type === 'deleted') return `删除了 ${name}`;
+          const fieldLabels = (agent.fields || []).map(item => item.label || item.field).filter(Boolean);
+          const capabilities = collectHistoricalCapabilities(agent);
+          const parts = [];
+          if (fieldLabels.length) parts.push(`修改了 ${name} 的${fieldLabels.join('、')}`);
+          if (capabilities.added.length) parts.push(`为 ${name} 新增 ${capabilities.added.length} 项挂载能力`);
+          if (capabilities.removed.length) parts.push(`从 ${name} 移除 ${capabilities.removed.length} 项挂载能力`);
+          return parts.join('，') || `${changeLabels[agent.change_type] || '调整'}了 ${name}`;
+        });
+        const otherCount = historicalOtherCount(diff);
+        const phrases = [...agentPhrases];
+        if (otherCount) phrases.push(`另有 ${otherCount} 项其他配置变化`);
+        return `本次${phrases.length ? phrases.join('；') : '存在配置变化'}。`;
+      };
+
+      const renderHistoricalReleaseMeta = (release, label, currentId) => `
+        <div class="rounded-xl border ${release?.release_id === currentId ? 'border-emerald-200 bg-emerald-50/60' : 'border-slate-200 bg-white'} p-3 min-w-0">
+          <div class="flex flex-wrap items-center gap-2">
+            <span class="text-xs font-semibold text-slate-500">${label}</span>
+            <span class="text-base font-semibold text-slate-900">Release #${escapeHtml(String(release?.version || '-'))}</span>
+            ${release?.release_id === currentId ? '<span class="px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-700 text-[11px]">当前运行</span>' : ''}
+          </div>
+          <div class="mt-1 text-[11px] font-mono text-slate-500 break-all">${escapeHtml(release?.release_id || '-')}</div>
+          <div class="mt-1 text-xs text-slate-500">发布时间：${escapeHtml(release?.published_at || release?.created_at || '未发布')}</div>
+        </div>`;
+
+      const renderHistoricalDiffComparison = (data, currentId) => {
+        const release = data?.release || {};
+        const parent = data?.parent_release || null;
+        const diff = data?.diff || {};
+        const summary = diff.summary || {};
+        if (!parent) {
+          return `
+            <div class="space-y-4">
+              ${renderHistoricalReleaseMeta(release, '当前版本', currentId)}
+              <div class="rounded-2xl border border-indigo-200 bg-indigo-50 p-5 text-sm text-indigo-900">
+                <div class="font-semibold">这是初始版本，没有上一个版本可供比较。</div>
+                <div class="text-xs text-indigo-700 mt-1">完整原始快照仍可从历史列表按需查看。</div>
+              </div>
+            </div>`;
+        }
+        return `
+          <div class="space-y-5">
+            <section>
+              <div class="grid md:grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] gap-3 items-center">
+                ${renderHistoricalReleaseMeta(parent, '父版本', currentId)}
+                <div class="text-center text-xl text-slate-400">→</div>
+                ${renderHistoricalReleaseMeta(release, '当前版本', currentId)}
+              </div>
+            </section>
+            <section class="rounded-2xl border ${diff.has_changes ? 'border-indigo-200 bg-indigo-50/70' : 'border-amber-200 bg-amber-50'} p-4 md:p-5">
+              <div class="text-xs font-semibold ${diff.has_changes ? 'text-indigo-600' : 'text-amber-700'}">变更结论</div>
+              <div class="mt-1 text-base font-semibold ${diff.has_changes ? 'text-indigo-950' : 'text-amber-900'}">${escapeHtml(buildHistoricalDiffNarrative(diff))}</div>
+              <div class="mt-3 flex flex-wrap gap-x-4 gap-y-1 text-xs text-slate-500">
+                <span>新增 ${summary.added || 0}</span>
+                <span>修改 ${summary.modified || 0}</span>
+                <span>停用 ${summary.disabled || 0}</span>
+                <span>删除 ${summary.deleted || 0}</span>
+                <span>受影响 Agent ${summary.affected_agents || 0}</span>
+              </div>
+            </section>
+            ${!diff.has_changes ? '' : `
+              ${(diff.agents || []).length ? `
+                <section>
+                  <div class="mb-3">
+                    <h3 class="text-base font-semibold text-slate-900">Agent 变化</h3>
+                    <p class="text-xs text-slate-500 mt-1">先看用户可感知的 Agent 参数和挂载能力，再查看其他工程配置。</p>
+                  </div>
+                  <div class="space-y-4">${diff.agents.map(renderHistoricalAgentChange).join('')}</div>
+                </section>` : '<div class="rounded-xl border border-dashed border-slate-200 p-4 text-sm text-slate-500">本次没有 Agent 参数或挂载能力变化。</div>'}
+              ${renderHistoricalOtherChanges(diff)}
+            `}
+          </div>`;
+      };
+
+      const openReleaseDiffModal = (data, currentRelease) => {
+        const release = data?.release || {};
+        const parent = data?.parent_release || null;
+        const currentId = currentRelease?.release_id || '';
+        const comparisonTitle = parent
+          ? `Release #${parent.version || '-'} → Release #${release.version || '-'}`
+          : `Release #${release.version || '-'}（初始版本）`;
+        const modal = document.createElement('div');
+        modal.id = 'runtime-history-diff-modal';
+        modal.className = 'fixed inset-0 z-[60] flex items-center justify-center bg-slate-950/55 p-3 md:p-6';
+        modal.innerHTML = `
+          <div class="bg-slate-50 rounded-2xl shadow-2xl w-full max-w-6xl max-h-[94vh] flex flex-col overflow-hidden">
+            <div class="flex items-start justify-between gap-4 px-4 md:px-6 py-4 border-b border-slate-200 bg-white">
+              <div>
+                <div class="text-xs font-semibold text-indigo-600">历史 RuntimeRelease 差异</div>
+                <h2 class="text-lg md:text-xl font-semibold text-slate-900 mt-1">${escapeHtml(comparisonTitle)}</h2>
+                <div class="text-xs text-slate-500 mt-1">当前运行版本：Release #${escapeHtml(String(currentRelease?.version || '-'))} · ${escapeHtml(currentId || '-')}</div>
+              </div>
+              <button class="runtime-history-diff-close shrink-0 p-2 hover:bg-slate-100 rounded-lg text-slate-500" aria-label="关闭历史版本差异">&times;</button>
+            </div>
+            <div class="p-4 md:p-6 overflow-y-auto flex-1 min-h-0">${renderHistoricalDiffComparison(data, currentId)}</div>
+            <div class="px-4 md:px-6 py-3 border-t border-slate-200 bg-white flex justify-end">
+              <button class="runtime-history-diff-close px-4 py-2 rounded-xl bg-slate-100 hover:bg-slate-200 text-sm text-slate-700">关闭</button>
+            </div>
+          </div>`;
+        const previousOverflow = document.body.style.overflow;
+        document.body.style.overflow = 'hidden';
+        document.body.appendChild(modal);
+        const close = () => {
+          document.body.style.overflow = previousOverflow;
+          modal.remove();
+        };
+        modal.querySelectorAll('.runtime-history-diff-close').forEach(button => button.addEventListener('click', close));
+        modal.addEventListener('click', event => { if (event.target === modal) close(); });
+      };
+
       const renderReleaseSummary = (release, current = false) => {
         if (!release) return '<div class="rounded-2xl border border-red-100 bg-red-50 p-4 text-sm text-red-700">当前没有 Published RuntimeRelease。</div>';
         const validation = release.validation || {};
@@ -4983,18 +5269,19 @@
               <div class="text-[11px] text-slate-500 mt-1">${escapeHtml(release.release_id || '')} · ${escapeHtml((release.config_hash || '').slice(0, 12))} · ${escapeHtml(release.published_at || release.created_at || '')}</div>
             </div>
             <div class="flex flex-wrap gap-2">
-              <button class="runtime-history-diff text-xs px-3 py-1.5 rounded-lg border border-indigo-200 text-indigo-700" data-release-id="${escapeHtml(release.release_id)}">查看变更</button>
+              <button class="runtime-history-diff text-xs px-3 py-1.5 rounded-lg border border-indigo-200 text-indigo-700" data-release-id="${escapeHtml(release.release_id)}">${release.parent_release_id ? `与 #${escapeHtml(releaseVersionFromId(release.parent_release_id) || '上一版本')} 比较` : '初始版本（无上版）'}</button>
               <button class="runtime-history-config text-xs px-3 py-1.5 rounded-lg border border-slate-200 text-slate-600" data-release-id="${escapeHtml(release.release_id)}">完整快照</button>
               ${release.release_id !== currentId && release.validation?.valid ? `<button class="runtime-rollback-btn text-xs px-3 py-1.5 rounded-lg border border-amber-200 text-amber-700" data-release-id="${escapeHtml(release.release_id)}">回滚</button>` : ''}
             </div>
           </div>
         </div>`;
 
-      const bindHistoryActions = root => {
+      const bindHistoryActions = (root, currentRelease) => {
+        const currentId = currentRelease?.release_id || '';
         root.querySelectorAll('.runtime-history-diff').forEach(button => button.addEventListener('click', async () => {
           try {
             const data = await apiGet(`/api/runtime/releases/${encodeURIComponent(button.dataset.releaseId)}/diff?include_details=true`);
-            openDrawer(`Release #${data.release?.version || '-'} 版本差异`, renderDiff(data.diff || {}));
+            openReleaseDiffModal(data, currentRelease);
           } catch (err) {
             showToast('加载版本差异失败：' + (err.message || err), 'error');
           }
@@ -5081,7 +5368,7 @@
           publishButton.disabled = !draft.can_publish;
           publishButton.title = draft.block_reason === 'no_changes' ? '当前没有待发布变更' : '';
 
-          bindHistoryActions(requireElement('#runtime-history-list', 'RuntimeRelease 历史版本'));
+          bindHistoryActions(requireElement('#runtime-history-list', 'RuntimeRelease 历史版本'), current);
 
           const fullPreviewButton = $('#runtime-full-preview-btn');
           if (fullPreviewButton) fullPreviewButton.addEventListener('click', async () => {
@@ -5106,7 +5393,7 @@
               target.innerHTML = items.length
                 ? `<div class="space-y-2">${items.map(item => renderHistoryRow(item, current.release_id)).join('')}</div>`
                 : '<div class="text-sm text-slate-400">没有未发布草稿。</div>';
-              bindHistoryActions(target);
+              bindHistoryActions(target, current);
             } catch (err) {
               target.innerHTML = emptyState('草稿摘要加载失败');
             }
