@@ -5654,6 +5654,97 @@ def list_runtime_releases(limit: int = 50) -> List[Dict[str, Any]]:
     return [_parse_runtime_release(row) or {} for row in rows]
 
 
+def list_runtime_release_summaries(
+    limit: int = 10,
+    statuses: Optional[List[str]] = None,
+) -> List[Dict[str, Any]]:
+    """Read release metadata without loading immutable config snapshots."""
+
+    allowed_statuses = {"draft", "published", "superseded", "retired"}
+    normalized_statuses = [
+        str(status)
+        for status in (statuses or [])
+        if str(status) in allowed_statuses
+    ]
+    params: List[Any] = []
+    where = ""
+    if normalized_statuses:
+        placeholders = ",".join("?" for _ in normalized_statuses)
+        where = f"WHERE r.status IN ({placeholders})"
+        params.extend(normalized_statuses)
+    params.append(max(1, min(int(limit), 50)))
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute(
+        f"""
+        SELECT
+            r.release_id,
+            r.version,
+            r.status,
+            r.config_hash,
+            r.validation_json,
+            r.parent_release_id,
+            r.created_by,
+            r.created_at,
+            r.published_at,
+            r.superseded_at,
+            parent.config_hash AS parent_config_hash
+        FROM runtime_releases r
+        LEFT JOIN runtime_releases parent
+            ON parent.release_id = r.parent_release_id
+        {where}
+        ORDER BY r.version DESC
+        LIMIT ?
+        """,
+        tuple(params),
+    )
+    rows = cursor.fetchall()
+    conn.close()
+    result: List[Dict[str, Any]] = []
+    for row in rows:
+        item = dict(row)
+        validation = _parse_json_text(item.pop("validation_json", None), {})
+        item["validation"] = {
+            "valid": bool(validation.get("valid")),
+            "errors_count": len(validation.get("errors") or []),
+            "warnings_count": len(validation.get("warnings") or []),
+            "counts": validation.get("counts") or {},
+        }
+        parent_hash = item.get("parent_config_hash")
+        item["change_summary"] = {
+            "has_parent": bool(item.get("parent_release_id")),
+            "has_changes": bool(
+                not parent_hash or parent_hash != item.get("config_hash")
+            ),
+            "label": (
+                "初始发布"
+                if not item.get("parent_release_id")
+                else (
+                    "配置有变化"
+                    if parent_hash != item.get("config_hash")
+                    else "与父版本配置相同"
+                )
+            ),
+        }
+        result.append(item)
+    return result
+
+
+def count_runtime_releases(status: Optional[str] = None) -> int:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    if status:
+        cursor.execute(
+            "SELECT COUNT(*) FROM runtime_releases WHERE status = ?",
+            (str(status),),
+        )
+    else:
+        cursor.execute("SELECT COUNT(*) FROM runtime_releases")
+    value = int(cursor.fetchone()[0])
+    conn.close()
+    return value
+
+
 def publish_runtime_release(release_id: str) -> Dict[str, Any]:
     """Atomically move the current pointer to one validated draft release."""
     now = now_cn()
@@ -5662,7 +5753,11 @@ def publish_runtime_release(release_id: str) -> Dict[str, Any]:
     try:
         cursor.execute("BEGIN IMMEDIATE")
         cursor.execute(
-            "SELECT status, validation_json FROM runtime_releases WHERE release_id = ?",
+            """
+            SELECT status, validation_json, config_hash
+            FROM runtime_releases
+            WHERE release_id = ?
+            """,
             (release_id,),
         )
         row = cursor.fetchone()
@@ -5674,11 +5769,20 @@ def publish_runtime_release(release_id: str) -> Dict[str, Any]:
 
         cursor.execute(
             """
-            SELECT release_id FROM runtime_release_pointer
+            SELECT p.release_id, r.config_hash
+            FROM runtime_release_pointer p
+            JOIN runtime_releases r ON r.release_id = p.release_id
             WHERE pointer_key = 'current'
             """
         )
         current = cursor.fetchone()
+        if current and (
+            current["release_id"] == release_id
+            or current["config_hash"] == row["config_hash"]
+        ):
+            raise ValueError(
+                "no_changes: target configuration matches current published release"
+            )
         if current and current["release_id"] != release_id:
             cursor.execute(
                 """

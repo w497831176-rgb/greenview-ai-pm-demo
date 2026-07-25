@@ -13,8 +13,10 @@ from pydantic import BaseModel, Field
 from app.runtime.agent_factory import vertical_agent_cards
 from app.runtime.contracts import RuntimePath, ToolEffect
 from app.runtime.release_compiler import (
-    compile_runtime_release,
-    publish_compiled_release,
+    diff_runtime_configs,
+    preview_runtime_release,
+    publish_current_runtime_config,
+    summarize_release,
 )
 from app.runtime.acceptance import ACCEPTANCE_CASES
 from app.runtime.snapshot_resolver import resolve_snapshot
@@ -22,12 +24,14 @@ from app.runtime.tool_planner import plan_tools
 from app.skill_runtime import select_skills
 from agents.router import _capability_fallback
 from db.property_db import (
+    count_runtime_releases,
     get_agent_by_agent_id,
     get_current_runtime_release,
     get_evidence_ledger,
     get_runtime_release,
-    list_runtime_releases,
     list_runtime_acceptance_runs,
+    list_runtime_release_summaries,
+    list_runtime_releases,
     list_tool_policies,
     publish_runtime_release,
     rollback_runtime_release,
@@ -149,10 +153,117 @@ async def current_release():
     return {"release": release}
 
 
+@router.get("/releases/overview")
+async def release_overview():
+    """One lightweight request for the default release-center screen."""
+
+    preview = preview_runtime_release(created_by="platform-ui")
+    current = preview.get("current_release")
+    current_id = (current or {}).get("release_id")
+    history = [
+        item
+        for item in list_runtime_release_summaries(
+            limit=11,
+            statuses=["published", "superseded", "retired"],
+        )
+        if item.get("release_id") != current_id
+    ][:10]
+    preview_payload = {
+        key: value
+        for key, value in preview.items()
+        if key != "current_release"
+    }
+    return {
+        "current": current,
+        "draft": preview_payload,
+        "history": history,
+        "draft_count": count_runtime_releases("draft"),
+        "initial_load_contract": {
+            "full_config_loaded": False,
+            "acceptance_cases_loaded": False,
+            "acceptance_runs_loaded": False,
+            "history_limit": 10,
+        },
+    }
+
+
+@router.get("/releases/summaries")
+async def release_summaries(
+    limit: int = 10,
+    status: Optional[str] = None,
+):
+    allowed_statuses = {"draft", "published", "superseded", "retired"}
+    if status and status not in allowed_statuses:
+        raise HTTPException(status_code=400, detail="invalid release status")
+    items = list_runtime_release_summaries(
+        limit=limit,
+        statuses=[status] if status else None,
+    )
+    return {
+        "releases": items,
+        "count": len(items),
+        "full_config_loaded": False,
+    }
+
+
+@router.post("/releases/preview")
+async def preview_release(request: PublishRequest):
+    preview = preview_runtime_release(created_by=request.created_by)
+    return {
+        "preview": preview,
+        "persisted": False,
+        "next_step": (
+            "publish"
+            if preview.get("can_publish")
+            else preview.get("block_reason")
+        ),
+    }
+
+
+@router.get("/releases/preview/diff")
+async def preview_release_diff(include_details: bool = True):
+    preview = preview_runtime_release(
+        created_by="platform-ui",
+        include_details=include_details,
+    )
+    return {
+        "base_release": preview.get("current_release"),
+        "candidate_hash": preview.get("config_hash"),
+        "diff": preview.get("diff"),
+        "validation": preview.get("validation"),
+        "persisted": False,
+    }
+
+
 @router.get("/releases")
 async def releases(limit: int = 50):
     items = [_redact_release(item) for item in list_runtime_releases(limit)]
     return {"releases": items, "count": len(items)}
+
+
+@router.get("/releases/{release_id}/diff")
+async def release_diff(
+    release_id: str,
+    include_details: bool = True,
+):
+    release = get_runtime_release(release_id)
+    if not release:
+        raise HTTPException(status_code=404, detail="runtime release not found")
+    parent = (
+        get_runtime_release(str(release.get("parent_release_id")))
+        if release.get("parent_release_id")
+        else None
+    )
+    return {
+        "release": summarize_release(release),
+        "parent_release": summarize_release(parent),
+        "diff": diff_runtime_configs(
+            (parent or {}).get("config") or {},
+            release.get("config") or {},
+            include_details=include_details,
+        ),
+        "full_config_loaded": False,
+    }
 
 
 @router.get("/releases/{release_id}")
@@ -168,24 +279,29 @@ async def release_detail(release_id: str):
 
 @router.post("/releases/compile")
 async def compile_release(request: PublishRequest):
-    release = compile_runtime_release(created_by=request.created_by)
+    preview = preview_runtime_release(created_by=request.created_by)
     return {
-        "release": _redact_release(release),
+        "preview": preview,
         "published": False,
+        "persisted": False,
         "next_step": (
             "publish"
-            if (release.get("validation") or {}).get("valid")
-            else "fix_validation_errors"
+            if preview.get("can_publish")
+            else preview.get("block_reason")
         ),
     }
 
 
 @router.post("/releases/publish-current-config")
 async def publish_current_config(request: PublishRequest):
-    release = publish_compiled_release(created_by=request.created_by)
+    result = publish_current_runtime_config(created_by=request.created_by)
     return {
-        "release": _redact_release(release),
-        "published": release.get("status") == "published",
+        "release": _redact_release(result.get("release")),
+        "published": bool(result.get("published")),
+        "created": bool(result.get("created")),
+        "reason": result.get("reason"),
+        "has_changes": bool(result.get("has_changes")),
+        "validation": result.get("validation") or {},
         "effective_on": "new_session",
         "existing_sessions": "keep_pinned_snapshot",
     }
