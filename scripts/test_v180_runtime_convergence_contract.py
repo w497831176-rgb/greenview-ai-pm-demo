@@ -38,6 +38,17 @@ def test_release_and_snapshot_immutability():
     init_db()
     release_1 = ensure_bootstrap_release()
     snapshot_1 = resolve_snapshot("session-old")
+    from app.agents import AgentCreate, create_agent
+
+    asyncio.run(
+        create_agent(
+            AgentCreate(
+                agent_id="snapshot-contract-agent",
+                name="Snapshot Contract Agent",
+                instructions="Creates a real configuration change for release 2.",
+            )
+        )
+    )
     release_2 = publish_compiled_release(created_by="contract-test")
     snapshot_old_again = resolve_snapshot("session-old")
     snapshot_new = resolve_snapshot("session-new")
@@ -1294,7 +1305,6 @@ def test_fixed_acceptance_matrix():
         "cleanup",
     }
     assert all(required.issubset(case) for case in ACCEPTANCE_CASES)
-
 
 
 def test_owner_chat_runtime_is_single_track():

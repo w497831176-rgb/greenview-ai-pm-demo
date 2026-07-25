@@ -363,6 +363,493 @@ def _compile_graph() -> Tuple[Dict[str, Any], List[ToolPolicy]]:
     return graph, policies
 
 
+_AGENT_FIELD_LABELS = {
+    "name": "名称",
+    "description": "描述",
+    "instructions": "Prompt / Instructions",
+    "model_id": "模型",
+    "enabled": "启用状态",
+    "category": "Agent 类型",
+}
+
+_SKILL_FIELD_LABELS = {
+    "name": "名称",
+    "description": "描述",
+    "version": "版本",
+    "trigger_condition": "触发条件",
+    "enabled": "启用状态",
+    "content_hash": "内容哈希",
+}
+
+_KNOWLEDGE_FIELD_LABELS = {
+    "title": "文档名称",
+    "category": "分类",
+    "document_version": "文档版本",
+    "index_status": "索引状态",
+    "chunk_size": "Chunk 大小",
+    "chunk_overlap": "Chunk 重叠",
+    "split_strategy": "切片策略",
+}
+
+_MCP_FIELD_LABELS = {
+    "name": "名称",
+    "description": "描述",
+    "enabled": "启用状态",
+    "is_builtin": "内置能力",
+}
+
+_MCP_TOOL_FIELD_LABELS = {
+    "description": "描述",
+    "effect": "读写类型",
+    "risk_level": "风险级别",
+    "enabled": "运行时启用",
+    "requires_confirmation": "需要确认",
+    "execution_mode": "执行模式",
+}
+
+
+def _diff_value(value: Any, *, field: str, include_details: bool) -> Any:
+    if field == "instructions" and isinstance(value, str):
+        if include_details:
+            return value
+        return {
+            "preview": value[:160],
+            "length": len(value),
+            "truncated": len(value) > 160,
+        }
+    return value
+
+
+def _field_changes(
+    before: Dict[str, Any],
+    after: Dict[str, Any],
+    labels: Dict[str, str],
+    *,
+    include_details: bool,
+) -> List[Dict[str, Any]]:
+    changes: List[Dict[str, Any]] = []
+    for field, label in labels.items():
+        old_value = before.get(field)
+        new_value = after.get(field)
+        if old_value == new_value:
+            continue
+        changes.append(
+            {
+                "field": field,
+                "label": label,
+                "old": _diff_value(
+                    old_value,
+                    field=field,
+                    include_details=include_details,
+                ),
+                "new": _diff_value(
+                    new_value,
+                    field=field,
+                    include_details=include_details,
+                ),
+            }
+        )
+    return changes
+
+
+def _id_name_map(
+    before: List[Dict[str, Any]],
+    after: List[Dict[str, Any]],
+    id_field: str,
+    name_field: str,
+) -> Dict[Any, str]:
+    result: Dict[Any, str] = {}
+    for item in [*before, *after]:
+        item_id = item.get(id_field)
+        if item_id is None:
+            continue
+        result[item_id] = str(item.get(name_field) or item_id)
+    return result
+
+
+def _named_binding_changes(
+    before_values: List[Any],
+    after_values: List[Any],
+    names: Dict[Any, str],
+    *,
+    id_field: str,
+) -> Dict[str, List[Dict[str, Any]]]:
+    before_set = set(before_values or [])
+    after_set = set(after_values or [])
+
+    def rows(values: set[Any]) -> List[Dict[str, Any]]:
+        return [
+            {id_field: value, "name": names.get(value, str(value))}
+            for value in sorted(values, key=lambda item: str(item))
+        ]
+
+    return {
+        "added": rows(after_set - before_set),
+        "removed": rows(before_set - after_set),
+    }
+
+
+def _change_type(
+    before: Optional[Dict[str, Any]],
+    after: Optional[Dict[str, Any]],
+    fields: List[Dict[str, Any]],
+    *,
+    has_nested_changes: bool = False,
+) -> Optional[str]:
+    if before is None:
+        return "added"
+    if after is None:
+        return "deleted"
+    if bool(before.get("enabled")) and not bool(after.get("enabled")):
+        return "disabled"
+    if fields or has_nested_changes:
+        return "modified"
+    return None
+
+
+def _collection_diff(
+    before_items: List[Dict[str, Any]],
+    after_items: List[Dict[str, Any]],
+    *,
+    key_field: str,
+    name_field: str,
+    labels: Dict[str, str],
+    include_details: bool,
+) -> List[Dict[str, Any]]:
+    before_map = {item.get(key_field): item for item in before_items}
+    after_map = {item.get(key_field): item for item in after_items}
+    result: List[Dict[str, Any]] = []
+    for item_id in sorted(
+        set(before_map) | set(after_map),
+        key=lambda item: str(item),
+    ):
+        before = before_map.get(item_id)
+        after = after_map.get(item_id)
+        fields = _field_changes(
+            before or {},
+            after or {},
+            labels,
+            include_details=include_details,
+        )
+        change_type = _change_type(before, after, fields)
+        if not change_type:
+            continue
+        source = after or before or {}
+        result.append(
+            {
+                "id": item_id,
+                "name": str(source.get(name_field) or item_id),
+                "change_type": change_type,
+                "fields": fields,
+            }
+        )
+    return result
+
+
+def _mcp_tool_nodes(servers: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    result: List[Dict[str, Any]] = []
+    for server in servers:
+        server_name = str(server.get("name") or "")
+        for tool in server.get("tools") or []:
+            policy = tool.get("policy") or {}
+            metadata = tool.get("tool_metadata") or {}
+            tool_name = str(tool.get("name") or "")
+            result.append(
+                {
+                    "tool_key": f"{server_name}:{tool_name}",
+                    "name": f"{server_name} / {tool_name}",
+                    "description": tool.get("description") or "",
+                    "effect": policy.get("effect") or "unknown",
+                    "risk_level": policy.get("risk_level") or "L3",
+                    "enabled": bool(policy.get("enabled")),
+                    "requires_confirmation": bool(
+                        policy.get("requires_confirmation")
+                    ),
+                    "execution_mode": metadata.get("execution_mode")
+                    or "unknown",
+                }
+            )
+    return result
+
+
+def _flatten_policy(
+    value: Any,
+    prefix: str = "",
+) -> Dict[str, Any]:
+    if not isinstance(value, dict):
+        return {prefix: value}
+    result: Dict[str, Any] = {}
+    for key in sorted(value):
+        path = f"{prefix}.{key}" if prefix else str(key)
+        nested = value[key]
+        if isinstance(nested, dict):
+            result.update(_flatten_policy(nested, path))
+        elif isinstance(nested, list):
+            result[path] = {
+                "count": len(nested),
+                "hash": content_hash(nested),
+            }
+        else:
+            result[path] = nested
+    return result
+
+
+def _policy_diff(
+    before: Any,
+    after: Any,
+    *,
+    category: str,
+    label: str,
+) -> List[Dict[str, Any]]:
+    before_flat = _flatten_policy(before or {})
+    after_flat = _flatten_policy(after or {})
+    result: List[Dict[str, Any]] = []
+    for path in sorted(set(before_flat) | set(after_flat)):
+        if before_flat.get(path) == after_flat.get(path):
+            continue
+        result.append(
+            {
+                "category": category,
+                "label": label,
+                "field": path,
+                "old": before_flat.get(path),
+                "new": after_flat.get(path),
+            }
+        )
+    return result
+
+
+def diff_runtime_configs(
+    before: Optional[Dict[str, Any]],
+    after: Optional[Dict[str, Any]],
+    *,
+    include_details: bool = False,
+) -> Dict[str, Any]:
+    """Return a deterministic, presentation-ready RuntimeRelease diff.
+
+    The lightweight form deliberately omits full configs, Chunk snapshots,
+    Skill bodies and MCP schemas. Full Agent instructions are returned only
+    when an operator explicitly requests detailed diff data.
+    """
+
+    before = before or {}
+    after = after or {}
+    before_skills = before.get("skills") or []
+    after_skills = after.get("skills") or []
+    before_knowledge = before.get("knowledge") or []
+    after_knowledge = after.get("knowledge") or []
+    before_servers = before.get("mcp_servers") or []
+    after_servers = after.get("mcp_servers") or []
+
+    skill_names = _id_name_map(
+        before_skills,
+        after_skills,
+        "skill_id",
+        "name",
+    )
+    knowledge_names = _id_name_map(
+        before_knowledge,
+        after_knowledge,
+        "knowledge_doc_id",
+        "title",
+    )
+    server_names = {
+        str(item.get("name") or ""): str(item.get("name") or "")
+        for item in [*before_servers, *after_servers]
+        if item.get("name")
+    }
+
+    before_agents = {
+        item.get("agent_id"): item for item in before.get("agents") or []
+    }
+    after_agents = {
+        item.get("agent_id"): item for item in after.get("agents") or []
+    }
+    agent_changes: List[Dict[str, Any]] = []
+    for agent_id in sorted(
+        set(before_agents) | set(after_agents),
+        key=lambda item: str(item),
+    ):
+        old_agent = before_agents.get(agent_id)
+        new_agent = after_agents.get(agent_id)
+        fields = _field_changes(
+            old_agent or {},
+            new_agent or {},
+            _AGENT_FIELD_LABELS,
+            include_details=include_details,
+        )
+        capabilities = {
+            "skills": _named_binding_changes(
+                (old_agent or {}).get("skill_ids") or [],
+                (new_agent or {}).get("skill_ids") or [],
+                skill_names,
+                id_field="skill_id",
+            ),
+            "knowledge": _named_binding_changes(
+                (old_agent or {}).get("knowledge_doc_ids") or [],
+                (new_agent or {}).get("knowledge_doc_ids") or [],
+                knowledge_names,
+                id_field="knowledge_doc_id",
+            ),
+            "mcp_servers": _named_binding_changes(
+                (old_agent or {}).get("mcp_server_names") or [],
+                (new_agent or {}).get("mcp_server_names") or [],
+                server_names,
+                id_field="server_name",
+            ),
+        }
+        has_capability_changes = any(
+            values["added"] or values["removed"]
+            for values in capabilities.values()
+        )
+        change_type = _change_type(
+            old_agent,
+            new_agent,
+            fields,
+            has_nested_changes=has_capability_changes,
+        )
+        if not change_type:
+            continue
+        source = new_agent or old_agent or {}
+        agent_changes.append(
+            {
+                "agent_id": agent_id,
+                "name": str(source.get("name") or agent_id),
+                "change_type": change_type,
+                "fields": fields,
+                "capabilities": capabilities,
+            }
+        )
+
+    skill_changes = _collection_diff(
+        before_skills,
+        after_skills,
+        key_field="skill_id",
+        name_field="name",
+        labels=_SKILL_FIELD_LABELS,
+        include_details=include_details,
+    )
+    knowledge_changes = _collection_diff(
+        before_knowledge,
+        after_knowledge,
+        key_field="knowledge_doc_id",
+        name_field="title",
+        labels=_KNOWLEDGE_FIELD_LABELS,
+        include_details=include_details,
+    )
+    mcp_changes = _collection_diff(
+        before_servers,
+        after_servers,
+        key_field="name",
+        name_field="name",
+        labels=_MCP_FIELD_LABELS,
+        include_details=include_details,
+    )
+    mcp_tool_changes = _collection_diff(
+        _mcp_tool_nodes(before_servers),
+        _mcp_tool_nodes(after_servers),
+        key_field="tool_key",
+        name_field="name",
+        labels=_MCP_TOOL_FIELD_LABELS,
+        include_details=include_details,
+    )
+
+    policy_changes = [
+        *_policy_diff(
+            before.get("model_policy"),
+            after.get("model_policy"),
+            category="model_policy",
+            label="默认模型策略",
+        ),
+        *_policy_diff(
+            before.get("retrieval_policy"),
+            after.get("retrieval_policy"),
+            category="retrieval_policy",
+            label="检索参数",
+        ),
+        *_policy_diff(
+            before.get("budget_policy"),
+            after.get("budget_policy"),
+            category="budget_policy",
+            label="预算策略",
+        ),
+    ]
+
+    all_entity_changes = [
+        *agent_changes,
+        *skill_changes,
+        *knowledge_changes,
+        *mcp_changes,
+        *mcp_tool_changes,
+    ]
+    counts = {
+        "added": sum(
+            item["change_type"] == "added" for item in all_entity_changes
+        ),
+        "modified": sum(
+            item["change_type"] == "modified" for item in all_entity_changes
+        )
+        + len(policy_changes),
+        "disabled": sum(
+            item["change_type"] == "disabled" for item in all_entity_changes
+        ),
+        "deleted": sum(
+            item["change_type"] == "deleted" for item in all_entity_changes
+        ),
+        "affected_agents": len(agent_changes),
+    }
+    before_hash = content_hash(before)
+    after_hash = content_hash(after)
+    has_changes = before_hash != after_hash
+    if has_changes and not any(counts.values()):
+        policy_changes.append(
+            {
+                "category": "configuration",
+                "label": "其他配置",
+                "field": "snapshot",
+                "old": before_hash[:12],
+                "new": after_hash[:12],
+            }
+        )
+        counts["modified"] = 1
+
+    return {
+        "has_changes": has_changes,
+        "before_hash": before_hash,
+        "after_hash": after_hash,
+        "summary": counts,
+        "agents": agent_changes,
+        "skills": skill_changes,
+        "knowledge": knowledge_changes,
+        "mcp_servers": mcp_changes,
+        "mcp_tools": mcp_tool_changes,
+        "policies": policy_changes,
+    }
+
+
+def summarize_release(release: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not release:
+        return None
+    validation = release.get("validation") or {}
+    return {
+        "release_id": release.get("release_id"),
+        "version": release.get("version"),
+        "status": release.get("status"),
+        "config_hash": release.get("config_hash"),
+        "parent_release_id": release.get("parent_release_id"),
+        "created_by": release.get("created_by"),
+        "created_at": release.get("created_at"),
+        "published_at": release.get("published_at"),
+        "superseded_at": release.get("superseded_at"),
+        "validation": {
+            "valid": bool(validation.get("valid")),
+            "errors": validation.get("errors") or [],
+            "warnings": validation.get("warnings") or [],
+            "counts": validation.get("counts") or {},
+        },
+    }
+
+
 def validate_release_graph(graph: Dict[str, Any], policies: List[ToolPolicy]) -> Dict[str, Any]:
     errors: List[Dict[str, Any]] = []
     warnings: List[Dict[str, Any]] = []
@@ -455,33 +942,148 @@ def validate_release_graph(graph: Dict[str, Any], policies: List[ToolPolicy]) ->
     }
 
 
-def compile_runtime_release(created_by: str = "operator") -> Dict[str, Any]:
+def _prepare_runtime_candidate() -> Dict[str, Any]:
     graph, policies = _compile_graph()
-    validation = validate_release_graph(graph, policies)
-    current = get_current_runtime_release()
+    return {
+        "config": graph,
+        "policies": policies,
+        "config_hash": content_hash(graph),
+        "validation": validate_release_graph(graph, policies),
+        "current": get_current_runtime_release(),
+    }
+
+
+def preview_runtime_release(
+    created_by: str = "operator",
+    *,
+    include_details: bool = False,
+) -> Dict[str, Any]:
+    """Compile and validate current Draft configuration without persistence."""
+
+    candidate = _prepare_runtime_candidate()
+    current = candidate["current"]
+    release_diff = diff_runtime_configs(
+        (current or {}).get("config") or {},
+        candidate["config"],
+        include_details=include_details,
+    )
+    has_changes = bool(
+        not current or candidate["config_hash"] != current.get("config_hash")
+    )
+    validation = candidate["validation"]
+    can_publish = bool(validation.get("valid") and has_changes)
+    return {
+        "created_by": created_by,
+        "config_hash": candidate["config_hash"],
+        "has_changes": has_changes,
+        "can_publish": can_publish,
+        "block_reason": (
+            None
+            if can_publish
+            else ("no_changes" if not has_changes else "validation_failed")
+        ),
+        "validation": validation,
+        "diff": release_diff,
+        "current_release": summarize_release(current),
+        "persisted": False,
+        "effective_on": "new_session",
+        "existing_sessions": "keep_pinned_snapshot",
+    }
+
+
+def _persist_candidate(
+    candidate: Dict[str, Any],
+    *,
+    created_by: str,
+) -> Dict[str, Any]:
+    current = candidate.get("current")
     version = next_runtime_release_version()
     release_id = f"rr_{version:04d}_{uuid.uuid4().hex[:8]}"
     release = create_runtime_release(
         release_id=release_id,
         version=version,
-        config_hash=content_hash(graph),
-        config=graph,
-        validation=validation,
+        config_hash=candidate["config_hash"],
+        config=candidate["config"],
+        validation=candidate["validation"],
         parent_release_id=(current or {}).get("release_id"),
         created_by=created_by,
     )
     replace_tool_policies(
         release_id,
-        [policy.model_dump(mode="json") for policy in policies],
+        [
+            policy.model_dump(mode="json")
+            for policy in candidate.get("policies") or []
+        ],
     )
     return release
 
 
+def compile_runtime_release(created_by: str = "operator") -> Dict[str, Any]:
+    """Persist one explicit draft.
+
+    UI preview/validation does not call this function. It remains available for
+    bootstrap and compatibility contracts that intentionally need a draft.
+    """
+
+    return _persist_candidate(
+        _prepare_runtime_candidate(),
+        created_by=created_by,
+    )
+
+
+def publish_current_runtime_config(
+    created_by: str = "operator",
+) -> Dict[str, Any]:
+    """Validate and publish exactly once, or return a non-persistent block."""
+
+    candidate = _prepare_runtime_candidate()
+    current = candidate["current"]
+    if current and candidate["config_hash"] == current.get("config_hash"):
+        return {
+            "release": summarize_release(current),
+            "published": False,
+            "created": False,
+            "reason": "no_changes",
+            "has_changes": False,
+            "validation": candidate["validation"],
+        }
+    if not candidate["validation"].get("valid"):
+        return {
+            "release": None,
+            "published": False,
+            "created": False,
+            "reason": "validation_failed",
+            "has_changes": True,
+            "validation": candidate["validation"],
+            "diff": diff_runtime_configs(
+                (current or {}).get("config") or {},
+                candidate["config"],
+            ),
+        }
+    release = _persist_candidate(candidate, created_by=created_by)
+    published = publish_runtime_release(release["release_id"])
+    return {
+        "release": published,
+        "published": True,
+        "created": True,
+        "reason": "published",
+        "has_changes": True,
+        "validation": candidate["validation"],
+    }
+
+
 def publish_compiled_release(created_by: str = "operator") -> Dict[str, Any]:
-    release = compile_runtime_release(created_by=created_by)
-    if not (release.get("validation") or {}).get("valid"):
-        return release
-    return publish_runtime_release(release["release_id"])
+    result = publish_current_runtime_config(created_by=created_by)
+    release = dict(result.get("release") or {})
+    if not release:
+        release["validation"] = result.get("validation") or {}
+        release["status"] = "draft"
+    release["_publish_result"] = {
+        "published": result.get("published"),
+        "created": result.get("created"),
+        "reason": result.get("reason"),
+    }
+    return release
 
 
 def ensure_bootstrap_release() -> Dict[str, Any]:

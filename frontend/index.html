@@ -4566,7 +4566,7 @@
     }
 
 
-    async function renderRuntimePage(container) {
+    async function _renderRuntimePageLegacy(container) {
       container.innerHTML = `
         <div class="max-w-6xl mx-auto p-4 md:p-6 space-y-5">
           <div class="flex flex-col md:flex-row md:items-end md:justify-between gap-3">
@@ -4791,6 +4791,362 @@
         }
       });
       await loadRuntime();
+    }
+
+
+    async function renderRuntimePage(container) {
+      container.innerHTML = `
+        <div class="max-w-6xl mx-auto p-4 md:p-6 space-y-5">
+          <div class="flex flex-col md:flex-row md:items-end md:justify-between gap-3">
+            <div>
+              <h2 class="text-xl font-semibold text-slate-900">RuntimeRelease 发布中心</h2>
+              <p class="text-sm text-slate-500 mt-1">看清配置变化、发布校验、生效范围与回滚版本；默认不下载完整历史快照。</p>
+            </div>
+            <div class="flex flex-wrap gap-2">
+              <button id="runtime-preview-btn" class="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl text-sm">重新预览</button>
+              <button id="runtime-publish-btn" class="px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white rounded-xl text-sm disabled:opacity-40 disabled:cursor-not-allowed">校验并发布</button>
+            </div>
+          </div>
+          <div id="runtime-content">${loadingState()}</div>
+        </div>`;
+
+      let overview = null;
+
+      const changeLabels = {
+        added: '新增',
+        modified: '修改',
+        disabled: '停用',
+        deleted: '删除'
+      };
+
+      const changeStyles = {
+        added: 'bg-emerald-50 text-emerald-700 border-emerald-200',
+        modified: 'bg-indigo-50 text-indigo-700 border-indigo-200',
+        disabled: 'bg-amber-50 text-amber-700 border-amber-200',
+        deleted: 'bg-red-50 text-red-700 border-red-200'
+      };
+
+      const displayDiffValue = value => {
+        if (value && typeof value === 'object' && Object.prototype.hasOwnProperty.call(value, 'preview')) {
+          return `${value.preview || '（空）'}${value.truncated ? ` …（共 ${value.length} 字）` : ''}`;
+        }
+        if (value === null || value === undefined || value === '') return '（空）';
+        if (typeof value === 'boolean') return value ? '启用' : '停用';
+        if (typeof value === 'object') return JSON.stringify(value, null, 2);
+        return String(value);
+      };
+
+      const renderFieldChange = item => {
+        const oldValue = displayDiffValue(item.old);
+        const newValue = displayDiffValue(item.new);
+        const body = `
+          <div class="grid md:grid-cols-[1fr_auto_1fr] gap-2 items-stretch mt-2">
+            <pre class="whitespace-pre-wrap break-words rounded-lg bg-slate-50 border border-slate-100 p-3 text-xs text-slate-600">${escapeHtml(oldValue)}</pre>
+            <div class="self-center text-slate-400 text-center">→</div>
+            <pre class="whitespace-pre-wrap break-words rounded-lg bg-indigo-50 border border-indigo-100 p-3 text-xs text-indigo-800">${escapeHtml(newValue)}</pre>
+          </div>`;
+        if (item.field === 'instructions') {
+          return `<details class="rounded-xl border border-slate-100 p-3"><summary class="cursor-pointer text-xs font-semibold text-slate-700">${escapeHtml(item.label)}</summary>${body}</details>`;
+        }
+        return `<div class="rounded-xl border border-slate-100 p-3"><div class="text-xs font-semibold text-slate-700">${escapeHtml(item.label)}</div>${body}</div>`;
+      };
+
+      const renderBindingChanges = (label, values) => {
+        const added = values?.added || [];
+        const removed = values?.removed || [];
+        if (!added.length && !removed.length) return '';
+        return `
+          <div class="rounded-xl bg-slate-50 border border-slate-100 p-3 text-xs">
+            <div class="font-semibold text-slate-700">${escapeHtml(label)}</div>
+            ${added.length ? `<div class="mt-1 text-emerald-700">+ ${added.map(item => escapeHtml(item.name)).join('、')}</div>` : ''}
+            ${removed.length ? `<div class="mt-1 text-red-700">− ${removed.map(item => escapeHtml(item.name)).join('、')}</div>` : ''}
+          </div>`;
+      };
+
+      const renderAgentChange = agent => `
+        <div class="bg-white rounded-2xl border border-slate-200 p-4">
+          <div class="flex items-center justify-between gap-3">
+            <div>
+              <div class="font-semibold text-slate-900">${escapeHtml(agent.name || agent.agent_id)}</div>
+              <div class="text-[11px] font-mono text-slate-400 mt-0.5">${escapeHtml(agent.agent_id || '')}</div>
+            </div>
+            <span class="px-2 py-1 rounded-full border text-xs ${changeStyles[agent.change_type] || changeStyles.modified}">${changeLabels[agent.change_type] || agent.change_type}</span>
+          </div>
+          ${(agent.fields || []).length ? `<div class="space-y-2 mt-3">${agent.fields.map(renderFieldChange).join('')}</div>` : ''}
+          <div class="grid md:grid-cols-3 gap-2 mt-3">
+            ${renderBindingChanges('Skill', agent.capabilities?.skills)}
+            ${renderBindingChanges('RAG 文档', agent.capabilities?.knowledge)}
+            ${renderBindingChanges('MCP Server', agent.capabilities?.mcp_servers)}
+          </div>
+        </div>`;
+
+      const renderEntityChanges = (title, items) => {
+        if (!items?.length) return '';
+        return `
+          <section>
+            <h4 class="text-sm font-semibold text-slate-800 mb-2">${escapeHtml(title)}</h4>
+            <div class="space-y-2">
+              ${items.map(item => `
+                <div class="bg-white rounded-xl border border-slate-200 p-3">
+                  <div class="flex items-center justify-between gap-2">
+                    <span class="text-sm font-medium text-slate-800">${escapeHtml(item.name || item.id)}</span>
+                    <span class="text-xs px-2 py-1 rounded-full border ${changeStyles[item.change_type] || changeStyles.modified}">${changeLabels[item.change_type] || item.change_type}</span>
+                  </div>
+                  ${(item.fields || []).length ? `<div class="space-y-2 mt-2">${item.fields.map(renderFieldChange).join('')}</div>` : ''}
+                </div>`).join('')}
+            </div>
+          </section>`;
+      };
+
+      const renderDiff = diff => {
+        const summary = diff?.summary || {};
+        const hasChanges = !!diff?.has_changes;
+        return `
+          <div class="space-y-4">
+            <div class="grid grid-cols-2 md:grid-cols-5 gap-2">
+              ${[
+                ['新增', summary.added || 0, 'text-emerald-700'],
+                ['修改', summary.modified || 0, 'text-indigo-700'],
+                ['停用', summary.disabled || 0, 'text-amber-700'],
+                ['删除', summary.deleted || 0, 'text-red-700'],
+                ['受影响 Agent', summary.affected_agents || 0, 'text-slate-800']
+              ].map(([label, value, style]) => `<div class="rounded-xl bg-slate-50 border border-slate-100 p-3 text-center"><div class="text-xl font-semibold ${style}">${value}</div><div class="text-[11px] text-slate-500 mt-1">${label}</div></div>`).join('')}
+            </div>
+            ${!hasChanges ? '<div class="rounded-xl border border-emerald-200 bg-emerald-50 p-4 text-sm text-emerald-800">当前没有待发布变更。</div>' : ''}
+            ${(diff?.agents || []).length ? `<section><h4 class="text-sm font-semibold text-slate-800 mb-2">Agent 参数与挂载能力</h4><div class="space-y-3">${diff.agents.map(renderAgentChange).join('')}</div></section>` : ''}
+            ${renderEntityChanges('Skill 变化', diff?.skills)}
+            ${renderEntityChanges('RAG 文档变化', diff?.knowledge)}
+            ${renderEntityChanges('MCP Server 变化', diff?.mcp_servers)}
+            ${renderEntityChanges('MCP Tool 与读写策略', diff?.mcp_tools)}
+            ${(diff?.policies || []).length ? `
+              <section>
+                <h4 class="text-sm font-semibold text-slate-800 mb-2">模型、检索与预算策略</h4>
+                <div class="space-y-2">${diff.policies.map(item => renderFieldChange({ ...item, label: `${item.label} · ${item.field}` })).join('')}</div>
+              </section>` : ''}
+          </div>`;
+      };
+
+      const renderReleaseSummary = (release, current = false) => {
+        if (!release) return '<div class="rounded-2xl border border-red-100 bg-red-50 p-4 text-sm text-red-700">当前没有 Published RuntimeRelease。</div>';
+        const validation = release.validation || {};
+        const counts = validation.counts || {};
+        return `
+          <div class="bg-white rounded-2xl border ${current ? 'border-brand-200' : 'border-slate-200'} shadow-soft p-5">
+            <div class="flex flex-wrap items-start justify-between gap-3">
+              <div>
+                <div class="flex items-center gap-2">
+                  <h3 class="font-semibold text-slate-900">Release #${escapeHtml(String(release.version || '-'))}</h3>
+                  <span class="text-xs px-2 py-1 rounded-full ${current ? 'bg-emerald-50 text-emerald-700' : 'bg-slate-100 text-slate-600'}">${current ? '当前运行' : escapeHtml(release.status || '-')}</span>
+                </div>
+                <div class="text-xs font-mono text-slate-500 mt-1">${escapeHtml(release.release_id || '')}</div>
+                <div class="text-xs text-slate-500 mt-1">发布时间：${escapeHtml(release.published_at || '未发布')} · 发布人：${escapeHtml(release.created_by || '-')}</div>
+              </div>
+              <div class="text-right">
+                <div class="text-xs font-mono text-slate-500">${escapeHtml((release.config_hash || '').slice(0, 12))}</div>
+                <div class="text-[11px] text-slate-500 mt-1">Agent ${counts.agents || 0} · Skill ${counts.skills || 0} · RAG ${counts.knowledge_docs || 0} · MCP ${counts.mcp_servers || 0}</div>
+              </div>
+            </div>
+            ${current ? '<div class="mt-3 rounded-xl bg-indigo-50 border border-indigo-100 p-3 text-xs text-indigo-800">发布后仅下一新会话使用新版本；旧会话继续保持原 Snapshot。</div>' : ''}
+          </div>`;
+      };
+
+      const renderValidation = draft => {
+        const validation = draft?.validation || {};
+        const errors = validation.errors || [];
+        const warnings = validation.warnings || [];
+        return `
+          <div class="bg-white rounded-2xl border ${draft?.can_publish ? 'border-emerald-200' : 'border-amber-200'} p-5">
+            <div class="flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <h3 class="font-semibold text-slate-900">发布校验</h3>
+                <p class="text-sm mt-1 ${draft?.can_publish ? 'text-emerald-700' : 'text-amber-700'}">
+                  ${draft?.can_publish ? '允许发布' : (draft?.block_reason === 'no_changes' ? '当前没有待发布变更' : '存在阻塞错误')}
+                </p>
+              </div>
+              <div class="text-xs text-slate-500">errors ${errors.length} · warnings ${warnings.length}</div>
+            </div>
+            ${errors.length ? `<div class="mt-3 space-y-1">${errors.map(item => `<div class="text-xs text-red-700 bg-red-50 rounded-lg p-2">${escapeHtml(item.code || JSON.stringify(item))}</div>`).join('')}</div>` : ''}
+            ${warnings.length ? `<details class="mt-3"><summary class="cursor-pointer text-xs text-amber-700">查看 ${warnings.length} 条非阻塞警告</summary><div class="space-y-1 mt-2">${warnings.map(item => `<div class="text-xs text-amber-700 bg-amber-50 rounded-lg p-2">${escapeHtml(item.code || JSON.stringify(item))}</div>`).join('')}</div></details>` : ''}
+            <div class="mt-3 text-xs text-slate-500">影响范围：${draft?.diff?.summary?.affected_agents || 0} 个 Agent；生效时间：发布后的下一新会话。</div>
+          </div>`;
+      };
+
+      const renderHistoryRow = (release, currentId) => `
+        <div class="rounded-xl border border-slate-200 bg-white p-3">
+          <div class="flex flex-col md:flex-row md:items-center md:justify-between gap-3">
+            <div>
+              <div class="flex items-center gap-2">
+                <span class="font-medium text-sm text-slate-800">#${escapeHtml(String(release.version || '-'))}</span>
+                <span class="text-xs text-slate-500">${escapeHtml(release.status || '-')}</span>
+                <span class="text-xs text-slate-400">${escapeHtml(release.change_summary?.label || '配置变化')}</span>
+              </div>
+              <div class="text-[11px] text-slate-500 mt-1">${escapeHtml(release.release_id || '')} · ${escapeHtml((release.config_hash || '').slice(0, 12))} · ${escapeHtml(release.published_at || release.created_at || '')}</div>
+            </div>
+            <div class="flex flex-wrap gap-2">
+              <button class="runtime-history-diff text-xs px-3 py-1.5 rounded-lg border border-indigo-200 text-indigo-700" data-release-id="${escapeHtml(release.release_id)}">查看变更</button>
+              <button class="runtime-history-config text-xs px-3 py-1.5 rounded-lg border border-slate-200 text-slate-600" data-release-id="${escapeHtml(release.release_id)}">完整快照</button>
+              ${release.release_id !== currentId && release.validation?.valid ? `<button class="runtime-rollback-btn text-xs px-3 py-1.5 rounded-lg border border-amber-200 text-amber-700" data-release-id="${escapeHtml(release.release_id)}">回滚</button>` : ''}
+            </div>
+          </div>
+        </div>`;
+
+      const bindHistoryActions = root => {
+        root.querySelectorAll('.runtime-history-diff').forEach(button => button.addEventListener('click', async () => {
+          try {
+            const data = await apiGet(`/api/runtime/releases/${encodeURIComponent(button.dataset.releaseId)}/diff?include_details=true`);
+            openDrawer(`Release #${data.release?.version || '-'} 版本差异`, renderDiff(data.diff || {}));
+          } catch (err) {
+            showToast('加载版本差异失败：' + (err.message || err), 'error');
+          }
+        }));
+        root.querySelectorAll('.runtime-history-config').forEach(button => button.addEventListener('click', async () => {
+          try {
+            const data = await apiGet(`/api/runtime/releases/${encodeURIComponent(button.dataset.releaseId)}`);
+            openDrawer('不可变配置快照', `<pre class="whitespace-pre-wrap break-words text-[11px] bg-slate-50 border rounded-xl p-3">${escapeHtml(JSON.stringify(data, null, 2))}</pre>`);
+          } catch (err) {
+            showToast('加载完整快照失败：' + (err.message || err), 'error');
+          }
+        }));
+        root.querySelectorAll('.runtime-rollback-btn').forEach(button => button.addEventListener('click', async () => {
+          const releaseId = button.dataset.releaseId;
+          if (!confirm(`确认把当前指针回滚到 ${releaseId}？仅下一新会话生效。`)) return;
+          try {
+            await apiPost('/api/runtime/releases/rollback', { release_id: releaseId });
+            showToast(`已回滚到 ${releaseId}；已有会话保持原 Snapshot`);
+            await loadOverview();
+          } catch (err) {
+            showToast('回滚失败：' + (err.message || err), 'error');
+          }
+        }));
+      };
+
+      async function openAdvancedAcceptance() {
+        await _renderRuntimePageLegacy(container);
+        const heading = container.querySelector('h2');
+        if (heading) heading.textContent = 'RuntimeRelease 高级验收';
+        const subtitle = heading?.nextElementSibling;
+        if (subtitle) subtitle.textContent = '按需加载 Trace、新增能力、组合验收、固定矩阵与运行记录。';
+        const actionBar = container.querySelector('.flex.gap-2');
+        if (actionBar) {
+          actionBar.innerHTML = '<button id="runtime-back-center-btn" class="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl text-sm">返回发布中心</button>';
+          actionBar.querySelector('#runtime-back-center-btn').addEventListener('click', () => renderRuntimePage(container));
+        }
+      }
+
+      async function loadOverview() {
+        requireElement('#runtime-content', 'RuntimeRelease 发布中心').innerHTML = loadingState();
+        try {
+          overview = await apiGet('/api/runtime/releases/overview');
+          const current = overview.current || {};
+          const draft = overview.draft || {};
+          const history = overview.history || [];
+          requireElement('#runtime-content', 'RuntimeRelease 发布中心').innerHTML = `
+            <div class="space-y-5">
+              <section>
+                <h3 class="text-sm font-semibold text-slate-700 mb-2">当前运行版本</h3>
+                ${renderReleaseSummary(current, true)}
+              </section>
+              <section class="bg-slate-50 rounded-2xl border border-slate-200 p-4 md:p-5">
+                <div class="flex flex-wrap items-center justify-between gap-3 mb-4">
+                  <div>
+                    <h3 class="font-semibold text-slate-900">待发布变更</h3>
+                    <p class="text-xs text-slate-500 mt-1">当前平台 Draft vs Published RuntimeRelease</p>
+                  </div>
+                  ${draft.has_changes ? '<button id="runtime-full-preview-btn" class="text-xs px-3 py-2 rounded-lg border border-indigo-200 text-indigo-700 bg-white">查看完整参数差异</button>' : ''}
+                </div>
+                ${renderDiff(draft.diff || {})}
+              </section>
+              ${renderValidation(draft)}
+              <section>
+                <div class="flex items-center justify-between mb-2">
+                  <h3 class="text-sm font-semibold text-slate-700">历史版本（最近 ${history.length} 条）</h3>
+                  <span class="text-[11px] text-slate-400">完整配置仅在点击后加载</span>
+                </div>
+                <div id="runtime-history-list" class="space-y-2">${history.length ? history.map(item => renderHistoryRow(item, current.release_id)).join('') : '<div class="text-sm text-slate-400">暂无历史版本。</div>'}</div>
+              </section>
+              <details id="runtime-drafts-panel" class="bg-white rounded-2xl border border-slate-200 p-4">
+                <summary class="cursor-pointer font-semibold text-sm text-slate-800">未发布草稿（${overview.draft_count || 0}）</summary>
+                <div id="runtime-drafts-content" class="mt-3 text-sm text-slate-400">展开后按需加载轻量摘要。</div>
+              </details>
+              <div class="rounded-2xl border border-dashed border-indigo-200 bg-indigo-50/50 p-5 flex flex-col md:flex-row md:items-center md:justify-between gap-3">
+                <div>
+                  <h3 class="font-semibold text-indigo-900">高级验收</h3>
+                  <p class="text-xs text-indigo-700 mt-1">Trace、新增能力、组合验收、固定矩阵和运行记录不会在首屏请求。</p>
+                </div>
+                <button id="runtime-advanced-btn" class="px-4 py-2 bg-indigo-600 text-white rounded-xl text-sm">进入高级验收</button>
+              </div>
+            </div>`;
+
+          const publishButton = requireElement('#runtime-publish-btn', 'RuntimeRelease 发布中心');
+          publishButton.disabled = !draft.can_publish;
+          publishButton.title = draft.block_reason === 'no_changes' ? '当前没有待发布变更' : '';
+
+          bindHistoryActions(requireElement('#runtime-history-list', 'RuntimeRelease 历史版本'));
+
+          const fullPreviewButton = $('#runtime-full-preview-btn');
+          if (fullPreviewButton) fullPreviewButton.addEventListener('click', async () => {
+            try {
+              const data = await apiGet('/api/runtime/releases/preview/diff?include_details=true');
+              openDrawer('Draft 完整参数差异', renderDiff(data.diff || {}));
+            } catch (err) {
+              showToast('加载完整差异失败：' + (err.message || err), 'error');
+            }
+          });
+
+          let draftsLoaded = false;
+          const draftsPanel = requireElement('#runtime-drafts-panel', '未发布草稿');
+          draftsPanel.addEventListener('toggle', async () => {
+            if (!draftsPanel.open || draftsLoaded) return;
+            draftsLoaded = true;
+            const target = requireElement('#runtime-drafts-content', '未发布草稿');
+            target.innerHTML = loadingState();
+            try {
+              const data = await apiGet('/api/runtime/releases/summaries?status=draft&limit=20');
+              const items = data.releases || [];
+              target.innerHTML = items.length
+                ? `<div class="space-y-2">${items.map(item => renderHistoryRow(item, current.release_id)).join('')}</div>`
+                : '<div class="text-sm text-slate-400">没有未发布草稿。</div>';
+              bindHistoryActions(target);
+            } catch (err) {
+              target.innerHTML = emptyState('草稿摘要加载失败');
+            }
+          });
+
+          requireElement('#runtime-advanced-btn', '高级验收').addEventListener('click', openAdvancedAcceptance);
+        } catch (err) {
+          requireElement('#runtime-content', 'RuntimeRelease 发布中心').innerHTML = emptyState('运行时发布信息加载失败');
+        }
+      }
+
+      requireElement('#runtime-preview-btn', 'RuntimeRelease 发布中心').addEventListener('click', async () => {
+        try {
+          const data = await apiPost('/api/runtime/releases/preview', { created_by: 'platform-ui' });
+          const preview = data.preview || {};
+          openDrawer('Draft 校验与变更预览', `${renderValidation(preview)}${renderDiff(preview.diff || {})}`);
+          showToast(preview.can_publish ? '校验通过，可以发布' : (preview.block_reason === 'no_changes' ? '当前没有待发布变更' : '存在阻塞错误'), preview.can_publish ? 'success' : 'error');
+        } catch (err) {
+          showToast('草稿预览失败：' + (err.message || err), 'error');
+        }
+      });
+
+      requireElement('#runtime-publish-btn', 'RuntimeRelease 发布中心').addEventListener('click', async () => {
+        if (!overview?.draft?.can_publish) return showToast('当前没有可发布变更', 'error');
+        if (!confirm('发布后仅影响下一新会话；已有会话继续使用原 Snapshot。确认发布？')) return;
+        try {
+          const data = await apiPost('/api/runtime/releases/publish-current-config', { created_by: 'platform-ui' });
+          if (!data.published) {
+            showToast(data.reason === 'no_changes' ? '当前没有待发布变更，未创建重复 Release' : '发布校验未通过', 'error');
+            await loadOverview();
+            return;
+          }
+          showToast(`已发布 ${data.release?.release_id || '新 RuntimeRelease'}；下一新会话生效`);
+          await loadOverview();
+        } catch (err) {
+          showToast('发布失败：' + (err.message || err), 'error');
+        }
+      });
+
+      await loadOverview();
     }
 
 
