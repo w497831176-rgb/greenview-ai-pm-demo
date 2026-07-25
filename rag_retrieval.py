@@ -17,8 +17,8 @@ import rag_store
 
 
 _CRITICAL_VALUE = re.compile(
-    r"(?:\d+(?:\.\d+)?|[一二三四五六七八九十百千万两半]+)\s*"
-    r"(?:分钟|小时|工作日|天|元|万元|%|次|年|个月|月|日)"
+    r"(?P<number>\d+(?:\.\d+)?|[一二三四五六七八九十百千万两半]+)\s*"
+    r"(?P<unit>个\s*工作日|工作日|分钟|小时|天|元|万元|%|次|年|个月|月|日)"
 )
 
 
@@ -67,10 +67,14 @@ def _context_relevance_score(query: str, content: str) -> float:
 
 
 def _critical_values(text: str) -> set[str]:
-    return {
-        re.sub(r"\s+", "", match.group(0)).lower()
-        for match in _CRITICAL_VALUE.finditer(text or "")
-    }
+    values: set[str] = set()
+    for match in _CRITICAL_VALUE.finditer(text or ""):
+        number = re.sub(r"\s+", "", match.group("number")).lower()
+        unit = re.sub(r"\s+", "", match.group("unit")).lower()
+        if unit == "个工作日":
+            unit = "工作日"
+        values.add(f"{number}{unit}")
+    return values
 
 
 def _evidence_relevance(

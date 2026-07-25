@@ -33,8 +33,8 @@ _GENERIC_BIGRAMS = {
     "数据",
 }
 _CRITICAL_VALUE = re.compile(
-    r"(?:\d+(?:\.\d+)?|[一二三四五六七八九十百千万两半]+)\s*"
-    r"(?:分钟|小时|工作日|天|元|万元|%|次|年|个月|月|日)"
+    r"(?P<number>\d+(?:\.\d+)?|[一二三四五六七八九十百千万两半]+)\s*"
+    r"(?P<unit>个\s*工作日|工作日|分钟|小时|天|元|万元|%|次|年|个月|月|日)"
 )
 
 
@@ -49,10 +49,16 @@ def _semantic_bigrams(text: str) -> Set[str]:
 
 def _critical_values(text: str) -> Set[str]:
     """Extract policy-sensitive time, money, percentage and count values."""
-    return {
-        re.sub(r"\s+", "", match.group(0)).lower()
-        for match in _CRITICAL_VALUE.finditer(text or "")
-    }
+    values: Set[str] = set()
+    for match in _CRITICAL_VALUE.finditer(text or ""):
+        number = re.sub(r"\s+", "", match.group("number")).lower()
+        unit = re.sub(r"\s+", "", match.group("unit")).lower()
+        # “3个工作日”与“3工作日”是同一时效表达，但仍必须与
+        # “5个工作日”保持不同，避免引用中的数字被模型悄悄改写。
+        if unit == "个工作日":
+            unit = "工作日"
+        values.add(f"{number}{unit}")
+    return values
 
 
 def _is_structural_content(content: str, title: str = "") -> bool:
