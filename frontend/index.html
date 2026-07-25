@@ -531,8 +531,128 @@
       }, '提交');
     }
 
+    function toolCallName(call) {
+      if (typeof call === 'string') return call;
+      return call && (call.tool_name || call.name) ? (call.tool_name || call.name) : '';
+    }
+
+    function toolCallActionType(call) {
+      if (!call || typeof call !== 'object') return '';
+      return call.action_type || (call.arguments || {}).action_type || '';
+    }
+
+    function toolCallStatus(call) {
+      if (!call || typeof call !== 'object') return '';
+      return call.status || call.phase || (call.arguments || {}).phase || '';
+    }
+
+    function isControlledWorkOrderCall(call) {
+      return toolCallName(call) === 'action_gateway' && toolCallActionType(call) === 'work_order.create';
+    }
+
+    function isWorkOrderWorkflowCall(call) {
+      const name = toolCallName(call);
+      return isControlledWorkOrderCall(call) || name === 'work_order_workflow';
+    }
+
+    function controlledWriteStatusLabel(status) {
+      return {
+        draft_updated: '工单草稿已更新',
+        awaiting_confirmation: '等待业主确认',
+        confirmation_blocked: '信息不完整，暂不能提交',
+        committed: '正式工单已提交',
+        idempotent_replay: '重复确认，未再次写入',
+        rejected: '业主已取消',
+        failed: '提交失败',
+        unknown: '受控操作处理中'
+      }[status] || '受控操作处理中';
+    }
+
+    function controlledWriteStatusStyle(status, isVerifiedCommit) {
+      if (isVerifiedCommit || status === 'idempotent_replay') return 'border-emerald-200 bg-emerald-50 text-emerald-900';
+      if (status === 'failed' || status === 'confirmation_blocked') return 'border-rose-200 bg-rose-50 text-rose-900';
+      if (status === 'rejected') return 'border-slate-200 bg-slate-50 text-slate-700';
+      return 'border-amber-200 bg-amber-50 text-amber-900';
+    }
+
+    function renderControlledWriteCard(call) {
+      const status = toolCallStatus(call) || 'unknown';
+      const receiptId = call && call.receipt_id ? String(call.receipt_id) : '';
+      const resourceId = call && (call.resource_id || call.work_order_id) ? String(call.resource_id || call.work_order_id) : '';
+      const proposalId = call && call.proposal_id ? String(call.proposal_id) : ((call && call.arguments && call.arguments.proposal_id) ? String(call.arguments.proposal_id) : '');
+      const isVerifiedCommit = status === 'committed' && Boolean(receiptId && resourceId);
+      const displayedStatus = status === 'committed' && !isVerifiedCommit ? '提交凭证不完整，不能确认创建成功' : controlledWriteStatusLabel(status);
+      const style = controlledWriteStatusStyle(status, isVerifiedCommit);
+      const receiptEvidence = isVerifiedCommit ? `
+        <div class="mt-2 grid gap-1 text-xs">
+          <div><span class="font-medium">真实工单号：</span><span class="font-mono">${escapeHtml(resourceId)}</span></div>
+          <div><span class="font-medium">写入回执：</span><span class="font-mono">${escapeHtml(receiptId)}</span></div>
+          <div>确认方式：业主本人确认（HITL）· 无需人工接管</div>
+          <div>已启用幂等保护</div>
+          ${proposalId ? `<details class="mt-1"><summary class="cursor-pointer">查看提议编号</summary><div class="font-mono mt-1">${escapeHtml(proposalId)}</div></details>` : ''}
+        </div>` : '';
+      return `<div class="w-full border rounded-xl p-3 ${style}">
+        <div class="flex flex-wrap items-center justify-between gap-2">
+          <div class="font-medium text-sm">受控业务写入：创建维修工单</div>
+          <span class="text-xs font-medium">${escapeHtml(displayedStatus)}</span>
+        </div>
+        <div class="mt-1 text-xs opacity-80">执行通道：应用规则工作流 → ActionGateway → 内部工单服务</div>
+        <div class="mt-1 text-xs opacity-80">本次非MCP写入 · 本次未调用模型</div>
+        ${receiptEvidence}
+      </div>`;
+    }
+
+    function liveToolStatusText(toolCalls) {
+      const calls = toolCalls || [];
+      const controlled = calls.filter(isControlledWorkOrderCall);
+      const ordinary = calls.filter(call => !isControlledWorkOrderCall(call));
+      const parts = ordinary.length
+        ? [`调用工具：${ordinary.map(call => toolCallName(call) || JSON.stringify(call)).join('、')}`]
+        : [];
+      controlled.forEach(call => parts.push(`受控业务写入：创建维修工单（${controlledWriteStatusLabel(toolCallStatus(call) || 'unknown')}）`));
+      return parts.join(' · ');
+    }
+
+    function traceUsagePresentation(usageSource, tools) {
+      const hasRuleWorkflow = (tools || []).some(isWorkOrderWorkflowCall);
+      if (usageSource === 'not_applicable' && hasRuleWorkflow) {
+        return {
+          label: '规则工作流',
+          title: '本轮没有模型调用，因此没有模型Token与成本；业务Trace、确认与写入审计仍然有效。'
+        };
+      }
+      if (usageSource === 'not_applicable') {
+        return {
+          label: '无模型用量',
+          title: '本轮未调用模型，因此没有模型 Token/成本'
+        };
+      }
+      return {
+        label: {
+          provider_reported_complete: 'Provider完整',
+          provider_reported_total_only: 'Provider仅总量',
+          local_estimate: '本地估算',
+          unavailable: '不可得',
+          provider_reported: 'Provider账单',
+          estimated_tokenization: '本地估算'
+        }[usageSource] || '未知',
+        title: `usage_source: ${usageSource || 'unknown'}`
+      };
+    }
+
+    function maskTraceText(value) {
+      return String(value ?? '').replace(/(^|\D)(1[3-9]\d{9})(?!\d)/g, (_, prefix, phone) => `${prefix}${phone.slice(0, 3)}****${phone.slice(-4)}`);
+    }
+
+    function safeTraceJson(value) {
+      return maskTraceText(JSON.stringify(value, null, 2));
+    }
+
     function renderAiMessageTags(skills, tools, agent, routeReason = '', routeIntent = '', modelId = '', thinkingEnabled = null, modelSelectionReason = '', traceId = '', mcpCalls = null, usageSource = '', currentAgentId = '') {
       const tags = [];
+      const allTools = tools || [];
+      const controlledWriteCalls = allTools.filter(isControlledWorkOrderCall);
+      const ordinaryTools = allTools.filter(call => !isControlledWorkOrderCall(call));
       if (modelId) {
         const modelLabel = modelId === 'deepseek-v4-pro' ? 'Pro' : (modelId === 'deepseek-v4-flash' ? 'Flash' : modelId);
         const thinkingText = thinkingEnabled ? '· thinking' : '';
@@ -541,7 +661,7 @@
       if (routeReason) tags.push(`<span class="px-1.5 py-0.5 bg-slate-100 text-slate-600 rounded text-[10px]" title="${escapeHtml(routeIntent || '')}">路由原因：${escapeHtml(routeReason)}</span>`);
       if (agent) tags.push(`<span class="px-1.5 py-0.5 bg-indigo-50 text-indigo-600 rounded text-[10px]" title="agent_id: ${escapeHtml(currentAgentId || '')}">当前处理 Agent：${escapeHtml(agent)}</span>`);
       if (skills && skills.length) tags.push(`<span class="px-1.5 py-0.5 bg-brand-50 text-brand-600 rounded text-[10px]" title="Skill 提供可复用的业务规则与执行方法；它不是知识库引用。">已命中 Skill（业务规则）：${escapeHtml(skills.map(s => (typeof s === 'object' && s !== null ? (s.name || JSON.stringify(s)) : String(s))).join('、'))}</span>`);
-      if (tools && tools.length) tags.push(`<span class="px-1.5 py-0.5 bg-gold-50 text-gold-600 rounded text-[10px]">已调用工具：${escapeHtml(tools.map(t => typeof t === 'string' ? t : (t.name || t.tool_name || JSON.stringify(t))).join('、'))}</span>`);
+      if (ordinaryTools.length) tags.push(`<span class="px-1.5 py-0.5 bg-gold-50 text-gold-600 rounded text-[10px]">已调用工具：${escapeHtml(ordinaryTools.map(t => typeof t === 'string' ? t : (t.name || t.tool_name || JSON.stringify(t))).join('、'))}</span>`);
       if (mcpCalls && mcpCalls.length) {
         const okCount = mcpCalls.filter(c => c.status === 'success').length;
         const expectedCount = mcpCalls.filter(c => ['empty', 'not_found', 'invalid_input', 'unauthorized'].includes(c.status)).length;
@@ -551,18 +671,12 @@
         tags.push(`<span class="px-1.5 py-0.5 bg-cyan-50 text-cyan-600 rounded text-[10px] cursor-help" title="${escapeHtml(summary)}">MCP 调用：${statusText}</span>`);
       }
       if (traceId) {
-        const sourceLabel = {
-          provider_reported_complete: 'Provider完整',
-          provider_reported_total_only: 'Provider仅总量',
-          local_estimate: '本地估算',
-          unavailable: '不可得',
-          not_applicable: '不适用',
-          provider_reported: 'Provider账单',
-          estimated_tokenization: '本地估算'
-        }[usageSource] || '未知';
-        tags.push(`<button type="button" class="px-1.5 py-0.5 bg-slate-50 text-slate-500 rounded text-[10px] hover:bg-slate-100 hover:text-slate-700 transition-colors" title="trace_id: ${escapeHtml(traceId)} · usage_source: ${escapeHtml(usageSource || 'unknown')}" onclick="openTraceDrawer('${escapeHtml(traceId)}')">Trace · ${escapeHtml(sourceLabel)}</button>`);
+        const traceUsage = traceUsagePresentation(usageSource, allTools);
+        tags.push(`<button type="button" class="px-1.5 py-0.5 bg-slate-50 text-slate-500 rounded text-[10px] hover:bg-slate-100 hover:text-slate-700 transition-colors" title="${escapeHtml(traceUsage.title)} · trace_id: ${escapeHtml(traceId)}" onclick="openTraceDrawer('${escapeHtml(traceId)}')">Trace · ${escapeHtml(traceUsage.label)}</button>`);
       }
-      return tags.length ? `<div class="flex flex-wrap items-center gap-1 mt-2">${tags.join('')}</div>` : '';
+      const tagHtml = tags.length ? `<div class="flex flex-wrap items-center gap-1 mt-2">${tags.join('')}</div>` : '';
+      const controlledWriteHtml = controlledWriteCalls.length ? `<div class="mt-2 space-y-2">${controlledWriteCalls.map(renderControlledWriteCard).join('')}</div>` : '';
+      return `${controlledWriteHtml}${tagHtml}`;
     }
 
     async function openTraceDrawer(traceId) {
@@ -577,9 +691,26 @@
         const mcpCalls = data.mcp_calls || [];
         const messages = data.messages || [];
         const assistantMsg = messages.find(m => m.role === 'assistant') || {};
+        const assistantToolCalls = assistantMsg.tool_calls || [];
         const currentAgent = assistantMsg.current_agent || trace.agent_name || '-';
         const currentAgentId = assistantMsg.current_agent_id || trace.agent_id || '-';
         const skills = (assistantMsg.activated_skills || []).map(s => typeof s === 'object' ? (s.name || JSON.stringify(s)) : String(s));
+        const proposals = runtimeEvidence.action_proposals || [];
+        const approvals = runtimeEvidence.approval_events || [];
+        const receipts = runtimeEvidence.action_receipts || [];
+        const workflowCalls = assistantToolCalls.filter(isWorkOrderWorkflowCall);
+        const controlledWriteCalls = assistantToolCalls.filter(isControlledWorkOrderCall);
+        const controlledGatewayCall = controlledWriteCalls[0] || null;
+        const controlledProposal = proposals.find(proposal => proposal.action_type === 'work_order.create') || null;
+        const controlledProposalId = controlledProposal
+          ? controlledProposal.proposal_id
+          : (controlledGatewayCall && (controlledGatewayCall.proposal_id || (controlledGatewayCall.arguments || {}).proposal_id));
+        const controlledApproval = approvals.find(approval => approval.proposal_id === controlledProposalId) || null;
+        const controlledReceipt = receipts.find(receipt =>
+          receipt.proposal_id === controlledProposalId
+          || (controlledGatewayCall && controlledGatewayCall.receipt_id && receipt.receipt_id === controlledGatewayCall.receipt_id)
+        ) || null;
+        const isControlledWorkOrderTrace = Boolean(controlledWriteCalls.length || controlledProposal);
         const stageName = { router: '路由判定', vertical_agent: '业务 Agent 回答', darwin: 'Darwin 分析', retest: 'Badcase 复测' };
         const sourceName = {
           provider_reported_complete: 'Provider 返回完整拆分',
@@ -608,11 +739,18 @@
             capability_policy_override: '能力策略校正',
           }[routeMode] || routeMode;
           return `<div class="border border-slate-200 rounded-xl p-3 text-sm space-y-1"><div class="font-medium text-slate-900">${escapeHtml(stageName[call.stage] || call.stage || '模型调用')} · ${escapeHtml(call.model_id || '-')}</div><div class="text-xs text-slate-500">用量来源：${escapeHtml(sourceName[call.usage_source] || call.usage_source || '未知')}${routeModeLabel ? ` · 路由方式：${escapeHtml(routeModeLabel)}` : ''}</div><div class="text-xs text-slate-600">${escapeHtml(usageLine)}</div><div class="text-xs text-slate-700">${escapeHtml(costLine)}</div><div class="text-xs text-slate-500">${escapeHtml(priceText(call.price_snapshot || {}))}</div></div>`;
-        }).join('') : '<p class="text-sm text-slate-400">本轮没有模型调用；如为规则工作流，这是预期行为。</p>';
-        const workflowCalls = (assistantMsg.tool_calls || []).filter(call => (call.tool_name || call.name) === 'work_order_workflow');
-        const workflowHtml = workflowCalls.length ? workflowCalls.map(call => `<div class="border border-emerald-200 bg-emerald-50 rounded-xl p-3 text-sm"><div class="font-medium text-emerald-800">维修工单工作流：${escapeHtml((call.arguments || {}).action || '已处理')}</div><div class="text-xs text-emerald-700 mt-1">${escapeHtml(call.result_summary || '')}</div>${call.work_order_id ? `<div class="text-xs text-emerald-700 mt-1">真实工单号：${escapeHtml(call.work_order_id)}</div>` : ''}</div>`).join('') : '';
+        }).join('') : (isControlledWorkOrderTrace
+          ? '<p class="text-sm text-slate-500">本轮为确定性规则工作流，没有调用模型，因此模型Token与成本不适用。</p>'
+          : '<p class="text-sm text-slate-400">本轮没有模型调用。</p>');
+        const workflowHtml = workflowCalls.length ? workflowCalls.map(call => {
+          const name = toolCallName(call);
+          const label = name === 'action_gateway' ? '受控写入网关' : '维修工单确认工作流';
+          return `<div class="border border-emerald-200 bg-emerald-50 rounded-xl p-3 text-sm"><div class="font-medium text-emerald-800">${escapeHtml(label)}：${escapeHtml(controlledWriteStatusLabel(toolCallStatus(call) || 'unknown'))}</div><div class="text-xs text-emerald-700 mt-1">${escapeHtml(maskTraceText(call.result_summary || ''))}</div></div>`;
+        }).join('') : '';
         const mcpOutcomeLabel = { success: '成功', empty: '无匹配数据', not_found: '未找到', invalid_input: '参数不合法', unauthorized: '无权限', timeout: '调用超时', upstream_error: '上游异常', failed: '调用失败' };
-        const mcpHtml = mcpCalls.length ? mcpCalls.map(call => `<div class="border border-slate-200 rounded-xl p-3 text-sm"><div class="font-medium text-slate-900">${escapeHtml(call.server_name || 'unknown')} · ${escapeHtml(call.tool_name || '-')}</div><div class="text-xs text-slate-500 mt-1">${call.invocation_mode === 'policy_preinvoke' ? '系统策略预调用' : 'Agent 自主调用'} · ${escapeHtml(mcpOutcomeLabel[call.status] || call.status || '未知')}</div><div class="text-xs text-slate-500 mt-1">参数：${escapeHtml(JSON.stringify(call.arguments || call.args || {}))}</div><div class="text-xs text-slate-600 mt-1">结果摘要：${escapeHtml((call.result_summary || call.error_summary || '无').slice(0, 240))}</div></div>`).join('') : '<p class="text-sm text-slate-400">本轮未调用 MCP 工具。</p>';
+        const mcpHtml = mcpCalls.length ? mcpCalls.map(call => `<div class="border border-slate-200 rounded-xl p-3 text-sm"><div class="font-medium text-slate-900">${escapeHtml(call.server_name || 'unknown')} · ${escapeHtml(call.tool_name || '-')}</div><div class="text-xs text-slate-500 mt-1">${call.invocation_mode === 'policy_preinvoke' ? '系统策略预调用' : 'Agent 自主调用'} · ${escapeHtml(mcpOutcomeLabel[call.status] || call.status || '未知')}</div><div class="text-xs text-slate-500 mt-1">参数：${escapeHtml(safeTraceJson(call.arguments || call.args || {}))}</div><div class="text-xs text-slate-600 mt-1">结果摘要：${escapeHtml(maskTraceText((call.result_summary || call.error_summary || '无').slice(0, 240)))}</div></div>`).join('') : (isControlledWorkOrderTrace
+          ? '<p class="text-sm text-slate-500">本轮未调用MCP；正式写入由内部工单服务完成。</p>'
+          : '<p class="text-sm text-slate-400">本轮未调用 MCP 工具。</p>');
         const citations = assistantMsg.citations || [];
         const usedCitations = citations.filter(c => c.used_in_answer === true);
         const candidateCitations = citations.filter(c => c.used_in_answer !== true);
@@ -622,30 +760,66 @@
           request_received: '接收请求', router: '路由决策', rag_retrieval: 'RAG 检索',
           mcp_policy_preinvoke: '策略预调用 MCP', model_response: '模型生成',
           handoff_policy: '人机协同策略', handoff_state: '人工接管状态',
-          work_order_workflow: '工单确认工作流', evaluation_rule_gate: '评估规则门槛'
+          action_gateway: '受控写入网关', work_order_workflow: '维修工单确认工作流',
+          evaluation_rule_gate: '评估规则门槛'
         };
         const eventHtml = traceEvents.length ? `<div class="space-y-2">${traceEvents.map(event => `
           <div class="border border-slate-200 rounded-xl p-3 text-sm">
             <div class="flex justify-between gap-3"><span class="font-medium text-slate-800">${escapeHtml(spanLabels[event.span_name] || event.span_name || '事件')}</span><span class="text-xs text-slate-500">${escapeHtml(event.status || '-')} · ${event.latency_ms ?? '-'}ms</span></div>
-            ${event.output_summary ? `<div class="mt-1 text-xs text-slate-600 whitespace-pre-wrap">${escapeHtml(event.output_summary)}</div>` : ''}
-            ${event.metadata ? `<details class="mt-2"><summary class="text-xs text-slate-500 cursor-pointer">元数据</summary><pre class="mt-1 text-[10px] bg-slate-50 p-2 rounded overflow-x-auto">${escapeHtml(JSON.stringify(event.metadata, null, 2))}</pre></details>` : ''}
+            ${event.output_summary ? `<div class="mt-1 text-xs text-slate-600 whitespace-pre-wrap">${escapeHtml(maskTraceText(event.output_summary))}</div>` : ''}
+            ${event.metadata ? `<details class="mt-2"><summary class="text-xs text-slate-500 cursor-pointer">元数据</summary><pre class="mt-1 text-[10px] bg-slate-50 p-2 rounded overflow-x-auto">${escapeHtml(safeTraceJson(event.metadata))}</pre></details>` : ''}
           </div>`).join('')}</div>` : '<p class="text-sm text-slate-400">该版本前的历史对话未记录 span 事件；不补造历史过程。</p>';
+        const controlledExecutionEvent = traceEvents.find(event => ['action_gateway', 'work_order_workflow'].includes(event.span_name)) || null;
+        const controlledStages = [];
+        if (controlledProposal && controlledProposal.payload && Object.keys(controlledProposal.payload).length) {
+          controlledStages.push(`<div class="rounded-lg border border-slate-200 p-3"><div class="font-medium text-slate-900">1. Draft</div><div class="mt-1 text-xs text-slate-600">提议中存在待确认工单草稿；为保护隐私，默认不展示完整 Payload。</div></div>`);
+        }
+        if (controlledProposal) {
+          controlledStages.push(`<div class="rounded-lg border border-slate-200 p-3"><div class="font-medium text-slate-900">2. Proposal</div><div class="mt-1 text-xs text-slate-600">操作：创建维修工单 · 状态：${escapeHtml(controlledProposal.status || '-')}</div><div class="mt-1 text-xs text-slate-500 font-mono">proposal_id: ${escapeHtml(controlledProposal.proposal_id || '-')}</div></div>`);
+        }
+        if (controlledApproval) {
+          const approvalActor = controlledApproval.actor && String(controlledApproval.actor).startsWith('owner:')
+            ? `业主本人（${maskTraceText(controlledApproval.actor)}）`
+            : maskTraceText(controlledApproval.actor || '-');
+          controlledStages.push(`<div class="rounded-lg border border-slate-200 p-3"><div class="font-medium text-slate-900">3. Owner Approval</div><div class="mt-1 text-xs text-slate-600">决定：${escapeHtml(controlledApproval.decision || '-')} · 确认人：${escapeHtml(approvalActor)}</div>${controlledApproval.decided_at ? `<div class="mt-1 text-xs text-slate-500">确认时间：${escapeHtml(controlledApproval.decided_at)}</div>` : ''}<div class="mt-1 text-xs text-slate-600">这是业主确认（HITL），不等同于转人工接管。</div></div>`);
+        }
+        if (controlledGatewayCall || controlledExecutionEvent) {
+          const gatewayStatus = toolCallStatus(controlledGatewayCall) || (controlledExecutionEvent && controlledExecutionEvent.status) || '-';
+          const gatewayLatency = controlledExecutionEvent && controlledExecutionEvent.latency_ms !== undefined ? ` · ${controlledExecutionEvent.latency_ms}ms` : '';
+          controlledStages.push(`<div class="rounded-lg border border-slate-200 p-3"><div class="font-medium text-slate-900">4. ActionGateway Execution</div><div class="mt-1 text-xs text-slate-600">状态：${escapeHtml(gatewayStatus)}${escapeHtml(gatewayLatency)} · 应用内受控写入</div></div>`);
+        }
+        if (controlledReceipt) {
+          const verifiedReceipt = controlledReceipt.status === 'committed' && Boolean(controlledReceipt.receipt_id && controlledReceipt.resource_id);
+          const receiptStatus = verifiedReceipt
+            ? '已提交'
+            : (controlledReceipt.status === 'committed' ? '回执字段不完整，不能确认写入成功' : (controlledReceipt.status || '-'));
+          const replayed = toolCallStatus(controlledGatewayCall) === 'idempotent_replay'
+            || Boolean(controlledReceipt.result && controlledReceipt.result.idempotent_replay === true);
+          controlledStages.push(`<div class="rounded-lg border ${verifiedReceipt ? 'border-emerald-200 bg-emerald-50' : 'border-amber-200 bg-amber-50'} p-3"><div class="font-medium text-slate-900">5. Committed Receipt</div><div class="mt-1 text-xs text-slate-700">状态：${escapeHtml(receiptStatus)} · 对象：${escapeHtml(controlledReceipt.resource_type || 'work_order')}</div>${controlledReceipt.resource_id ? `<div class="mt-1 text-xs text-slate-700 font-mono">resource_id: ${escapeHtml(controlledReceipt.resource_id)}</div>` : ''}${controlledReceipt.receipt_id ? `<div class="mt-1 text-xs text-slate-700 font-mono">receipt_id: ${escapeHtml(controlledReceipt.receipt_id)}</div>` : ''}<div class="mt-1 text-xs text-slate-600">幂等保护：${controlledReceipt.idempotency_key ? '已启用' : '无证据'} · 重复写入：${replayed ? '已阻止' : '否'}</div>${controlledReceipt.error_summary ? `<div class="mt-1 text-xs text-rose-700">错误：${escapeHtml(maskTraceText(controlledReceipt.error_summary))}</div>` : ''}</div>`);
+        }
+        const controlledWriteEvidenceHtml = isControlledWorkOrderTrace ? `
+          <div>
+            <h4 class="font-medium text-slate-900 mb-2">受控业务写入证据</h4>
+            <div class="rounded-xl border border-blue-200 bg-blue-50 p-3 text-xs text-blue-900 space-y-1 mb-3">
+              <div>Action类型：work_order.create · 写入对象：维修工单</div>
+              <div>执行方式：应用层受控写入 · 是否MCP：否 · 是否调用模型：否</div>
+              <div>人工语义：业主确认属于 HITL；只有显式转人工才属于人工接管</div>
+            </div>
+            <div class="space-y-2">${controlledStages.length ? controlledStages.join('') : '<p class="text-sm text-slate-400">没有可展示的写入证据；不补造历史过程。</p>'}</div>
+          </div>` : '';
         const evaluationRun = data.evaluation_run;
         const evaluationHtml = evaluationRun ? `<div class="bg-violet-50 border border-violet-200 rounded-xl p-3 text-sm space-y-1"><div class="font-medium text-violet-900">Golden Set 评估运行 #${escapeHtml(String(evaluationRun.id || '-'))}</div><div class="text-xs text-violet-700">状态：${escapeHtml(evaluationRun.status || '-')} · 风险：${escapeHtml(trace.risk_level || '-')} · 用例 ID：${escapeHtml(String(trace.evaluation_case_id || '-'))}</div><div class="text-xs text-violet-700">该 Trace 是操作员主动运行的质量验证，不等同于线上 SLA 或自动放量。</div></div>` : '';
         const config = runtimeEvidence.config_snapshot || {};
         const violations = runtimeEvidence.contract_violations || [];
-        const proposals = runtimeEvidence.action_proposals || [];
-        const approvals = runtimeEvidence.approval_events || [];
-        const receipts = runtimeEvidence.action_receipts || [];
         const runtimeContractHtml = Object.keys(runtimeEvidence).length ? `
           <div class="rounded-xl border ${violations.length ? 'border-amber-200 bg-amber-50' : 'border-emerald-200 bg-emerald-50'} p-3 text-sm">
             <div class="font-medium ${violations.length ? 'text-amber-900' : 'text-emerald-900'}">V1.8 Evidence Ledger</div>
             <div class="mt-1 text-xs text-slate-700">Release：${escapeHtml(config.release_id || '-')} · Snapshot：${escapeHtml(config.snapshot_id || '-')}</div>
             <div class="mt-1 text-xs text-slate-700">Proposal ${proposals.length} · Approval ${approvals.length} · Receipt ${receipts.length} · Contract violation ${violations.length}</div>
-            ${violations.length ? `<details class="mt-2"><summary class="text-xs cursor-pointer">查看契约违规</summary><pre class="mt-1 text-[10px] bg-white/70 p-2 rounded overflow-x-auto">${escapeHtml(JSON.stringify(violations, null, 2))}</pre></details>` : ''}
+            ${violations.length ? `<details class="mt-2"><summary class="text-xs cursor-pointer">查看契约违规</summary><pre class="mt-1 text-[10px] bg-white/70 p-2 rounded overflow-x-auto">${escapeHtml(safeTraceJson(violations))}</pre></details>` : ''}
           </div>` : '';
-        const summaryText = [`Trace ID：${traceId}`, `Release：${config.release_id || '-'}`, `Snapshot：${config.snapshot_id || '-'}`, `当前 Agent：${currentAgent} (${currentAgentId})`, `激活 Skill：${skills.join('、') || '无'}`, `模型调用：${modelCalls.length} 次`, `MCP 调用：${mcpCalls.length} 次`, `回答实际引用：${usedCitations.map(c => `《${c.doc_title}》分片${c.chunk_index}`).join('、') || '无'}`, `契约违规：${violations.length}`, `链路事件：${traceEvents.map(e => spanLabels[e.span_name] || e.span_name).join(' → ') || '历史 Trace 无 span 记录'}`].join('\n');
-        const html = `<div class="space-y-5"><div class="bg-slate-50 rounded-xl p-3 border border-slate-200 text-sm space-y-1"><div><span class="text-slate-500">Trace：</span><span class="font-mono">${escapeHtml(traceId)}</span></div><div><span class="text-slate-500">当前 Agent：</span>${escapeHtml(currentAgent)} <span class="text-xs text-slate-400">(${escapeHtml(currentAgentId)})</span></div><div><span class="text-slate-500">激活 Skill：</span>${escapeHtml(skills.join('、') || '无')}</div></div>${runtimeContractHtml}${evaluationHtml}${workflowHtml ? `<div><h4 class="font-medium text-slate-900 mb-2">业务工作流</h4>${workflowHtml}</div>` : ''}<div><h4 class="font-medium text-slate-900 mb-2">链路事件（Span）</h4>${eventHtml}</div><div><h4 class="font-medium text-slate-900 mb-2">模型调用与成本</h4><div class="space-y-2">${modelCards}</div></div><div><h4 class="font-medium text-slate-900 mb-2">MCP 工具证据</h4><div class="space-y-2">${mcpHtml}</div></div><div><h4 class="font-medium text-slate-900 mb-2">RAG 证据</h4><p class="text-xs text-slate-500 mb-1">回答实际引用</p>${citationList(usedCitations)}<details class="mt-3"><summary class="text-xs text-slate-500 cursor-pointer">仅检索到、未写入回答的候选（${candidateCitations.length}）</summary>${citationList(candidateCitations)}</details></div><button type="button" id="trace-copy-summary" class="w-full px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white rounded-xl text-sm transition-colors">复制可读摘要</button></div>`;
+        const summaryText = maskTraceText([`Trace ID：${traceId}`, `Release：${config.release_id || '-'}`, `Snapshot：${config.snapshot_id || '-'}`, `当前 Agent：${currentAgent} (${currentAgentId})`, `激活 Skill：${skills.join('、') || '无'}`, `模型调用：${modelCalls.length} 次`, `MCP 调用：${mcpCalls.length} 次`, `受控写入：${isControlledWorkOrderTrace ? '创建维修工单（ActionGateway）' : '无'}`, `回答实际引用：${usedCitations.map(c => `《${c.doc_title}》分片${c.chunk_index}`).join('、') || '无'}`, `契约违规：${violations.length}`, `链路事件：${traceEvents.map(e => spanLabels[e.span_name] || e.span_name).join(' → ') || '历史 Trace 无 span 记录'}`].join('\n'));
+        const html = `<div class="space-y-5"><div class="bg-slate-50 rounded-xl p-3 border border-slate-200 text-sm space-y-1"><div><span class="text-slate-500">Trace：</span><span class="font-mono">${escapeHtml(traceId)}</span></div><div><span class="text-slate-500">当前 Agent：</span>${escapeHtml(currentAgent)} <span class="text-xs text-slate-400">(${escapeHtml(currentAgentId)})</span></div><div><span class="text-slate-500">激活 Skill：</span>${escapeHtml(skills.join('、') || '无')}</div></div>${runtimeContractHtml}${evaluationHtml}${controlledWriteEvidenceHtml}${workflowHtml ? `<div><h4 class="font-medium text-slate-900 mb-2">业务工作流</h4>${workflowHtml}</div>` : ''}<div><h4 class="font-medium text-slate-900 mb-2">链路事件（Span）</h4>${eventHtml}</div><div><h4 class="font-medium text-slate-900 mb-2">模型调用与成本</h4><div class="space-y-2">${modelCards}</div></div><div><h4 class="font-medium text-slate-900 mb-2">MCP 工具证据</h4><div class="space-y-2">${mcpHtml}</div></div><div><h4 class="font-medium text-slate-900 mb-2">RAG 证据</h4><p class="text-xs text-slate-500 mb-1">回答实际引用</p>${citationList(usedCitations)}<details class="mt-3"><summary class="text-xs text-slate-500 cursor-pointer">仅检索到、未写入回答的候选（${candidateCitations.length}）</summary>${citationList(candidateCitations)}</details></div><button type="button" id="trace-copy-summary" class="w-full px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white rounded-xl text-sm transition-colors">复制可读摘要</button></div>`;
         openDrawer('Trace 详情', html);
         setTimeout(() => { const button = $('#trace-copy-summary'); if (button) button.addEventListener('click', async () => { try { await navigator.clipboard.writeText(summaryText); showToast('Trace 摘要已复制', 'success'); } catch (_) { showToast('复制失败', 'error'); } }); }, 0);
       } catch (err) {
@@ -1655,9 +1829,8 @@
             } else if (eventType === 'tool_calls') {
               if (data.current_agent && STATE.currentRoute) STATE.currentRoute.current_agent = data.current_agent;
               if (data.current_agent_id && STATE.currentRoute) STATE.currentRoute.current_agent_id = data.current_agent_id;
-              const toolNames = (data.tool_calls || []).map(t => typeof t === 'string' ? t : (t.name || t.tool_name || JSON.stringify(t))).join('、');
               const statusEl = placeholder.querySelector('.ai-message-tool-status');
-              if (statusEl) statusEl.textContent = toolNames ? `调用工具：${toolNames}` : '';
+              if (statusEl) statusEl.textContent = liveToolStatusText(data.tool_calls || []);
             } else if (eventType === 'done') {
               receivedDone = true;
               if (typeof data.content === 'string') accumulated = data.content;
