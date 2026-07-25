@@ -110,6 +110,7 @@ KNOWLEDGE_GOVERNED_TERMS = (
     "依据",
     "引用",
     "收费",
+    "免费",
     "费用",
     "价格",
     "权限",
@@ -129,6 +130,17 @@ KNOWLEDGE_GOVERNED_TERMS = (
     "几小时",
     "怎么办",
     "如何处理",
+)
+KNOWLEDGE_SERVICE_FACT_PATTERNS = (
+    re.compile(
+        r"(?:小区|物业).{0,16}"
+        r"(?:有没有|有无|是否(?:有|提供|支持|办理)|提供|支持).{0,24}"
+        r"(?:服务|维修|办理|安排)"
+    ),
+    re.compile(
+        r"(?:有没有|有无|是否(?:有|提供|支持)|支不支持|能否).{0,24}"
+        r"(?:服务|维修|办理|安排)"
+    ),
 )
 KNOWLEDGE_INSUFFICIENT_RESPONSE = (
     "当前知识依据不足，无法确认具体结论。我不能将“未检索到”表述为"
@@ -281,7 +293,42 @@ def _requires_rag_citations(message: str) -> bool:
 
 def _requires_direct_knowledge_evidence(message: str) -> bool:
     compact = re.sub(r"\s+", "", message or "")
-    return any(marker in compact for marker in KNOWLEDGE_GOVERNED_TERMS)
+    return any(marker in compact for marker in KNOWLEDGE_GOVERNED_TERMS) or any(
+        pattern.search(compact) for pattern in KNOWLEDGE_SERVICE_FACT_PATTERNS
+    )
+
+
+def _knowledge_evidence_decision(
+    message: str,
+    evidence_count: int,
+    structured_realtime_query: bool,
+    allowed_document_ids: Optional[set[int]] = None,
+) -> Dict[str, Any]:
+    """Return the lightweight evidence gate decision used by runtime and Trace."""
+
+    count = max(0, int(evidence_count or 0))
+    required = bool(
+        not structured_realtime_query
+        and _requires_direct_knowledge_evidence(message)
+    )
+    blocked = bool(required and count == 0)
+    return {
+        "required": required,
+        "blocked": blocked,
+        "evidence_count": count,
+        "allowed_document_ids": sorted(allowed_document_ids or set()),
+        "evidence_decision": (
+            "rejected_insufficient"
+            if blocked
+            else ("accepted" if count else "not_required")
+        ),
+        "reason": (
+            "no_accepted_evidence"
+            if blocked
+            else ("accepted_direct_evidence" if count else "knowledge_not_required")
+        ),
+        "model_invoked": not blocked,
+    }
 
 
 def _append_runtime_evidence_summary(
@@ -1496,6 +1543,10 @@ class RuntimeCoordinator:
             message,
             read_tool_plans,
         )
+        direct_knowledge_required = bool(
+            not structured_realtime_query
+            and _requires_direct_knowledge_evidence(message)
+        )
         state.next_step = "retrieve"
         retrieval_started = time.time()
         allowed_doc_ids = {
@@ -1511,7 +1562,11 @@ class RuntimeCoordinator:
         retrieval_status = (
             "skipped_structured_realtime_query"
             if structured_realtime_query
-            else "not_requested"
+            else (
+                "skipped_no_bound_knowledge"
+                if direct_knowledge_required and not allowed_doc_ids
+                else "not_requested"
+            )
         )
         if not structured_realtime_query:
             yield _sse(
@@ -1591,7 +1646,11 @@ class RuntimeCoordinator:
                 if retrieval_status == "failed"
                 else (
                     "skipped"
-                    if retrieval_status == "skipped_structured_realtime_query"
+                    if retrieval_status
+                    in {
+                        "skipped_structured_realtime_query",
+                        "skipped_no_bound_knowledge",
+                    }
                     else "success"
                 )
             ),
@@ -1615,10 +1674,15 @@ class RuntimeCoordinator:
                 "snapshot_fallback": used_snapshot_fallback,
                 "evidence_policy": (retrieval or {}).get("evidence_policy"),
                 "filter_summary": (retrieval or {}).get("filter_summary"),
+                "direct_knowledge_required": direct_knowledge_required,
                 "decision_reason": (
                     "structured_realtime_query"
                     if structured_realtime_query
-                    else "knowledge_evidence_required"
+                    else (
+                        "knowledge_evidence_required"
+                        if direct_knowledge_required
+                        else "knowledge_evidence_not_required"
+                    )
                 ),
             },
         )
@@ -1679,14 +1743,14 @@ class RuntimeCoordinator:
                 invocation_mode="policy_preinvoke",
             )
 
-        direct_knowledge_required = bool(
-            allowed_doc_ids
-            and not structured_realtime_query
-            and _requires_direct_knowledge_evidence(message)
+        knowledge_gate = _knowledge_evidence_decision(
+            message,
+            len(evidence.items),
+            structured_realtime_query,
+            allowed_doc_ids,
         )
-        knowledge_evidence_blocked = bool(
-            direct_knowledge_required and not evidence.items
-        )
+        direct_knowledge_required = bool(knowledge_gate["required"])
+        knowledge_evidence_blocked = bool(knowledge_gate["blocked"])
         evidence_prompt = prompt_evidence_allowlist(evidence)
         build = build_agent_from_snapshot(
             snapshot,
@@ -1749,11 +1813,8 @@ class RuntimeCoordinator:
                 ),
                 retrieval_status=retrieval_status,
                 evidence_count=len(evidence.items),
-                evidence_decision=(
-                    "rejected_insufficient"
-                    if knowledge_evidence_blocked
-                    else ("accepted" if evidence.items else "not_available")
-                ),
+                direct_knowledge_required=direct_knowledge_required,
+                evidence_decision=knowledge_gate["evidence_decision"],
             ),
             "tool": _decision(
                 "selected" if read_tool_plans else "skipped",
@@ -1799,7 +1860,7 @@ class RuntimeCoordinator:
             metadata={"decision_summary": decision_summary},
         )
         state.next_step = "answer"
-        model_invoked = not knowledge_evidence_blocked
+        model_invoked = bool(knowledge_gate["model_invoked"])
         if knowledge_evidence_blocked:
             record_trace_event(
                 trace_id,
@@ -1807,9 +1868,15 @@ class RuntimeCoordinator:
                 "success",
                 output_summary="knowledge evidence insufficient; vertical model skipped",
                 metadata={
-                    "decision": "rejected_insufficient",
+                    "direct_knowledge_required": direct_knowledge_required,
+                    "decision": knowledge_gate["evidence_decision"],
+                    "reason": knowledge_gate["reason"],
                     "retrieval_status": retrieval_status,
                     "evidence_count": 0,
+                    "allowed_document_ids": knowledge_gate[
+                        "allowed_document_ids"
+                    ],
+                    "model_invoked": model_invoked,
                 },
             )
             yield _sse(

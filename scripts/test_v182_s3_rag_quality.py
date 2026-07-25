@@ -6,6 +6,7 @@ from unittest.mock import patch
 import rag_chunking
 import rag_retrieval
 from app.runtime.citation_renderer import (
+    _critical_values as citation_critical_values,
     build_evidence_set,
     prompt_evidence_allowlist,
     render_citations,
@@ -13,6 +14,7 @@ from app.runtime.citation_renderer import (
 from app.runtime.contracts import EvidenceItem, EvidenceSet
 from app.runtime.coordinator import (
     KNOWLEDGE_INSUFFICIENT_RESPONSE,
+    _knowledge_evidence_decision,
     _requires_direct_knowledge_evidence,
     _results_from_snapshot,
     _static_response_stream,
@@ -213,6 +215,101 @@ def test_numeric_claim_must_be_in_cited_chunk():
     assert not violations
 
 
+def test_workday_critical_values_are_distinct_and_normalized():
+    assert citation_critical_values("3个工作日、5个工作日") == {
+        "3工作日",
+        "5工作日",
+    }
+    assert citation_critical_values("3工作日") == {"3工作日"}
+    assert rag_retrieval._critical_values("3个工作日、5个工作日") == {
+        "3工作日",
+        "5工作日",
+    }
+    assert citation_critical_values("5分钟、30分钟、24小时") == {
+        "5分钟",
+        "30分钟",
+        "24小时",
+    }
+
+
+def test_workday_claim_mismatch_is_blocked():
+    evidence = EvidenceSet(
+        items=[_evidence_item("维修投诉应当在24小时内响应，并在3个工作日内反馈。")],
+        query="维修投诉多久响应并反馈",
+    )
+    _, citations, violations = render_citations(
+        "维修投诉会在24小时内响应、5个工作日内反馈。"
+        "[[evidence:ev_test]]",
+        evidence,
+    )
+    assert not citations
+    assert any(
+        item["code"] == "unsupported_critical_value"
+        and "5工作日" in item["values"]
+        for item in violations
+    ), violations
+
+
+def test_supported_workday_and_emergency_values_still_pass():
+    workday_evidence = EvidenceSet(
+        items=[_evidence_item("维修投诉应当在24小时内响应，并在3个工作日内反馈。")],
+        query="维修投诉多久响应并反馈",
+    )
+    rendered, citations, violations = render_citations(
+        "维修投诉会在24小时内响应、3个工作日内反馈。"
+        "[[evidence:ev_test]]",
+        workday_evidence,
+    )
+    assert "【引用1】" in rendered
+    assert len(citations) == 1
+    assert not violations
+
+    emergency_evidence = EvidenceSet(
+        items=[_evidence_item("紧急维修5分钟内登记，工程人员30分钟内到场。")],
+        query="物业紧急维修响应时效",
+    )
+    rendered, citations, violations = render_citations(
+        "紧急维修5分钟内登记、30分钟内到场。[[evidence:ev_test]]",
+        emergency_evidence,
+    )
+    assert "【引用1】" in rendered
+    assert len(citations) == 1
+    assert not violations
+
+
+def test_unknown_service_is_blocked_without_bound_knowledge():
+    for question in (
+        "小区有没有免费搬家服务？",
+        "小区提供免费搬家服务吗？",
+        "是否支持无人机上门维修？",
+    ):
+        decision = _knowledge_evidence_decision(
+            question,
+            evidence_count=0,
+            structured_realtime_query=False,
+            allowed_document_ids=set(),
+        )
+        assert decision["required"], (question, decision)
+        assert decision["blocked"], (question, decision)
+        assert decision["evidence_decision"] == "rejected_insufficient"
+        assert decision["reason"] == "no_accepted_evidence"
+        assert decision["model_invoked"] is False
+        assert decision["allowed_document_ids"] == []
+
+
+def test_supported_service_knowledge_allows_model_answer():
+    decision = _knowledge_evidence_decision(
+        "小区是否提供预约上门维修服务？",
+        evidence_count=1,
+        structured_realtime_query=False,
+        allowed_document_ids={1},
+    )
+    assert decision["required"]
+    assert not decision["blocked"]
+    assert decision["evidence_decision"] == "accepted"
+    assert decision["model_invoked"] is True
+
+
 def test_snapshot_fallback_uses_content_gate_and_filters_heading():
     versions = {
         1: {
@@ -265,6 +362,11 @@ def main():
         test_structural_chunk_never_enters_evidence_set,
         test_empty_evidence_prompt_forbids_industry_fallback,
         test_numeric_claim_must_be_in_cited_chunk,
+        test_workday_critical_values_are_distinct_and_normalized,
+        test_workday_claim_mismatch_is_blocked,
+        test_supported_workday_and_emergency_values_still_pass,
+        test_unknown_service_is_blocked_without_bound_knowledge,
+        test_supported_service_knowledge_allows_model_answer,
         test_snapshot_fallback_uses_content_gate_and_filters_heading,
         test_knowledge_gate_contract_and_static_response,
     ]
