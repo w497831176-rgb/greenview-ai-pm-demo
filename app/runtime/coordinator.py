@@ -2031,7 +2031,9 @@ class RuntimeCoordinator:
             )
 
         rendered, citations, citation_violations = render_citations(
-            full_content, evidence
+            full_content,
+            evidence,
+            tool_invocations=state.tool_invocations,
         )
         citation_required = bool(
             evidence.items

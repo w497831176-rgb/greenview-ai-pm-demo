@@ -34,13 +34,21 @@ _GENERIC_BIGRAMS = {
 }
 _CRITICAL_VALUE = re.compile(
     r"(?P<number>\d+(?:\.\d+)?|[一二三四五六七八九十百千万两半]+)\s*"
-    r"(?P<unit>个\s*工作日|工作日|分钟|小时|天|元|万元|%|次|年|个月|月|日)"
+    r"(?P<unit>个\s*工作日|个\s*种植舱|工作日|种植舱|分钟|小时|天|份|元|万元|%|次|年|个月|月|日)"
 )
 _CALCULATION_INPUT_VALUE = re.compile(
     r"(?:连续|持续)\s*"
     r"(?P<number>\d+(?:\.\d+)?|[一二三四五六七八九十百千万两半]+)\s*"
     r"(?P<unit>分钟|小时|天|个月|月|年)\s*"
     r"(?:需要|共需|总共|合计|计算)"
+)
+_CALCULATION_ENTITY_INPUT = re.compile(
+    r"(?P<number>\d+(?:\.\d+)?|[一二三四五六七八九十百千万两半]+)\s*"
+    r"(?P<unit>个\s*种植舱|种植舱)"
+)
+_CALCULATION_QUESTION = re.compile(r"多少|计算|共需|总共|合计|总需求")
+_TOOL_RESULT_NUMBER = re.compile(
+    r"['\"]result['\"]\s*:\s*(?P<number>[-+]?\d+(?:\.\d+)?)"
 )
 
 
@@ -75,7 +83,46 @@ def _calculation_input_values(text: str) -> Set[str]:
         number = re.sub(r"\s+", "", match.group("number")).lower()
         unit = re.sub(r"\s+", "", match.group("unit")).lower()
         values.add(f"{number}{unit}")
+    if _CALCULATION_QUESTION.search(text or ""):
+        for match in _CALCULATION_ENTITY_INPUT.finditer(text or ""):
+            number = re.sub(r"\s+", "", match.group("number")).lower()
+            unit = re.sub(r"\s+", "", match.group("unit")).lower()
+            values.add(f"{number}{unit}")
     return values
+
+
+def _normalize_number(number: str) -> str:
+    normalized = str(number or "").strip().lstrip("+")
+    if "." in normalized:
+        normalized = normalized.rstrip("0").rstrip(".")
+    return normalized or "0"
+
+
+def _successful_tool_result_numbers(tool_invocations: Iterable[Any]) -> Set[str]:
+    """Return numeric results from successful Tool receipts, never arguments."""
+
+    values: Set[str] = set()
+    for invocation in tool_invocations or []:
+        if isinstance(invocation, dict):
+            invocation_status = invocation.get("invocation_status")
+            business_status = invocation.get("business_status")
+            result_summary = invocation.get("result_summary")
+        else:
+            invocation_status = getattr(invocation, "invocation_status", None)
+            business_status = getattr(invocation, "business_status", None)
+            result_summary = getattr(invocation, "result_summary", None)
+        if invocation_status != "success" or business_status != "success":
+            continue
+        for match in _TOOL_RESULT_NUMBER.finditer(str(result_summary or "")):
+            values.add(_normalize_number(match.group("number")))
+    return values
+
+
+def _tool_supports_critical_value(value: str, tool_numbers: Set[str]) -> bool:
+    match = re.match(r"(?P<number>[-+]?\d+(?:\.\d+)?)", value or "")
+    return bool(
+        match and _normalize_number(match.group("number")) in tool_numbers
+    )
 
 
 def _is_structural_content(content: str, title: str = "") -> bool:
@@ -104,29 +151,46 @@ def _is_structural_content(content: str, title: str = "") -> bool:
 
 
 def _citation_context(answer: str, match: re.Match) -> str:
+    """Return one sentence/list item, not the surrounding Markdown section."""
+
     line_start = answer.rfind("\n", 0, match.start()) + 1
-    # Models often place a marker on a short "依据" line and put the actual
-    # supported facts in the immediately following Markdown bullets. Validate
-    # the whole local paragraph/section, not only the marker's physical line.
-    max_end = min(len(answer), match.end() + 800)
-    section_end = answer.find("\n\n", match.end())
-    if section_end < 0 or section_end > max_end:
-        section_end = max_end
-    first_section = answer[line_start:section_end].strip()
-    # Models often emit a short source-label line, then a blank line, then the
-    # actual supported Markdown list.  Treat that label plus the immediately
-    # following paragraph/list as one citation context.
-    if (
-        section_end < max_end
-        and any(marker in first_section for marker in ("引用来源", "依据", "参考文档"))
-        and len(first_section) <= 120
-    ):
-        next_start = section_end + 2
-        next_end = answer.find("\n\n", next_start)
-        if next_end < 0 or next_end > max_end:
-            next_end = max_end
-        section_end = next_end
-    return answer[line_start:section_end].strip()
+    line_end = answer.find("\n", match.end())
+    if line_end < 0:
+        line_end = len(answer)
+    line = answer[line_start:line_end]
+    marker_start = match.start() - line_start
+    marker_end = match.end() - line_start
+
+    visible_line = EVIDENCE_MARKER.sub("", line)
+    visible_line = re.sub(r"^[\s#>*+-]+", "", visible_line)
+    visible_line = re.sub(r"[*_`\s]+", " ", visible_line).strip()
+    source_label = re.fullmatch(
+        r"(?:依据|引用来源|参考文档)(?:[：:].{0,80})?",
+        visible_line,
+    )
+    if source_label:
+        next_start = line_end
+        while next_start < len(answer) and answer[next_start] in "\r\n":
+            next_start += 1
+        next_end = answer.find("\n", next_start)
+        if next_end < 0:
+            next_end = len(answer)
+        next_line = answer[next_start:next_end].strip()
+        return "\n".join(part for part in (line.strip(), next_line) if part)
+
+    prefix = line[:marker_start].rstrip()
+    boundary_search_end = len(prefix.rstrip("。！？；.!?; "))
+    sentence_start = max(
+        (prefix.rfind(token, 0, boundary_search_end) for token in "。！？；.!?;"),
+        default=-1,
+    ) + 1
+    sentence_ends = [
+        position + 1
+        for token in "。！？；.!?;"
+        if (position := line.find(token, marker_end)) >= 0
+    ]
+    sentence_end = min(sentence_ends) if sentence_ends else len(line)
+    return line[sentence_start:sentence_end].strip()
 
 
 def _citation_is_supported(context: str, evidence: EvidenceItem) -> bool:
@@ -242,6 +306,7 @@ def prompt_evidence_allowlist(evidence: EvidenceSet) -> str:
 def render_citations(
     answer: str,
     evidence: EvidenceSet,
+    tool_invocations: Optional[Iterable[Any]] = None,
 ) -> Tuple[str, List[Citation], List[Dict[str, Any]]]:
     """Validate model markers, render indices and return UI-safe snapshots."""
     by_id = evidence.by_id()
@@ -249,9 +314,31 @@ def render_citations(
     violations: List[Dict[str, Any]] = []
     grounded_critical_values: Set[str] = set()
     calculation_inputs = _calculation_input_values(evidence.query)
+    tool_result_numbers = _successful_tool_result_numbers(tool_invocations or [])
+
+    def normalize_evidence_id(raw_evidence_id: str) -> str:
+        evidence_id = raw_evidence_id.strip()
+        if evidence_id not in by_id and f"ev_{evidence_id}" in by_id:
+            return f"ev_{evidence_id}"
+        return evidence_id
+
+    # Compatibility for V1.7 prompts that still emit positional markers. Turn
+    # them into IDs first; otherwise a newly rendered [1] could be mistaken for
+    # the first retrieval candidate even when it came from a different ID.
+    def replace_legacy(match: re.Match) -> str:
+        index = int(match.group(1) or match.group(2))
+        if index < 1 or index > len(evidence.items):
+            violations.append(
+                {"code": "invalid_positional_citation", "index": index}
+            )
+            return ""
+        evidence_id = evidence.items[index - 1].evidence_id
+        return f"[[evidence:{evidence_id}]]"
+
+    normalized = LEGACY_MARKER.sub(replace_legacy, answer or "")
 
     def replace_id(match: re.Match) -> str:
-        evidence_id = match.group(1).strip()
+        evidence_id = normalize_evidence_id(match.group(1))
         # Some providers preserve the stable hash but omit the readable
         # ``ev_`` namespace prefix.  Accept that one unambiguous formatting
         # variation, then immediately normalize it back to the immutable ID.
@@ -269,7 +356,7 @@ def render_citations(
                 {"code": "invalid_evidence_id", "evidence_id": evidence_id}
             )
             return ""
-        context = _citation_context(answer or "", match)
+        context = _citation_context(normalized, match)
         if not _citation_is_supported(context, by_id[evidence_id]):
             violations.append(
                 {
@@ -280,9 +367,17 @@ def render_citations(
             )
             return ""
         context_values = _critical_values(context)
-        evidence_values = _critical_values(by_id[evidence_id].content_snapshot)
+        attached_evidence_values: Set[str] = set()
+        for attached_match in EVIDENCE_MARKER.finditer(context):
+            attached_id = normalize_evidence_id(attached_match.group(1))
+            if attached_id in by_id:
+                attached_evidence_values.update(
+                    _critical_values(by_id[attached_id].content_snapshot)
+                )
         unsupported_values = sorted(
-            context_values - evidence_values - calculation_inputs
+            value
+            for value in context_values - attached_evidence_values - calculation_inputs
+            if not _tool_supports_critical_value(value, tool_result_numbers)
         )
         if unsupported_values:
             violations.append(
@@ -294,25 +389,11 @@ def render_citations(
                 }
             )
             return ""
-        grounded_critical_values.update(context_values & evidence_values)
+        grounded_critical_values.update(context_values & attached_evidence_values)
         if evidence_id not in ordered_ids:
             ordered_ids.append(evidence_id)
         return f"【引用{ordered_ids.index(evidence_id) + 1}】"
 
-    # Compatibility for V1.7 prompts that still emit positional markers. Turn
-    # them into IDs first; otherwise a newly rendered [1] could be mistaken for
-    # the first retrieval candidate even when it came from a different ID.
-    def replace_legacy(match: re.Match) -> str:
-        index = int(match.group(1) or match.group(2))
-        if index < 1 or index > len(evidence.items):
-            violations.append(
-                {"code": "invalid_positional_citation", "index": index}
-            )
-            return ""
-        evidence_id = evidence.items[index - 1].evidence_id
-        return f"[[evidence:{evidence_id}]]"
-
-    normalized = LEGACY_MARKER.sub(replace_legacy, answer or "")
     rendered = EVIDENCE_MARKER.sub(replace_id, normalized)
 
     def remove_unstructured_marker(match: re.Match) -> str:
@@ -326,9 +407,13 @@ def render_citations(
 
     rendered = UNSTRUCTURED_MARKER.sub(remove_unstructured_marker, rendered)
     ungrounded_values = sorted(
-        _critical_values(answer or "")
-        - grounded_critical_values
-        - calculation_inputs
+        value
+        for value in (
+            _critical_values(answer or "")
+            - grounded_critical_values
+            - calculation_inputs
+        )
+        if not _tool_supports_critical_value(value, tool_result_numbers)
     )
     if ungrounded_values:
         violations.append(

@@ -384,6 +384,16 @@ def test_calculation_input_does_not_weaken_policy_value_citations():
         "连续7天是用户给定的计算输入；每舱每天3份。"
         "[[evidence:ev_test]]\n\n计算：4 × 7 × 3 = 84份。",
         evidence,
+        tool_invocations=[
+            {
+                "invocation_status": "success",
+                "business_status": "success",
+                "result_summary": (
+                    "content='84.0' metadata={'structured_content': "
+                    "{'result': 84.0}}"
+                ),
+            }
+        ],
     )
     assert "【引用1】" in rendered
     assert len(citations) == 1
