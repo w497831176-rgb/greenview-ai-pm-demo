@@ -36,6 +36,12 @@ _CRITICAL_VALUE = re.compile(
     r"(?P<number>\d+(?:\.\d+)?|[一二三四五六七八九十百千万两半]+)\s*"
     r"(?P<unit>个\s*工作日|工作日|分钟|小时|天|元|万元|%|次|年|个月|月|日)"
 )
+_CALCULATION_INPUT_VALUE = re.compile(
+    r"(?:连续|持续)\s*"
+    r"(?P<number>\d+(?:\.\d+)?|[一二三四五六七八九十百千万两半]+)\s*"
+    r"(?P<unit>分钟|小时|天|个月|月|年)\s*"
+    r"(?:需要|共需|总共|合计|计算)"
+)
 
 
 def _semantic_bigrams(text: str) -> Set[str]:
@@ -57,6 +63,17 @@ def _critical_values(text: str) -> Set[str]:
         # “5个工作日”保持不同，避免引用中的数字被模型悄悄改写。
         if unit == "个工作日":
             unit = "工作日"
+        values.add(f"{number}{unit}")
+    return values
+
+
+def _calculation_input_values(text: str) -> Set[str]:
+    """Extract duration operands supplied by the user for a calculation."""
+
+    values: Set[str] = set()
+    for match in _CALCULATION_INPUT_VALUE.finditer(text or ""):
+        number = re.sub(r"\s+", "", match.group("number")).lower()
+        unit = re.sub(r"\s+", "", match.group("unit")).lower()
         values.add(f"{number}{unit}")
     return values
 
@@ -231,6 +248,7 @@ def render_citations(
     ordered_ids: List[str] = []
     violations: List[Dict[str, Any]] = []
     grounded_critical_values: Set[str] = set()
+    calculation_inputs = _calculation_input_values(evidence.query)
 
     def replace_id(match: re.Match) -> str:
         evidence_id = match.group(1).strip()
@@ -263,7 +281,9 @@ def render_citations(
             return ""
         context_values = _critical_values(context)
         evidence_values = _critical_values(by_id[evidence_id].content_snapshot)
-        unsupported_values = sorted(context_values - evidence_values)
+        unsupported_values = sorted(
+            context_values - evidence_values - calculation_inputs
+        )
         if unsupported_values:
             violations.append(
                 {
@@ -274,7 +294,7 @@ def render_citations(
                 }
             )
             return ""
-        grounded_critical_values.update(context_values)
+        grounded_critical_values.update(context_values & evidence_values)
         if evidence_id not in ordered_ids:
             ordered_ids.append(evidence_id)
         return f"【引用{ordered_ids.index(evidence_id) + 1}】"
@@ -306,7 +326,9 @@ def render_citations(
 
     rendered = UNSTRUCTURED_MARKER.sub(remove_unstructured_marker, rendered)
     ungrounded_values = sorted(
-        _critical_values(answer or "") - grounded_critical_values
+        _critical_values(answer or "")
+        - grounded_critical_values
+        - calculation_inputs
     )
     if ungrounded_values:
         violations.append(

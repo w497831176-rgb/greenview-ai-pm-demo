@@ -21,6 +21,13 @@ _CRITICAL_VALUE = re.compile(
     r"(?P<unit>个\s*工作日|工作日|分钟|小时|天|元|万元|%|次|年|个月|月|日)"
 )
 
+_CALCULATION_INPUT_VALUE = re.compile(
+    r"(?:连续|持续)\s*"
+    r"(?P<number>\d+(?:\.\d+)?|[一二三四五六七八九十百千万两半]+)\s*"
+    r"(?P<unit>分钟|小时|天|个月|月|年)\s*"
+    r"(?:需要|共需|总共|合计|计算)"
+)
+
 
 def _tokenize(text: str) -> List[str]:
     """Tokenize Chinese/English/number text into searchable terms.
@@ -77,6 +84,30 @@ def _critical_values(text: str) -> set[str]:
     return values
 
 
+def _calculation_input_values(text: str) -> set[str]:
+    """Return user-supplied duration operands, not evidence claims.
+
+    In a question such as ``4个种植舱连续7天需要多少份`` the seven days
+    are an input to the requested calculation.  Requiring that operand to
+    appear in the policy chunk would incorrectly reject the evidence that
+    supplies the per-cabin daily standard.  The narrow grammar deliberately
+    keeps policy questions such as ``是否必须7天内完成`` protected.
+    """
+
+    values: set[str] = set()
+    for match in _CALCULATION_INPUT_VALUE.finditer(text or ""):
+        number = re.sub(r"\s+", "", match.group("number")).lower()
+        unit = re.sub(r"\s+", "", match.group("unit")).lower()
+        values.add(f"{number}{unit}")
+    return values
+
+
+def _required_evidence_values(text: str) -> set[str]:
+    """Critical values that must be present in a retrieved evidence chunk."""
+
+    return _critical_values(text) - _calculation_input_values(text)
+
+
 def _evidence_relevance(
     query: str,
     result: Dict[str, Any],
@@ -84,7 +115,7 @@ def _evidence_relevance(
 ) -> tuple[float, str]:
     """Apply one content gate across keyword, vector and fused candidates."""
     content = result.get("content", "")
-    query_values = _critical_values(query)
+    query_values = _required_evidence_values(query)
     if query_values and not query_values.issubset(_critical_values(content)):
         return 0.0, "filtered_unsupported_critical_value"
 

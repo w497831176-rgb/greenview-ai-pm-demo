@@ -338,6 +338,69 @@ def test_snapshot_fallback_uses_content_gate_and_filters_heading():
     assert results == [], results
 
 
+def test_calculation_duration_is_input_not_required_policy_evidence():
+    query = (
+        "根据《火星温室补给规则（验收专用）》，"
+        "4个种植舱连续7天需要多少份标准营养液？"
+    )
+    assert rag_retrieval._critical_values(query) == {"7天"}
+    assert rag_retrieval._required_evidence_values(query) == set()
+
+    content = (
+        "# 火星温室补给规则（验收专用）\n"
+        "## 标准营养液补给\n"
+        "每个种植舱每天需要3份标准营养液。"
+    )
+    versions = {
+        124: {
+            "title": "火星温室补给规则（验收专用）",
+            "document_hash": "doc-hash",
+            "document_version": "v1",
+            "chunk_snapshots": [
+                {"chunk_index": 0, "content": content, "chunk_hash": "chunk-hash"},
+            ],
+        }
+    }
+    results, used_fallback = _results_from_snapshot(
+        query,
+        [],
+        versions,
+        {124},
+        5,
+        0.2,
+    )
+    assert used_fallback
+    assert len(results) == 1, results
+    assert "3份标准营养液" in results[0]["content"]
+
+
+def test_calculation_input_does_not_weaken_policy_value_citations():
+    query = "4个种植舱连续7天需要多少份标准营养液？"
+    evidence = EvidenceSet(
+        items=[_evidence_item("每个种植舱每天需要3份标准营养液。")],
+        query=query,
+    )
+    rendered, citations, violations = render_citations(
+        "连续7天是用户给定的计算输入；每舱每天3份。"
+        "[[evidence:ev_test]]\n\n计算：4 × 7 × 3 = 84份。",
+        evidence,
+    )
+    assert "【引用1】" in rendered
+    assert len(citations) == 1
+    assert not violations, violations
+
+    mismatched = EvidenceSet(
+        items=[_evidence_item("维修投诉应在3个工作日内反馈。")],
+        query="维修投诉多久反馈？",
+    )
+    _, citations, violations = render_citations(
+        "维修投诉应在5个工作日内反馈。[[evidence:ev_test]]",
+        mismatched,
+    )
+    assert not citations
+    assert any(item["code"] == "unsupported_critical_value" for item in violations)
+
+
 def test_knowledge_gate_contract_and_static_response():
     assert _requires_direct_knowledge_evidence("维修期间是否免费安排酒店？")
     assert KNOWLEDGE_INSUFFICIENT_RESPONSE.startswith("当前知识依据不足")
@@ -368,6 +431,8 @@ def main():
         test_unknown_service_is_blocked_without_bound_knowledge,
         test_supported_service_knowledge_allows_model_answer,
         test_snapshot_fallback_uses_content_gate_and_filters_heading,
+        test_calculation_duration_is_input_not_required_policy_evidence,
+        test_calculation_input_does_not_weaken_policy_value_citations,
         test_knowledge_gate_contract_and_static_response,
     ]
     for test in tests:

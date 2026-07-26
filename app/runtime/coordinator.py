@@ -541,7 +541,7 @@ def _results_from_snapshot(
             document.get("title") or "",
         ):
             continue
-        query_values = rag_retrieval._critical_values(query)
+        query_values = rag_retrieval._required_evidence_values(query)
         if query_values and not query_values.issubset(
             rag_retrieval._critical_values(content)
         ):
