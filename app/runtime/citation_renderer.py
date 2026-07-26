@@ -150,47 +150,147 @@ def _is_structural_content(content: str, title: str = "") -> bool:
     )
 
 
-def _citation_context(answer: str, match: re.Match) -> str:
-    """Return one sentence/list item, not the surrounding Markdown section."""
+def _strip_markdown_display(text: str) -> str:
+    """Normalize presentation markup without changing the factual words."""
 
-    line_start = answer.rfind("\n", 0, match.start()) + 1
-    line_end = answer.find("\n", match.end())
-    if line_end < 0:
-        line_end = len(answer)
-    line = answer[line_start:line_end]
-    marker_start = match.start() - line_start
-    marker_end = match.end() - line_start
+    visible = EVIDENCE_MARKER.sub("", text or "")
+    visible = re.sub(r"!\[([^\]]*)\]\([^)]*\)", r"\1", visible)
+    visible = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", visible)
+    visible = re.sub(r"^[\s#>*+-]+", "", visible)
+    visible = re.sub(r"^[①②③④⑤⑥⑦⑧⑨⑩]\s*", "", visible)
+    visible = re.sub(r"[*_`~]+", "", visible)
+    visible = re.sub(r"\s+", " ", visible).strip(" |\t\r\n")
+    if not re.search(r"[\u4e00-\u9fffA-Za-z0-9]", visible):
+        return ""
+    return visible
 
-    visible_line = EVIDENCE_MARKER.sub("", line)
-    visible_line = re.sub(r"^[\s#>*+-]+", "", visible_line)
-    visible_line = re.sub(r"[*_`\s]+", " ", visible_line).strip()
-    source_label = re.fullmatch(
-        r"(?:依据|引用来源|参考文档)(?:[：:].{0,80})?",
-        visible_line,
-    )
-    if source_label:
-        next_start = line_end
-        while next_start < len(answer) and answer[next_start] in "\r\n":
-            next_start += 1
-        next_end = answer.find("\n", next_start)
-        if next_end < 0:
-            next_end = len(answer)
-        next_line = answer[next_start:next_end].strip()
-        return "\n".join(part for part in (line.strip(), next_line) if part)
 
-    prefix = line[:marker_start].rstrip()
-    boundary_search_end = len(prefix.rstrip("。！？；.!?; "))
-    sentence_start = max(
-        (prefix.rfind(token, 0, boundary_search_end) for token in "。！？；.!?;"),
-        default=-1,
-    ) + 1
-    sentence_ends = [
-        position + 1
-        for token in "。！？；.!?;"
-        if (position := line.find(token, marker_end)) >= 0
+def _table_cells(line: str) -> Optional[List[str]]:
+    """Return Markdown table cells, or ``None`` for an ordinary line."""
+
+    stripped = (line or "").strip()
+    if "|" not in stripped:
+        return None
+    if stripped.startswith("|"):
+        stripped = stripped[1:]
+    if stripped.endswith("|"):
+        stripped = stripped[:-1]
+    cells = [cell.strip() for cell in stripped.split("|")]
+    return cells if len(cells) >= 2 else None
+
+
+def _is_table_separator(cells: Optional[List[str]]) -> bool:
+    if not cells:
+        return False
+    return all(bool(re.fullmatch(r":?-{3,}:?", cell.replace(" ", ""))) for cell in cells)
+
+
+def _normalize_table_claim(line: str) -> str:
+    cells = _table_cells(line) or []
+    factual_cells = [
+        _strip_markdown_display(cell)
+        for cell in cells
+        if _strip_markdown_display(cell)
     ]
-    sentence_end = min(sentence_ends) if sentence_ends else len(line)
-    return line[sentence_start:sentence_end].strip()
+    if len(factual_cells) == 2:
+        return f"{factual_cells[0]}为{factual_cells[1]}"
+    return "；".join(factual_cells)
+
+
+def _sentence_spans(line: str) -> List[Tuple[int, int]]:
+    """Split one non-table line into sentence-sized display spans."""
+
+    spans: List[Tuple[int, int]] = []
+    start = 0
+    for boundary in re.finditer(r"[。！？；.!?;]+", line or ""):
+        spans.append((start, boundary.end()))
+        start = boundary.end()
+    if start < len(line):
+        spans.append((start, len(line)))
+    return spans or [(0, len(line))]
+
+
+def _is_display_heading(raw: str, normalized: str) -> bool:
+    # A heading can itself contain a factual claim (and even critical values),
+    # so Markdown heading syntax must never exempt it from evidence checks.
+    return not normalized
+
+
+def _build_atomic_claims(answer: str) -> Tuple[List[Dict[str, Any]], Set[int]]:
+    """Map Markdown citation markers to normalized atomic factual claims.
+
+    Markdown remains the rendering surface only.  Tables become row facts,
+    ordinary prose becomes sentence facts, and a citation-only display line is
+    attached to the immediately preceding still-unbound fact.  A citation-only
+    line without such a fact is ignored rather than invented into a claim.
+    """
+
+    lines = (answer or "").splitlines(keepends=True)
+    claims: List[Dict[str, Any]] = []
+    ignored_markers: Set[int] = set()
+    offset = 0
+
+    for line_index, raw_with_ending in enumerate(lines):
+        line = raw_with_ending.rstrip("\r\n")
+        next_line = (
+            lines[line_index + 1].rstrip("\r\n")
+            if line_index + 1 < len(lines)
+            else ""
+        )
+        cells = _table_cells(line)
+        next_cells = _table_cells(next_line)
+        line_markers = list(EVIDENCE_MARKER.finditer(line))
+
+        if cells is not None:
+            if _is_table_separator(cells) or _is_table_separator(next_cells):
+                offset += len(raw_with_ending)
+                continue
+            claim_text = _normalize_table_claim(line)
+            if claim_text:
+                claims.append(
+                    {
+                        "text": claim_text,
+                        "marker_starts": [offset + item.start() for item in line_markers],
+                        "line_index": line_index,
+                        "kind": "table_row",
+                    }
+                )
+            offset += len(raw_with_ending)
+            continue
+
+        for segment_start, segment_end in _sentence_spans(line):
+            segment = line[segment_start:segment_end]
+            segment_markers = list(EVIDENCE_MARKER.finditer(segment))
+            marker_starts = [
+                offset + segment_start + item.start() for item in segment_markers
+            ]
+            claim_text = _strip_markdown_display(segment)
+
+            if marker_starts and not claim_text:
+                previous = claims[-1] if claims else None
+                if (
+                    previous
+                    and not previous["marker_starts"]
+                    and line_index - int(previous["line_index"]) <= 1
+                ):
+                    previous["marker_starts"].extend(marker_starts)
+                else:
+                    ignored_markers.update(marker_starts)
+                continue
+
+            if claim_text and not _is_display_heading(segment, claim_text):
+                claims.append(
+                    {
+                        "text": claim_text,
+                        "marker_starts": marker_starts,
+                        "line_index": line_index,
+                        "kind": "sentence",
+                    }
+                )
+
+        offset += len(raw_with_ending)
+
+    return claims, ignored_markers
 
 
 def _citation_is_supported(context: str, evidence: EvidenceItem) -> bool:
@@ -336,65 +436,104 @@ def render_citations(
         return f"[[evidence:{evidence_id}]]"
 
     normalized = LEGACY_MARKER.sub(replace_legacy, answer or "")
+    claims, ignored_marker_starts = _build_atomic_claims(normalized)
+    marker_decisions: Dict[int, Tuple[str, Optional[str]]] = {}
 
-    def replace_id(match: re.Match) -> str:
-        evidence_id = normalize_evidence_id(match.group(1))
+    def resolved_evidence_id(raw_evidence_id: str) -> str:
+        evidence_id = normalize_evidence_id(raw_evidence_id)
         # Some providers preserve the stable hash but omit the readable
-        # ``ev_`` namespace prefix.  Accept that one unambiguous formatting
-        # variation, then immediately normalize it back to the immutable ID.
-        # A suffix that matches zero or multiple EvidenceItems stays invalid.
-        if evidence_id not in by_id:
-            suffix_matches = [
-                candidate
-                for candidate in by_id
-                if candidate == f"ev_{evidence_id}"
-            ]
-            if len(suffix_matches) == 1:
-                evidence_id = suffix_matches[0]
-        if evidence_id not in by_id:
-            violations.append(
-                {"code": "invalid_evidence_id", "evidence_id": evidence_id}
-            )
-            return ""
-        context = _citation_context(normalized, match)
-        if not _citation_is_supported(context, by_id[evidence_id]):
-            violations.append(
-                {
-                    "code": "unsupported_evidence_citation",
-                    "evidence_id": evidence_id,
-                    "claim_context": context[:240],
-                }
-            )
-            return ""
-        context_values = _critical_values(context)
-        attached_evidence_values: Set[str] = set()
-        for attached_match in EVIDENCE_MARKER.finditer(context):
-            attached_id = normalize_evidence_id(attached_match.group(1))
-            if attached_id in by_id:
-                attached_evidence_values.update(
-                    _critical_values(by_id[attached_id].content_snapshot)
+        # ``ev_`` namespace prefix. Accept only the unambiguous prefixed form.
+        if evidence_id not in by_id and f"ev_{evidence_id}" in by_id:
+            evidence_id = f"ev_{evidence_id}"
+        return evidence_id
+
+    all_markers = {
+        match.start(): match for match in EVIDENCE_MARKER.finditer(normalized)
+    }
+    for marker_start in ignored_marker_starts:
+        marker_decisions[marker_start] = ("ignored_display", None)
+
+    for claim in claims:
+        marker_starts = list(claim.get("marker_starts") or [])
+        if not marker_starts:
+            continue
+        claim_text = str(claim.get("text") or "")
+        valid_markers: List[Tuple[int, str]] = []
+        for marker_start in marker_starts:
+            marker = all_markers.get(marker_start)
+            if marker is None:
+                continue
+            evidence_id = resolved_evidence_id(marker.group(1))
+            if evidence_id not in by_id:
+                violations.append(
+                    {"code": "invalid_evidence_id", "evidence_id": evidence_id}
                 )
+                marker_decisions[marker_start] = ("rejected", None)
+                continue
+            valid_markers.append((marker_start, evidence_id))
+
+        if not valid_markers:
+            continue
+        supporting_ids = {
+            evidence_id
+            for _, evidence_id in valid_markers
+            if _citation_is_supported(claim_text, by_id[evidence_id])
+        }
+        if not supporting_ids:
+            for marker_start, evidence_id in valid_markers:
+                violations.append(
+                    {
+                        "code": "unsupported_evidence_citation",
+                        "evidence_id": evidence_id,
+                        "claim_context": claim_text[:240],
+                    }
+                )
+                marker_decisions[marker_start] = ("rejected", None)
+            continue
+
+        context_values = _critical_values(claim_text)
+        supporting_evidence_values: Set[str] = set()
+        for evidence_id in supporting_ids:
+            supporting_evidence_values.update(
+                _critical_values(by_id[evidence_id].content_snapshot)
+            )
         unsupported_values = sorted(
             value
-            for value in context_values - attached_evidence_values - calculation_inputs
+            for value in context_values - supporting_evidence_values - calculation_inputs
             if not _tool_supports_critical_value(value, tool_result_numbers)
         )
         if unsupported_values:
             violations.append(
                 {
                     "code": "unsupported_critical_value",
-                    "evidence_id": evidence_id,
+                    "evidence_id": sorted(supporting_ids)[0],
+                    "evidence_ids": sorted(supporting_ids),
                     "values": unsupported_values,
-                    "claim_context": context[:240],
+                    "claim_context": claim_text[:240],
                 }
             )
+            for marker_start, _ in valid_markers:
+                marker_decisions[marker_start] = ("rejected", None)
+            continue
+
+        grounded_critical_values.update(context_values & supporting_evidence_values)
+        for marker_start, evidence_id in valid_markers:
+            marker_decisions[marker_start] = ("accepted", evidence_id)
+
+    def replace_id(match: re.Match) -> str:
+        decision, evidence_id = marker_decisions.get(
+            match.start(), ("ignored_display", None)
+        )
+        if decision != "accepted" or not evidence_id:
             return ""
-        grounded_critical_values.update(context_values & attached_evidence_values)
         if evidence_id not in ordered_ids:
             ordered_ids.append(evidence_id)
         return f"【引用{ordered_ids.index(evidence_id) + 1}】"
 
     rendered = EVIDENCE_MARKER.sub(replace_id, normalized)
+    # If a citation-only display line could not be attached to an immediately
+    # preceding fact, remove its now-empty arrow rather than leaving UI debris.
+    rendered = re.sub(r"(?m)^[ \t]*(?:>\s*)?[—–-]\s*$\r?\n?", "", rendered)
 
     def remove_unstructured_marker(match: re.Match) -> str:
         violations.append(
