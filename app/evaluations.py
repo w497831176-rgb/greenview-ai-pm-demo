@@ -363,6 +363,19 @@ def evaluate_runtime_evidence(case: Dict[str, Any], answer: str, done: Dict[str,
             "pass" if len(model_calls) == expected_count else "fail",
         ))
 
+    for config_key, label, actual_items in (
+        ("expected_mcp_call_count", "MCP 调用次数", done.get("mcp_calls") or []),
+        ("expected_citation_count", "Citation 数量", done.get("citations") or []),
+        ("expected_skill_count", "Skill 命中数量", _normalize_skill_names(done)),
+    ):
+        if assertions.get(config_key) is None:
+            continue
+        expected_count = int(assertions[config_key])
+        checks.append(_rule(
+            config_key, label, expected_count, len(actual_items),
+            "pass" if len(actual_items) == expected_count else "fail",
+        ))
+
     forced_failure = assertions.get("controlled_failure")
     if forced_failure:
         checks.append(_rule(
