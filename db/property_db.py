@@ -4617,6 +4617,8 @@ def update_chat_trace(
     evaluation_run_id: Optional[int] = None,
     risk_level: Optional[str] = None,
     version_snapshot: Optional[str] = None,
+    created_at: Optional[str] = None,
+    updated_at: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     now = now_cn()
     conn = _get_conn()
@@ -4650,11 +4652,14 @@ def update_chat_trace(
     if version_snapshot is not None:
         fields.append("version_snapshot = ?")
         params.append(version_snapshot)
+    if created_at is not None:
+        fields.append("created_at = ?")
+        params.append(created_at)
     if not fields:
         conn.close()
         return get_chat_trace(trace_id)
     fields.append("updated_at = ?")
-    params.append(now)
+    params.append(updated_at or now)
     params.append(trace_id)
     cursor.execute(
         f"UPDATE chat_traces SET {', '.join(fields)} WHERE trace_id = ?",

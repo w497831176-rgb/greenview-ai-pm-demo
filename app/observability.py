@@ -740,6 +740,18 @@ async def trace_detail(trace_id: str):
         else:
             raise HTTPException(status_code=404, detail="Trace not found")
 
+    operation_metadata = trace.get("version_snapshot")
+    if isinstance(operation_metadata, str) and operation_metadata:
+        import json
+
+        try:
+            operation_metadata = json.loads(operation_metadata)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            operation_metadata = None
+    trace["operation_metadata"] = (
+        operation_metadata if isinstance(operation_metadata, dict) else None
+    )
+
     raw_calls = get_model_calls_for_trace(trace_id)
     mcp_calls = get_mcp_call_audits_for_trace(trace_id)
     session_id = trace.get("session_id")

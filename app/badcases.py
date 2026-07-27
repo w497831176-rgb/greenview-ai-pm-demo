@@ -44,6 +44,10 @@ from app.badcase_schema import (
 )
 from app.observability import _check_budget
 from app.runtime.cost_ledger import build_cost_entry, cost_entry_usage_payload
+from app.runtime.darwin_evidence import (
+    persist_darwin_operation,
+    start_darwin_operation,
+)
 from app.runtime.provider_evidence import provider_evidence_from_run
 from app.settings import MODEL, MODEL_ID, build_model
 from app.skill_runtime import canonical_metadata, next_patch_version
@@ -1364,6 +1368,12 @@ async def darwin_fix(case_id: int, request: DarwinFixRequest = DarwinFixRequest(
 
     darwin_trace_id = uuid.uuid4().hex[:16]
     model_id = "deepseek-v4-pro"
+    operation_started_at = now_cn()
+    start_darwin_operation(
+        trace_id=darwin_trace_id,
+        badcase_id=case_id,
+        started_at=operation_started_at,
+    )
     start = time.time()
     status = "success"
     error_summary = None
@@ -1372,21 +1382,30 @@ async def darwin_fix(case_id: int, request: DarwinFixRequest = DarwinFixRequest(
     # Darwin uses Pro and is an extra evaluation step; enforce the daily budget.
     budget = _check_budget("darwin")
     if budget.get("alert_level") == "blocked":
-        try:
-            record_model_call(
-                trace_id=darwin_trace_id,
-                stage="darwin",
-                model_id=model_id,
-                status="blocked",
-                latency_ms=0,
-                usage_source="unavailable",
-                model_selection_reason="Darwin deep analysis blocked by daily budget",
-                error_summary=budget.get("reason") or _BUDGET_BLOCKED_DETAIL,
-                estimated_cost_cny=None,
-                price_snapshot=None,
-            )
-        except Exception:
-            pass
+        blocked_reason = budget.get("reason") or _BUDGET_BLOCKED_DETAIL
+        model_call = record_model_call(
+            trace_id=darwin_trace_id,
+            stage="darwin",
+            model_id=model_id,
+            status="blocked",
+            latency_ms=0,
+            usage_source="unavailable",
+            model_selection_reason="Darwin deep analysis blocked by daily budget",
+            error_summary=blocked_reason,
+            estimated_cost_cny=None,
+            price_snapshot=None,
+        )
+        persist_darwin_operation(
+            trace_id=darwin_trace_id,
+            badcase_id=case_id,
+            model_call=model_call,
+            operation_status="failed",
+            started_at=operation_started_at,
+            completed_at=now_cn(),
+            status_before=case["status"],
+            status_after=case["status"],
+            error_summary=blocked_reason,
+        )
         raise HTTPException(status_code=403, detail=_BUDGET_BLOCKED_DETAIL)
 
     try:
@@ -1401,31 +1420,42 @@ async def darwin_fix(case_id: int, request: DarwinFixRequest = DarwinFixRequest(
     cost, normalized_usage = _cost_evidence_for_call(
         "darwin", model_id, usage, status
     )
-    try:
-        record_model_call(
+    model_call = record_model_call(
+        trace_id=darwin_trace_id,
+        stage="darwin",
+        model_id=model_id,
+        status=status,
+        latency_ms=latency_ms,
+        input_tokens=cost.input_tokens,
+        output_tokens=cost.output_tokens,
+        reasoning_tokens=cost.reasoning_tokens,
+        cached_tokens=cost.input_cache_hit_tokens,
+        total_tokens=cost.total_tokens,
+        usage_source=cost.usage_source.value,
+        model_selection_reason="Darwin deep analysis uses Pro",
+        error_summary=error_summary,
+        price_snapshot=(
+            cost.price_snapshot.model_dump(mode="json")
+            if cost.price_snapshot
+            else None
+        ),
+        estimated_cost_cny=cost.amount,
+        usage_normalized=normalized_usage,
+    )
+
+    if status != "success":
+        persist_darwin_operation(
             trace_id=darwin_trace_id,
-            stage="darwin",
-            model_id=model_id,
-            status=status,
-            latency_ms=latency_ms,
-            input_tokens=cost.input_tokens,
-            output_tokens=cost.output_tokens,
-            reasoning_tokens=cost.reasoning_tokens,
-            cached_tokens=cost.input_cache_hit_tokens,
-            total_tokens=cost.total_tokens,
-            usage_source=cost.usage_source.value,
-            model_selection_reason="Darwin deep analysis uses Pro",
-            error_summary=error_summary,
-            price_snapshot=(
-                cost.price_snapshot.model_dump(mode="json")
-                if cost.price_snapshot
-                else None
-            ),
-            estimated_cost_cny=cost.amount,
-            usage_normalized=normalized_usage,
+            badcase_id=case_id,
+            model_call=model_call,
+            operation_status="failed",
+            started_at=operation_started_at,
+            completed_at=now_cn(),
+            status_before=case["status"],
+            status_after=case["status"],
+            error_summary=error_summary or "Darwin Provider call failed",
         )
-    except Exception:
-        pass
+        raise HTTPException(status_code=502, detail="Darwin Provider call failed")
 
     analysis_obj = _extract_json(analysis_text) or {}
     if not analysis_obj and status == "success":
@@ -1549,6 +1579,17 @@ async def darwin_fix(case_id: int, request: DarwinFixRequest = DarwinFixRequest(
         },
         before,
         new_status,
+    )
+    persist_darwin_operation(
+        trace_id=darwin_trace_id,
+        badcase_id=case_id,
+        model_call=model_call,
+        operation_status="complete",
+        started_at=operation_started_at,
+        completed_at=now_cn(),
+        drafts=created_drafts,
+        status_before=before,
+        status_after=new_status,
     )
     return {
         "badcase": _enrich_badcase(updated),
