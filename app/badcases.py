@@ -43,6 +43,8 @@ from app.badcase_schema import (
     validate_status_transition,
 )
 from app.observability import _check_budget
+from app.runtime.cost_ledger import build_cost_entry, cost_entry_usage_payload
+from app.runtime.provider_evidence import provider_evidence_from_run
 from app.settings import MODEL, MODEL_ID, build_model
 from app.skill_runtime import canonical_metadata, next_patch_version
 from app.utils.cost_utils import build_price_snapshot, compute_cost_cny
@@ -291,7 +293,7 @@ def _require_draft_transition(draft_type: str, draft: Dict[str, Any], new_status
         raise HTTPException(status_code=400, detail=str(exc))
 
 
-def _extract_usage(usage_obj: Any) -> Dict[str, Optional[int]]:
+def _extract_usage(usage_obj: Any) -> Dict[str, Any]:
     if isinstance(usage_obj, dict):
         return {
             "input_tokens": usage_obj.get("input_tokens") or usage_obj.get("prompt_tokens"),
@@ -309,7 +311,17 @@ def _extract_usage(usage_obj: Any) -> Dict[str, Optional[int]]:
     }
 
 
-async def _collect_response(generator) -> Tuple[str, Dict[str, Optional[int]]]:
+def _merge_provider_evidence(usage: Dict[str, Any], value: Any) -> None:
+    evidence = provider_evidence_from_run(value)
+    if evidence.get("usage"):
+        usage.update(evidence["usage"])
+    if evidence.get("provider_response_model"):
+        usage["provider_response_model"] = evidence["provider_response_model"]
+    if evidence.get("provider_request_id"):
+        usage["provider_request_id"] = evidence["provider_request_id"]
+
+
+async def _collect_response(generator) -> Tuple[str, Dict[str, Any]]:
     """Collect text and usage from an Agno async generator or a single response."""
     response = ""
     usage = {}
@@ -324,24 +336,24 @@ async def _collect_response(generator) -> Tuple[str, Dict[str, Optional[int]]]:
                     response += str(chunk.delta)
                 elif isinstance(chunk, str):
                     response += chunk
+                _merge_provider_evidence(usage, chunk)
                 if hasattr(chunk, "usage") and chunk.usage:
-                    usage = _extract_usage(chunk.usage)
+                    usage.update(_extract_usage(chunk.usage))
             return response.strip(), usage
         result = await generator
+        _merge_provider_evidence(usage, result)
         if hasattr(result, "content"):
             if hasattr(result, "usage") and result.usage:
-                usage = _extract_usage(result.usage)
+                usage.update(_extract_usage(result.usage))
             return str(result.content).strip(), usage
         if isinstance(result, str):
             return result.strip(), usage
         return "", usage
     except Exception:
-        import traceback
-        traceback.print_exc()
-        return "", usage
+        raise
 
 
-async def _llm_generate(prompt: str, model: Optional[Any] = None, model_id: Optional[str] = None) -> Tuple[str, Dict[str, Optional[int]]]:
+async def _llm_generate(prompt: str, model: Optional[Any] = None, model_id: Optional[str] = None) -> Tuple[str, Dict[str, Any]]:
     """Generate text using the default, a provided model, or a model_id."""
     from agno.agent import Agent
 
@@ -349,7 +361,10 @@ async def _llm_generate(prompt: str, model: Optional[Any] = None, model_id: Opti
     if model_id:
         selected_model = build_model(model_id)
     agent = Agent(model=selected_model or MODEL, markdown=False)
-    return await _collect_response(agent.arun(prompt, stream=False))
+    content, usage = await _collect_response(agent.arun(prompt, stream=False))
+    active_model = selected_model or MODEL
+    usage["thinking_enabled"] = getattr(active_model, "use_thinking", None)
+    return content, usage
 
 
 def _extract_json(text: str) -> Optional[Dict[str, Any]]:
@@ -642,9 +657,9 @@ async def classify_badcase(case_id: int, request: ClassifyRequest = ClassifyRequ
 
     if request.auto:
         latency_ms = int((time.time() - start) * 1000)
-        total_tokens = usage.get("total_tokens") or (usage.get("input_tokens") or 0) + (usage.get("output_tokens") or 0)
-        usage_source = "provider_reported" if usage.get("total_tokens") else "estimated_tokenization" if total_tokens else "unavailable"
-        cost_cny, snapshot = _calculate_cost(model_id, usage)
+        cost, normalized_usage = _cost_evidence_for_call(
+            "badcase_classify", model_id, usage, status
+        )
         try:
             record_model_call(
                 trace_id=classify_trace_id,
@@ -652,16 +667,21 @@ async def classify_badcase(case_id: int, request: ClassifyRequest = ClassifyRequ
                 model_id=model_id,
                 status=status,
                 latency_ms=latency_ms,
-                input_tokens=usage.get("input_tokens"),
-                output_tokens=usage.get("output_tokens"),
-                reasoning_tokens=usage.get("reasoning_tokens"),
-                cached_tokens=usage.get("cached_tokens"),
-                total_tokens=total_tokens,
-                usage_source=usage_source,
+                input_tokens=cost.input_tokens,
+                output_tokens=cost.output_tokens,
+                reasoning_tokens=cost.reasoning_tokens,
+                cached_tokens=cost.input_cache_hit_tokens,
+                total_tokens=cost.total_tokens,
+                usage_source=cost.usage_source.value,
                 model_selection_reason="Badcase classification uses Flash",
                 error_summary=error_summary,
-                price_snapshot=snapshot,
-                estimated_cost_cny=cost_cny,
+                price_snapshot=(
+                    cost.price_snapshot.model_dump(mode="json")
+                    if cost.price_snapshot
+                    else None
+                ),
+                estimated_cost_cny=cost.amount,
+                usage_normalized=normalized_usage,
             )
         except Exception:
             pass
@@ -1256,6 +1276,33 @@ def _calculate_cost(model_id: str, usage: Dict[str, Optional[int]]) -> tuple:
     return cost, snapshot
 
 
+def _cost_evidence_for_call(
+    stage: str,
+    requested_model: str,
+    usage: Dict[str, Any],
+    status: str,
+):
+    provider_response_model = usage.get("provider_response_model")
+    price_model = provider_response_model or requested_model
+    cost = build_cost_entry(
+        stage=stage,
+        provider="deepseek",
+        requested_model=requested_model,
+        response_model=None,
+        provider_response_model=provider_response_model,
+        thinking_enabled=usage.get("thinking_enabled"),
+        model_policy_version="v1.8.2-s5-badcase",
+        provider_usage=usage or None,
+        price_row=get_enabled_price_for_model(price_model),
+        provider_succeeded=status == "success",
+    )
+    normalized = cost_entry_usage_payload(
+        cost,
+        provider_request_id=usage.get("provider_request_id"),
+    )
+    return cost, normalized
+
+
 @router.post("/{case_id}/darwin-fix")
 async def darwin_fix(case_id: int, request: DarwinFixRequest = DarwinFixRequest()):
     """Run Darwin deep analysis on a classified badcase and generate structured fix drafts."""
@@ -1351,9 +1398,9 @@ async def darwin_fix(case_id: int, request: DarwinFixRequest = DarwinFixRequest(
         status = "failed"
         error_summary = str(e)[:300]
     latency_ms = int((time.time() - start) * 1000)
-    total_tokens = usage.get("total_tokens") or (usage.get("input_tokens") or 0) + (usage.get("output_tokens") or 0)
-    usage_source = "provider_reported" if usage.get("total_tokens") else "estimated_tokenization" if total_tokens else "unavailable"
-    cost_cny, snapshot = _calculate_cost(model_id, usage)
+    cost, normalized_usage = _cost_evidence_for_call(
+        "darwin", model_id, usage, status
+    )
     try:
         record_model_call(
             trace_id=darwin_trace_id,
@@ -1361,16 +1408,21 @@ async def darwin_fix(case_id: int, request: DarwinFixRequest = DarwinFixRequest(
             model_id=model_id,
             status=status,
             latency_ms=latency_ms,
-            input_tokens=usage.get("input_tokens"),
-            output_tokens=usage.get("output_tokens"),
-            reasoning_tokens=usage.get("reasoning_tokens"),
-            cached_tokens=usage.get("cached_tokens"),
-            total_tokens=total_tokens,
-            usage_source=usage_source,
+            input_tokens=cost.input_tokens,
+            output_tokens=cost.output_tokens,
+            reasoning_tokens=cost.reasoning_tokens,
+            cached_tokens=cost.input_cache_hit_tokens,
+            total_tokens=cost.total_tokens,
+            usage_source=cost.usage_source.value,
             model_selection_reason="Darwin deep analysis uses Pro",
             error_summary=error_summary,
-            price_snapshot=snapshot,
-            estimated_cost_cny=cost_cny,
+            price_snapshot=(
+                cost.price_snapshot.model_dump(mode="json")
+                if cost.price_snapshot
+                else None
+            ),
+            estimated_cost_cny=cost.amount,
+            usage_normalized=normalized_usage,
         )
     except Exception:
         pass
@@ -1913,4 +1965,3 @@ async def check_tools_badcase(case_id: int):
     )
     _record_action(case_id, "check-tools", {"analysis": analysis}, before, new_status)
     return {"badcase": _enrich_badcase(updated), "analysis": analysis}
-

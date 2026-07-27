@@ -572,6 +572,13 @@ async def traces(
 
 def _build_cost_formula(call: Dict[str, Any]) -> str:
     """Build a human-readable cost formula from the recorded price snapshot."""
+    normalized = call.get("usage_normalized") or {}
+    contract = normalized.get("cost_contract") or {}
+    if contract.get("formula"):
+        return contract["formula"]
+    if contract.get("availability_note"):
+        return contract["availability_note"]
+
     snapshot = call.get("price_snapshot") or {}
     if not snapshot:
         return "单价已配置，但 Provider 未返回本次 usage，无法估算本次成本"
@@ -586,7 +593,6 @@ def _build_cost_formula(call: Dict[str, Any]) -> str:
     output_p = snapshot.get("output_price_per_1m")
 
     # V1.4.3: normalized usage fields are preferred over legacy raw fields.
-    normalized = call.get("usage_normalized") or {}
     if normalized.get("usage_split_unavailable"):
         return "usage_split_unavailable：Provider 未拆分缓存/未缓存输入，成本 --"
 
@@ -623,6 +629,40 @@ def _enrich_model_call(call: Dict[str, Any], session_id: Optional[str]) -> Dict[
         except Exception:
             usage_norm = None
     enriched["usage_normalized"] = usage_norm or {}
+    enriched["requested_model"] = (
+        enriched["usage_normalized"].get("requested_model") or model_id
+    )
+    # Never fall back to requested_model: null means the Provider/SDK did not
+    # return or retain the actual response model for this historical call.
+    enriched["provider_response_model"] = enriched["usage_normalized"].get(
+        "provider_response_model"
+    )
+    enriched["thinking_enabled"] = enriched["usage_normalized"].get(
+        "thinking_enabled"
+    )
+    enriched["provider_request_id"] = enriched["usage_normalized"].get(
+        "provider_request_id"
+    )
+    enriched["provider_usage"] = {
+        "input_cache_hit_tokens": enriched["usage_normalized"].get(
+            "input_cache_hit_tokens"
+        ),
+        "input_cache_miss_tokens": enriched["usage_normalized"].get(
+            "input_cache_miss_tokens"
+        ),
+        "output_tokens": enriched["usage_normalized"].get("output_tokens"),
+    }
+
+    snapshot = enriched.get("price_snapshot") or {}
+    for key in (
+        "input_price_per_1m",
+        "cached_input_price_per_1m",
+        "output_price_per_1m",
+        "currency",
+        "effective_date",
+        "source_note",
+    ):
+        enriched[key] = snapshot.get(key)
 
     stage = enriched.get("stage") or ""
     if stage in ("darwin", "badcase_classify", "retest"):
@@ -632,6 +672,39 @@ def _enrich_model_call(call: Dict[str, Any], session_id: Optional[str]) -> Dict[
 
     enriched["cost_formula"] = _build_cost_formula(enriched)
     return enriched
+
+
+def _cost_summary(calls: List[Dict[str, Any]]) -> Dict[str, Any]:
+    by_model: Dict[str, Dict[str, Any]] = {}
+    known_cost_cny = 0.0
+    unknown_cost_calls = 0
+    for call in calls:
+        model_id = (
+            call.get("provider_response_model")
+            or call.get("requested_model")
+            or call.get("model_id")
+            or "unknown"
+        )
+        item = by_model.setdefault(
+            model_id,
+            {"model_id": model_id, "calls": 0, "tokens": 0, "cost_cny": 0.0, "unknown_cost_calls": 0},
+        )
+        item["calls"] += 1
+        item["tokens"] += int(call.get("total_tokens") or 0)
+        amount = call.get("estimated_cost_cny")
+        if amount is None:
+            unknown_cost_calls += 1
+            item["unknown_cost_calls"] += 1
+        else:
+            known_cost_cny += float(amount)
+            item["cost_cny"] += float(amount)
+    return {
+        "calls": len(calls),
+        "known_cost_cny": round(known_cost_cny, 8),
+        "unknown_cost_calls": unknown_cost_calls,
+        "complete": unknown_cost_calls == 0,
+        "by_model": list(by_model.values()),
+    }
 
 
 @router.get("/traces/{trace_id}")
@@ -674,6 +747,15 @@ async def trace_detail(trace_id: str):
     trace_messages = [m for m in messages if m.get("trace_id") == trace_id]
 
     model_calls = [_enrich_model_call(c, session_id) for c in raw_calls]
+    session_model_calls: List[Dict[str, Any]] = []
+    if session_id:
+        for session_trace in list_chat_traces(session_id=session_id, limit=100):
+            session_model_calls.extend(
+                _enrich_model_call(c, session_id)
+                for c in get_model_calls_for_trace(session_trace["trace_id"])
+            )
+    else:
+        session_model_calls = list(model_calls)
     trace_events = list_trace_events(trace_id)
     evaluation_run = get_evaluation_run_by_trace_id(trace_id)
 
@@ -702,6 +784,8 @@ async def trace_detail(trace_id: str):
         "evaluation_run": evaluation_run,
         "messages": trace_messages,
         "context_breakdown": context_breakdown,
+        "trace_cost_summary": _cost_summary(model_calls),
+        "session_cost_summary": _cost_summary(session_model_calls),
     }
 
 

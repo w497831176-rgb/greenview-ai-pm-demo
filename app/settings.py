@@ -14,6 +14,7 @@ from agno.models.deepseek import DeepSeek
 
 from db import get_postgres_db
 from db.property_db import get_default_model_config, get_model_config_by_model_id
+from app.runtime.provider_evidence import capture_provider_response
 
 # ---------------------------------------------------------------------------
 # Database
@@ -27,6 +28,18 @@ agent_db = get_postgres_db()
 # Runtime default for all owner-facing chat paths.
 MODEL_ID = "deepseek-v4-flash"
 USE_THINKING = True
+
+
+class EvidenceDeepSeek(DeepSeek):
+    """DeepSeek adapter that preserves fields dropped by Agno 2.6.21."""
+
+    def _parse_provider_response(self, response, response_format=None):
+        parsed = super()._parse_provider_response(response, response_format)
+        return capture_provider_response(parsed, response)
+
+    def _parse_provider_response_delta(self, response_delta):
+        parsed = super()._parse_provider_response_delta(response_delta)
+        return capture_provider_response(parsed, response_delta)
 
 
 def _deepseek_api_key() -> str:
@@ -78,7 +91,7 @@ def build_model(model_id: Optional[str] = None, **overrides) -> DeepSeek:
         (config.get("base_url") if config else None) or _deepseek_base_url(),
     )
 
-    return DeepSeek(
+    return EvidenceDeepSeek(
         id=resolved_id,
         api_key=api_key,
         base_url=base_url,

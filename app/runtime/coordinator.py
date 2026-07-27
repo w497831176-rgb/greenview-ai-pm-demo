@@ -31,7 +31,7 @@ from app.runtime.contracts import (
     ToolInvocation,
     content_hash,
 )
-from app.runtime.cost_ledger import build_cost_entry
+from app.runtime.cost_ledger import build_cost_entry, cost_entry_usage_payload
 from app.runtime.evidence_ledger import EvidenceLedger
 from app.runtime.mcp_executor import (
     build_model_native_read_tools,
@@ -39,6 +39,7 @@ from app.runtime.mcp_executor import (
 )
 from app.runtime.snapshot_resolver import resolve_snapshot
 from app.runtime.tool_planner import plan_tools, unique_write_plan
+from app.runtime.provider_evidence import provider_evidence_from_run
 from app.settings import MODEL_ID, USE_THINKING, build_model
 from app.work_order_workflow import (
     action_gateway,
@@ -460,21 +461,16 @@ def _model_provider(snapshot_config: Dict[str, Any], model_id: str) -> str:
     )
 
 
-def _usage_for_observability(cost: Any) -> Dict[str, Any]:
-    complete = cost.usage_source.value == "provider_reported_complete"
-    return {
-        "uncached_input_tokens": (
-            max(0, int(cost.input_tokens or 0) - int(cost.cached_input_tokens or 0))
-            if complete
-            else None
-        ),
-        "cached_input_tokens": cost.cached_input_tokens if complete else None,
-        "output_tokens": cost.output_tokens if complete else None,
-        "reasoning_tokens": cost.reasoning_tokens,
-        "total_tokens": cost.total_tokens,
-        "usage_split_unavailable": not complete,
-        "cost_contract": cost.model_dump(mode="json"),
-    }
+def _thinking_for_snapshot(snapshot_config: Dict[str, Any], model_id: str) -> bool:
+    params = _model_config_for_snapshot(snapshot_config, model_id).get("model_params") or {}
+    return bool(params.get("use_thinking", USE_THINKING))
+
+
+def _usage_for_observability(
+    cost: Any,
+    provider_request_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    return cost_entry_usage_payload(cost, provider_request_id=provider_request_id)
 
 
 def _results_from_snapshot(
@@ -1486,24 +1482,35 @@ class RuntimeCoordinator:
             },
         )
 
-        router_usage = route_result.get("metrics") or {}
+        router_evidence = route_result.get("provider_evidence") or {}
+        router_usage = router_evidence.get("usage") or route_result.get("metrics") or {}
+        router_response_model = router_evidence.get("provider_response_model")
+        router_status = route_result.get("provider_status") or "success"
+        router_billing_model = router_response_model or router_model_id
+        router_thinking = _thinking_for_snapshot(snapshot.config, router_model_id)
         router_cost = build_cost_entry(
             stage="router",
             provider=_model_provider(snapshot.config, router_model_id),
             requested_model=router_model_id,
-            response_model=router_model_id,
+            response_model=None,
+            provider_response_model=router_response_model,
+            thinking_enabled=router_thinking,
             model_policy_version=str(
                 (snapshot.config.get("model_policy") or {}).get("version") or "v1.8"
             ),
             provider_usage=router_usage if router_usage else None,
-            price_row=_price_for_snapshot(snapshot.config, router_model_id),
+            price_row=_price_for_snapshot(snapshot.config, router_billing_model),
             local_estimate_tokens=_estimate_tokens(message),
+            provider_succeeded=router_status == "success",
         )
         state.cost_entries.append(router_cost)
         state.model_calls.append(
             {
                 "stage": "router",
                 "model_id": router_model_id,
+                "requested_model": router_model_id,
+                "provider_response_model": router_response_model,
+                "thinking_enabled": router_thinking,
                 "latency_ms": int((time.time() - router_started) * 1000),
                 "usage": router_usage,
                 "usage_source": router_cost.usage_source.value,
@@ -1514,6 +1521,8 @@ class RuntimeCoordinator:
             stage="router",
             model_id=router_model_id,
             model_selection_reason=f"published snapshot route to {selected}",
+            status=router_status,
+            error_summary=route_result.get("provider_error_summary"),
             latency_ms=int((time.time() - router_started) * 1000),
             input_tokens=router_cost.input_tokens,
             output_tokens=router_cost.output_tokens,
@@ -1527,7 +1536,10 @@ class RuntimeCoordinator:
                 else None
             ),
             estimated_cost_cny=router_cost.amount,
-            usage_normalized=_usage_for_observability(router_cost),
+            usage_normalized=_usage_for_observability(
+                router_cost,
+                provider_request_id=router_evidence.get("provider_request_id"),
+            ),
         )
 
         handoff_policy = evaluate_handoff_policy(message)
@@ -1901,6 +1913,11 @@ class RuntimeCoordinator:
         provisional_buffer = ""
         tool_calls: List[Dict[str, Any]] = list(build.skill_tool_calls)
         final_metrics: Dict[str, Optional[int]] = {}
+        final_provider_evidence: Dict[str, Any] = {
+            "provider_response_model": None,
+            "provider_request_id": None,
+            "usage": {},
+        }
         last_progress_at = time.time()
         response_stream = (
             build.agent.arun(
@@ -1945,6 +1962,17 @@ class RuntimeCoordinator:
             metrics = _metrics_dict(chunk)
             if metrics:
                 final_metrics.update(metrics)
+            chunk_evidence = provider_evidence_from_run(chunk)
+            if chunk_evidence.get("provider_response_model"):
+                final_provider_evidence["provider_response_model"] = chunk_evidence[
+                    "provider_response_model"
+                ]
+            if chunk_evidence.get("provider_request_id"):
+                final_provider_evidence["provider_request_id"] = chunk_evidence[
+                    "provider_request_id"
+                ]
+            if chunk_evidence.get("usage"):
+                final_provider_evidence["usage"].update(chunk_evidence["usage"])
             if time.time() - last_progress_at >= 12:
                 yield _sse(
                     "progress",
@@ -2078,16 +2106,24 @@ class RuntimeCoordinator:
         vertical_cost = None
         vertical_usage_source = "not_invoked"
         if model_invoked:
+            vertical_usage = final_provider_evidence.get("usage") or final_metrics
+            vertical_response_model = final_provider_evidence.get(
+                "provider_response_model"
+            )
+            vertical_billing_model = vertical_response_model or model_id
+            vertical_thinking = _thinking_for_snapshot(snapshot.config, model_id)
             vertical_cost = build_cost_entry(
                 stage="vertical_agent",
                 provider=_model_provider(snapshot.config, model_id),
                 requested_model=model_id,
-                response_model=model_id,
+                response_model=None,
+                provider_response_model=vertical_response_model,
+                thinking_enabled=vertical_thinking,
                 model_policy_version=str(
                     (snapshot.config.get("model_policy") or {}).get("version") or "v1.8"
                 ),
-                provider_usage=final_metrics if final_metrics else None,
-                price_row=_price_for_snapshot(snapshot.config, model_id),
+                provider_usage=vertical_usage if vertical_usage else None,
+                price_row=_price_for_snapshot(snapshot.config, vertical_billing_model),
                 local_estimate_tokens=_estimate_tokens(contextual_message + rendered),
             )
             vertical_usage_source = vertical_cost.usage_source.value
@@ -2096,8 +2132,11 @@ class RuntimeCoordinator:
                 {
                     "stage": "vertical_agent",
                     "model_id": model_id,
+                    "requested_model": model_id,
+                    "provider_response_model": vertical_response_model,
+                    "thinking_enabled": vertical_thinking,
                     "latency_ms": int((time.time() - agent_started) * 1000),
-                    "usage": final_metrics,
+                    "usage": vertical_usage,
                     "usage_source": vertical_usage_source,
                 }
             )
@@ -2119,7 +2158,12 @@ class RuntimeCoordinator:
                     else None
                 ),
                 estimated_cost_cny=vertical_cost.amount,
-                usage_normalized=_usage_for_observability(vertical_cost),
+                usage_normalized=_usage_for_observability(
+                    vertical_cost,
+                    provider_request_id=final_provider_evidence.get(
+                        "provider_request_id"
+                    ),
+                ),
             )
 
         state.status = RunStatus.COMPLETED

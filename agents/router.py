@@ -12,6 +12,7 @@ from typing import Any, AsyncIterator, Dict, List, Optional
 
 from agno.agent import Agent
 
+from app.runtime.provider_evidence import provider_evidence_from_run
 from app.settings import MODEL, agent_db
 from db.property_db import get_agent_by_agent_id
 
@@ -347,6 +348,9 @@ async def classify_intent(
     route_mode = "model_success"
     raw_response = ""
     metrics: Dict[str, Any] = {}
+    provider_evidence: Dict[str, Any] = {}
+    provider_status = "success"
+    provider_error_summary = None
     try:
         router_agent = create_router_agent(
             vertical_agents,
@@ -361,9 +365,13 @@ async def classify_intent(
         )
         response = await _collect_response(response_obj)
         raw_response = response
+        provider_evidence = provider_evidence_from_run(response_obj)
 
-        # Collect provider metrics if available.
-        if hasattr(response_obj, "metrics") and response_obj.metrics:
+        # Prefer raw DeepSeek cache-hit/cache-miss/output evidence. Generic
+        # Agno metrics are retained only as an incomplete fallback.
+        if provider_evidence.get("usage"):
+            metrics = dict(provider_evidence["usage"])
+        elif hasattr(response_obj, "metrics") and response_obj.metrics:
             m = response_obj.metrics
             value = lambda key: m.get(key) if isinstance(m, dict) else getattr(m, key, None)
             metrics = {
@@ -407,15 +415,20 @@ async def classify_intent(
             "raw": raw_response,
             "route_mode": route_mode,
             "metrics": metrics,
+            "provider_evidence": provider_evidence,
+            "provider_status": provider_status,
+            "provider_error_summary": provider_error_summary,
             "fallback_scores": (
                 fallback_scores if route_mode == "capability_fallback"
                 else capability_scores if route_mode == "capability_policy_override"
                 else []
             ),
         }
-    except Exception:
+    except Exception as exc:
         import traceback
         traceback.print_exc()
+        provider_status = "failed"
+        provider_error_summary = str(exc)[:300]
         target, reason, fallback_scores = _capability_fallback(message, vertical_agents)
         return {
             "target_agent_id": target,
@@ -423,6 +436,9 @@ async def classify_intent(
             "raw": raw_response,
             "route_mode": "capability_fallback",
             "metrics": metrics,
+            "provider_evidence": provider_evidence,
+            "provider_status": provider_status,
+            "provider_error_summary": provider_error_summary,
             "fallback_scores": fallback_scores,
         }
 

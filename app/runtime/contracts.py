@@ -54,6 +54,8 @@ class RiskLevel(str, Enum):
 
 
 class UsageSource(str, Enum):
+    PROVIDER_ACTUAL = "provider_actual"
+    ESTIMATED = "estimated"
     PROVIDER_REPORTED_COMPLETE = "provider_reported_complete"
     PROVIDER_REPORTED_TOTAL_ONLY = "provider_reported_total_only"
     LOCAL_ESTIMATE = "local_estimate"
@@ -187,10 +189,14 @@ class CostEntry(ImmutableModel):
     provider: str
     requested_model: Optional[str] = None
     response_model: Optional[str] = None
+    provider_response_model: Optional[str] = None
+    thinking_enabled: Optional[bool] = None
     model_policy_version: str
     usage_source: UsageSource
     input_tokens: Optional[int] = None
     cached_input_tokens: Optional[int] = None
+    input_cache_hit_tokens: Optional[int] = None
+    input_cache_miss_tokens: Optional[int] = None
     output_tokens: Optional[int] = None
     reasoning_tokens: Optional[int] = None
     total_tokens: Optional[int] = None
