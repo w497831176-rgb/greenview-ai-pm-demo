@@ -6,6 +6,7 @@ No model, HTTP, database, RuntimeRelease, or business-data calls are made.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 from app.runtime.contracts import CostEntry, UsageSource
@@ -176,7 +177,14 @@ def main() -> None:
     assert pro.thinking_enabled is True
     assert pro.provider_response_model == "deepseek-v4-pro"
 
-    print("PASS: V1.8.2-S5 deterministic provider cost contract (10 checks)")
+    # 11. Darwin response metadata reads the unified CostEntry contract.
+    darwin_source = Path("app/badcases.py").read_text(encoding="utf-8")
+    assert 'analysis_obj["token_cost_estimate"] = cost.amount' in darwin_source
+    assert '"usage_source": cost.usage_source.value' in darwin_source
+    assert '"total_tokens": cost.total_tokens' in darwin_source
+    assert '"estimated_cost_cny": cost.amount' in darwin_source
+
+    print("PASS: V1.8.2-S5 deterministic provider cost contract (11 checks)")
 
 
 if __name__ == "__main__":

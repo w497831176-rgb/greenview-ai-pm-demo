@@ -1458,7 +1458,7 @@ async def darwin_fix(case_id: int, request: DarwinFixRequest = DarwinFixRequest(
     # Enrich with runtime metadata.
     analysis_obj["model"] = model_id
     analysis_obj["trace_id"] = darwin_trace_id
-    analysis_obj["token_cost_estimate"] = cost_cny
+    analysis_obj["token_cost_estimate"] = cost.amount
 
     # Keep a backward-compatible root_cause alias for downstream consumers.
     analysis_obj.setdefault("root_cause", analysis_obj["root_cause_hypothesis"])
@@ -1557,9 +1557,9 @@ async def darwin_fix(case_id: int, request: DarwinFixRequest = DarwinFixRequest(
         "model_id": model_id,
         "darwin_skill_found": bool(darwin),
         "darwin_trace_id": darwin_trace_id,
-        "usage_source": usage_source,
-        "total_tokens": total_tokens,
-        "estimated_cost_cny": cost_cny,
+        "usage_source": cost.usage_source.value,
+        "total_tokens": cost.total_tokens,
+        "estimated_cost_cny": cost.amount,
     }
 
 
