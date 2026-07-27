@@ -2841,6 +2841,108 @@ def list_badcases(
     return [dict(r) for r in rows]
 
 
+def list_badcases_page(
+    page: int = 1,
+    page_size: int = 20,
+    status: Optional[str] = None,
+    category: Optional[str] = None,
+    source: Optional[str] = None,
+    root_cause_domain: Optional[str] = None,
+    priority: Optional[str] = None,
+    search: Optional[str] = None,
+    has_trace: Optional[bool] = None,
+    has_retest: Optional[bool] = None,
+    created_after: Optional[str] = None,
+    created_before: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Return one lightweight Badcase page without loading long evidence fields.
+
+    The list view deliberately uses one COUNT and one bounded SELECT.  Full
+    context, answers, Darwin analysis and action details remain detail-only.
+    """
+    page = max(1, int(page or 1))
+    page_size = 50 if int(page_size or 20) == 50 else 20
+    where = ["1=1"]
+    params: List[Any] = []
+
+    for column, value in [
+        ("b.status", status),
+        ("b.category", category),
+        ("b.source", source),
+        ("b.root_cause_domain", root_cause_domain),
+        ("b.priority", priority),
+    ]:
+        if value:
+            where.append(f"{column} = ?")
+            params.append(value)
+    if search and search.strip():
+        needle = f"%{search.strip()}%"
+        where.append(
+            "(CAST(b.id AS TEXT) LIKE ? OR b.title LIKE ? OR b.original_query LIKE ? "
+            "OR b.feedback_reason LIKE ? OR b.trace_id LIKE ?)"
+        )
+        params.extend([needle] * 5)
+    any_trace = "COALESCE(b.trace_id, '') != '' OR COALESCE(b.darwin_trace_id, '') != '' OR COALESCE(b.retest_trace_id, '') != ''"
+    if has_trace is True:
+        where.append(f"({any_trace})")
+    elif has_trace is False:
+        where.append(f"NOT ({any_trace})")
+    if has_retest is True:
+        where.append("COALESCE(b.retest_trace_id, '') != '' OR COALESCE(b.retest_response, '') != ''")
+    elif has_retest is False:
+        where.append("COALESCE(b.retest_trace_id, '') = '' AND COALESCE(b.retest_response, '') = ''")
+    if created_after:
+        where.append("b.created_at >= ?")
+        params.append(created_after)
+    if created_before:
+        where.append("b.created_at <= ?")
+        params.append(created_before)
+
+    where_sql = " AND ".join(where)
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute(f"SELECT COUNT(*) AS total FROM badcases b WHERE {where_sql}", params)
+    total = int(cursor.fetchone()["total"] or 0)
+    total_pages = max(1, (total + page_size - 1) // page_size)
+    page = min(page, total_pages)
+    offset = (page - 1) * page_size
+    cursor.execute(
+        f"""
+        SELECT
+            b.id, b.status, b.source, b.priority, b.category,
+            COALESCE(NULLIF(b.root_cause_domain, ''), 'unknown') AS root_cause_domain,
+            COALESCE(NULLIF(b.original_query, ''), NULLIF(b.feedback_reason, ''),
+                     NULLIF(b.title, ''), substr(COALESCE(b.description, ''), 1, 200), '-') AS summary,
+            b.trace_id, b.darwin_trace_id, b.retest_trace_id,
+            b.created_at, b.updated_at,
+            CASE WHEN COALESCE(b.darwin_trace_id, '') != '' OR COALESCE(b.darwin_analysis, '') != '' THEN 1 ELSE 0 END AS has_darwin,
+            CASE WHEN COALESCE(b.retest_trace_id, '') != '' OR COALESCE(b.retest_response, '') != '' THEN 1 ELSE 0 END AS has_retest,
+            CASE WHEN EXISTS (SELECT 1 FROM knowledge_drafts kd WHERE kd.badcase_id = b.id)
+                       OR EXISTS (SELECT 1 FROM skill_prompt_drafts sd WHERE sd.badcase_id = b.id)
+                       OR EXISTS (SELECT 1 FROM capability_gap_drafts cd WHERE cd.badcase_id = b.id)
+                 THEN 1 ELSE 0 END AS has_fix_draft
+        FROM badcases b
+        WHERE {where_sql}
+        ORDER BY COALESCE(b.updated_at, b.created_at) DESC, b.id DESC
+        LIMIT ? OFFSET ?
+        """,
+        [*params, page_size, offset],
+    )
+    items = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+    for item in items:
+        item["has_darwin"] = bool(item.get("has_darwin"))
+        item["has_retest"] = bool(item.get("has_retest"))
+        item["has_fix_draft"] = bool(item.get("has_fix_draft"))
+    return {
+        "items": items,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "total_pages": total_pages,
+    }
+
+
 def update_badcase(
     case_id: int,
     title: Optional[str] = None,
@@ -3361,6 +3463,16 @@ def evaluation_summary() -> Dict[str, Any]:
     failed = sum(1 for item in golden_rows if item.get("status") in {"failed", "error"})
     manual = sum(1 for item in golden_rows if item.get("status") == "needs_manual_review")
     total_cost = sum(float(item.get("estimated_cost_cny") or 0.0) for item in golden_rows)
+    active_golden_ids = {int(item["id"]) for item in golden_cases}
+    latest_by_case: Dict[int, Dict[str, Any]] = {}
+    for item in sorted(golden_rows, key=lambda row: (str(row.get("created_at") or ""), int(row.get("id") or 0)), reverse=True):
+        case_id = int(item.get("evaluation_case_id") or 0)
+        if case_id in active_golden_ids and case_id not in latest_by_case:
+            latest_by_case[case_id] = item
+    latest_rows = list(latest_by_case.values())
+    latest_passed = sum(1 for item in latest_rows if item.get("status") == "passed")
+    latest_failed = sum(1 for item in latest_rows if item.get("status") in {"failed", "error"})
+    latest_manual = sum(1 for item in latest_rows if item.get("status") == "needs_manual_review")
     return {
         "cases_active_by_risk": by_risk,
         "golden_cases_total": len(golden_cases),
@@ -3368,6 +3480,12 @@ def evaluation_summary() -> Dict[str, Any]:
         "golden_runs_passed": passed,
         "golden_runs_failed": failed,
         "golden_pass_rate": round((passed / total) * 100, 2) if total else None,
+        "latest_golden_cases_total": len(golden_cases),
+        "latest_golden_runs_total": len(latest_rows),
+        "latest_golden_runs_passed": latest_passed,
+        "latest_golden_runs_failed": latest_failed,
+        "latest_golden_runs_needing_manual_review": latest_manual,
+        "latest_golden_pass_rate": round((latest_passed / len(golden_cases)) * 100, 2) if golden_cases else None,
         "controlled_failure_canary_runs": len(canary_rows),
         "runs_total": total,
         "runs_passed": passed,

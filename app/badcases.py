@@ -22,7 +22,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +67,8 @@ from db.property_db import (
     delete_badcase as db_delete_badcase,
     delete_knowledge_doc as db_delete_knowledge_doc,
     get_agent_by_agent_id,
+    get_agent_knowledge_bindings,
+    get_agent_tools,
     get_badcase as db_get_badcase,
     get_capability_gap_draft as db_get_capability_gap_draft,
     get_chat_message,
@@ -75,10 +77,12 @@ from db.property_db import (
     get_knowledge_draft as db_get_knowledge_draft,
     get_skill,
     get_skill_by_name,
+    get_current_runtime_release,
     get_agent_skills,
     get_skill_prompt_draft as db_get_skill_prompt_draft,
     list_badcase_actions,
     list_badcases as db_list_badcases,
+    list_badcases_page as db_list_badcases_page,
     list_capability_gap_drafts as db_list_capability_gap_drafts,
     list_evaluation_runs,
     list_knowledge_drafts as db_list_knowledge_drafts,
@@ -191,6 +195,28 @@ class RejectRequest(BaseModel):
 
 class TransitionRequest(BaseModel):
     status: str = "verifying"
+    note: str = ""
+
+
+class AgentConfigApplyEvidenceRequest(BaseModel):
+    agent_id: str
+    before_description: str
+    before_instructions: str
+    after_description: str
+    after_instructions: str
+    skill_ids_before: List[int] = Field(default_factory=list)
+    skill_ids_after: List[int] = Field(default_factory=list)
+    knowledge_doc_ids_before: List[int] = Field(default_factory=list)
+    knowledge_doc_ids_after: List[int] = Field(default_factory=list)
+    mcp_tools_before: List[str] = Field(default_factory=list)
+    mcp_tools_after: List[str] = Field(default_factory=list)
+    review_note: str = ""
+
+
+class RuntimeReleaseEvidenceRequest(BaseModel):
+    release_id: str
+    version: int
+    parent_release_id: Optional[str] = None
     note: str = ""
 
 
@@ -445,22 +471,42 @@ async def list_badcases(
     has_retest: Optional[bool] = None,
     created_after: Optional[str] = None,
     created_before: Optional[str] = None,
+    root_cause_domain: Optional[str] = None,
+    priority: Optional[str] = None,
+    search: Optional[str] = None,
+    page: int = 1,
+    page_size: int = 20,
 ):
-    """List badcases with optional filters."""
+    """Return a bounded, lightweight Badcase workbench page."""
     if status and status not in VALID_STATUSES:
         raise HTTPException(status_code=400, detail=f"invalid status: {status}")
     if category and category not in VALID_CATEGORIES:
         raise HTTPException(status_code=400, detail=f"invalid category: {category}")
-    cases = db_list_badcases(
+    if root_cause_domain and root_cause_domain not in ROOT_CAUSE_DOMAINS:
+        raise HTTPException(status_code=400, detail=f"invalid root_cause_domain: {root_cause_domain}")
+    if priority and priority not in {"low", "medium", "high"}:
+        raise HTTPException(status_code=400, detail=f"invalid priority: {priority}")
+    if page < 1:
+        raise HTTPException(status_code=400, detail="page must be >= 1")
+    if page_size not in {20, 50}:
+        raise HTTPException(status_code=400, detail="page_size must be 20 or 50")
+    result = db_list_badcases_page(
+        page=page,
+        page_size=page_size,
         status=status,
         category=category,
         source=source,
+        root_cause_domain=root_cause_domain,
+        priority=priority,
+        search=search,
         has_trace=has_trace,
         has_retest=has_retest,
         created_after=created_after,
         created_before=created_before,
     )
-    return {"badcases": [_enrich_badcase(c) for c in cases], "count": len(cases)}
+    # Keep aliases for older callers, but both aliases now contain lightweight
+    # list rows only; long evidence remains detail-only.
+    return {**result, "badcases": result["items"], "count": result["total"]}
 
 
 @router.get("/{case_id}")
@@ -1713,6 +1759,101 @@ async def transition_badcase(case_id: int, request: TransitionRequest = Transiti
     updated = db_update_badcase(case_id, status=request.status)
     _record_action(case_id, "transition", {"note": request.note}, case["status"], request.status, "user")
     return {"badcase": _enrich_badcase(updated)}
+
+
+@router.post("/{case_id}/record-agent-config-apply")
+async def record_agent_config_apply(case_id: int, request: AgentConfigApplyEvidenceRequest):
+    """Record a human-reviewed Agent configuration apply as Badcase evidence.
+
+    The Agent itself is still edited through the existing Agent management API.
+    This endpoint verifies the live result and records the before/after evidence;
+    it never calls a model and never changes Skill/RAG/MCP bindings.
+    """
+    case = _load_case(case_id)
+    _require_case_status(case, "record-agent-config-apply", {"fixing"})
+    agent = get_agent_by_agent_id(request.agent_id)
+    if not agent:
+        raise HTTPException(status_code=404, detail="target agent not found")
+    if (agent.get("description") or "") != request.after_description:
+        raise HTTPException(status_code=409, detail="live agent description does not match reviewed after value")
+    if (agent.get("instructions") or "") != request.after_instructions:
+        raise HTTPException(status_code=409, detail="live agent instructions do not match reviewed after value")
+
+    live_skill_ids = sorted(int(value) for value in get_agent_skills(request.agent_id))
+    live_knowledge_ids = sorted(int(value) for value in (get_agent_knowledge_bindings(request.agent_id) or []))
+    live_mcp_tools = sorted(
+        str(item.get("tool_name")) for item in get_agent_tools(request.agent_id)
+        if item.get("tool_name")
+    )
+    before_bindings = (
+        sorted(request.skill_ids_before),
+        sorted(request.knowledge_doc_ids_before),
+        sorted(request.mcp_tools_before),
+    )
+    after_bindings = (
+        sorted(request.skill_ids_after),
+        sorted(request.knowledge_doc_ids_after),
+        sorted(request.mcp_tools_after),
+    )
+    if before_bindings != after_bindings:
+        raise HTTPException(status_code=409, detail="S7 routing fix must not change Skill/RAG/MCP bindings")
+    if after_bindings != (live_skill_ids, live_knowledge_ids, live_mcp_tools):
+        raise HTTPException(status_code=409, detail="live Agent bindings do not match reviewed evidence")
+    if not request.review_note.strip():
+        raise HTTPException(status_code=400, detail="human review note required")
+
+    detail = {
+        "target_type": "agent_route_config",
+        "agent_id": request.agent_id,
+        "agent_row_id": agent.get("id"),
+        "before": {
+            "description": request.before_description,
+            "instructions": request.before_instructions,
+        },
+        "after": {
+            "description": request.after_description,
+            "instructions": request.after_instructions,
+        },
+        "bindings_unchanged": {
+            "skill_ids": live_skill_ids,
+            "knowledge_doc_ids": live_knowledge_ids,
+            "mcp_tools": live_mcp_tools,
+        },
+        "human_reviewed": True,
+        "review_note": request.review_note.strip(),
+        "auto_applied_darwin_draft": False,
+    }
+    updated = _move_to_verifying_after_apply(
+        case, case_id, "apply-agent-config", detail
+    )
+    return {"badcase": _enrich_badcase(updated), "evidence": detail}
+
+
+@router.post("/{case_id}/record-runtime-release")
+async def record_runtime_release(case_id: int, request: RuntimeReleaseEvidenceRequest):
+    """Link the actually published RuntimeRelease to a verifying Badcase."""
+    case = _load_case(case_id)
+    _require_case_status(case, "record-runtime-release", {"verifying"})
+    current = get_current_runtime_release()
+    if not current:
+        raise HTTPException(status_code=503, detail="no published RuntimeRelease")
+    if current.get("release_id") != request.release_id or int(current.get("version") or 0) != request.version:
+        raise HTTPException(status_code=409, detail="current RuntimeRelease does not match supplied evidence")
+    actual_parent = current.get("parent_release_id")
+    if request.parent_release_id is not None and actual_parent != request.parent_release_id:
+        raise HTTPException(status_code=409, detail="RuntimeRelease parent does not match supplied evidence")
+    detail = {
+        "release_id": current.get("release_id"),
+        "version": current.get("version"),
+        "parent_release_id": actual_parent,
+        "config_hash": current.get("config_hash"),
+        "note": request.note.strip(),
+        "effective_on": "new_session",
+    }
+    release_label = f"v{current.get('version')} / {current.get('release_id')}"
+    updated = db_update_badcase(case_id, release_version=release_label)
+    _record_action(case_id, "runtime-release", detail, case["status"], case["status"], "operator")
+    return {"badcase": _enrich_badcase(updated), "release": detail}
 
 
 @router.get("/{case_id}/actions")

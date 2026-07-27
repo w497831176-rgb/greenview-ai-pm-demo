@@ -16,11 +16,13 @@ from pydantic import BaseModel, Field
 
 from app.observability import _check_budget
 from db.property_db import (
+    add_badcase_action,
     create_badcase,
     create_evaluation_case,
     create_evaluation_run,
     evaluation_summary,
     get_badcase_by_evaluation_run,
+    get_badcase,
     get_chat_trace,
     get_evidence_ledger,
     get_evaluation_case,
@@ -30,10 +32,12 @@ from db.property_db import (
     list_evaluation_cases,
     list_evaluation_runs,
     list_trace_events,
+    now_cn,
     record_trace_event,
     update_chat_trace,
     update_evaluation_case,
     update_evaluation_run,
+    update_badcase,
 )
 
 
@@ -93,6 +97,10 @@ class EvaluationCaseUpdate(BaseModel):
 class EvaluationReviewRequest(BaseModel):
     passed: bool
     note: str
+
+
+class EvaluationRunRequest(BaseModel):
+    linked_badcase_id: Optional[int] = None
 
 
 def _validate_case_payload(payload: Dict[str, Any]) -> None:
@@ -569,6 +577,79 @@ def _ensure_badcase_for_run(run_id: int) -> Dict[str, Any]:
     return badcase
 
 
+def _validate_linked_retest(case_id: int, badcase_id: Optional[int]) -> Optional[Dict[str, Any]]:
+    if badcase_id is None:
+        return None
+    badcase = get_badcase(int(badcase_id))
+    if not badcase:
+        raise HTTPException(status_code=404, detail="linked Badcase not found")
+    if badcase.get("status") != "verifying":
+        raise HTTPException(status_code=409, detail="linked Evaluation retest requires Badcase status=verifying")
+    linked_case_id = badcase.get("linked_evaluation_case_id")
+    if linked_case_id is not None and int(linked_case_id) != int(case_id):
+        raise HTTPException(status_code=409, detail="Badcase is linked to a different Evaluation case")
+    return badcase
+
+
+def _link_evaluation_retest(
+    badcase: Dict[str, Any],
+    case: Dict[str, Any],
+    run: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Persist one explicit Evaluation run as the real retest for a Badcase."""
+    run_id = int(run["id"])
+    update_evaluation_run(run_id, badcase_id=int(badcase["id"]))
+    run = get_evaluation_run(run_id) or run
+    passed = run.get("status") == "passed"
+    before_status = str(badcase.get("status") or "verifying")
+    after_status = before_status if passed else "fixing"
+    retest_at = now_cn()
+    baseline_run_id = badcase.get("linked_evaluation_run_id")
+    baseline_trace_id = badcase.get("trace_id")
+    retest_context = {
+        "type": "evaluation_retest",
+        "evaluation_case_id": case.get("id"),
+        "evaluation_case_key": case.get("case_key"),
+        "evaluation_run_id": run_id,
+        "run_status": run.get("status"),
+        "rule_results": run.get("rule_results") or [],
+        "evidence": run.get("evidence") or {},
+        "baseline_evaluation_run_id": baseline_run_id,
+        "baseline_trace_id": baseline_trace_id,
+    }
+    updated = update_badcase(
+        int(badcase["id"]),
+        status=after_status,
+        retest_response=run.get("answer") or "",
+        retest_context_json=json.dumps(retest_context, ensure_ascii=False, default=str),
+        retest_trace_id=run.get("trace_id") or "",
+        last_retest_at=retest_at,
+        linked_evaluation_case_id=int(case["id"]),
+        linked_evaluation_run_id=run_id,
+    )
+    add_badcase_action(
+        badcase_id=int(badcase["id"]),
+        action_type="evaluation-retest",
+        action_detail=json.dumps({
+            "evaluation_case_id": case.get("id"),
+            "evaluation_case_key": case.get("case_key"),
+            "evaluation_run_id": run_id,
+            "trace_id": run.get("trace_id"),
+            "result": run.get("status"),
+            "failed_rule_keys": [
+                item.get("key") for item in (run.get("rule_results") or [])
+                if item.get("status") == "fail"
+            ],
+            "baseline_evaluation_run_id": baseline_run_id,
+            "baseline_trace_id": baseline_trace_id,
+        }, ensure_ascii=False, default=str),
+        status_before=before_status,
+        status_after=after_status,
+        created_by="operator",
+    )
+    return updated or badcase
+
+
 @router.get("/overview")
 async def overview():
     return {"summary": evaluation_summary()}
@@ -620,13 +701,14 @@ async def update_case(case_id: int, request: EvaluationCaseUpdate):
 
 
 @router.post("/cases/{case_id}/run")
-async def run_case(case_id: int):
+async def run_case(case_id: int, request: EvaluationRunRequest = EvaluationRunRequest()):
     """Explicitly run one active Golden Set case through the real chat runtime."""
     case = get_evaluation_case(case_id)
     if not case:
         raise HTTPException(status_code=404, detail="evaluation case not found")
     if case.get("status") != "active":
         raise HTTPException(status_code=409, detail="仅 active 评估用例可运行；草稿请先人工审核并启用")
+    linked_badcase = _validate_linked_retest(case_id, request.linked_badcase_id)
 
     # Evaluation is an explicit background-quality operation, unlike ordinary
     # owner chat.  Respect a hard budget stop before spending a new model call.
@@ -660,7 +742,10 @@ async def run_case(case_id: int):
                 if done.get("trace_id") else None
             ),
         )
-        badcase = _ensure_badcase_for_run(run["id"])
+        badcase = (
+            _link_evaluation_retest(linked_badcase, case, run)
+            if linked_badcase else _ensure_badcase_for_run(run["id"])
+        )
         return {
             "case": case,
             "run": get_evaluation_run(run["id"]),
@@ -680,7 +765,10 @@ async def run_case(case_id: int):
             evidence={"runtime_error": str(exc)[:500]},
             rule_results=checks,
         )
-        badcase = _ensure_badcase_for_run(run["id"])
+        badcase = (
+            _link_evaluation_retest(linked_badcase, case, run)
+            if linked_badcase else _ensure_badcase_for_run(run["id"])
+        )
         return {
             "case": case,
             "run": get_evaluation_run(run["id"]),
@@ -724,7 +812,10 @@ async def run_case(case_id: int):
             output_summary=f"{sum(1 for item in checks if item['status'] == 'pass')} pass / {sum(1 for item in checks if item['status'] == 'fail')} fail",
             metadata={"evaluation_case_id": case_id, "evaluation_run_id": run.get("id"), "risk_level": case.get("risk_level")},
         )
-    badcase = _ensure_badcase_for_run(run["id"]) if run_status == "failed" else None
+    if linked_badcase:
+        badcase = _link_evaluation_retest(linked_badcase, case, run)
+    else:
+        badcase = _ensure_badcase_for_run(run["id"]) if run_status == "failed" else None
     if badcase:
         run = get_evaluation_run(run["id"]) or run
     return {
