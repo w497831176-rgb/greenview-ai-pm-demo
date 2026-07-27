@@ -23,11 +23,15 @@ from db.property_db import (
     claim_handoff,
     close_handoff,
     create_badcase,
+    create_chat_feedback,
     create_chat_session,
+    get_chat_feedback,
     get_chat_message,
     get_chat_session,
     get_handoff_package,
     get_previous_user_message,
+    get_user_feedback_badcase,
+    link_chat_feedback_badcase,
     list_chat_messages,
     list_handoff_sessions,
     list_user_chat_sessions,
@@ -140,8 +144,8 @@ class ChatRequest(BaseModel):
 
 class FeedbackRequest(BaseModel):
     session_id: str
-    message_id: Optional[int] = None
-    reason: str
+    message_id: int
+    reason: Optional[str] = None
     type: Optional[str] = "thumb_down"  # thumb_up / thumb_down
 
 
@@ -289,17 +293,47 @@ async def chat_session_detail(session_id: str):
 
 @router.post("/feedback")
 async def chat_feedback(request: FeedbackRequest):
-    """Create a badcase from user feedback on an AI response."""
-    if not request.reason or not request.reason.strip():
-        raise HTTPException(status_code=400, detail="反馈描述不能为空")
+    """Persist message feedback; only negative feedback enters Badcase."""
+    feedback_type = str(request.type or "thumb_down").strip()
+    if feedback_type not in {"thumb_up", "thumb_down"}:
+        raise HTTPException(status_code=400, detail="反馈类型仅支持 thumb_up 或 thumb_down")
+    if not request.session_id.strip():
+        raise HTTPException(status_code=400, detail="session_id 不能为空")
 
-    reason = request.reason.strip()
-    msg = None
-    user_msg = None
-    if request.message_id:
-        msg = get_chat_message(request.message_id)
-        if msg:
-            user_msg = get_previous_user_message(request.session_id, request.message_id)
+    reason = (request.reason or "").strip()
+    if feedback_type == "thumb_up":
+        reason = reason or "回答有帮助"
+    else:
+        reason = reason or "未提供具体原因"
+
+    msg = get_chat_message(request.message_id)
+    if not msg:
+        raise HTTPException(status_code=404, detail="反馈目标消息不存在")
+    if msg.get("session_id") != request.session_id:
+        raise HTTPException(status_code=409, detail="反馈消息不属于当前会话")
+    if msg.get("role") != "assistant":
+        raise HTTPException(status_code=409, detail="只能反馈 AI 回答")
+    if feedback_type == "thumb_down" and not msg.get("trace_id"):
+        raise HTTPException(status_code=409, detail="该历史回答缺少 Trace，无法形成可验证 Badcase")
+
+    existing = get_chat_feedback(request.session_id, request.message_id)
+    if existing:
+        if existing.get("feedback_type") != feedback_type:
+            raise HTTPException(status_code=409, detail="该回答已记录另一种反馈，不能重复改写")
+        badcase = (
+            get_user_feedback_badcase(request.session_id, request.message_id)
+            if existing.get("badcase_id")
+            else None
+        )
+        return {
+            "status": "ok",
+            "feedback": existing,
+            "badcase": badcase,
+            "already_recorded": True,
+            "message": "该反馈已记录，未重复创建 Badcase",
+        }
+
+    user_msg = get_previous_user_message(request.session_id, request.message_id)
 
     original_query = ""
     ai_response = ""
@@ -307,7 +341,7 @@ async def chat_feedback(request: FeedbackRequest):
     context_json: Dict[str, Any] = {
         "session_id": request.session_id,
         "message_id": request.message_id,
-        "feedback_type": request.type,
+        "feedback_type": feedback_type,
     }
     if msg:
         ai_response = msg.get("content") or ""
@@ -333,8 +367,43 @@ async def chat_feedback(request: FeedbackRequest):
         original_query = user_msg.get("content") or ""
         context_json["user_message_id"] = user_msg.get("id")
 
-    source = "user_feedback" if request.type == "thumb_down" else "manual"
-    action_type = "user_feedback" if request.type == "thumb_down" else "manual_feedback"
+    legacy_badcase = get_user_feedback_badcase(request.session_id, request.message_id)
+    if feedback_type == "thumb_up" and legacy_badcase:
+        raise HTTPException(status_code=409, detail="该回答已有历史负向反馈，不能改写为正向反馈")
+
+    if feedback_type == "thumb_up":
+        feedback = create_chat_feedback(
+            session_id=request.session_id,
+            message_id=request.message_id,
+            feedback_type=feedback_type,
+            reason=reason,
+            trace_id=trace_id,
+        )
+        return {
+            "status": "ok",
+            "feedback": feedback,
+            "badcase": None,
+            "already_recorded": False,
+            "message": "感谢反馈；点赞已记录，不会创建 Badcase",
+        }
+
+    if legacy_badcase:
+        feedback = create_chat_feedback(
+            session_id=request.session_id,
+            message_id=request.message_id,
+            feedback_type=feedback_type,
+            reason=reason,
+            trace_id=trace_id,
+            badcase_id=legacy_badcase["id"],
+        )
+        return {
+            "status": "ok",
+            "feedback": feedback,
+            "badcase": legacy_badcase,
+            "already_recorded": True,
+            "message": "已关联原有 Badcase，未重复创建",
+        }
+
     badcase = create_badcase(
         title=f"人工反馈：{reason[:40]}",
         description=reason,
@@ -344,22 +413,22 @@ async def chat_feedback(request: FeedbackRequest):
         evidence=reason,
         source_message_id=request.message_id,
         session_id=request.session_id,
-        source=source,
+        source="user_feedback",
         original_query=original_query,
         ai_response=ai_response,
         feedback_reason=reason,
         context_json=json.dumps(context_json, ensure_ascii=False, default=str),
         trace_id=trace_id,
-        priority="high" if request.type == "thumb_down" else "medium",
+        priority="high",
         message_id=request.message_id,
     )
     add_badcase_action(
         badcase_id=badcase["id"],
-        action_type=action_type,
+        action_type="user_feedback",
         action_detail=json.dumps(
             {
                 "reason": reason,
-                "type": request.type,
+                "type": feedback_type,
                 "query": original_query,
                 "response": ai_response,
             },
@@ -370,7 +439,25 @@ async def chat_feedback(request: FeedbackRequest):
         status_after="pending",
         created_by="owner",
     )
-    return {"status": "ok", "badcase": badcase, "source": source}
+    feedback = create_chat_feedback(
+        session_id=request.session_id,
+        message_id=request.message_id,
+        feedback_type=feedback_type,
+        reason=reason,
+        trace_id=trace_id,
+        badcase_id=badcase["id"],
+    )
+    if not feedback.get("badcase_id"):
+        feedback = link_chat_feedback_badcase(
+            request.session_id, request.message_id, badcase["id"]
+        ) or feedback
+    return {
+        "status": "ok",
+        "feedback": feedback,
+        "badcase": badcase,
+        "already_recorded": False,
+        "message": "负向反馈已记录并关联一个 Badcase",
+    }
 
 
 @router.post("/handoff")

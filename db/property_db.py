@@ -335,6 +335,29 @@ def init_db():
         )
         """
     )
+    # V1.8.2-S6: one durable feedback fact per assistant message.  Positive
+    # feedback is deliberately not a Badcase; negative feedback may link one.
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS chat_feedback (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            message_id INTEGER NOT NULL,
+            trace_id TEXT,
+            feedback_type TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            badcase_id INTEGER,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(session_id, message_id),
+            FOREIGN KEY (message_id) REFERENCES chat_messages(id),
+            FOREIGN KEY (badcase_id) REFERENCES badcases(id)
+        )
+        """
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_chat_feedback_trace ON chat_feedback(trace_id)"
+    )
     # V1.4.3: add current_agent_id column to existing chat_messages.
     try:
         cursor.execute("ALTER TABLE chat_messages ADD COLUMN current_agent_id TEXT")
@@ -3119,8 +3142,29 @@ def list_evaluation_cases(status: Optional[str] = None, source: Optional[str] = 
     sql += " ORDER BY updated_at DESC, id DESC"
     cursor.execute(sql, params)
     rows = cursor.fetchall()
+    results: List[Dict[str, Any]] = []
+    for row in rows:
+        item = _enrich_evaluation_case(dict(row)) or {}
+        cursor.execute(
+            """
+            SELECT id, status, trace_id, badcase_id, created_at
+            FROM evaluation_runs WHERE evaluation_case_id = ?
+            ORDER BY id DESC LIMIT 1
+            """,
+            (item.get("id"),),
+        )
+        latest = cursor.fetchone()
+        if latest:
+            item.update({
+                "last_run_id": latest["id"],
+                "last_run_status": latest["status"],
+                "last_run_trace_id": latest["trace_id"],
+                "last_run_badcase_id": latest["badcase_id"],
+                "last_run_at": latest["created_at"],
+            })
+        results.append(item)
     conn.close()
-    return [_enrich_evaluation_case(dict(row)) or {} for row in rows]
+    return results
 
 
 def update_evaluation_case(case_id: int, **updates: Any) -> Optional[Dict[str, Any]]:
@@ -3229,6 +3273,19 @@ def get_evaluation_run_by_trace_id(trace_id: str) -> Optional[Dict[str, Any]]:
     return _enrich_evaluation_run(dict(row) if row else None)
 
 
+def get_badcase_by_evaluation_run(run_id: int) -> Optional[Dict[str, Any]]:
+    """Return the one Badcase linked to an evaluation run, if any."""
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT * FROM badcases WHERE linked_evaluation_run_id = ? ORDER BY id ASC LIMIT 1",
+        (run_id,),
+    )
+    row = cursor.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
 def list_evaluation_runs(evaluation_case_id: Optional[int] = None, limit: int = 100) -> List[Dict[str, Any]]:
     conn = _get_conn()
     cursor = conn.cursor()
@@ -3273,40 +3330,85 @@ def update_evaluation_run(
 
 
 def evaluation_summary() -> Dict[str, Any]:
-    """Return a compact quality/cost summary without inventing production KPIs."""
+    """Return Golden Set results; controlled failure canaries are separate."""
     conn = _get_conn()
     cursor = conn.cursor()
     cursor.execute(
         """
-        SELECT COUNT(*) AS total,
-               SUM(CASE WHEN status = 'passed' THEN 1 ELSE 0 END) AS passed,
-               SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed,
-               SUM(CASE WHEN status = 'needs_manual_review' THEN 1 ELSE 0 END) AS manual_review,
-               COALESCE(SUM(estimated_cost_cny), 0) AS total_cost,
-               COALESCE(SUM(CASE WHEN status = 'passed' THEN estimated_cost_cny ELSE 0 END), 0) AS passed_cost
-        FROM evaluation_runs
+        SELECT r.*, c.risk_level, c.status AS case_status, c.rubric_json
+        FROM evaluation_runs r
+        JOIN evaluation_cases c ON c.id = r.evaluation_case_id
         """
     )
-    row = dict(cursor.fetchone() or {})
-    cursor.execute(
-        "SELECT risk_level, COUNT(*) AS total FROM evaluation_cases WHERE status = 'active' GROUP BY risk_level"
-    )
-    by_risk = {r["risk_level"]: r["total"] for r in cursor.fetchall()}
+    rows = [dict(item) for item in cursor.fetchall()]
+    cursor.execute("SELECT * FROM evaluation_cases WHERE status = 'active'")
+    active_cases = [dict(item) for item in cursor.fetchall()]
     conn.close()
-    passed = int(row.get("passed") or 0)
-    total = int(row.get("total") or 0)
-    total_cost = float(row.get("total_cost") or 0.0)
+
+    def is_canary(item: Dict[str, Any]) -> bool:
+        rubric = _parse_json_text(item.get("rubric_json"), {})
+        return bool(isinstance(rubric, dict) and rubric.get("controlled_failure_canary"))
+
+    golden_rows = [item for item in rows if not is_canary(item)]
+    canary_rows = [item for item in rows if is_canary(item)]
+    golden_cases = [item for item in active_cases if not is_canary(item)]
+    by_risk: Dict[str, int] = {}
+    for item in golden_cases:
+        key = str(item.get("risk_level") or "unknown")
+        by_risk[key] = by_risk.get(key, 0) + 1
+    total = len(golden_rows)
+    passed = sum(1 for item in golden_rows if item.get("status") == "passed")
+    failed = sum(1 for item in golden_rows if item.get("status") in {"failed", "error"})
+    manual = sum(1 for item in golden_rows if item.get("status") == "needs_manual_review")
+    total_cost = sum(float(item.get("estimated_cost_cny") or 0.0) for item in golden_rows)
     return {
         "cases_active_by_risk": by_risk,
+        "golden_cases_total": len(golden_cases),
+        "golden_runs_total": total,
+        "golden_runs_passed": passed,
+        "golden_runs_failed": failed,
+        "golden_pass_rate": round((passed / total) * 100, 2) if total else None,
+        "controlled_failure_canary_runs": len(canary_rows),
         "runs_total": total,
         "runs_passed": passed,
-        "runs_failed": int(row.get("failed") or 0),
-        "runs_needing_manual_review": int(row.get("manual_review") or 0),
+        "runs_failed": failed,
+        "runs_needing_manual_review": manual,
         "deterministic_pass_rate": round((passed / total) * 100, 2) if total else None,
         "model_direct_cost_cny": round(total_cost, 8),
         "cost_per_passed_run_cny": round(total_cost / passed, 8) if passed else None,
-        "note": "仅统计已显式运行的演示评估与模型直接 Token 估算；不代表生产 SLA 或全量业务成本。",
+        "note": "仅统计已显式运行的黄金评估；受控失败探针不计入黄金集通过率。成本来自关联 Trace 的模型调用记录，不代表供应商账单。",
     }
+
+
+def get_session_runtime_side_effects(session_id: str) -> Dict[str, int]:
+    """Count persisted business effects for one isolated evaluation session."""
+    conn = _get_conn()
+    cursor = conn.cursor()
+    counts: Dict[str, int] = {}
+    for key, sql in [
+        ("work_orders", "SELECT COUNT(*) FROM work_orders WHERE session_id = ?"),
+        ("work_order_drafts", "SELECT COUNT(*) FROM work_order_drafts WHERE session_id = ?"),
+        ("action_proposals", "SELECT COUNT(*) FROM action_proposals WHERE session_id = ?"),
+        (
+            "action_receipts",
+            """SELECT COUNT(*) FROM action_receipts r
+               JOIN action_proposals p ON p.proposal_id = r.proposal_id
+               WHERE p.session_id = ?""",
+        ),
+    ]:
+        cursor.execute(sql, (session_id,))
+        counts[key] = int((cursor.fetchone() or [0])[0] or 0)
+    cursor.execute(
+        "SELECT handoff_status FROM chat_sessions WHERE session_id = ?", (session_id,)
+    )
+    row = cursor.fetchone()
+    counts["handoffs"] = int(bool(row and row["handoff_status"] != "none"))
+    counts["business_writes"] = sum(
+        counts[key]
+        for key in ("work_orders", "work_order_drafts", "action_proposals", "action_receipts")
+    )
+    conn.close()
+    return counts
 
 
 # -----------------------------------------------------------------------------
@@ -4245,6 +4347,89 @@ def get_previous_user_message(session_id: str, ai_message_id: int) -> Optional[D
     row = cursor.fetchone()
     conn.close()
     return _normalize_chat_message(dict(row)) if row else None
+
+
+def get_chat_feedback(session_id: str, message_id: int) -> Optional[Dict[str, Any]]:
+    """Return the single durable feedback fact for an assistant message."""
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT * FROM chat_feedback WHERE session_id = ? AND message_id = ?",
+        (session_id, message_id),
+    )
+    row = cursor.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def create_chat_feedback(
+    session_id: str,
+    message_id: int,
+    feedback_type: str,
+    reason: str,
+    trace_id: Optional[str] = None,
+    badcase_id: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Persist feedback idempotently; callers resolve semantic conflicts."""
+    existing = get_chat_feedback(session_id, message_id)
+    if existing:
+        return existing
+    now = now_cn()
+    conn = _get_conn()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            """
+            INSERT INTO chat_feedback
+            (session_id, message_id, trace_id, feedback_type, reason, badcase_id, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (session_id, message_id, trace_id, feedback_type, reason, badcase_id, now, now),
+        )
+        conn.commit()
+    except sqlite3.IntegrityError:
+        conn.rollback()
+    finally:
+        conn.close()
+    return get_chat_feedback(session_id, message_id) or {}
+
+
+def link_chat_feedback_badcase(
+    session_id: str, message_id: int, badcase_id: int
+) -> Optional[Dict[str, Any]]:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        UPDATE chat_feedback SET badcase_id = ?, updated_at = ?
+        WHERE session_id = ? AND message_id = ?
+        """,
+        (badcase_id, now_cn(), session_id, message_id),
+    )
+    conn.commit()
+    conn.close()
+    return get_chat_feedback(session_id, message_id)
+
+
+def get_user_feedback_badcase(
+    session_id: str, message_id: int
+) -> Optional[Dict[str, Any]]:
+    """Find a prior negative-feedback Badcase, including pre-S6 records."""
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT * FROM badcases
+        WHERE source = 'user_feedback'
+          AND session_id = ?
+          AND (message_id = ? OR source_message_id = ?)
+        ORDER BY id ASC LIMIT 1
+        """,
+        (session_id, message_id, message_id),
+    )
+    row = cursor.fetchone()
+    conn.close()
+    return dict(row) if row else None
 
 
 def list_chat_messages(session_id: str) -> List[Dict[str, Any]]:

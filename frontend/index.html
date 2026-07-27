@@ -495,22 +495,46 @@
       $('#drawer-panel').classList.add('translate-x-full');
     }
 
-    async function sendThumbFeedback(messageId, type, reason = null) {
+    function markThumbFeedback(button, type, payload = {}) {
+      if (!button) return;
+      const group = button.parentElement;
+      if (!group) return;
+      group.querySelectorAll('button').forEach(item => {
+        item.disabled = true;
+        item.classList.add('opacity-40', 'cursor-not-allowed');
+      });
+      button.classList.remove('opacity-40', 'text-slate-400');
+      button.classList.add(type === 'thumb_up' ? 'text-brand-600' : 'text-red-600');
+      let state = group.querySelector('.thumb-feedback-state');
+      if (!state) {
+        state = document.createElement('span');
+        state.className = 'thumb-feedback-state ml-1 text-[10px] text-emerald-600';
+        group.appendChild(state);
+      }
+      const badcaseId = payload.badcase && payload.badcase.id;
+      state.textContent = type === 'thumb_up' ? '已点赞' : (badcaseId ? `已反馈 · Badcase #${badcaseId}` : '已反馈');
+    }
+
+    async function sendThumbFeedback(messageId, type, reason = null, button = null) {
       try {
         const res = await fetch(`${API_BASE}/api/chat/feedback`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ session_id: STATE.chatSessionId, message_id: messageId, type, reason })
         });
-        if (!res.ok) throw new Error('提交失败');
-        showToast('反馈已提交', 'success');
+        const payload = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(payload.detail || '提交失败');
+        markThumbFeedback(button, type, payload);
+        showToast(payload.message || (type === 'thumb_up' ? '点赞已记录' : '负向反馈已关联 Badcase'), 'success');
+        return payload;
       } catch (err) {
         showToast('反馈提交失败：' + err.message, 'error');
+        return null;
       }
     }
 
-    function openThumbFeedbackModal(messageId) {
-      const reasons = ['答非所问', '信息错误', '缺少信息', '其他'];
+    function openThumbFeedbackModal(messageId, button = null) {
+      const reasons = ['答非所问', '事实错误', '无依据编造', '未解决问题', '其他'];
       const body = `
         <p class="text-sm text-slate-600 mb-3">请选择不满意的原因：</p>
         <div class="space-y-2" id="thumb-reason-group">
@@ -524,8 +548,9 @@
       `;
       openModal('反馈原因', body, async () => {
         const selected = document.querySelector('input[name="thumb-reason"]:checked');
-        const reason = selected ? selected.value : '其他';
-        await sendThumbFeedback(messageId, 'thumb_down', reason);
+        const reason = selected ? selected.value : null;
+        const saved = await sendThumbFeedback(messageId, 'thumb_down', reason, button);
+        if (!saved) return false;
         closeModal();
         return true;
       }, '提交');
@@ -1647,8 +1672,8 @@
           }
           const upBtn = footer.querySelector('.thumb-up-btn');
           const downBtn = footer.querySelector('.thumb-down-btn');
-          if (upBtn) upBtn.onclick = () => sendThumbFeedback(messageId, 'thumb_up');
-          if (downBtn) downBtn.onclick = () => openThumbFeedbackModal(messageId);
+          if (upBtn) upBtn.onclick = () => sendThumbFeedback(messageId, 'thumb_up', null, upBtn);
+          if (downBtn) downBtn.onclick = () => openThumbFeedbackModal(messageId, downBtn);
           const tagsEl = footer.querySelector('.ai-message-tags');
           if (tagsEl) {
             const route = STATE.currentRoute || {};
@@ -1979,8 +2004,8 @@
       `;
       const upBtn = div.querySelector('.thumb-up-btn');
       const downBtn = div.querySelector('.thumb-down-btn');
-      if (upBtn) upBtn.onclick = () => sendThumbFeedback(messageId, 'thumb_up');
-      if (downBtn) downBtn.onclick = () => openThumbFeedbackModal(messageId);
+      if (upBtn) upBtn.onclick = () => sendThumbFeedback(messageId, 'thumb_up', null, upBtn);
+      if (downBtn) downBtn.onclick = () => openThumbFeedbackModal(messageId, downBtn);
       container.appendChild(div);
       scrollChatToBottom();
     }
@@ -3768,16 +3793,27 @@
           </div>`;
           const runHtml = runs.length ? `<div class="space-y-3">${runs.map(run => {
             const rules = run.rule_results || [];
+            const evidence = run.evidence || {};
+            const decisions = evidence.decision_summary || {};
+            const evidenceLine = [
+              `Agent ${evidence.current_agent_id || '未记录'}`,
+              `Skill ${(evidence.activated_skills || []).join('、') || '跳过/无'}`,
+              `RAG ${(decisions.rag || {}).status || '未记录'}`,
+              `Tool ${(evidence.tool_names || []).join('、') || '跳过/无'}`,
+              `Citation ${(evidence.citations || []).length}`,
+              `Handoff ${evidence.handoff ? (evidence.handoff_reason || '是') : '否'}`
+            ].join(' · ');
             return `<div class="border border-slate-200 rounded-xl p-3 space-y-2">
               <div class="flex items-center justify-between gap-2"><div class="font-medium text-sm text-slate-900">运行 #${escapeHtml(String(run.id))}</div>${badge(runStateLabel[run.status] || run.status, colorForRun(run.status))}</div>
               <div class="text-xs text-slate-500">${escapeHtml(formatTimeLabel(run.created_at))} · Trace ${escapeHtml(run.trace_id || '未生成')} · ${run.total_tokens ?? '—'} Token · ${money(run.estimated_cost_cny)}</div>
-              ${rules.length ? `<div class="space-y-1">${rules.map(rule => `<div class="text-xs ${rule.status === 'fail' ? 'text-red-700' : rule.status === 'pass' ? 'text-emerald-700' : 'text-slate-500'}">${rule.status === 'pass' ? '✓' : rule.status === 'fail' ? '×' : '•'} ${escapeHtml(rule.label)}：${escapeHtml(Array.isArray(rule.expected) ? rule.expected.join('、') : String(rule.expected ?? '—'))}${rule.note ? `（${escapeHtml(rule.note)}）` : ''}</div>`).join('')}</div>` : ''}
+              <div class="text-[11px] text-slate-600 bg-slate-50 rounded-lg p-2">${escapeHtml(evidenceLine)}</div>
+              ${rules.length ? `<div class="space-y-2">${rules.map(rule => `<div class="text-xs rounded-lg border p-2 ${rule.status === 'fail' ? 'border-red-200 bg-red-50 text-red-800' : rule.status === 'pass' ? 'border-emerald-100 bg-emerald-50 text-emerald-800' : 'border-slate-200 text-slate-600'}"><div class="font-medium">${rule.status === 'pass' ? '✓' : rule.status === 'fail' ? '×' : '•'} ${escapeHtml(rule.label)}</div><div class="mt-1"><span class="text-slate-500">预期：</span>${escapeHtml(typeof rule.expected === 'object' ? JSON.stringify(rule.expected) : String(rule.expected ?? '—'))}</div><div><span class="text-slate-500">实际：</span>${escapeHtml(typeof rule.actual === 'object' ? JSON.stringify(rule.actual) : String(rule.actual ?? '—'))}</div>${rule.note ? `<div class="mt-1">失败说明：${escapeHtml(rule.note)}</div>` : ''}</div>`).join('')}</div>` : ''}
               ${run.operator_judgement ? `<div class="text-xs bg-slate-50 p-2 rounded">人工评审：${escapeHtml(run.operator_judgement)} · ${escapeHtml(run.operator_note || '')}</div>` : ''}
               <div class="flex flex-wrap gap-2 pt-1">
                 ${run.trace_id ? `<button class="evaluation-open-trace text-xs px-2 py-1 bg-slate-100 hover:bg-slate-200 rounded-lg" data-trace-id="${escapeHtml(run.trace_id)}">查看 Trace</button>` : ''}
                 ${run.status === 'needs_manual_review' ? `<button class="evaluation-review-run text-xs px-2 py-1 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 rounded-lg" data-run-id="${run.id}">人工评审</button>` : ''}
-                ${['failed', 'needs_manual_review'].includes(run.status) && !run.badcase_id ? `<button class="evaluation-create-badcase text-xs px-2 py-1 bg-red-50 hover:bg-red-100 text-red-700 rounded-lg" data-run-id="${run.id}">沉淀为 Badcase</button>` : ''}
                 ${run.badcase_id ? `<span class="text-xs text-slate-500">已关联 Badcase #${escapeHtml(String(run.badcase_id))}</span>` : ''}
+                ${run.status === 'failed' && !run.badcase_id ? `<span class="text-xs text-red-600">Badcase 关联异常，请检查接口证据</span>` : ''}
               </div>
             </div>`;
           }).join('')}</div>` : '<p class="text-sm text-slate-400">尚未运行。只有操作员主动点击“运行真实链路”才会产生一次真实模型调用。</p>';
@@ -3785,7 +3821,7 @@
             ${item.status === 'draft' ? `<button id="evaluation-activate" class="px-3 py-2 bg-brand-600 hover:bg-brand-700 text-white rounded-xl text-sm">启用用例</button>` : ''}
             ${item.status === 'active' ? `<button id="evaluation-run" class="px-3 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-sm">运行真实链路</button><button id="evaluation-archive" class="px-3 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl text-sm">归档</button>` : ''}
           </div>`;
-          openDrawer(`Golden Set · ${item.case_key || item.id}`, `<div class="space-y-5"><div><div class="flex items-center gap-2"><h4 class="text-lg font-semibold text-slate-900">${escapeHtml(item.title || '-')}</h4>${badge(caseStateLabel[item.status] || item.status, colorForCase(item.status))}${badge(item.risk_level || 'L2', 'bg-violet-50 text-violet-700')}</div><p class="mt-2 text-sm text-slate-600 whitespace-pre-wrap">${escapeHtml(item.description || item.scenario || '未填写描述')}</p></div><div class="bg-slate-50 border border-slate-200 rounded-xl p-3"><div class="text-xs text-slate-500 mb-1">测试输入（运行时会作为一条新会话消息）</div><div class="text-sm text-slate-800 whitespace-pre-wrap">${escapeHtml(item.user_message || '')}</div></div><div><h5 class="font-medium text-slate-900 mb-2">可验证门槛</h5>${requirements}</div>${item.rubric && Object.keys(item.rubric).length ? `<div class="text-xs text-amber-700 bg-amber-50 border border-amber-100 rounded-xl p-3">此用例含业务 Rubric。硬规则通过后，仍必须由人工写下是否通过的依据；系统不伪造“模型自评”结论。</div>` : ''}${actions}<div><h5 class="font-medium text-slate-900 mb-2">运行记录</h5>${runHtml}</div></div>`);
+          openDrawer(`Golden Set · ${item.case_key || item.id}`, `<div class="space-y-5"><div><div class="flex items-center gap-2"><h4 class="text-lg font-semibold text-slate-900">${escapeHtml(item.title || '-')}</h4>${badge(caseStateLabel[item.status] || item.status, colorForCase(item.status))}${badge(item.risk_level || 'L2', 'bg-violet-50 text-violet-700')}</div><p class="mt-2 text-sm text-slate-600 whitespace-pre-wrap">${escapeHtml(item.description || item.scenario || '未填写描述')}</p></div><div class="bg-slate-50 border border-slate-200 rounded-xl p-3"><div class="text-xs text-slate-500 mb-1">测试输入（运行时会作为一条新会话消息）</div><div class="text-sm text-slate-800 whitespace-pre-wrap">${escapeHtml(item.user_message || '')}</div></div><div><h5 class="font-medium text-slate-900 mb-2">可验证门槛</h5>${requirements}</div>${item.rubric && item.rubric.operator_rubric ? `<div class="text-xs text-amber-700 bg-amber-50 border border-amber-100 rounded-xl p-3">此用例含人工业务 Rubric。确定性规则通过后仍需人工记录判断依据。</div>` : ''}${item.rubric && item.rubric.controlled_failure_canary ? `<div class="text-xs text-red-700 bg-red-50 border border-red-100 rounded-xl p-3">这是验收用受控失败探针，不计入黄金集通过率。</div>` : ''}${actions}<div><h5 class="font-medium text-slate-900 mb-2">运行记录</h5>${runHtml}</div></div>`);
           setTimeout(() => {
             const activate = $('#evaluation-activate');
             if (activate) activate.addEventListener('click', async () => { await apiPut(`/api/evaluations/cases/${item.id}`, { status: 'active' }); await loadAll(); await openCase(item.id); showToast('用例已启用'); });
@@ -3800,11 +3836,6 @@
             });
             $$('.evaluation-open-trace').forEach(button => button.addEventListener('click', () => openTraceDrawer(button.dataset.traceId)));
             $$('.evaluation-review-run').forEach(button => button.addEventListener('click', () => openReviewModal(Number(button.dataset.runId), item.id)));
-            $$('.evaluation-create-badcase').forEach(button => button.addEventListener('click', async () => {
-              if (!window.confirm('将本次失败证据沉淀为一个 Trace 关联 Badcase；系统不会自动判定根因。确认？')) return;
-              try { await apiPost(`/api/evaluations/runs/${button.dataset.runId}/create-badcase`, {}); await openCase(item.id); showToast('已创建 Trace 关联 Badcase'); }
-              catch (err) { showToast('创建 Badcase 失败：' + err.message, 'error'); }
-            }));
           }, 0);
         } catch (err) { showToast('加载评估用例失败：' + err.message, 'error'); }
       }
@@ -3864,7 +3895,7 @@
         const summary = state.summary || {};
         container.innerHTML = `<div class="max-w-6xl mx-auto p-4 md:p-6 space-y-5">
           <div class="flex flex-wrap items-end justify-between gap-3"><div><h2 class="text-xl font-semibold text-slate-900">评估中心（Golden Set）</h2><p class="text-sm text-slate-500 mt-1">把关键业务链路固定成可重复的产品门槛：规则检查 + 人工 Rubric，而不是只看一次回答好不好。</p></div><button id="evaluation-create" class="px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white rounded-xl text-sm">新增 Golden Set</button></div>
-          <div class="grid grid-cols-1 md:grid-cols-3 gap-3"><div class="bg-white border border-slate-200 rounded-2xl p-4"><div class="text-xs text-slate-500">累计运行</div><div class="text-2xl font-semibold text-slate-900 mt-1">${summary.total_runs || 0}</div></div><div class="bg-white border border-slate-200 rounded-2xl p-4"><div class="text-xs text-slate-500">规则通过 / 失败 / 待人工</div><div class="text-lg font-semibold text-slate-900 mt-1">${summary.passed || 0} / ${summary.failed || 0} / ${summary.needs_manual_review || 0}</div></div><div class="bg-white border border-slate-200 rounded-2xl p-4"><div class="text-xs text-slate-500">评估模型直接成本</div><div class="text-2xl font-semibold text-slate-900 mt-1">${money(summary.estimated_cost_cny)}</div><div class="text-[11px] text-slate-400 mt-1">仅按 Trace 价格快照估算，不是供应商账单。</div></div></div>
+          <div class="grid grid-cols-1 md:grid-cols-3 gap-3"><div class="bg-white border border-slate-200 rounded-2xl p-4"><div class="text-xs text-slate-500">黄金集用例 / 累计运行</div><div class="text-2xl font-semibold text-slate-900 mt-1">${summary.golden_cases_total || 0} / ${summary.golden_runs_total || 0}</div><div class="text-[11px] text-slate-400 mt-1">受控失败探针 ${summary.controlled_failure_canary_runs || 0} 次，不计入统计</div></div><div class="bg-white border border-slate-200 rounded-2xl p-4"><div class="text-xs text-slate-500">通过 / 失败 / 待人工 · 通过率</div><div class="text-lg font-semibold text-slate-900 mt-1">${summary.golden_runs_passed || 0} / ${summary.golden_runs_failed || 0} / ${summary.runs_needing_manual_review || 0} · ${summary.golden_pass_rate == null ? '—' : summary.golden_pass_rate + '%'}</div></div><div class="bg-white border border-slate-200 rounded-2xl p-4"><div class="text-xs text-slate-500">黄金集 Trace 模型直接成本</div><div class="text-2xl font-semibold text-slate-900 mt-1">${money(summary.model_direct_cost_cny)}</div><div class="text-[11px] text-slate-400 mt-1">来自各 Trace 已记录模型调用；受控失败探针不计入。</div></div></div>
           <div class="bg-violet-50 border border-violet-200 rounded-2xl p-4 text-sm text-violet-900"><div class="font-medium">质量运营闭环</div><div class="mt-1 text-violet-800">Trace 记录这一次怎样发生；Badcase 保存真实失败与修复；Golden Set 将关键修复固化为可重复门槛。运行评估必须由操作员主动点击，系统不自动消耗模型，也不伪造线上 SLA。</div></div>
           <div class="bg-white rounded-2xl border border-slate-200 overflow-hidden"><div class="overflow-x-auto"><table class="w-full text-sm"><thead><tr class="bg-slate-50 border-b border-slate-200"><th class="px-4 py-3 text-left text-slate-600">用例</th><th class="px-4 py-3 text-left text-slate-600">来源 / 风险</th><th class="px-4 py-3 text-left text-slate-600">预期路径</th><th class="px-4 py-3 text-left text-slate-600">状态</th><th class="px-4 py-3 text-left text-slate-600">最近运行</th><th class="px-4 py-3 text-left text-slate-600"></th></tr></thead><tbody class="divide-y divide-slate-100">${state.cases.length ? state.cases.map(item => `<tr class="hover:bg-slate-50"><td class="px-4 py-3"><div class="font-medium text-slate-900">${escapeHtml(item.title || '-')}</div><div class="font-mono text-[11px] text-slate-500">${escapeHtml(item.case_key || '')}</div></td><td class="px-4 py-3">${badge(item.source || '-', 'bg-slate-100 text-slate-600')} ${badge(item.risk_level || '-', 'bg-violet-50 text-violet-700')}</td><td class="px-4 py-3 text-xs text-slate-600">${escapeHtml([item.expected_agent_id, ...(item.expected_tools || []), ...(item.expected_citation_docs || [])].filter(Boolean).join(' · ') || '人工 Rubric / 无硬门槛')}</td><td class="px-4 py-3">${badge(caseStateLabel[item.status] || item.status, colorForCase(item.status))}</td><td class="px-4 py-3 text-xs text-slate-500">${item.last_run_status ? `${badge(runStateLabel[item.last_run_status] || item.last_run_status, colorForRun(item.last_run_status))}<div class="mt-1">${escapeHtml(formatTimeLabel(item.last_run_at))}</div>` : '未运行'}</td><td class="px-4 py-3"><button class="evaluation-open-case px-3 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg text-xs" data-case-id="${item.id}">查看</button></td></tr>`).join('') : `<tr><td colspan="6" class="px-4 py-10 text-center text-slate-400">还没有 Golden Set。先把一个高风险或高频业务链路写成可重复用例。</td></tr>`}</tbody></table></div></div></div>`;
         $('#evaluation-create').addEventListener('click', openCreateModal);

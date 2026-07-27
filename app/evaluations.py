@@ -20,13 +20,17 @@ from db.property_db import (
     create_evaluation_case,
     create_evaluation_run,
     evaluation_summary,
+    get_badcase_by_evaluation_run,
+    get_chat_trace,
+    get_evidence_ledger,
     get_evaluation_case,
     get_evaluation_run,
     get_model_calls_for_trace,
+    get_session_runtime_side_effects,
     list_evaluation_cases,
     list_evaluation_runs,
+    list_trace_events,
     record_trace_event,
-    update_badcase,
     update_chat_trace,
     update_evaluation_case,
     update_evaluation_run,
@@ -172,6 +176,8 @@ def _rule(
     hard: bool = True,
     note: str = "",
 ) -> Dict[str, Any]:
+    if status == "fail" and not note:
+        note = "实际结果与预期不一致"
     return {
         "key": key,
         "label": label,
@@ -181,6 +187,27 @@ def _rule(
         "hard": hard,
         "note": note,
     }
+
+
+def _nested_value(value: Any, path: str) -> Any:
+    current = value
+    for part in str(path).split("."):
+        if not isinstance(current, dict):
+            return None
+        current = current.get(part)
+    return current
+
+
+def _matches_contract(expected: Any, actual: Any) -> bool:
+    if isinstance(expected, list):
+        actual_items = actual if isinstance(actual, list) else []
+        return all(item in actual_items for item in expected)
+    return actual == expected
+
+
+def _manual_rubric_required(case: Dict[str, Any]) -> bool:
+    rubric = case.get("rubric") or {}
+    return bool(isinstance(rubric, dict) and rubric.get("operator_rubric"))
 
 
 def evaluate_runtime_evidence(case: Dict[str, Any], answer: str, done: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], str]:
@@ -248,10 +275,115 @@ def evaluate_runtime_evidence(case: Dict[str, Any], answer: str, done: Dict[str,
     else:
         checks.append(_rule("handoff", "人机协同边界", "未配置", bool(done.get("handoff")), "not_configured"))
 
+    rubric = case.get("rubric") or {}
+    assertions = rubric.get("deterministic_assertions") or {}
+    decision_summary = done.get("decision_summary") or {}
+    expected_decisions = assertions.get("expected_decision_summary") or {}
+    for component, expected_fields in expected_decisions.items():
+        actual_decision = decision_summary.get(component) or {}
+        for field, expected_value in (expected_fields or {}).items():
+            actual_value = _nested_value(actual_decision, field)
+            passed = _matches_contract(expected_value, actual_value)
+            checks.append(_rule(
+                f"decision_{component}_{field}",
+                f"{component} 决策 · {field}",
+                expected_value,
+                actual_value,
+                "pass" if passed else "fail",
+            ))
+
+    citation_terms = _text_list(assertions.get("citation_required_terms"))
+    if citation_terms:
+        citation_text = "\n".join(
+            " ".join(str(item.get(key) or "") for key in ("doc_title", "content_snapshot", "content"))
+            for item in (done.get("citations") or [])
+            if isinstance(item, dict)
+        ).lower()
+        missing = [term for term in citation_terms if term.lower() not in citation_text]
+        checks.append(_rule(
+            "citation_support", "引用内容支持关键事实", citation_terms,
+            citation_text[:1200], "pass" if not missing else "fail",
+            note=("引用中缺少：" + "、".join(missing)) if missing else "",
+        ))
+
+    if assertions.get("require_knowledge_insufficient"):
+        passed = "当前知识依据不足" in (answer or "")
+        checks.append(_rule(
+            "knowledge_insufficient", "无依据时安全拒答", "当前知识依据不足",
+            answer[:800], "pass" if passed else "fail",
+        ))
+
+    side_effects = done.get("side_effects") or {}
+    if assertions.get("forbid_business_side_effects"):
+        actual_writes = int(side_effects.get("business_writes") or 0)
+        checks.append(_rule(
+            "business_side_effects", "无 ActionGateway/工单业务写入", 0,
+            {key: side_effects.get(key, 0) for key in (
+                "business_writes", "work_orders", "work_order_drafts",
+                "action_proposals", "action_receipts",
+            )},
+            "pass" if actual_writes == 0 else "fail",
+        ))
+
+    if assertions.get("require_mcp_business_success"):
+        calls = done.get("mcp_calls") or []
+        valid_calls = [call for call in calls if isinstance(call, dict)]
+        successful = bool(valid_calls) and len(valid_calls) == len(calls) and all(
+            str(call.get("invocation_status") or call.get("status") or "").lower() == "success"
+            and str(call.get("business_status") or "success").lower() == "success"
+            for call in valid_calls
+        )
+        checks.append(_rule(
+            "mcp_business_success", "MCP 调用与业务结果成功", True, calls,
+            "pass" if successful else "fail",
+        ))
+
+    model_calls = done.get("model_calls") or []
+    if assertions.get("forbid_normal_business_answer"):
+        actual = {
+            "handoff": bool(done.get("handoff")),
+            "model_call_count": len(model_calls),
+            "agent_decision": (decision_summary.get("agent") or {}).get("status"),
+        }
+        passed = (
+            actual["handoff"]
+            and actual["model_call_count"] == 0
+            and actual["agent_decision"] == "skipped"
+        )
+        checks.append(_rule(
+            "handoff_preempts_answer", "人工接管优先且未生成普通业务回答",
+            {"handoff": True, "model_call_count": 0, "agent_decision": "skipped"},
+            actual, "pass" if passed else "fail",
+        ))
+
+    if assertions.get("expected_model_call_count") is not None:
+        expected_count = int(assertions["expected_model_call_count"])
+        checks.append(_rule(
+            "model_call_count", "模型调用次数", expected_count, len(model_calls),
+            "pass" if len(model_calls) == expected_count else "fail",
+        ))
+
+    forced_failure = assertions.get("controlled_failure")
+    if forced_failure:
+        checks.append(_rule(
+            "controlled_failure", "受控故障注入（不计入黄金集）",
+            forced_failure.get("expected", "故意设置为不满足"),
+            forced_failure.get("actual", "安全只读链路"),
+            "fail",
+            note="此失败由验收用例显式注入，不代表真实能力故障。",
+        ))
+
     hard_fail = any(item["hard"] and item["status"] == "fail" for item in checks)
-    needs_manual = bool(case.get("rubric"))
+    needs_manual = _manual_rubric_required(case)
     status = "failed" if hard_fail else "needs_manual_review" if needs_manual else "passed"
     return checks, status
+
+
+class RuntimeExecutionError(RuntimeError):
+    def __init__(self, message: str, answer: str, done: Dict[str, Any]):
+        super().__init__(message)
+        self.answer = answer
+        self.done = done
 
 
 async def _run_real_chat(message: str, session_id: str) -> Tuple[str, Dict[str, Any]]:
@@ -260,8 +392,13 @@ async def _run_real_chat(message: str, session_id: str) -> Tuple[str, Dict[str, 
 
     answer = ""
     done: Dict[str, Any] = {}
+    runtime_error = ""
     async for chunk in _stream_agent_response(message, session_id, "evaluation"):
+        event_name = ""
         for line in chunk.splitlines():
+            if line.startswith("event:"):
+                event_name = line[6:].strip()
+                continue
             if not line.startswith("data:"):
                 continue
             raw = line[5:].strip()
@@ -273,14 +410,22 @@ async def _run_real_chat(message: str, session_id: str) -> Tuple[str, Dict[str, 
                 continue
             if not isinstance(payload, dict):
                 continue
-            if payload.get("content"):
+            if event_name == "delta" and payload.get("content"):
                 answer += str(payload["content"])
-            if payload.get("status") == "complete" or payload.get("message_id"):
+            elif event_name in {"final", "done"} and payload.get("content"):
+                answer = str(payload["content"])
+            if event_name == "done" or payload.get("message_id"):
                 done = payload
             if payload.get("error"):
-                raise RuntimeError(str(payload["error"]))
+                runtime_error = str(payload["error"])
     if not done:
-        done = {"status": "complete", "answer": answer}
+        done = {"status": "failed" if runtime_error else "complete", "answer": answer}
+    if runtime_error or done.get("status") == "failed":
+        raise RuntimeExecutionError(
+            runtime_error or str(done.get("error_code") or "runtime failed"),
+            answer,
+            done,
+        )
     return answer, done
 
 
@@ -292,6 +437,123 @@ def _direct_model_cost(trace_id: str) -> Optional[float]:
     if any(value is None for value in costs):
         return None
     return round(sum(float(value or 0.0) for value in costs), 8)
+
+
+def _enrich_runtime_evidence(
+    done: Dict[str, Any], trace_id: Optional[str], session_id: str
+) -> Dict[str, Any]:
+    enriched = dict(done or {})
+    trace = get_chat_trace(trace_id) if trace_id else None
+    model_calls = get_model_calls_for_trace(trace_id) if trace_id else []
+    ledger_row = get_evidence_ledger(trace_id) if trace_id else None
+    trace_events = list_trace_events(trace_id) if trace_id else []
+    if not enriched.get("decision_summary"):
+        for event in reversed(trace_events):
+            decision = (event.get("metadata") or {}).get("decision_summary")
+            if decision:
+                enriched["decision_summary"] = decision
+                break
+    if trace:
+        enriched["current_agent_id"] = enriched.get("current_agent_id") or trace.get("agent_id")
+        enriched["current_agent"] = enriched.get("current_agent") or trace.get("agent_name")
+        enriched["route_intent"] = enriched.get("route_intent") or trace.get("intent")
+    enriched["model_calls"] = model_calls
+    enriched["evidence_ledger"] = (ledger_row or {}).get("ledger") or {}
+    enriched["trace_events"] = trace_events
+    enriched["side_effects"] = get_session_runtime_side_effects(session_id)
+    return enriched
+
+
+def _evaluation_evidence(done: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "route_intent": done.get("route_intent"),
+        "route_reason": done.get("route_reason"),
+        "current_agent": done.get("current_agent"),
+        "current_agent_id": done.get("current_agent_id"),
+        "activated_skills": _normalize_skill_names(done),
+        "tool_names": _normalize_tool_names(done),
+        "mcp_calls": done.get("mcp_calls") or [],
+        "citations": done.get("citations") or [],
+        "handoff": bool(done.get("handoff")),
+        "handoff_state": done.get("handoff_state"),
+        "handoff_reason": done.get("handoff_reason"),
+        "decision_summary": done.get("decision_summary") or {},
+        "model_calls": done.get("model_calls") or [],
+        "side_effects": done.get("side_effects") or {},
+        "evidence_ledger": done.get("evidence_ledger") or {},
+        "trace_events": done.get("trace_events") or [],
+        "token_count": done.get("round_token_count") or done.get("token_count"),
+        "usage_source": done.get("usage_source"),
+    }
+
+
+def _ensure_badcase_for_run(run_id: int) -> Dict[str, Any]:
+    """Idempotently persist one source=evaluation Badcase for a failed run."""
+    run = get_evaluation_run(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="evaluation run not found")
+    if run.get("badcase_id"):
+        existing = get_badcase_by_evaluation_run(run_id)
+        return existing or {"id": run["badcase_id"]}
+    existing = get_badcase_by_evaluation_run(run_id)
+    if existing:
+        update_evaluation_run(run_id, badcase_id=existing["id"])
+        return existing
+    if run.get("status") not in {"failed", "error"}:
+        raise HTTPException(status_code=409, detail="仅失败运行可自动沉淀为 Badcase")
+    case = get_evaluation_case(int(run["evaluation_case_id"]))
+    if not case:
+        raise HTTPException(status_code=404, detail="evaluation case not found")
+    failed_rules = [
+        item for item in (run.get("rule_results") or [])
+        if item.get("status") == "fail"
+    ]
+    evidence = run.get("evidence") or {}
+    expected = {
+        "agent": case.get("expected_agent_id"),
+        "skills": case.get("expected_skills"),
+        "tools": case.get("expected_tools"),
+        "citation_docs": case.get("expected_citation_docs"),
+        "required_terms": case.get("required_terms"),
+        "forbidden_terms": case.get("forbidden_terms"),
+        "handoff": case.get("expected_handoff"),
+        "deterministic_assertions": (case.get("rubric") or {}).get("deterministic_assertions") or {},
+    }
+    controlled = bool((case.get("rubric") or {}).get("controlled_failure_canary"))
+    marker = "【受控故障注入】" if controlled else ""
+    context = {
+        "controlled_failure_canary": controlled,
+        "evaluation_case": case,
+        "evaluation_run": run,
+        "failed_assertions": failed_rules,
+        "answer": run.get("answer"),
+        "runtime_evidence": evidence,
+    }
+    badcase = create_badcase(
+        title=f"{marker}评估失败：{case['case_key']} · {case['title']}",
+        description=(
+            "验收用受控失败，验证评估到 Badcase 的沉淀链路。"
+            if controlled else
+            "Golden Set 确定性断言未通过，需按 Trace 归因。"
+        ),
+        category="pending",
+        status="pending",
+        source="evaluation",
+        original_query=case.get("user_message"),
+        ai_response=run.get("answer"),
+        context_json=json.dumps(context, ensure_ascii=False, default=str),
+        trace_id=run.get("trace_id"),
+        priority="high" if case.get("risk_level") in {"L3", "L4"} else "medium",
+        symptom="受控断言失败" if controlled else "评估断言失败",
+        expected_behavior=json.dumps(expected, ensure_ascii=False, default=str),
+        actual_behavior=json.dumps(evidence, ensure_ascii=False, default=str),
+        root_cause_domain="controlled_test" if controlled else "unknown",
+        impact_scope=f"评估用例 {case['case_key']} · 风险 {case.get('risk_level')}",
+        linked_evaluation_case_id=case["id"],
+        linked_evaluation_run_id=run_id,
+    )
+    update_evaluation_run(run_id, badcase_id=badcase["id"])
+    return badcase
 
 
 @router.get("/overview")
@@ -362,30 +624,67 @@ async def run_case(case_id: int):
     session_id = f"evaluation-{case['case_key'][:32]}-{uuid.uuid4().hex[:8]}"
     try:
         answer, done = await _run_real_chat(case["user_message"], session_id)
-    except Exception as exc:
+    except RuntimeExecutionError as exc:
+        done = _enrich_runtime_evidence(
+            exc.done, exc.done.get("trace_id"), session_id
+        )
+        checks = [_rule(
+            "runtime_completion", "Provider/运行时成功完成", "complete",
+            done.get("status") or "failed", "fail", note=str(exc)[:500],
+        )]
+        evidence = _evaluation_evidence(done)
         run = create_evaluation_run(
             evaluation_case_id=case_id,
-            status="error",
+            status="failed",
+            trace_id=done.get("trace_id"),
             session_id=session_id,
-            evidence={"error": str(exc)[:500]},
+            answer=exc.answer,
+            evidence={**evidence, "runtime_error": str(exc)[:500]},
+            rule_results=checks,
+            total_tokens=evidence.get("token_count"),
+            estimated_cost_cny=(
+                _direct_model_cost(done.get("trace_id"))
+                if done.get("trace_id") else None
+            ),
         )
-        return {"case": case, "run": run, "message": "运行失败，已保留错误证据；未伪造评估结论。"}
+        badcase = _ensure_badcase_for_run(run["id"])
+        return {
+            "case": case,
+            "run": get_evaluation_run(run["id"]),
+            "rule_results": checks,
+            "badcase": badcase,
+            "message": "运行失败；已保存真实失败并自动关联 Evaluation Badcase，未伪造成 PASS。",
+        }
+    except Exception as exc:
+        checks = [_rule(
+            "runtime_completion", "Provider/运行时成功完成", "complete",
+            "failed", "fail", note=str(exc)[:500],
+        )]
+        run = create_evaluation_run(
+            evaluation_case_id=case_id,
+            status="failed",
+            session_id=session_id,
+            evidence={"runtime_error": str(exc)[:500]},
+            rule_results=checks,
+        )
+        badcase = _ensure_badcase_for_run(run["id"])
+        return {
+            "case": case,
+            "run": get_evaluation_run(run["id"]),
+            "rule_results": checks,
+            "badcase": badcase,
+            "message": "运行失败；已保留可见错误并自动关联 Evaluation Badcase。",
+        }
 
     trace_id = done.get("trace_id")
+    done = _enrich_runtime_evidence(done, trace_id, session_id)
     checks, run_status = evaluate_runtime_evidence(case, answer, done)
-    evidence = {
-        "route_intent": done.get("route_intent"),
-        "route_reason": done.get("route_reason"),
-        "current_agent": done.get("current_agent"),
-        "current_agent_id": done.get("current_agent_id"),
-        "activated_skills": _normalize_skill_names(done),
-        "tool_names": _normalize_tool_names(done),
-        "mcp_calls": done.get("mcp_calls") or [],
-        "citations": done.get("citations") or [],
-        "handoff": bool(done.get("handoff")),
-        "token_count": done.get("round_token_count") or done.get("token_count"),
-        "usage_source": done.get("usage_source"),
-    }
+    evidence = _evaluation_evidence(done)
+    model_tokens = [item.get("total_tokens") for item in (done.get("model_calls") or [])]
+    total_tokens = (
+        sum(int(value or 0) for value in model_tokens)
+        if model_tokens else (evidence.get("token_count") or 0)
+    )
     cost = _direct_model_cost(trace_id) if trace_id else None
     run = create_evaluation_run(
         evaluation_case_id=case_id,
@@ -395,7 +694,7 @@ async def run_case(case_id: int):
         answer=answer,
         evidence=evidence,
         rule_results=checks,
-        total_tokens=evidence.get("token_count"),
+        total_tokens=total_tokens,
         estimated_cost_cny=cost,
     )
     if trace_id:
@@ -412,10 +711,14 @@ async def run_case(case_id: int):
             output_summary=f"{sum(1 for item in checks if item['status'] == 'pass')} pass / {sum(1 for item in checks if item['status'] == 'fail')} fail",
             metadata={"evaluation_case_id": case_id, "evaluation_run_id": run.get("id"), "risk_level": case.get("risk_level")},
         )
+    badcase = _ensure_badcase_for_run(run["id"]) if run_status == "failed" else None
+    if badcase:
+        run = get_evaluation_run(run["id"]) or run
     return {
         "case": case,
         "run": run,
         "rule_results": checks,
+        "badcase": badcase,
         "budget": budget,
         "message": "硬规则结果已生成；涉及业务可用性、语气和复杂 SOP 的 Rubric 仍需人工审核。",
     }
@@ -434,52 +737,17 @@ async def review_run(run_id: int, request: EvaluationReviewRequest):
         operator_judgement="passed" if request.passed else "failed",
         operator_note=request.note.strip(),
     )
+    if not request.passed:
+        _ensure_badcase_for_run(run_id)
+        updated = get_evaluation_run(run_id)
     return {"run": updated}
 
 
 @router.post("/runs/{run_id}/create-badcase")
 async def create_badcase_from_run(run_id: int):
-    """Turn a failed evaluation into a trace-linked Badcase on operator click."""
-    run = get_evaluation_run(run_id)
-    if not run:
-        raise HTTPException(status_code=404, detail="evaluation run not found")
-    if run.get("badcase_id"):
-        return {"badcase_id": run["badcase_id"], "message": "该评估运行已关联 Badcase"}
-    if run.get("status") not in {"failed", "needs_manual_review"}:
-        raise HTTPException(status_code=409, detail="仅失败或待人工评审的运行可沉淀为 Badcase")
-    case = get_evaluation_case(int(run["evaluation_case_id"]))
-    if not case:
-        raise HTTPException(status_code=404, detail="evaluation case not found")
-    failed_rules = [item for item in (run.get("rule_results") or []) if item.get("status") == "fail"]
-    evidence = run.get("evidence") or {}
-    expected = {
-        "agent": case.get("expected_agent_id"),
-        "skills": case.get("expected_skills"),
-        "tools": case.get("expected_tools"),
-        "citation_docs": case.get("expected_citation_docs"),
-        "required_terms": case.get("required_terms"),
-        "forbidden_terms": case.get("forbidden_terms"),
-        "handoff": case.get("expected_handoff"),
+    """Backward-compatible idempotent access to the automatic S6 link."""
+    badcase = _ensure_badcase_for_run(run_id)
+    return {
+        "badcase": badcase,
+        "message": "该失败评估已关联唯一的 Trace 证据 Badcase。",
     }
-    badcase = create_badcase(
-        title=f"评估失败：{case['case_key']} · {case['title']}",
-        description="Golden Set 规则未通过，需按 Trace 归因并修复。",
-        category="pending",
-        status="pending",
-        source="evaluation",
-        original_query=case.get("user_message"),
-        ai_response=run.get("answer"),
-        context_json=json.dumps({"evaluation_case": case, "evaluation_run": run, "failed_rules": failed_rules}, ensure_ascii=False, default=str),
-        trace_id=run.get("trace_id"),
-        priority="high" if case.get("risk_level") in {"L3", "L4"} else "medium",
-        symptom="评估规则失败",
-        expected_behavior=json.dumps(expected, ensure_ascii=False),
-        actual_behavior=json.dumps(evidence, ensure_ascii=False, default=str),
-        root_cause_domain="unknown",
-        impact_scope=f"评估用例 {case['case_key']} · 风险 {case.get('risk_level')}",
-        linked_evaluation_case_id=case["id"],
-        linked_evaluation_run_id=run_id,
-    )
-    update_evaluation_run(run_id, badcase_id=badcase["id"])
-    return {"badcase": badcase, "message": "已将失败评估沉淀为 Trace 关联 Badcase；尚未自动判定根因。"}
-
