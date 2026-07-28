@@ -744,12 +744,12 @@
         const isControlledWorkOrderTrace = Boolean(controlledWriteCalls.length || controlledProposal);
         const stageName = { router: 'Router', vertical_agent: '垂直 Agent', badcase_classify: 'Badcase 分类', darwin: 'Darwin / AI 专家', retest: 'Badcase 复测' };
         const sourceName = {
-          provider_actual: 'provider_actual（Provider 真实返回）',
-          estimated: 'estimated（明确估算）',
+          provider_actual: 'Provider真实',
+          estimated: '本地估算（非供应商账单）',
           provider_reported_complete: 'Provider 返回完整拆分',
           provider_reported_total_only: 'Provider 仅返回总量',
           local_estimate: '本地估算（不计费）',
-          unavailable: '本次不可得',
+          unavailable: '金额不可计算',
           not_applicable: '不适用',
           provider_reported: '模型服务商实际返回',
           estimated_tokenization: '本地估算'
@@ -776,15 +776,15 @@
           const responseModel = call.provider_response_model || '未返回/未采集';
           const thinking = call.thinking_enabled === true ? '开启' : (call.thinking_enabled === false ? '关闭' : '未采集');
           return `<div class="border border-slate-200 rounded-xl p-3 text-sm space-y-1"><div class="font-medium text-slate-900">${escapeHtml(stageName[call.stage] || call.stage || '模型调用')}</div><div class="text-xs text-slate-600">requested_model：${escapeHtml(call.requested_model || call.model_id || '-')}</div><div class="text-xs text-slate-600">provider_response_model：${escapeHtml(responseModel)} · Thinking：${escapeHtml(thinking)}</div><div class="text-xs text-slate-500">Usage 来源：${escapeHtml(sourceName[call.usage_source] || call.usage_source || '未知')}${routeModeLabel ? ` · 路由方式：${escapeHtml(routeModeLabel)}` : ''}</div><div class="text-xs text-slate-600">${escapeHtml(usageLine)}</div><div class="text-xs text-slate-700">${escapeHtml(costLine)}</div><div class="text-xs text-slate-500">${escapeHtml(priceText(call.price_snapshot || {}))}</div><div class="text-[10px] text-slate-500 font-mono">${escapeHtml(call.cost_formula || '成本公式不可得')}</div></div>`;
-        }).join('') : (isControlledWorkOrderTrace
-          ? '<p class="text-sm text-slate-500">本轮为确定性规则工作流，没有调用模型，因此模型Token与成本不适用。</p>'
-          : '<p class="text-sm text-slate-400">本轮没有模型调用。</p>');
+        }).join('') : '<p class="text-sm text-slate-500">本轮未调用模型，因此模型Token与费用不适用。</p>';
         const traceCostSummary = data.trace_cost_summary || {};
         const sessionCostSummary = data.session_cost_summary || {};
         const modelBreakdown = (sessionCostSummary.by_model || []).map(item =>
           `${item.model_id}: ${item.calls} 次 / ${money(item.cost_cny)}${item.unknown_cost_calls ? ` / ${item.unknown_cost_calls} 次金额不可得` : ''}`
         ).join('；') || '无模型调用';
-        const costSummaryHtml = `<div class="mb-2 rounded-xl border border-blue-200 bg-blue-50 p-3 text-xs text-blue-900"><div>本 Trace 合计：${money(traceCostSummary.known_cost_cny)}${traceCostSummary.unknown_cost_calls ? `（另有 ${traceCostSummary.unknown_cost_calls} 次不可得）` : ''}</div><div class="mt-1">本会话合计：${money(sessionCostSummary.known_cost_cny)}${sessionCostSummary.unknown_cost_calls ? `（另有 ${sessionCostSummary.unknown_cost_calls} 次不可得）` : ''}</div><div class="mt-1">Flash / Pro 分开统计：${escapeHtml(modelBreakdown)}</div></div>`;
+        const costSummaryHtml = modelCalls.length === 0
+          ? '<div class="mb-2 rounded-xl border border-slate-200 bg-slate-50 p-3 text-xs text-slate-700">本轮未调用模型，因此模型Token与费用不适用。</div>'
+          : `<div class="mb-2 rounded-xl border border-blue-200 bg-blue-50 p-3 text-xs text-blue-900"><div>本 Trace 合计：${money(traceCostSummary.known_cost_cny)}${traceCostSummary.unknown_cost_calls ? `（另有 ${traceCostSummary.unknown_cost_calls} 次金额不可计算）` : ''}</div><div class="mt-1">本会话合计：${money(sessionCostSummary.known_cost_cny)}${sessionCostSummary.unknown_cost_calls ? `（另有 ${sessionCostSummary.unknown_cost_calls} 次金额不可计算）` : ''}</div><div class="mt-1">Flash / Pro 分开统计：${escapeHtml(modelBreakdown)}</div></div>`;
         const workflowHtml = workflowCalls.length ? workflowCalls.map(call => {
           const name = toolCallName(call);
           const label = name === 'action_gateway' ? '受控写入网关' : '维修工单确认工作流';
@@ -3772,12 +3772,10 @@
         return Number(v).toLocaleString();
       }
       function sourceBadge(src) {
-        if (src === 'provider_actual') return '<span class="px-1.5 py-0.5 bg-green-50 text-green-600 rounded text-[10px]">provider_actual</span>';
-        if (src === 'estimated') return '<span class="px-1.5 py-0.5 bg-amber-50 text-amber-600 rounded text-[10px]">estimated</span>';
-        if (src === 'unavailable') return '<span class="px-1.5 py-0.5 bg-slate-100 text-slate-500 rounded text-[10px]">unavailable</span>';
-        if (src === 'provider_reported') return '<span class="px-1.5 py-0.5 bg-green-50 text-green-600 rounded text-[10px]">Provider账单</span>';
-        if (src === 'estimated_tokenization') return '<span class="px-1.5 py-0.5 bg-amber-50 text-amber-600 rounded text-[10px]">本地估算</span>';
-        return '<span class="px-1.5 py-0.5 bg-slate-100 text-slate-500 rounded text-[10px]">未知</span>';
+        if (src === 'provider_actual') return '<span class="px-1.5 py-0.5 bg-green-50 text-green-700 rounded text-[10px]">Provider真实</span>';
+        if (src === 'estimated') return '<span class="px-1.5 py-0.5 bg-amber-50 text-amber-700 rounded text-[10px]">本地估算（非账单）</span>';
+        if (src === 'unavailable' || src === 'provider_reported_total_only') return '<span class="px-1.5 py-0.5 bg-slate-100 text-slate-600 rounded text-[10px]">金额不可计算</span>';
+        return '<span class="px-1.5 py-0.5 bg-slate-100 text-slate-500 rounded text-[10px]">历史口径</span>';
       }
       function statusBadgeSmall(s) {
         if (s === 'success') return '<span class="text-green-600">成功</span>';
@@ -3793,89 +3791,84 @@
         if (state.filters.stage) params.append('stage', state.filters.stage);
         if (state.filters.search) params.append('trace_id', state.filters.search);
         const qs = params.toString() ? '?' + params.toString() : '';
-        const [overview, traces, trends, distribution, prices, budget] = await Promise.all([
+        const [overview, prices, budget] = await Promise.all([
           apiGet(`/api/observability/overview${qs}`).catch(() => ({})),
-          apiGet(`/api/observability/traces${qs}`).catch(() => ({ traces: [] })),
-          apiGet(`/api/observability/trends${qs}`).catch(() => ({ items: [] })),
-          apiGet(`/api/observability/distribution?group_by=${state.filters.groupBy}${state.filters.start ? '&start=' + state.filters.start : ''}${state.filters.end ? '&end=' + state.filters.end : ''}${state.filters.model ? '&model_id=' + state.filters.model : ''}`).catch(() => ({ items: [] })),
           apiGet('/api/observability/prices').catch(() => ({ prices: [] })),
           apiGet('/api/observability/budget').catch(() => ({ budget: {} })),
         ]);
+        const scope = overview.scope || {};
+        const traceParams = new URLSearchParams(params);
+        if (!state.filters.start && scope.start) traceParams.set('start', scope.start);
+        if (!state.filters.end && scope.end) traceParams.set('end', scope.end);
+        const traceQs = traceParams.toString() ? '?' + traceParams.toString() : '';
+        const traces = await apiGet(`/api/observability/traces${traceQs}`).catch(() => ({ traces: [] }));
         state.overview = overview;
         state.traces = traces.traces || [];
-        state.traceRange = { start: traces.start || state.filters.start, end: traces.end || state.filters.end };
-        state.trends = trends.items || [];
-        state.distribution = distribution.items || [];
+        state.traceRange = { start: traces.start || scope.start || state.filters.start, end: traces.end || scope.end || state.filters.end };
+        state.trends = [];
+        state.distribution = [];
         state.prices = prices.prices || [];
         state.budget = budget.budget || {};
       }
 
       function renderOverview() {
         const o = state.overview || {};
+        const scope = o.scope || {};
+        const usage = o.known_usage || {};
         const alerts = (o.alerts || []).map(a => `<span class="px-2 py-1 rounded-lg text-xs ${a.type === 'daily' ? 'bg-red-100 text-red-700' : 'bg-amber-100 text-amber-700'}">${a.type === 'daily' ? '每日' : '单次'}预警：阈值 ¥${a.threshold}，实际 ¥${a.actual}</span>`).join('');
-        const priceMissingWarning = o.price_missing ? `<div class="mt-3 p-3 bg-amber-50 border border-amber-200 rounded-xl text-xs text-amber-700 flex items-center gap-2"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path></svg>部分模型调用缺少价格配置，成本显示为“未配置价格”。请先到下方“模型价格表”补全价格。</div>` : '';
-
-        function periodCard(label, p) {
-          const usage = p && typeof p.budget_usage_percent === 'number' ? `${p.budget_usage_percent.toFixed(2)}%` : '-';
-          const usageBar = p && typeof p.budget_usage_percent === 'number' ? `
-            <div class="w-full h-1.5 bg-slate-100 rounded-full mt-2 overflow-hidden">
-              <div class="h-full ${p.budget_usage_percent >= 80 ? 'bg-red-500' : 'bg-brand-500'}" style="width: ${Math.min(100, p.budget_usage_percent)}%"></div>
-            </div>
-          ` : '';
-          return `
-            <div class="bg-white rounded-2xl shadow-soft border border-slate-200 p-4">
-              <div class="text-[11px] text-slate-500 mb-1">${label}</div>
-              <div class="text-lg font-semibold text-slate-900">${fmtTokens(p ? p.total_tokens : null)}</div>
-              <div class="text-[11px] text-slate-500 mt-1">估算成本 ${fmtCost(p ? p.estimated_cost_cny : null)}</div>
-              <div class="mt-2 text-[10px] text-slate-400 flex flex-col gap-0.5">
-                <span>Provider 账单 Token：${fmtTokens(p ? p.provider_reported_tokens : null)}</span>
-                <span>本地估算 Token：${fmtTokens(p ? p.local_estimated_tokens : null)}</span>
-                <span>预算使用：${usage}</span>
-              </div>
-              ${usageBar}
-            </div>
-          `;
-        }
+        const history = o.history_total || {};
+        const estimatedDisplay = Number(o.estimated_calls || 0) === 0
+          ? '暂无'
+          : Number(o.estimated_amount_unavailable_calls || 0) === Number(o.estimated_calls || 0)
+            ? '不可计算'
+            : fmtCost(o.estimated_cost_cny);
 
         return `
-          <div class="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-7 gap-3">
+          <div class="bg-white rounded-2xl shadow-soft border border-slate-200 p-4">
+            <div class="flex flex-wrap items-center justify-between gap-2">
+              <div><div class="text-sm font-semibold text-slate-900">${escapeHtml(scope.label || '统计范围')}</div><div class="text-xs text-slate-500 mt-1">${escapeHtml(scope.start || '-')} 至 ${escapeHtml(scope.end || '-')} · ${escapeHtml(scope.timezone || 'Asia/Shanghai')}</div></div>
+              <div class="text-xs text-slate-500">只统计真实 model_call；无模型规则流程不进入成本桶</div>
+            </div>
+          </div>
+          <div class="grid grid-cols-2 md:grid-cols-4 gap-3">
             <div class="bg-white rounded-2xl shadow-soft border border-slate-200 p-4">
-              <div class="text-[11px] text-slate-500">今日调用次数</div>
+              <div class="text-[11px] text-slate-500">模型调用次数</div>
               <div class="text-xl font-semibold text-slate-900 mt-1">${Number(o.calls || 0).toLocaleString()}</div>
             </div>
             <div class="bg-white rounded-2xl shadow-soft border border-slate-200 p-4">
-              <div class="text-[11px] text-slate-500">今日总 Token</div>
-              <div class="text-xl font-semibold text-slate-900 mt-1">${fmtTokens(o.total_tokens)}</div>
+              <div class="text-[11px] text-slate-500">Provider真实成本</div>
+              <div class="text-xl font-semibold text-emerald-700 mt-1">${Number(o.provider_actual_calls || 0) ? fmtCost(o.provider_actual_cost_cny) : '暂无'}</div>
+              <div class="text-[10px] text-slate-400 mt-1">仅 provider_actual · ${Number(o.provider_actual_calls || 0)}次</div>
             </div>
             <div class="bg-white rounded-2xl shadow-soft border border-slate-200 p-4">
-              <div class="text-[11px] text-slate-500">今日估算成本</div>
-              <div class="text-xl font-semibold text-slate-900 mt-1">${fmtCost(o.total_cost)}</div>
+              <div class="text-[11px] text-slate-500">本地估算成本</div>
+              <div class="text-xl font-semibold text-amber-700 mt-1">${estimatedDisplay}</div>
+              <div class="text-[10px] text-slate-400 mt-1">非供应商账单 · ${Number(o.estimated_calls || 0)}次</div>
             </div>
             <div class="bg-white rounded-2xl shadow-soft border border-slate-200 p-4">
-              <div class="text-[11px] text-slate-500">平均单轮 Token</div>
-              <div class="text-xl font-semibold text-slate-900 mt-1">${fmtTokens(o.avg_tokens)}</div>
-            </div>
-            <div class="bg-white rounded-2xl shadow-soft border border-slate-200 p-4">
-              <div class="text-[11px] text-slate-500">平均单轮估算成本</div>
-              <div class="text-xl font-semibold text-slate-900 mt-1">${fmtCost(o.avg_cost)}</div>
-            </div>
-            <div class="bg-white rounded-2xl shadow-soft border border-slate-200 p-4">
-              <div class="text-[11px] text-slate-500">成本未知调用数</div>
-              <div class="text-xl font-semibold text-slate-900 mt-1">${Number(o.unknown_cost_calls || 0).toLocaleString()}</div>
-            </div>
-            <div class="bg-white rounded-2xl shadow-soft border border-slate-200 p-4">
-              <div class="text-[11px] text-slate-500">失败调用数</div>
-              <div class="text-xl font-semibold text-slate-900 mt-1">${Number(o.failed_calls || 0).toLocaleString()}</div>
+              <div class="text-[11px] text-slate-500">金额不可计算</div>
+              <div class="text-xl font-semibold text-slate-700 mt-1">${Number(o.unavailable_calls || 0).toLocaleString()}次</div>
+              <div class="text-[10px] text-slate-400 mt-1">Usage/价格证据不足，不按0元处理</div>
             </div>
           </div>
           <div class="grid grid-cols-1 md:grid-cols-3 gap-3 mt-3">
-            ${periodCard('今日', o.today)}
-            ${periodCard('近7天', o.last_7_days)}
-            ${periodCard('本月', o.this_month)}
+            <div class="bg-white rounded-2xl shadow-soft border border-slate-200 p-4"><div class="text-[11px] text-slate-500">输入命中缓存</div><div class="text-lg font-semibold">${fmtTokens(usage.input_cache_hit_tokens || 0)}</div></div>
+            <div class="bg-white rounded-2xl shadow-soft border border-slate-200 p-4"><div class="text-[11px] text-slate-500">输入未命中缓存</div><div class="text-lg font-semibold">${fmtTokens(usage.input_cache_miss_tokens || 0)}</div></div>
+            <div class="bg-white rounded-2xl shadow-soft border border-slate-200 p-4"><div class="text-[11px] text-slate-500">输出Token</div><div class="text-lg font-semibold">${fmtTokens(usage.output_tokens || 0)}</div></div>
           </div>
           ${alerts ? `<div class="flex flex-wrap gap-2 mt-3">${alerts}</div>` : ''}
-          ${priceMissingWarning}
           <p class="text-[11px] text-slate-400 mt-2">${escapeHtml(o.cost_note || '按配置价格估算成本，非供应商实际结算金额')} · 货币 ${escapeHtml(o.currency || 'CNY')}</p>
+          <details class="mt-2 text-xs text-slate-500"><summary class="cursor-pointer">历史累计（不与今日混淆）</summary><div class="mt-2 rounded-lg bg-slate-50 p-3">模型调用 ${Number(history.calls || 0).toLocaleString()} 次 · Provider真实 ${fmtCost(history.provider_actual_cost_cny || 0)} · 本地估算 ${Number(history.estimated_calls || 0) ? fmtCost(history.estimated_cost_cny || 0) : '暂无'} · 金额不可计算 ${Number(history.unavailable_calls || 0).toLocaleString()} 次</div></details>
+        `;
+      }
+
+      function renderHighCostTraces() {
+        const items = (state.overview && state.overview.top_provider_actual_traces) || [];
+        return `
+          <div class="bg-white rounded-2xl shadow-soft border border-slate-200 p-4">
+            <div class="flex items-center justify-between mb-3"><h3 class="font-semibold text-slate-900">Provider真实成本最高的Trace</h3><span class="text-xs text-slate-400">当前统计范围 · 最多5条</span></div>
+            ${items.length ? `<div class="space-y-2">${items.map(item => `<button type="button" data-trace="${escapeHtml(item.trace_id)}" class="cg-high-cost w-full text-left rounded-xl border border-slate-200 p-3 hover:border-brand-300 hover:bg-brand-50"><div class="flex flex-wrap justify-between gap-2"><span class="font-mono text-xs text-slate-600">${escapeHtml(item.trace_id)}</span><span class="text-sm font-semibold text-emerald-700">${fmtCost(item.provider_actual_cost_cny)}</span></div><div class="mt-1 text-xs text-slate-600 line-clamp-1">${escapeHtml(item.scene || '后台模型分析')}</div><div class="mt-1 text-[11px] text-slate-400">${escapeHtml((item.stages || []).join(' → '))} · ${escapeHtml((item.models || []).map(m => m === 'deepseek-v4-pro' ? 'Pro' : (m === 'deepseek-v4-flash' ? 'Flash' : m)).join(' / '))} · ${fmtTokens(item.total_tokens)} Token</div></button>`).join('')}</div>` : '<p class="text-sm text-slate-400">当前范围没有Provider真实成本数据，不使用估算替代。</p>'}
+          </div>
         `;
       }
 
@@ -3981,7 +3974,12 @@
                   </div>
                   <div class="w-16 text-right text-slate-700">${Number(i.calls || 0).toLocaleString()}</div>
                   <div class="w-20 text-right text-slate-500">${fmtTokens(i.total_tokens)}</div>
-                  <div class="w-24 text-right text-slate-700">${fmtCost(i.estimated_cost_cny)}</div>
+                  <div class="w-36 text-right text-xs text-slate-700">
+                    ${Number(i.provider_actual_calls || 0) ? `<div class="text-emerald-700">真实 ${fmtCost(i.provider_actual_cost_cny)}</div>` : ''}
+                    ${Number(i.estimated_calls || 0) ? `<div class="text-amber-700">估算 ${fmtCost(i.estimated_cost_cny)}（非账单）</div>` : ''}
+                    ${Number(i.unavailable_calls || 0) ? `<div class="text-slate-500">${Number(i.unavailable_calls)}次不可计算</div>` : ''}
+                    ${!Number(i.calls || 0) ? '<div class="text-slate-400">不适用</div>' : ''}
+                  </div>
                 </div>
               `).join('')}
             </div>
@@ -4029,7 +4027,7 @@
             </div>
             <div class="overflow-x-auto">
               <table class="w-full text-sm">
-                <thead><tr class="text-left text-slate-500 text-xs border-b border-slate-100"><th class="pb-2">trace_id</th><th class="pb-2">时间</th><th class="pb-2">意图</th><th class="pb-2">Agent</th><th class="pb-2">模型</th><th class="pb-2">Token</th><th class="pb-2">估算成本</th><th class="pb-2">状态</th><th class="pb-2">操作</th></tr></thead>
+                <thead><tr class="text-left text-slate-500 text-xs border-b border-slate-100"><th class="pb-2">trace_id</th><th class="pb-2">时间</th><th class="pb-2">意图</th><th class="pb-2">Agent</th><th class="pb-2">模型</th><th class="pb-2">Token</th><th class="pb-2">成本口径</th><th class="pb-2">状态</th><th class="pb-2">操作</th></tr></thead>
                 <tbody>
                   ${items.map(t => `
                     <tr class="border-b border-slate-50 last:border-0 hover:bg-slate-50">
@@ -4038,8 +4036,16 @@
                       <td class="py-2">${escapeHtml(t.intent || '-')}</td>
                       <td class="py-2">${escapeHtml(t.agent_name || '-')}</td>
                       <td class="py-2">${escapeHtml(t.model_summary || '-')}</td>
-                      <td class="py-2">${t.no_model_calls ? '<span class="text-xs text-amber-600">尚无模型调用记录</span>' : fmtTokens(t.total_tokens)}</td>
-                      <td class="py-2">${t.price_missing ? '<span class="text-xs text-amber-600">未配置价格</span>' : fmtCost(t.estimated_cost_cny)}</td>
+                      <td class="py-2">${t.no_model_calls ? '<span class="text-xs text-slate-500">不适用</span>' : fmtTokens(t.total_tokens)}</td>
+                      <td class="py-2">${t.cost_status === 'not_applicable'
+                        ? '<span class="text-xs text-slate-500">无模型调用，不适用</span>'
+                        : t.cost_status === 'partial_unavailable'
+                          ? `<span class="text-xs text-slate-600">${Number(t.provider_actual_calls || 0) ? `真实 ${fmtCost(t.provider_actual_cost_cny)} + ` : ''}${Number(t.unavailable_calls || 0)}次不可计算</span>`
+                          : t.cost_status === 'provider_actual'
+                            ? `<span class="text-xs text-emerald-700">Provider真实 ${fmtCost(t.provider_actual_cost_cny)}</span>`
+                            : t.cost_status === 'estimated'
+                              ? `<span class="text-xs text-amber-700">本地估算 ${fmtCost(t.local_estimated_cost_cny)}（非账单）</span>`
+                              : '<span class="text-xs text-slate-600">真实与估算分列</span>'}</td>
                       <td class="py-2">${statusBadgeSmall(t.status)}</td>
                       <td class="py-2"><button type="button" data-trace="${escapeHtml(t.trace_id)}" class="cg-trace-detail px-2 py-1 bg-brand-50 text-brand-600 rounded-lg text-xs hover:bg-brand-100">查看账单</button></td>
                     </tr>
@@ -4055,91 +4061,49 @@
         try {
           const data = await apiGet(`/api/observability/traces/${traceId}`);
           const trace = data.trace || {};
-          const modelCalls = data.model_calls || [];
-          const mcpCalls = data.mcp_calls || [];
-          const breakdown = data.context_breakdown || {};
-          const traceCostSummary = data.trace_cost_summary || {};
+          const explanation = data.trace_cost_explanation || {};
+          const chain = explanation.chain || [];
+          const scope = explanation.cost_scope || {};
+          const recommendation = explanation.recommendation || {};
           const sessionCostSummary = data.session_cost_summary || {};
-          const totalCost = traceCostSummary.known_cost_cny || 0;
-          const totalTokens = modelCalls.reduce((sum, c) => sum + (c.total_tokens || 0), 0);
-          const callsHtml = modelCalls.map(c => {
-            const formula = c.cost_formula || (
-              `cost = input_cache_miss_tokens * input_price + input_cache_hit_tokens * cached_input_price + output_tokens * output_price`
-            );
-            const formulaDetail = [
-              c.input_price_per_1m ? `未缓存输入 ¥${c.input_price_per_1m}/M` : null,
-              c.cached_input_price_per_1m ? `缓存命中输入 ¥${c.cached_input_price_per_1m}/M` : null,
-              c.output_price_per_1m ? `输出 ¥${c.output_price_per_1m}/M` : null
-            ].filter(Boolean).join(' · ') || '单价已配置，但 Provider 未返回本次 usage';
-            const norm = c.usage_normalized || {};
-            const actualModel = c.provider_response_model || '未返回/未采集';
+          const noModel = Number(explanation.model_call_count || 0) === 0;
+          const callsHtml = chain.map(c => {
             const thinking = c.thinking_enabled === true ? '开启' : (c.thinking_enabled === false ? '关闭' : '未采集');
+            const amount = c.bucket === 'unavailable'
+              ? '金额不可计算'
+              : `${c.bucket === 'provider_actual' ? 'Provider真实 ' : '本地估算（非账单） '}${fmtCost(c.amount_cny)}`;
             return `
-            <div class="border border-slate-200 rounded-xl p-3 mb-2 text-sm">
-              <div class="flex items-center justify-between mb-1">
-                <span class="font-medium text-slate-900">${escapeHtml(c.stage)}</span>
-                <span class="text-xs">${statusBadgeSmall(c.status)} · ${sourceBadge(c.usage_source)}</span>
+            <div class="border border-slate-200 rounded-xl p-3 text-sm">
+              <div class="flex items-center justify-between gap-2"><span class="font-medium text-slate-900">${escapeHtml(c.stage_name || c.stage || '模型调用')}</span>${sourceBadge(c.usage_source)}</div>
+              <div class="grid grid-cols-2 md:grid-cols-3 gap-2 mt-2 text-xs">
+                <div><span class="text-slate-400">实际模型</span><div class="font-medium text-slate-700">${escapeHtml(c.provider_response_model || '未返回/未采集')}</div></div>
+                <div><span class="text-slate-400">Thinking</span><div class="font-medium text-slate-700">${thinking}</div></div>
+                <div><span class="text-slate-400">单次金额</span><div class="font-medium ${c.bucket === 'provider_actual' ? 'text-emerald-700' : 'text-slate-700'}">${amount}</div></div>
+                <div><span class="text-slate-400">输入命中缓存</span><div>${fmtTokens(c.input_cache_hit_tokens)}</div></div>
+                <div><span class="text-slate-400">输入未命中缓存</span><div>${fmtTokens(c.input_cache_miss_tokens)}</div></div>
+                <div><span class="text-slate-400">输出</span><div>${fmtTokens(c.output_tokens)}</div></div>
               </div>
-              <div class="text-xs text-slate-600">requested_model：${escapeHtml(c.requested_model || c.model_id || '-')}</div>
-              <div class="text-xs text-slate-600">provider_response_model：${escapeHtml(actualModel)} · Thinking：${escapeHtml(thinking)}</div>
-              <div class="text-xs text-slate-500">耗时 ${c.latency_ms || 0}ms · 模型选择原因：${escapeHtml(c.model_selection_reason || '-')}</div>
-              <div class="text-xs text-slate-500 mt-1">Provider Usage：输入未命中缓存 ${fmtTokens(norm.input_cache_miss_tokens)} / 输入命中缓存 ${fmtTokens(norm.input_cache_hit_tokens)} / 输出 ${fmtTokens(norm.output_tokens)} / 总计 ${fmtTokens(c.total_tokens)}</div>
-              <div class="text-xs text-slate-700 mt-1">单次调用金额：${c.estimated_cost_cny === null || c.estimated_cost_cny === undefined ? '不可得' : fmtCost(c.estimated_cost_cny)}</div>
-              <details class="mt-2">
-                <summary class="text-xs text-brand-600 cursor-pointer hover:text-brand-700">成本计算公式</summary>
-                <div class="mt-1 p-2 bg-slate-50 rounded-lg border border-slate-200">
-                  <div class="text-xs text-slate-700 font-mono">${escapeHtml(formula)}</div>
-                  <div class="text-[10px] text-slate-500 mt-1">${escapeHtml(formulaDetail)}</div>
-                </div>
-              </details>
-              ${c.error_summary ? `<div class="text-xs text-red-600 mt-1">错误：${escapeHtml(c.error_summary)}</div>` : ''}
             </div>
           `;}).join('');
-          const mcpHtml = mcpCalls.length ? mcpCalls.map(c => `
-            <div class="border border-slate-200 rounded-xl p-3 mb-2 text-sm">
-              <div class="flex items-center justify-between mb-1">
-                <span class="font-medium text-slate-900">[${escapeHtml(c.server_name)}] ${escapeHtml(c.tool_name)}</span>
-                <span class="text-xs">${statusBadgeSmall(c.status)} · ${c.latency_ms || 0}ms</span>
-              </div>
-              <div class="text-xs text-slate-500">invocation_mode: ${escapeHtml(c.invocation_mode || 'model_native')}</div>
-              <div class="text-xs text-slate-500">参数：${escapeHtml(JSON.stringify(c.arguments || {}))}</div>
-              ${c.result_summary ? `<div class="text-xs text-slate-600 mt-1 bg-slate-50 rounded p-1.5">结果摘要：${escapeHtml(c.result_summary)}</div>` : ''}
-              ${c.error_summary ? `<div class="text-xs text-red-600 mt-1">错误：${escapeHtml(c.error_summary)}</div>` : ''}
-            </div>
-          `).join('') : '<p class="text-sm text-slate-400">无 MCP 调用</p>';
-          const breakdownHtml = `
-            <div class="text-sm text-slate-600 space-y-1">
-              <div class="flex justify-between"><span>system prompt</span><span>${fmtContextTokens(breakdown.system_prompt_tokens)}</span></div>
-              <div class="flex justify-between"><span>history（历史消息）</span><span>${fmtContextTokens(breakdown.history_tokens)}</span></div>
-              <div class="flex justify-between"><span>skill</span><span>${fmtContextTokens(breakdown.skill_tokens)}</span></div>
-              <div class="flex justify-between"><span>rag</span><span>${fmtContextTokens(breakdown.rag_tokens)}</span></div>
-              <div class="flex justify-between"><span>tool_result</span><span>${fmtContextTokens(breakdown.tool_result_tokens)}</span></div>
-              <div class="flex justify-between"><span>user_message</span><span>${fmtContextTokens(breakdown.user_message_tokens)}</span></div>
-              <p class="text-[11px] text-amber-600 mt-2">本地上下文估算，不等于 Provider 原始账单</p>
-            </div>
-          `;
-          const sessionModelHtml = (sessionCostSummary.by_model || []).map(item =>
-            `<div>${escapeHtml(item.model_id)}：${item.calls} 次 · ${fmtTokens(item.tokens)} Token · ${fmtCost(item.cost_cny)}${item.unknown_cost_calls ? ` · ${item.unknown_cost_calls} 次金额不可得` : ''}</div>`
-          ).join('') || '<div>无模型调用</div>';
+          const costScopeHtml = noModel
+            ? '<div class="rounded-xl bg-slate-50 p-3 text-sm text-slate-700">本轮未调用模型，因此模型Token与费用不适用。</div>'
+            : `<div class="grid grid-cols-1 md:grid-cols-3 gap-2 text-sm"><div class="rounded-xl border border-emerald-200 bg-emerald-50 p-3"><div class="text-xs text-emerald-700">Provider真实</div><div class="font-semibold text-emerald-800">${Number(scope.provider_actual_calls || 0) ? fmtCost(scope.provider_actual_cost_cny) : '暂无'}</div></div><div class="rounded-xl border border-amber-200 bg-amber-50 p-3"><div class="text-xs text-amber-700">本地估算（非账单）</div><div class="font-semibold text-amber-800">${Number(scope.estimated_calls || 0) ? fmtCost(scope.estimated_cost_cny) : '暂无'}</div></div><div class="rounded-xl border border-slate-200 bg-slate-50 p-3"><div class="text-xs text-slate-500">无法计算</div><div class="font-semibold text-slate-700">${Number(scope.unavailable_calls || 0)}次</div></div></div>`;
+          const technicalCalls = chain.map(c => `<div class="border-b border-slate-100 py-2 last:border-0"><div>${escapeHtml(c.stage_name || c.stage || '-')} · 请求 ${escapeHtml(c.requested_model || '-')} · 返回 ${escapeHtml(c.provider_response_model || '未返回/未采集')}</div><div class="font-mono text-[10px] text-slate-500 mt-1">${escapeHtml(c.formula || '无完整公式')}</div></div>`).join('') || '<div>无模型调用记录</div>';
           const html = `
-            <div class="space-y-4">
-              <div class="bg-slate-50 rounded-xl p-3 border border-slate-200 text-sm">
-                <div><span class="text-slate-500">trace_id:</span> <span class="font-mono">${escapeHtml(traceId)}</span></div>
-                <div><span class="text-slate-500">session_id:</span> <span class="font-mono">${escapeHtml(trace.session_id || '-')}</span></div>
-                <div><span class="text-slate-500">用户问题：</span>${escapeHtml(trace.user_message || '-')}</div>
+            <div class="space-y-4 max-h-[75vh] overflow-y-auto pr-1">
+              <div class="rounded-xl border border-brand-200 bg-brand-50 p-4">
+                <div class="text-xs font-medium text-brand-700">人话结论</div>
+                <div class="mt-1 text-base font-semibold text-slate-900">${escapeHtml(explanation.summary || (noModel ? '本轮未调用模型，因此模型Token与费用不适用。' : '成本证据不可得'))}</div>
+                <div class="mt-2 text-xs text-slate-500">Trace ${escapeHtml(traceId)} · ${escapeHtml(trace.user_message || trace.intent || '后台操作')}</div>
               </div>
-              <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
-                <div class="bg-white rounded-xl border border-slate-200 p-3"><div class="text-[11px] text-slate-500">当前轮总 Token</div><div class="text-lg font-semibold">${fmtTokens(totalTokens)}</div></div>
-                <div class="bg-white rounded-xl border border-slate-200 p-3"><div class="text-[11px] text-slate-500">当前 Trace 金额</div><div class="text-lg font-semibold">${traceCostSummary.unknown_cost_calls ? `${fmtCost(totalCost)} + ${traceCostSummary.unknown_cost_calls} 次不可得` : fmtCost(totalCost)}</div></div>
-                <div class="bg-white rounded-xl border border-slate-200 p-3"><div class="text-[11px] text-slate-500">RAG 命中分片数</div><div class="text-lg font-semibold">${(data.messages || []).filter(m => m.role === 'assistant' && m.citations).reduce((s, m) => s + (m.citations || []).length, 0)}</div></div>
-              </div>
-              <div class="rounded-xl border border-blue-200 bg-blue-50 p-3 text-xs text-blue-900"><div class="font-medium">本会话合计：${fmtCost(sessionCostSummary.known_cost_cny || 0)}${sessionCostSummary.unknown_cost_calls ? ` + ${sessionCostSummary.unknown_cost_calls} 次不可得` : ''}</div><div class="mt-1">Flash / Pro 分开统计</div><div class="mt-1 space-y-1">${sessionModelHtml}</div></div>
-              <div><h4 class="font-medium text-slate-900 mb-2">模型调用</h4>${callsHtml || '<p class="text-sm text-slate-400">无模型调用记录</p>'}</div>
-              <div><h4 class="font-medium text-slate-900 mb-2">MCP 工具审计</h4>${mcpHtml}</div>
-              <div><h4 class="font-medium text-slate-900 mb-2">输入上下文构成估算</h4>${breakdownHtml}</div>
+              <div><h4 class="font-medium text-slate-900 mb-2">调用链</h4><div class="space-y-2">${callsHtml || '<div class="rounded-xl bg-slate-50 p-3 text-sm text-slate-700">本轮未调用模型，因此模型Token与费用不适用。</div>'}</div></div>
+              <div><h4 class="font-medium text-slate-900 mb-2">成本口径</h4>${costScopeHtml}</div>
+              <div class="rounded-xl border border-indigo-200 bg-indigo-50 p-3"><div class="text-xs font-medium text-indigo-700">唯一优化建议</div><div class="mt-1 font-semibold text-slate-900">${escapeHtml(recommendation.title || '当前成本结构正常，建议继续观察')}</div><div class="mt-2 text-xs text-slate-600"><b>为什么：</b>${escapeHtml(recommendation.why || '-')}</div><div class="mt-1 text-xs text-slate-600"><b>改什么：</b>${escapeHtml(recommendation.action || '-')}</div><div class="mt-1 text-xs text-slate-600"><b>预期方向：</b>${escapeHtml(recommendation.expected_direction || '-')}</div></div>
+              <div class="rounded-xl border border-slate-200 p-3"><div class="text-xs font-medium text-slate-700">如何复测（不会自动调用模型）</div><div class="mt-1 text-sm text-slate-600">${escapeHtml(recommendation.retest_method || '使用同一问题、同一配置、同一模型复测，并比较质量、引用、Token、金额和时延。')}</div></div>
+              <details class="rounded-xl border border-slate-200 p-3 text-xs text-slate-600"><summary class="cursor-pointer font-medium text-slate-700">技术细节、公式与会话累计</summary><div class="mt-2">${technicalCalls}</div><div class="mt-2 border-t border-slate-100 pt-2">${noModel ? '当前选中的Trace没有模型调用，因此本轮Token与费用不适用。' : `本会话已知成本 ${fmtCost(sessionCostSummary.known_cost_cny || 0)}${sessionCostSummary.unknown_cost_calls ? `；另有 ${sessionCostSummary.unknown_cost_calls} 次金额不可计算` : ''}。这是会话累计，不等于本次调用。`}</div></details>
             </div>
           `;
-          openModal('单次调用账单', html, null, '关闭');
+          openModal('Trace成本解释', html, null, '关闭');
         } catch (err) {
           showToast('加载 Trace 详情失败', 'error');
         }
@@ -4295,8 +4259,8 @@
             <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
               <div class="border border-slate-200 rounded-xl p-3">
                 <div class="text-sm font-medium text-slate-900 mb-2">COST-01：模型分层（Flash vs Pro）</div>
-                <p class="text-xs text-slate-500 mb-2">对同一固定投诉问题执行 Flash / Pro A/B，记录 Token、耗时、估算成本。质量判断为人工记录项。</p>
-                <button id="cg-run-cost01" type="button" class="px-3 py-1.5 bg-brand-600 hover:bg-brand-700 text-white rounded-lg text-xs">执行对比</button>
+                <p class="text-xs text-slate-500 mb-2">使用同题、同配置分别形成候选 Trace，再人工比较质量、引用、Token、真实成本和时延。本入口不会发起模型请求。</p>
+                <button id="cg-run-cost01" type="button" class="px-3 py-1.5 bg-brand-600 hover:bg-brand-700 text-white rounded-lg text-xs">查看复测方法</button>
                 <div id="cost01-result" class="mt-2 text-xs text-slate-600"></div>
               </div>
               <div class="border border-slate-200 rounded-xl p-3">
@@ -4312,23 +4276,7 @@
 
       async function runCost01() {
         const resultEl = $('#cost01-result');
-        resultEl.innerHTML = '<span class="text-slate-400">执行中...</span>';
-        try {
-          const query = '我要投诉楼下噪音太大，物业不作为';
-          const r = await apiPost('/api/model-configs/ab-test', { prompt: query });
-          const fmt = (d, name) => {
-            if (d.error) return `<div class="text-red-600">${name} 失败：${escapeHtml(d.error)}</div>`;
-            return `<div><span class="font-medium">${name}</span> · Token ${fmtTokens(d.total_tokens)} · 耗时 ${d.latency_ms || 0}ms · 估算 ${fmtCost(d.estimated_cost_cny)} · usage ${escapeHtml(d.usage_source || '-')}</div>`;
-          };
-          resultEl.innerHTML = `
-            <div>trace: ${escapeHtml(r.trace_id || '-')}</div>
-            ${fmt(r.model_a_result, 'Flash')}
-            ${fmt(r.model_b_result, 'Pro')}
-          `;
-          state.costCases.push({ id: 'COST-01', result: r });
-        } catch (err) {
-          resultEl.innerHTML = '<span class="text-red-600">执行失败：' + escapeHtml(err.message || err) + '</span>';
-        }
+        resultEl.innerHTML = '<div class="rounded-lg bg-slate-50 p-2">固定同一问题、同一配置快照和同一模型，各运行一次；比较答案质量、引用、三类Provider Usage、金额和时延。只有质量不下降时才接受优化。本入口只展示方法，不会调用模型。</div>';
       }
 
       async function runCost02() {
@@ -4369,28 +4317,23 @@
       function renderPage() {
         container.innerHTML = `
           <div class="max-w-6xl mx-auto p-4 md:p-6 space-y-5">
-            ${pageHeader('调用与成本治理', 'Trace 可观测性、Token 成本估算、模型价格表与预算预警').replace('sticky top-0 z-10', 'relative')}
+            ${pageHeader('调用与成本治理', '一分钟看懂模型选择、Token来源、真实费用与下一步优化').replace('sticky top-0 z-10', 'relative')}
             <div class="bg-brand-50 border border-brand-100 rounded-2xl p-4 flex flex-wrap items-center justify-between gap-3">
               <div>
-                <h2 class="font-semibold text-slate-900">模型价格表</h2>
-                <p class="text-xs text-slate-500 mt-0.5">未配置价格的模型调用将显示“未配置价格”，补全价格后即可估算真实成本。</p>
+                <h2 class="font-semibold text-slate-900">成本证据口径</h2>
+                <p class="text-xs text-slate-500 mt-0.5">Provider真实、本地估算和金额不可计算严格分开；Thinking状态不会改变Flash/Pro模型身份。</p>
               </div>
-              <button id="cg-scroll-to-prices" type="button" class="px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white rounded-xl text-sm transition-colors">查看模型价格表</button>
+              <button id="cg-scroll-to-prices" type="button" class="px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white rounded-xl text-sm transition-colors">查看价格证据</button>
             </div>
             ${renderOverview()}
+            ${renderHighCostTraces()}
             ${renderFilters()}
-            <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
-              ${renderTrends()}
-              ${renderDistribution()}
-            </div>
             <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
               ${renderModelChart()}
               ${renderStageChart()}
             </div>
             ${renderTraces()}
-            ${renderPrices()}
-            ${renderBudget()}
-            ${renderStrategy()}
+            <details class="rounded-2xl border border-slate-200 bg-slate-50 p-3"><summary class="cursor-pointer text-sm font-medium text-slate-700">价格、预算与通用策略（默认折叠）</summary><div class="mt-3 space-y-4">${renderPrices()}${renderBudget()}${renderStrategy()}</div></details>
             ${renderCostCases()}
             <div class="bg-white rounded-2xl shadow-soft border border-slate-200 p-4">
               <h3 class="font-semibold text-slate-900 mb-2">成本治理策略详情</h3>
@@ -4417,6 +4360,7 @@
           renderPage();
         });
         $$('.cg-trace-detail').forEach(btn => btn.addEventListener('click', () => showTraceDetail(btn.dataset.trace)));
+        $$('.cg-high-cost').forEach(btn => btn.addEventListener('click', () => showTraceDetail(btn.dataset.trace)));
         $('#cg-add-price').addEventListener('click', () => openPriceModal());
         $$('.cg-edit-price').forEach(btn => {
           const price = state.prices.find(p => String(p.id) === btn.dataset.priceId);
@@ -4447,22 +4391,7 @@
     async function renderCostStrategyPage(container) {
       async function runCost01() {
         const resultEl = $('#strategy-cost01-result');
-        resultEl.innerHTML = '<span class="text-slate-400">执行中...</span>';
-        try {
-          const query = '我要投诉楼下噪音太大，物业不作为';
-          const r = await apiPost('/api/model-configs/ab-test', { prompt: query });
-          const fmt = (d, name) => {
-            if (d.error) return `<div class="text-red-600">${name} 失败：${escapeHtml(d.error)}</div>`;
-            return `<div><span class="font-medium">${name}</span> · Token ${fmtTokens(d.total_tokens)} · 耗时 ${d.latency_ms || 0}ms · 估算 ${fmtCost(d.estimated_cost_cny)} · usage ${escapeHtml(d.usage_source || '-')}</div>`;
-          };
-          resultEl.innerHTML = `
-            <div>trace: ${escapeHtml(r.trace_id || '-')}</div>
-            ${fmt(r.model_a_result, 'Flash')}
-            ${fmt(r.model_b_result, 'Pro')}
-          `;
-        } catch (err) {
-          resultEl.innerHTML = '<span class="text-red-600">执行失败：' + escapeHtml(err.message || err) + '</span>';
-        }
+        resultEl.innerHTML = '<div class="rounded-lg bg-slate-50 p-2">固定同一问题、同一配置快照和同一模型，各形成一次候选Trace；人工比较答案质量、引用、三类Provider Usage、金额和时延。本入口只展示方法，不会调用模型。</div>';
       }
 
       async function runCost02() {
@@ -4519,7 +4448,7 @@
                 <li>Darwin 深度分析、A/B 测试使用 Pro。</li>
                 <li>只有质量门槛通过且 Usage 可比较，候选策略才能发布。</li>
               </ul>
-              <button id="strategy-cost01-run" type="button" class="px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white rounded-lg text-sm transition-colors">执行对比</button>
+              <button id="strategy-cost01-run" type="button" class="px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white rounded-lg text-sm transition-colors">查看复测方法</button>
               <div id="strategy-cost01-result" class="mt-3 text-xs text-slate-600 space-y-1"></div>
             </div>
 
