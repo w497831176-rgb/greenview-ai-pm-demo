@@ -114,6 +114,8 @@ check("21 Darwin root cause is expert suggestion", darwin_case["presentation"]["
 human_case = _enrich_badcase({"id": 3, "status": "rejected", "source": "auto", "category": "other", "root_cause": "old AI", "actions": [{"action_type": "mark-auto-false-positive", "action_detail": '{"reason":"人工复核为误抓"}', "created_by": "operator", "created_at": "2026-07-28"}]})
 check("22 explicit operator review is human confirmation", human_case["presentation"]["sections"][2]["text"].startswith("人工确认"))
 check("23 false positive is terminal outcome", human_case["terminal_outcome_label"] == "自动误抓")
+check("23a false positive is a history record", human_case["record_layer_label"] == "历史记录")
+check("23b Flash suggestion remains visibly separated", "AI分析建议（历史保留）" in human_case["presentation"]["sections"][2]["text"])
 check("24 four user statuses", [user_status_label(s) for s in ("pending", "fixing", "verifying", "closed")] == ["待审核", "处理中", "待验证", "已结束"])
 check("25 six-section detail contract", [s["title"] for s in human_case["presentation"]["sections"]] == ["怎么发现", "问题分类", "确认原因", "处理建议", "实际行动及理由", "最终结果"])
 check("26 six-node business timeline", len(human_case["presentation"]["business_timeline"]) == 6)

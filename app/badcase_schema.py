@@ -398,6 +398,11 @@ def _cause_presentation(badcase: Dict[str, Any], actions: List[Dict[str, Any]]) 
 def build_badcase_presentation(badcase: Dict[str, Any], actions: List[Dict[str, Any]]) -> Dict[str, Any]:
     outcome = _terminal_outcome(badcase, actions)
     cause = _cause_presentation(badcase, actions)
+    cause_text = f"{cause['source']}：{cause['text']}"
+    if cause["source"] == "人工确认" and badcase.get("root_cause"):
+        cause_text += f"\nAI分析建议（历史保留）：{badcase.get('root_cause')}"
+    if cause["source"] == "人工确认" and badcase.get("darwin_analysis"):
+        cause_text += "\nAI专家分析建议（历史保留）：详见折叠的技术证据"
     source = str(badcase.get("source_label") or "自动发现")
     discovery = str(
         badcase.get("feedback_reason")
@@ -417,7 +422,7 @@ def build_badcase_presentation(badcase: Dict[str, Any], actions: List[Dict[str, 
         "sections": [
             {"title": "怎么发现", "text": f"{source}：{discovery}"},
             {"title": "问题分类", "text": str(badcase.get("category_label") or "待分类")},
-            {"title": "确认原因", "text": f"{cause['source']}：{cause['text']}", "cause": cause},
+            {"title": "确认原因", "text": cause_text, "cause": cause},
             {"title": "处理建议", "text": advice},
             {"title": "实际行动及理由", "text": actual_action},
             {"title": "最终结果", "text": result},
@@ -498,7 +503,9 @@ def _enrich_badcase(badcase: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any
     )
     enriched["user_status_label"] = user_status_label(str(enriched.get("status") or "pending"))
     enriched["terminal_outcome_label"] = _terminal_outcome(enriched, enriched["actions"])
-    if enriched.get("is_system_observation"):
+    if enriched.get("is_auto_false_positive"):
+        enriched["record_layer_label"] = "历史记录"
+    elif enriched.get("is_system_observation"):
         enriched["record_layer_label"] = "系统观察"
     elif enriched.get("is_history_insufficient"):
         enriched["record_layer_label"] = "历史待核验"
