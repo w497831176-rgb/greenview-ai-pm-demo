@@ -3738,7 +3738,11 @@
       container.innerHTML = loadingState();
 
       const state = {
-        filters: { start: '', end: '', model: '', agent: '', intent: '', stage: '', search: '', groupBy: 'model' },
+        filters: { model: '', stage: '', search: '' },
+        rangeKey: 'today',
+        customStart: '',
+        customEnd: '',
+        pagination: { page: 1, pages: 1, total: 0, limit: 20, hasPrevious: false, hasNext: false },
         overview: null,
         traces: [],
         trends: [],
@@ -3748,15 +3752,25 @@
         costCases: [],
       };
 
-      function fmtDate(d) {
-        if (!d) return '';
-        const date = new Date(d);
-        if (isNaN(date.getTime())) return d;
-        return date.toISOString().slice(0, 10);
-      }
       function fmtTime(d) {
         if (!d) return '';
         return formatTimeLabel(d);
+      }
+
+      function beijingToday() {
+        const parts = new Intl.DateTimeFormat('zh-CN', {
+          timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit'
+        }).formatToParts(new Date()).reduce((acc, part) => ({ ...acc, [part.type]: part.value }), {});
+        return `${parts.year}-${parts.month}-${parts.day}`;
+      }
+
+      function scopeParams() {
+        const params = new URLSearchParams({ range_key: state.rangeKey });
+        if (state.rangeKey === 'custom') {
+          params.set('start', `${state.customStart} 00:00:00`);
+          params.set('end', `${state.customEnd} 23:59:59`);
+        }
+        return params;
       }
       function fmtCost(v) {
         if (v === null || v === undefined) return '金额无法计算';
@@ -3783,28 +3797,31 @@
       }
 
       async function loadAll() {
-        const params = new URLSearchParams();
-        if (state.filters.start) params.append('start', state.filters.start);
-        if (state.filters.end) params.append('end', state.filters.end);
-        if (state.filters.model) params.append('model_id', state.filters.model);
-        if (state.filters.stage) params.append('stage', state.filters.stage);
-        if (state.filters.search) params.append('trace_id', state.filters.search);
-        const qs = params.toString() ? '?' + params.toString() : '';
-        const [overview, prices, budget] = await Promise.all([
-          apiGet(`/api/observability/overview${qs}`).catch(() => ({})),
+        const overviewParams = scopeParams();
+        const traceParams = scopeParams();
+        if (state.filters.model) traceParams.set('model_id', state.filters.model);
+        if (state.filters.stage) traceParams.set('stage', state.filters.stage);
+        if (state.filters.search) traceParams.set('trace_id', state.filters.search);
+        traceParams.set('limit', String(state.pagination.limit));
+        traceParams.set('offset', String((state.pagination.page - 1) * state.pagination.limit));
+        const [overview, traces, prices, budget] = await Promise.all([
+          apiGet(`/api/observability/overview?${overviewParams.toString()}`).catch(() => ({})),
+          apiGet(`/api/observability/traces?${traceParams.toString()}`).catch(() => ({ traces: [], total: 0, page: 1, pages: 1 })),
           apiGet('/api/observability/prices').catch(() => ({ prices: [] })),
           apiGet('/api/observability/budget').catch(() => ({ budget: {} })),
         ]);
         const scope = overview.scope || {};
-        const traceParams = new URLSearchParams(params);
-        if (!state.filters.start && scope.start) traceParams.set('start', scope.start);
-        if (!state.filters.end && scope.end) traceParams.set('end', scope.end);
-        traceParams.set('limit', '10');
-        const traceQs = traceParams.toString() ? '?' + traceParams.toString() : '';
-        const traces = await apiGet(`/api/observability/traces${traceQs}`).catch(() => ({ traces: [] }));
         state.overview = overview;
         state.traces = traces.traces || [];
-        state.traceRange = { start: traces.start || scope.start || state.filters.start, end: traces.end || scope.end || state.filters.end };
+        state.traceRange = { start: traces.start || scope.start, end: traces.end || scope.end };
+        state.pagination = {
+          page: Number(traces.page || 1),
+          pages: Number(traces.pages || 1),
+          total: Number(traces.total || 0),
+          limit: Number(traces.limit || 20),
+          hasPrevious: Boolean(traces.has_previous),
+          hasNext: Boolean(traces.has_next),
+        };
         state.trends = [];
         state.distribution = [];
         state.prices = prices.prices || [];
@@ -3838,15 +3855,26 @@
             : estimatedCalls > 0
               ? { label: '有估算费用', tone: 'text-amber-700 bg-amber-50 border-amber-200' }
               : { label: '正常', tone: 'text-emerald-700 bg-emerald-50 border-emerald-200' };
+        const rangeLabel = scope.label || '所选范围';
+        const sentenceLead = state.rangeKey === 'custom' ? `${rangeLabel}，共` : `${rangeLabel}共`;
+        const cardPrefix = state.rangeKey === 'custom' ? '该期间' : rangeLabel;
+        const ranges = [
+          ['today', '今天'], ['yesterday', '昨天'], ['last_7_days', '近7天'],
+          ['this_month', '本月'], ['last_month', '上月'], ['custom', '自定义']
+        ];
 
         return `
-          <section class="bg-white rounded-2xl shadow-soft border border-slate-200 p-5" aria-labelledby="cg-today-title">
-            <h2 id="cg-today-title" class="text-sm font-semibold text-brand-700">今天一句话结论</h2>
-            <p class="mt-2 text-lg font-semibold text-slate-900">今天共调用模型${calls.toLocaleString()}次，${modelSummary}，共${tokens.toLocaleString()} Token，Provider真实费用${Number(o.provider_actual_calls || 0) ? fmtCost(o.provider_actual_cost_cny) : '暂无'}。${evidenceSummary}</p>
+          <section class="bg-white rounded-2xl shadow-soft border border-slate-200 p-5" aria-labelledby="cg-summary-title">
+            <div class="flex flex-wrap gap-2" aria-label="成本统计时间范围">
+              ${ranges.map(([key, label]) => `<button type="button" data-range="${key}" class="cg-range-btn px-3 py-1.5 rounded-lg text-sm ${state.rangeKey === key ? 'bg-brand-600 text-white' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'}">${label}</button>`).join('')}
+            </div>
+            ${state.rangeKey === 'custom' ? `<div class="mt-3 flex flex-wrap items-end gap-2"><label class="text-xs text-slate-500">开始日期<input id="cg-custom-start" type="date" value="${escapeHtml(state.customStart)}" class="block mt-1 px-3 py-2 border border-slate-200 rounded-lg text-sm text-slate-700"></label><label class="text-xs text-slate-500">结束日期<input id="cg-custom-end" type="date" value="${escapeHtml(state.customEnd)}" class="block mt-1 px-3 py-2 border border-slate-200 rounded-lg text-sm text-slate-700"></label><button id="cg-custom-apply" type="button" class="px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white rounded-lg text-sm">查询</button></div>` : ''}
+            <h2 id="cg-summary-title" class="mt-4 text-sm font-semibold text-brand-700">一句话结论</h2>
+            <p class="mt-2 text-lg font-semibold text-slate-900">${sentenceLead}调用模型${calls.toLocaleString()}次，${modelSummary}，共${tokens.toLocaleString()} Token，Provider真实费用${Number(o.provider_actual_calls || 0) ? fmtCost(o.provider_actual_cost_cny) : '暂无'}。${evidenceSummary}</p>
             <p class="mt-2 text-xs text-slate-500">统计范围：${escapeHtml(scope.start || '-')} 至 ${escapeHtml(scope.end || '-')} · 时区 ${escapeHtml(scope.timezone || 'Asia/Shanghai')}</p>
             <div class="grid grid-cols-1 sm:grid-cols-3 gap-3 mt-4">
-              <div class="rounded-xl border border-emerald-200 bg-emerald-50 p-3"><div class="text-xs text-emerald-700">今日真实费用</div><div class="mt-1 text-xl font-semibold text-emerald-800">${Number(o.provider_actual_calls || 0) ? fmtCost(o.provider_actual_cost_cny) : '暂无'}</div></div>
-              <div class="rounded-xl border border-slate-200 bg-slate-50 p-3"><div class="text-xs text-slate-500">今日模型调用</div><div class="mt-1 text-xl font-semibold text-slate-900">${calls.toLocaleString()}次</div></div>
+              <div class="rounded-xl border border-emerald-200 bg-emerald-50 p-3"><div class="text-xs text-emerald-700">${cardPrefix}真实费用</div><div class="mt-1 text-xl font-semibold text-emerald-800">${Number(o.provider_actual_calls || 0) ? fmtCost(o.provider_actual_cost_cny) : '暂无'}</div></div>
+              <div class="rounded-xl border border-slate-200 bg-slate-50 p-3"><div class="text-xs text-slate-500">${cardPrefix}模型调用</div><div class="mt-1 text-xl font-semibold text-slate-900">${calls.toLocaleString()}次</div></div>
               <div class="rounded-xl border p-3 ${attention.tone}"><div class="text-xs">需要关注</div><div class="mt-1 text-lg font-semibold">${attention.label}</div></div>
             </div>
           </section>
@@ -3868,15 +3896,7 @@
           <details class="mt-4 rounded-xl border border-slate-200 bg-slate-50 p-3">
             <summary class="cursor-pointer text-sm font-medium text-slate-700">高级筛选</summary>
             <div class="flex flex-wrap gap-3 items-end">
-              <div class="flex flex-col gap-1">
-                <label class="text-[10px] text-slate-400">开始日期</label>
-                <input id="cg-start" type="date" value="${state.filters.start ? fmtDate(state.filters.start) : ''}" class="px-3 py-2 border border-slate-200 rounded-xl text-sm">
-              </div>
-              <div class="flex flex-col gap-1">
-                <label class="text-[10px] text-slate-400">结束日期（含当天）</label>
-                <input id="cg-end" type="date" value="${state.filters.end ? fmtDate(state.filters.end) : ''}" class="px-3 py-2 border border-slate-200 rounded-xl text-sm">
-              </div>
-              <input id="cg-search" type="text" placeholder="session_id / trace_id" value="${escapeHtml(state.filters.search)}" class="px-3 py-2 border border-slate-200 rounded-xl text-sm w-48">
+              <input id="cg-search" type="text" placeholder="调用记录辅助编号" value="${escapeHtml(state.filters.search)}" class="px-3 py-2 border border-slate-200 rounded-xl text-sm w-48">
               <select id="cg-model" class="px-3 py-2 border border-slate-200 rounded-xl text-sm">
                 <option value="">全部模型</option>
                 <option value="deepseek-v4-flash" ${state.filters.model === 'deepseek-v4-flash' ? 'selected' : ''}>deepseek-v4-flash</option>
@@ -3889,12 +3909,6 @@
                 <option value="ab_test_a" ${state.filters.stage === 'ab_test_a' ? 'selected' : ''}>ab_test_a</option>
                 <option value="ab_test_b" ${state.filters.stage === 'ab_test_b' ? 'selected' : ''}>ab_test_b</option>
                 <option value="darwin" ${state.filters.stage === 'darwin' ? 'selected' : ''}>darwin</option>
-              </select>
-              <select id="cg-group" class="px-3 py-2 border border-slate-200 rounded-xl text-sm">
-                <option value="model" ${state.filters.groupBy === 'model' ? 'selected' : ''}>按模型分布</option>
-                <option value="agent" ${state.filters.groupBy === 'agent' ? 'selected' : ''}>按 Agent 分布</option>
-                <option value="intent" ${state.filters.groupBy === 'intent' ? 'selected' : ''}>按意图分布</option>
-                <option value="stage" ${state.filters.groupBy === 'stage' ? 'selected' : ''}>按阶段分布</option>
               </select>
               <button id="cg-apply" type="button" class="px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white rounded-xl text-sm">应用筛选</button>
             </div>
@@ -4001,25 +4015,27 @@
       }
 
       function renderTraces() {
-        let items = state.traces || [];
-        if (state.filters.search) {
-          const s = state.filters.search.toLowerCase();
-          items = items.filter(t => (t.trace_id || '').toLowerCase().includes(s) || (t.session_id || '').toLowerCase().includes(s));
-        }
+        const items = state.traces || [];
+        const pagination = state.pagination || {};
         const range = state.traceRange || {};
         const rangeText = (range.start || range.end)
           ? `<span class="text-xs text-slate-500">${escapeHtml(range.start || '')} 至 ${escapeHtml(range.end || '')}</span>`
           : '';
-        const rows = items.slice(0, 10).map(t => {
+        const rows = items.map(t => {
           const models = String(t.model_summary || '').toLowerCase();
           const modelLabel = t.no_model_calls
             ? '未调用模型'
             : (models.includes('pro') && models.includes('flash') ? 'Flash + Pro' : (models.includes('pro') ? 'Pro' : 'Flash'));
-          const callCount = Number(t.provider_actual_calls || 0) + Number(t.estimated_calls || 0) + Number(t.unavailable_calls || 0);
+          const callCount = Number(t.model_call_count || 0);
+          const partialCosts = [
+            Number(t.provider_actual_priced_calls || 0) ? `Provider真实费用 ${fmtCost(t.provider_actual_cost_cny)}` : '',
+            Number(t.estimated_priced_calls || 0) ? `本地估算 ${fmtCost(t.local_estimated_cost_cny)}，非账单` : '',
+            Number(t.unavailable_calls || 0) ? `${Number(t.unavailable_calls)}次金额无法计算` : '',
+          ].filter(Boolean).join('；');
           const costText = t.cost_status === 'not_applicable'
             ? '费用不适用'
             : t.cost_status === 'partial_unavailable'
-              ? `${Number(t.provider_actual_calls || 0) ? `Provider真实费用 ${fmtCost(t.provider_actual_cost_cny)}；` : ''}另有${Number(t.unavailable_calls || 0)}次金额无法计算`
+              ? partialCosts
               : t.cost_status === 'provider_actual'
                 ? `Provider真实费用 ${fmtCost(t.provider_actual_cost_cny)}`
                 : t.cost_status === 'estimated'
@@ -4045,11 +4061,15 @@
         }).join('');
         return `
           <section class="bg-white rounded-2xl shadow-soft border border-slate-200 p-4" aria-labelledby="cg-records-title">
-            <div class="flex items-center justify-between mb-3">
-              <div><h2 id="cg-records-title" class="font-semibold text-slate-900">钱花在哪：今日调用记录</h2><p class="mt-1 text-xs text-slate-500">默认最多展示10条，按当前统计范围查询</p></div>
-              ${rangeText}
+            <div class="flex flex-wrap items-start justify-between gap-2 mb-3">
+              <div><h2 id="cg-records-title" class="font-semibold text-slate-900">调用记录</h2><p class="mt-1 text-xs text-slate-500">每页20条 · 共${Number(pagination.total || 0).toLocaleString()}条</p></div>
+              <div class="text-right">${rangeText}<div class="mt-1 text-xs text-slate-400">第${Number(pagination.page || 1)}/${Number(pagination.pages || 1)}页</div></div>
             </div>
             <div class="space-y-2">${rows || '<p class="py-4 text-sm text-slate-400">当前范围暂无调用记录。</p>'}</div>
+            <div class="mt-4 flex items-center justify-end gap-2">
+              <button id="cg-prev-page" type="button" ${pagination.hasPrevious ? '' : 'disabled'} class="px-3 py-1.5 rounded-lg text-sm ${pagination.hasPrevious ? 'bg-slate-100 text-slate-700 hover:bg-slate-200' : 'bg-slate-50 text-slate-300 cursor-not-allowed'}">上一页</button>
+              <button id="cg-next-page" type="button" ${pagination.hasNext ? '' : 'disabled'} class="px-3 py-1.5 rounded-lg text-sm ${pagination.hasNext ? 'bg-brand-600 text-white hover:bg-brand-700' : 'bg-slate-50 text-slate-300 cursor-not-allowed'}">下一页</button>
+            </div>
             ${renderFilters()}
           </section>
         `;
@@ -4337,7 +4357,7 @@
       function renderPage() {
         container.innerHTML = `
           <div class="max-w-6xl mx-auto p-4 md:p-6 space-y-5">
-            ${pageHeader('调用与成本治理', '十秒看懂今天花了多少、钱花在哪、下一步怎么优化').replace('sticky top-0 z-10', 'relative')}
+            ${pageHeader('调用与成本治理', '十秒看懂所选时段花了多少、钱花在哪、下一步怎么优化').replace('sticky top-0 z-10', 'relative')}
             ${renderOverview()}
             ${renderTraces()}
             ${renderGovernancePrinciples()}
@@ -4349,14 +4369,48 @@
 
       function bindEvents() {
         $('#cg-apply').addEventListener('click', async () => {
-          const startVal = $('#cg-start').value;
-          const endVal = $('#cg-end').value;
-          state.filters.start = startVal ? startVal + ' 00:00:00' : '';
-          state.filters.end = endVal ? endVal + ' 23:59:59' : '';
           state.filters.search = $('#cg-search').value.trim();
           state.filters.model = $('#cg-model').value;
           state.filters.stage = $('#cg-stage').value;
-          state.filters.groupBy = $('#cg-group').value;
+          state.pagination.page = 1;
+          container.innerHTML = loadingState();
+          await loadAll();
+          renderPage();
+        });
+        $$('.cg-range-btn').forEach(btn => btn.addEventListener('click', async () => {
+          state.rangeKey = btn.dataset.range;
+          if (state.rangeKey === 'custom' && (!state.customStart || !state.customEnd)) {
+            state.customStart = beijingToday();
+            state.customEnd = state.customStart;
+          }
+          state.pagination.page = 1;
+          container.innerHTML = loadingState();
+          await loadAll();
+          renderPage();
+        }));
+        const customApply = $('#cg-custom-apply');
+        if (customApply) customApply.addEventListener('click', async () => {
+          const customStart = $('#cg-custom-start').value;
+          const customEnd = $('#cg-custom-end').value;
+          if (!customStart || !customEnd) return showToast('请选择完整的开始和结束日期', 'error');
+          if (customStart > customEnd) return showToast('开始日期不能晚于结束日期', 'error');
+          state.customStart = customStart;
+          state.customEnd = customEnd;
+          state.pagination.page = 1;
+          container.innerHTML = loadingState();
+          await loadAll();
+          renderPage();
+        });
+        const previousPage = $('#cg-prev-page');
+        if (previousPage && state.pagination.hasPrevious) previousPage.addEventListener('click', async () => {
+          state.pagination.page -= 1;
+          container.innerHTML = loadingState();
+          await loadAll();
+          renderPage();
+        });
+        const nextPage = $('#cg-next-page');
+        if (nextPage && state.pagination.hasNext) nextPage.addEventListener('click', async () => {
+          state.pagination.page += 1;
           container.innerHTML = loadingState();
           await loadAll();
           renderPage();

@@ -122,6 +122,72 @@ def _overview_scope(
     }
 
 
+def _reporting_scope(
+    range_key: Optional[str],
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+    now: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    """Resolve one canonical Asia/Shanghai reporting range."""
+    current = now or now_cn_dt()
+    key = range_key or ("custom" if start or end else "today")
+    current_end = current.strftime("%Y-%m-%d %H:%M:%S")
+
+    if key == "today":
+        scope = {
+            "label": "今天",
+            "start": current.strftime("%Y-%m-%d 00:00:00"),
+            "end": current_end,
+        }
+    elif key == "yesterday":
+        day = current - timedelta(days=1)
+        scope = {
+            "label": "昨天",
+            "start": day.strftime("%Y-%m-%d 00:00:00"),
+            "end": day.strftime("%Y-%m-%d 23:59:59"),
+        }
+    elif key == "last_7_days":
+        scope = {
+            "label": "近7天",
+            "start": (current - timedelta(days=6)).strftime("%Y-%m-%d 00:00:00"),
+            "end": current_end,
+        }
+    elif key == "this_month":
+        scope = {
+            "label": "本月",
+            "start": current.replace(day=1).strftime("%Y-%m-%d 00:00:00"),
+            "end": current_end,
+        }
+    elif key == "last_month":
+        this_month = current.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        previous_end = this_month - timedelta(seconds=1)
+        previous_start = previous_end.replace(day=1, hour=0, minute=0, second=0)
+        scope = {
+            "label": "上月",
+            "start": previous_start.strftime("%Y-%m-%d 00:00:00"),
+            "end": previous_end.strftime("%Y-%m-%d 23:59:59"),
+        }
+    elif key == "custom":
+        if not start or not end:
+            raise ValueError("自定义日期需要同时提供开始日期和结束日期")
+        normalized_end = _normalize_end(end)
+        if str(start) > str(normalized_end):
+            raise ValueError("开始日期不能晚于结束日期")
+        scope = {
+            "label": f"{str(start)[:10]}至{str(normalized_end)[:10]}期间",
+            "start": start,
+            "end": normalized_end,
+        }
+    else:
+        raise ValueError(f"不支持的时间范围: {key}")
+
+    return {
+        **scope,
+        "range_key": key,
+        "timezone": "Asia/Shanghai (UTC+8)",
+    }
+
+
 def _usage_payload(call: Dict[str, Any]) -> Dict[str, Any]:
     value = call.get("usage_normalized") or {}
     if isinstance(value, str):
@@ -394,9 +460,16 @@ def _check_budget(strategy: Optional[str] = None) -> Dict[str, Any]:
 async def overview(
     start: Optional[str] = Query(None, description="Start date/time ISO"),
     end: Optional[str] = Query(None, description="End date/time ISO"),
+    range_key: Optional[str] = Query(
+        None,
+        pattern="^(today|yesterday|last_7_days|this_month|last_month|custom)$",
+    ),
 ):
     """Return honest cost buckets for an explicit Asia/Shanghai range."""
-    scope = _overview_scope(start, end)
+    try:
+        scope = _reporting_scope(range_key, start, end)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     selected_calls = _fetch_model_calls(scope.get("start"), scope.get("end"))
     data = _aggregate_model_calls(selected_calls)
     history_total = _aggregate_model_calls(_fetch_model_calls(None, None))
@@ -519,6 +592,209 @@ def _normalize_end(end: Optional[str]) -> Optional[str]:
         return end
 
 
+def _list_trace_page(
+    *,
+    session_id: Optional[str] = None,
+    trace_id: Optional[str] = None,
+    intent: Optional[str] = None,
+    agent: Optional[str] = None,
+    model_id: Optional[str] = None,
+    stage: Optional[str] = None,
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+    range_key: Optional[str] = None,
+    limit: int = 20,
+    offset: int = 0,
+) -> Dict[str, Any]:
+    """Return one globally ordered, duplicate-free page of operation traces."""
+    if range_key:
+        scope = _reporting_scope(range_key, start, end)
+        effective_start = scope["start"]
+        effective_end = scope["end"]
+    else:
+        effective_start = start
+        effective_end = _normalize_end(end)
+        scope = {
+            "range_key": "custom" if start or end else None,
+            "start": effective_start,
+            "end": effective_end,
+            "timezone": "Asia/Shanghai (UTC+8)",
+        }
+
+    conditions = ["1=1"]
+    params: List[Any] = []
+    if trace_id:
+        conditions.append("a.trace_id = ?")
+        params.append(trace_id)
+    if session_id:
+        conditions.append("a.session_id = ?")
+        params.append(session_id)
+    if intent:
+        conditions.append("a.intent = ?")
+        params.append(intent)
+    if agent:
+        conditions.append("a.agent_name = ?")
+        params.append(agent)
+    if effective_start:
+        conditions.append("a.created_at >= ?")
+        params.append(effective_start)
+    if effective_end:
+        conditions.append("a.created_at <= ?")
+        params.append(effective_end)
+    if model_id or stage:
+        model_conditions = ["fm.trace_id = a.trace_id"]
+        if model_id:
+            model_conditions.append("fm.model_id = ?")
+            params.append(model_id)
+        if stage:
+            model_conditions.append("fm.stage = ?")
+            params.append(stage)
+        conditions.append(
+            f"EXISTS (SELECT 1 FROM model_calls fm WHERE {' AND '.join(model_conditions)})"
+        )
+    where_sql = " AND ".join(conditions)
+    all_traces_sql = """
+        WITH model_only AS (
+            SELECT
+                m.trace_id,
+                NULL AS session_id,
+                NULL AS user_message,
+                NULL AS intent,
+                NULL AS agent_name,
+                MAX(m.status) AS status,
+                MAX(m.created_at) AS created_at,
+                MAX(m.created_at) AS updated_at
+            FROM model_calls m
+            WHERE m.trace_id IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM chat_traces existing
+                  WHERE existing.trace_id = m.trace_id
+              )
+            GROUP BY m.trace_id
+        ), all_traces AS (
+            SELECT
+                t.trace_id, t.session_id, t.user_message, t.intent,
+                t.agent_name, t.status, t.created_at, t.updated_at
+            FROM chat_traces t
+            UNION ALL
+            SELECT
+                trace_id, session_id, user_message, intent,
+                agent_name, status, created_at, updated_at
+            FROM model_only
+        )
+    """
+
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute(
+        f"{all_traces_sql} SELECT COUNT(*) AS total FROM all_traces a WHERE {where_sql}",
+        params,
+    )
+    total = int(cursor.fetchone()["total"] or 0)
+    cursor.execute(
+        f"""
+        {all_traces_sql}
+        SELECT * FROM all_traces a
+        WHERE {where_sql}
+        ORDER BY a.created_at DESC, a.trace_id DESC
+        LIMIT ? OFFSET ?
+        """,
+        params + [limit, offset],
+    )
+    trace_rows = cursor.fetchall()
+
+    page_trace_ids = [row["trace_id"] for row in trace_rows]
+    agg_rows: Dict[str, Dict[str, Any]] = {}
+    if page_trace_ids:
+        placeholders = ",".join("?" for _ in page_trace_ids)
+        cursor.execute(
+            f"""
+            SELECT
+                trace_id,
+                GROUP_CONCAT(DISTINCT model_id) AS model_ids,
+                COALESCE(SUM(total_tokens), 0) AS total_tokens,
+                SUM(estimated_cost_cny) AS estimated_cost_cny,
+                COALESCE(SUM(CASE WHEN usage_source = 'provider_actual' THEN estimated_cost_cny ELSE 0 END), 0) AS provider_actual_cost_cny,
+                COALESCE(SUM(CASE WHEN usage_source = 'estimated' THEN estimated_cost_cny ELSE 0 END), 0) AS local_estimated_cost_cny,
+                SUM(CASE WHEN usage_source = 'provider_actual' THEN 1 ELSE 0 END) AS provider_actual_calls,
+                SUM(CASE WHEN usage_source = 'provider_actual' AND estimated_cost_cny IS NOT NULL THEN 1 ELSE 0 END) AS provider_actual_priced_calls,
+                SUM(CASE WHEN usage_source = 'estimated' THEN 1 ELSE 0 END) AS estimated_calls,
+                SUM(CASE WHEN usage_source = 'estimated' AND estimated_cost_cny IS NOT NULL THEN 1 ELSE 0 END) AS estimated_priced_calls,
+                SUM(CASE WHEN COALESCE(usage_source, 'unavailable') NOT IN ('provider_actual', 'estimated') OR estimated_cost_cny IS NULL THEN 1 ELSE 0 END) AS unknown_cost_calls,
+                COUNT(*) AS call_count
+            FROM model_calls
+            WHERE trace_id IN ({placeholders})
+            GROUP BY trace_id
+            """,
+            page_trace_ids,
+        )
+        agg_rows = {row["trace_id"]: dict(row) for row in cursor.fetchall()}
+    conn.close()
+
+    results = []
+    for row in trace_rows:
+        trace = dict(row)
+        agg = agg_rows.get(trace["trace_id"], {})
+        model_ids = [item for item in str(agg.get("model_ids") or "").split(",") if item]
+        call_count = int(agg.get("call_count") or 0)
+        provider_actual_calls = int(agg.get("provider_actual_calls") or 0)
+        provider_actual_priced_calls = int(
+            agg.get("provider_actual_priced_calls") or 0
+        )
+        estimated_calls = int(agg.get("estimated_calls") or 0)
+        estimated_priced_calls = int(agg.get("estimated_priced_calls") or 0)
+        unknown_cost_calls = int(agg.get("unknown_cost_calls") or 0)
+
+        if not model_ids:
+            model_summary = "尚无模型调用记录"
+        elif len(model_ids) == 1:
+            model_summary = _model_display_name(model_ids[0])
+        else:
+            model_summary = " + ".join(_model_display_name(item) for item in model_ids)
+
+        trace.update({
+            "models": model_ids,
+            "model_summary": model_summary,
+            "total_tokens": int(agg.get("total_tokens") or 0) if call_count else None,
+            "estimated_cost_cny": agg.get("estimated_cost_cny"),
+            "provider_actual_cost_cny": round(float(agg.get("provider_actual_cost_cny") or 0), 8),
+            "local_estimated_cost_cny": round(float(agg.get("local_estimated_cost_cny") or 0), 8),
+            "provider_actual_calls": provider_actual_calls,
+            "provider_actual_priced_calls": provider_actual_priced_calls,
+            "estimated_calls": estimated_calls,
+            "estimated_priced_calls": estimated_priced_calls,
+            "unavailable_calls": unknown_cost_calls,
+            "model_call_count": call_count,
+            "cost_status": (
+                "not_applicable" if call_count == 0
+                else "partial_unavailable" if unknown_cost_calls
+                else "provider_actual" if provider_actual_calls and not estimated_calls
+                else "estimated" if estimated_calls and not provider_actual_calls
+                else "mixed"
+            ),
+            "price_missing": unknown_cost_calls > 0,
+            "no_model_calls": call_count == 0,
+        })
+        results.append(trace)
+
+    pages = max(1, (total + limit - 1) // limit)
+    page = (offset // limit) + 1
+    return {
+        "traces": results,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "page": page,
+        "pages": pages,
+        "has_previous": offset > 0,
+        "has_next": offset + len(results) < total,
+        "start": effective_start,
+        "end": effective_end,
+        "range_key": scope.get("range_key"),
+        "timezone": scope.get("timezone"),
+    }
+
+
 @router.get("/traces")
 async def traces(
     session_id: Optional[str] = Query(None),
@@ -529,184 +805,30 @@ async def traces(
     stage: Optional[str] = Query(None),
     start: Optional[str] = Query(None),
     end: Optional[str] = Query(None),
-    limit: int = Query(100, ge=1, le=500),
+    range_key: Optional[str] = Query(
+        None,
+        pattern="^(today|yesterday|last_7_days|this_month|last_month|custom)$",
+    ),
+    limit: int = Query(20, ge=1, le=100),
     offset: int = Query(0, ge=0),
 ):
-    """List chat traces aggregated with their model calls.
-
-    Each returned trace includes:
-    - models: list of models actually invoked for this trace
-    - total_tokens: sum of model_calls.total_tokens
-    - estimated_cost_cny: sum of estimated_cost_cny (null if any call lacks a price)
-    - price_missing: true when at least one model call had no configured price
-    - no_model_calls: true when the trace has no model call records
-    """
-    effective_end = _normalize_end(end)
-
-    # Build model-call aggregation with its own filters.
-    m_conditions = ["1=1"]
-    m_params: List[Any] = []
-    if model_id:
-        m_conditions.append("model_id = ?")
-        m_params.append(model_id)
-    if stage:
-        m_conditions.append("stage = ?")
-        m_params.append(stage)
-    if start:
-        m_conditions.append("created_at >= ?")
-        m_params.append(start)
-    if effective_end:
-        m_conditions.append("created_at <= ?")
-        m_params.append(effective_end)
-    m_where = " AND ".join(m_conditions)
-
-    # Build chat-trace filters.
-    t_conditions = ["1=1"]
-    t_params: List[Any] = []
-    if trace_id:
-        t_conditions.append("trace_id = ?")
-        t_params.append(trace_id)
-    if session_id:
-        t_conditions.append("session_id = ?")
-        t_params.append(session_id)
-    if intent:
-        t_conditions.append("intent = ?")
-        t_params.append(intent)
-    if agent:
-        t_conditions.append("agent_name = ?")
-        t_params.append(agent)
-    if start:
-        t_conditions.append("created_at >= ?")
-        t_params.append(start)
-    if effective_end:
-        t_conditions.append("created_at <= ?")
-        t_params.append(effective_end)
-    t_where = " AND ".join(t_conditions)
-
-    conn = _get_conn()
-    cursor = conn.cursor()
-
-    # Aggregate model calls per trace.
-    cursor.execute(
-        f"""
-        SELECT
-            trace_id,
-            GROUP_CONCAT(DISTINCT model_id) as model_ids,
-            COALESCE(SUM(total_tokens), 0) as total_tokens,
-            SUM(estimated_cost_cny) as estimated_cost_cny,
-            COALESCE(SUM(CASE WHEN usage_source = 'provider_actual' THEN estimated_cost_cny ELSE 0 END), 0) as provider_actual_cost_cny,
-            COALESCE(SUM(CASE WHEN usage_source = 'estimated' THEN estimated_cost_cny ELSE 0 END), 0) as local_estimated_cost_cny,
-            SUM(CASE WHEN usage_source = 'provider_actual' THEN 1 ELSE 0 END) as provider_actual_calls,
-            SUM(CASE WHEN usage_source = 'estimated' THEN 1 ELSE 0 END) as estimated_calls,
-            SUM(CASE WHEN COALESCE(usage_source, 'unavailable') NOT IN ('provider_actual', 'estimated') OR (usage_source = 'provider_actual' AND estimated_cost_cny IS NULL) THEN 1 ELSE 0 END) as unknown_cost_calls,
-            COUNT(*) as call_count
-        FROM model_calls
-        WHERE {m_where}
-        GROUP BY trace_id
-        """,
-        m_params,
-    )
-    agg_rows = {r["trace_id"]: dict(r) for r in cursor.fetchall()}
-
-    # Main query: chat traces joined with aggregated model-call metrics.
-    cursor.execute(
-        f"""
-        SELECT
-            t.trace_id,
-            t.session_id,
-            t.user_message,
-            t.intent,
-            t.agent_name,
-            t.status,
-            t.created_at,
-            t.updated_at
-        FROM chat_traces t
-        WHERE {t_where}
-        ORDER BY t.created_at DESC
-        LIMIT ? OFFSET ?
-        """,
-        t_params + [limit, offset],
-    )
-    trace_rows = cursor.fetchall()
-
-    # Also include traces that only exist in model_calls when no chat-trace
-    # filters other than start/end/model/stage are requested.
-    if not any([trace_id, session_id, intent, agent]):
-        cursor.execute(
-            f"""
-            SELECT
-                m.trace_id,
-                NULL as session_id,
-                NULL as user_message,
-                NULL as intent,
-                NULL as agent_name,
-                MAX(m.status) as status,
-                MAX(m.created_at) as created_at,
-                MAX(m.created_at) as updated_at
-            FROM model_calls m
-            WHERE {m_where}
-              AND m.trace_id NOT IN (SELECT trace_id FROM chat_traces)
-            GROUP BY m.trace_id
-            ORDER BY created_at DESC
-            LIMIT ? OFFSET ?
-            """,
-            m_params + [limit, offset],
+    """List one server-paginated page of chat, model-only, and no-model traces."""
+    try:
+        return _list_trace_page(
+            session_id=session_id,
+            trace_id=trace_id,
+            intent=intent,
+            agent=agent,
+            model_id=model_id,
+            stage=stage,
+            start=start,
+            end=end,
+            range_key=range_key,
+            limit=limit,
+            offset=offset,
         )
-        trace_rows.extend(cursor.fetchall())
-
-    conn.close()
-
-    results = []
-    for row in trace_rows:
-        trace = dict(row)
-        agg = agg_rows.get(trace["trace_id"], {})
-        model_ids_str = agg.get("model_ids") or ""
-        model_ids = [m for m in model_ids_str.split(",") if m]
-        call_count = agg.get("call_count") or 0
-        total_tokens = agg.get("total_tokens") or 0
-        estimated_cost_cny = agg.get("estimated_cost_cny")
-        provider_actual_cost_cny = agg.get("provider_actual_cost_cny") or 0.0
-        local_estimated_cost_cny = agg.get("local_estimated_cost_cny") or 0.0
-        provider_actual_calls = agg.get("provider_actual_calls") or 0
-        estimated_calls = agg.get("estimated_calls") or 0
-        unknown_cost_calls = agg.get("unknown_cost_calls") or 0
-        price_missing = unknown_cost_calls > 0
-
-        # Build a concise model summary.
-        if not model_ids:
-            model_summary = "尚无模型调用记录"
-        elif len(model_ids) == 1:
-            display = _model_display_name(model_ids[0])
-            model_summary = display
-        else:
-            display = _model_display_name(model_ids[0])
-            model_summary = f"{display}（router + vertical）"
-
-        trace["models"] = model_ids
-        trace["model_summary"] = model_summary
-        trace["total_tokens"] = total_tokens if call_count else None
-        trace["estimated_cost_cny"] = estimated_cost_cny
-        trace["provider_actual_cost_cny"] = round(provider_actual_cost_cny, 8)
-        trace["local_estimated_cost_cny"] = round(local_estimated_cost_cny, 8)
-        trace["provider_actual_calls"] = provider_actual_calls
-        trace["estimated_calls"] = estimated_calls
-        trace["unavailable_calls"] = unknown_cost_calls
-        trace["cost_status"] = (
-            "not_applicable"
-            if call_count == 0
-            else "partial_unavailable"
-            if unknown_cost_calls
-            else "provider_actual"
-            if provider_actual_calls and not estimated_calls
-            else "estimated"
-            if estimated_calls and not provider_actual_calls
-            else "mixed"
-        )
-        trace["price_missing"] = price_missing
-        trace["no_model_calls"] = call_count == 0
-        results.append(trace)
-
-    return {"traces": results, "start": start, "end": effective_end}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 def _build_cost_formula(call: Dict[str, Any]) -> str:

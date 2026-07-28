@@ -173,7 +173,8 @@ def main() -> None:
     assert platform_menu.count("label: '调用与成本治理'") == 1
     assert "label: '成本优化策略'" not in platform_menu
     assert "/api/model-configs/ab-test" not in cost_section
-    assert "traceParams.set('limit', '10')" in cost_section
+    assert "traceParams.set('limit', String(state.pagination.limit))" in cost_section
+    assert "traceParams.set('offset', String((state.pagination.page - 1) * state.pagination.limit))" in cost_section
     assert all(label in render_page for label in (
         "renderOverview()",
         "renderTraces()",
@@ -188,11 +189,16 @@ def main() -> None:
         "cg-open-strategy-page",
     ))
     assert all(label in cost_section for label in (
-        "今天一句话结论",
-        "今日真实费用",
-        "今日模型调用",
+        "一句话结论",
+        "['today', '今天']",
+        "['yesterday', '昨天']",
+        "['last_7_days', '近7天']",
+        "['this_month', '本月']",
+        "['last_month', '上月']",
+        "['custom', '自定义']",
         "需要关注",
-        "钱花在哪：今日调用记录",
+        "调用记录",
+        "每页20条",
         "高级筛选",
         "我们的成本治理原则",
         "查看详情",
