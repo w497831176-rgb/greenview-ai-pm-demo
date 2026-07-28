@@ -1,4 +1,4 @@
-"""Deterministic V1.8.2-S9-B cost-story contract checks.
+"""Deterministic V1.8.2-S9-B/S9-B.1 cost-story and frontend hierarchy checks.
 
 No HTTP, model, RuntimeRelease, or business-data call is made.
 """
@@ -165,16 +165,49 @@ def main() -> None:
     assert "¥0" not in failed_story["summary"]
     assert failed_story["recommendation"]["code"] == "evidence_insufficient"
 
-    # 8. UI is read-only for model comparison and keeps technical detail folded.
+    # 8. UI has one navigation entry, three default regions, and folded engineering detail.
     source = Path("frontend/index.html").read_text(encoding="utf-8")
-    cost_section = source[source.index("function renderCostCases") : source.index("async function _renderRuntimePageLegacy")]
+    platform_menu = source[source.index("platform: [") : source.index("const ICONS")]
+    cost_section = source[source.index("async function renderCostGovernancePage") : source.index("async function renderCostStrategyPage")]
+    render_page = cost_section[cost_section.rindex("function renderPage()") : cost_section.index("function bindEvents()")]
+    assert platform_menu.count("label: '调用与成本治理'") == 1
+    assert "label: '成本优化策略'" not in platform_menu
     assert "/api/model-configs/ab-test" not in cost_section
-    assert cost_section.count("查看复测方法") >= 2
-    assert "renderHighCostTraces()" in cost_section
-    assert "本轮未调用模型，因此模型Token与费用不适用。" in source
-    assert "技术细节、公式与会话累计" in source
+    assert "traceParams.set('limit', '10')" in cost_section
+    assert all(label in render_page for label in (
+        "renderOverview()",
+        "renderTraces()",
+        "renderGovernancePrinciples()",
+        "高级信息：价格、预算与策略说明",
+    ))
+    assert all(label not in render_page for label in (
+        "renderHighCostTraces()",
+        "renderModelChart()",
+        "renderStageChart()",
+        "renderCostCases()",
+        "cg-open-strategy-page",
+    ))
+    assert all(label in cost_section for label in (
+        "今天一句话结论",
+        "今日真实费用",
+        "今日模型调用",
+        "需要关注",
+        "钱花在哪：今日调用记录",
+        "高级筛选",
+        "我们的成本治理原则",
+        "查看详情",
+        "1. 本次发生了什么",
+        "2. 为什么这样选择",
+        "3. 花费怎么来的",
+        "4. 下一步建议",
+        "查看Token与计算明细",
+        "本轮使用确定性规则完成，没有调用模型，因此Token与模型费用不适用。",
+        "本轮发生了模型调用，但Provider用量证据不完整，因此无法计算金额；系统没有按0元处理。",
+    ))
+    assert "$('#cg-run-cost01').addEventListener" not in cost_section
+    assert "$('#cg-run-cost02').addEventListener" not in cost_section
 
-    print("PASS: V1.8.2-S9-B deterministic cost-story contract (8 groups)")
+    print("PASS: V1.8.2-S9-B/S9-B.1 deterministic cost-story contract (8 groups)")
 
 
 if __name__ == "__main__":
