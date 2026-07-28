@@ -14,6 +14,7 @@ from app.handoff_policy import evaluate_handoff_policy
 from app.runtime.agent_factory import build_agent_from_snapshot, vertical_agent_cards
 from app.runtime.badcase_capture import capture_runtime_badcase
 from app.runtime.citation_renderer import (
+    build_skill_evidence,
     build_evidence_set,
     prompt_evidence_allowlist,
     render_citations,
@@ -2062,9 +2063,16 @@ class RuntimeCoordinator:
             full_content,
             evidence,
             tool_invocations=state.tool_invocations,
+            skill_sources=build.skill_evidence_sources,
+            action_receipts=state.action_receipts,
+        )
+        linked_skill_evidence = build_skill_evidence(
+            full_content,
+            build.skill_evidence_sources,
         )
         citation_required = bool(
             evidence.items
+            and not linked_skill_evidence
             and (
                 direct_knowledge_required
                 or _requires_rag_citations(message)
@@ -2169,6 +2177,10 @@ class RuntimeCoordinator:
         state.status = RunStatus.COMPLETED
         state.next_step = None
         ledger.capture_state(state)
+        ledger.set(
+            "skill_evidence",
+            linked_skill_evidence,
+        )
         ledger.append(
             "evaluation_results",
             {
@@ -2200,6 +2212,7 @@ class RuntimeCoordinator:
                 "passed": (
                     not direct_knowledge_required
                     or bool(citations)
+                    or bool(linked_skill_evidence)
                     or rendered.startswith("当前知识依据不足")
                 ),
                 "required": direct_knowledge_required,
@@ -2231,6 +2244,7 @@ class RuntimeCoordinator:
                 "activated_skill_ids": [
                     item.skill_id for item in state.activated_skills
                 ],
+                "skill_evidence": ledger.contract.skill_evidence,
                 "evidence_ids": [item.evidence_id for item in evidence.items],
                 "citation_evidence_ids": [
                     item.evidence_id for item in citations
@@ -2264,6 +2278,15 @@ class RuntimeCoordinator:
         skills_payload = [
             item.model_dump(mode="json") for item in state.activated_skills
         ]
+        skill_evidence_by_id = {
+            int(item["skill_id"]): item
+            for item in ledger.contract.skill_evidence
+            if item.get("skill_id") is not None
+        }
+        for item in skills_payload:
+            evidence_item = skill_evidence_by_id.get(int(item.get("skill_id") or 0))
+            if evidence_item:
+                item["evidence"] = evidence_item
         mcp_payload = []
         for item in state.tool_invocations:
             payload = item.model_dump(mode="json")
@@ -2336,7 +2359,14 @@ class RuntimeCoordinator:
             original_query=message,
             ai_response=rendered,
             source_message_id=saved.get("id"),
+            delivery_context={
+                "normal_completed": True,
+                "safe_rejection": rendered.startswith("当前知识依据不足"),
+                "renderer_intercepted": knowledge_grounding_failed,
+            },
         )
+        if ledger.contract.system_observations:
+            ledger.persist("complete")
         if auto_badcase:
             ledger.append(
                 "badcase_links",

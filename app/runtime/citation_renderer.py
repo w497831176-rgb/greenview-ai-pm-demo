@@ -36,6 +36,7 @@ _CRITICAL_VALUE = re.compile(
     r"(?P<number>\d+(?:\.\d+)?|[一二三四五六七八九十百千万两半]+)\s*"
     r"(?P<unit>个\s*工作日|个\s*种植舱|工作日|种植舱|分钟|小时|天|份|元|万元|%|次|年|个月|月|日)"
 )
+_PHONE_VALUE = re.compile(r"(?<!\d)(?:0\d{2,3}[- ]?\d{7,8}|1[3-9]\d{9})(?!\d)")
 _CALCULATION_INPUT_VALUE = re.compile(
     r"(?:连续|持续)\s*"
     r"(?P<number>\d+(?:\.\d+)?|[一二三四五六七八九十百千万两半]+)\s*"
@@ -72,6 +73,9 @@ def _critical_values(text: str) -> Set[str]:
         if unit == "个工作日":
             unit = "工作日"
         values.add(f"{number}{unit}")
+    for match in _PHONE_VALUE.finditer(text or ""):
+        digits = re.sub(r"\D", "", match.group(0))
+        values.add(f"phone:{digits}")
     return values
 
 
@@ -123,6 +127,42 @@ def _tool_supports_critical_value(value: str, tool_numbers: Set[str]) -> bool:
     return bool(
         match and _normalize_number(match.group("number")) in tool_numbers
     )
+
+
+def _supporting_excerpt(content: str, values: Set[str], limit: int = 400) -> str:
+    """Return a short immutable excerpt that contains the supporting values."""
+
+    lines = [line.strip() for line in re.split(r"[\r\n]+", content or "") if line.strip()]
+    matched = [line for line in lines if _critical_values(line) & values]
+    excerpt = " ".join(matched) if matched else ""
+    return excerpt[:limit]
+
+
+def build_skill_evidence(
+    answer: str,
+    skill_sources: Optional[Iterable[Dict[str, Any]]] = None,
+) -> List[Dict[str, Any]]:
+    """Build answer-linked evidence from Skills activated in this exact Snapshot."""
+
+    answer_values = _critical_values(answer or "")
+    result: List[Dict[str, Any]] = []
+    for source in skill_sources or []:
+        content = str(source.get("content_snapshot") or "")
+        supported = answer_values & _critical_values(content)
+        if not supported:
+            continue
+        result.append(
+            {
+                "skill_id": source.get("skill_id"),
+                "name": source.get("name"),
+                "version": source.get("version"),
+                "snapshot_id": source.get("snapshot_id"),
+                "content_hash": source.get("content_hash"),
+                "supported_values": sorted(supported),
+                "supporting_excerpt": _supporting_excerpt(content, supported),
+            }
+        )
+    return result
 
 
 def _is_structural_content(content: str, title: str = "") -> bool:
@@ -407,12 +447,29 @@ def render_citations(
     answer: str,
     evidence: EvidenceSet,
     tool_invocations: Optional[Iterable[Any]] = None,
+    skill_sources: Optional[Iterable[Dict[str, Any]]] = None,
+    action_receipts: Optional[Iterable[Any]] = None,
 ) -> Tuple[str, List[Citation], List[Dict[str, Any]]]:
     """Validate model markers, render indices and return UI-safe snapshots."""
     by_id = evidence.by_id()
     ordered_ids: List[str] = []
     violations: List[Dict[str, Any]] = []
-    grounded_critical_values: Set[str] = set()
+    # User-provided facts and evidence activated in this exact run are legal
+    # support. Skill support is deliberately not rendered as a fake RAG citation.
+    grounded_critical_values: Set[str] = set(_critical_values(evidence.query))
+    for skill in skill_sources or []:
+        grounded_critical_values.update(
+            _critical_values(str(skill.get("content_snapshot") or ""))
+        )
+    for receipt in action_receipts or []:
+        if isinstance(receipt, dict):
+            status = receipt.get("status")
+            result = receipt.get("result")
+        else:
+            status = getattr(receipt, "status", None)
+            result = getattr(receipt, "result", None)
+        if status == "committed":
+            grounded_critical_values.update(_critical_values(str(result or "")))
     calculation_inputs = _calculation_input_values(evidence.query)
     tool_result_numbers = _successful_tool_result_numbers(tool_invocations or [])
 

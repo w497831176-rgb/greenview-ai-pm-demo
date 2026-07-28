@@ -27,6 +27,7 @@ from pydantic import BaseModel, Field
 logger = logging.getLogger(__name__)
 
 from app.badcase_schema import (
+    CATEGORY_LABELS,
     ROOT_CAUSE_DOMAINS,
     VALID_CATEGORIES,
     VALID_STATUSES,
@@ -41,6 +42,7 @@ from app.badcase_schema import (
     require_status,
     validate_draft_status_transition,
     validate_status_transition,
+    user_status_label,
 )
 from app.observability import _check_budget
 from app.runtime.cost_ledger import build_cost_entry, cost_entry_usage_payload
@@ -191,6 +193,11 @@ class AcceptLimitationRequest(BaseModel):
 
 class RejectRequest(BaseModel):
     rejected_reason: str = ""
+    review_result: str = ""
+
+
+class SystemObservationRequest(BaseModel):
+    reason: str = ""
 
 
 class TransitionRequest(BaseModel):
@@ -476,6 +483,8 @@ async def list_badcases(
     search: Optional[str] = None,
     page: int = 1,
     page_size: int = 20,
+    view_scope: str = "current",
+    user_status: Optional[str] = None,
 ):
     """Return a bounded, lightweight Badcase workbench page."""
     if status and status not in VALID_STATUSES:
@@ -490,6 +499,10 @@ async def list_badcases(
         raise HTTPException(status_code=400, detail="page must be >= 1")
     if page_size not in {20, 50}:
         raise HTTPException(status_code=400, detail="page_size must be 20 or 50")
+    if view_scope not in {"current", "history", "all"}:
+        raise HTTPException(status_code=400, detail="view_scope must be current, history or all")
+    if user_status and user_status not in {"review", "processing", "verifying", "ended"}:
+        raise HTTPException(status_code=400, detail="invalid user_status")
     result = db_list_badcases_page(
         page=page,
         page_size=page_size,
@@ -503,7 +516,24 @@ async def list_badcases(
         has_retest=has_retest,
         created_after=created_after,
         created_before=created_before,
+        view_scope=view_scope,
+        user_status=user_status,
     )
+    for item in result["items"]:
+        item["category_label"] = CATEGORY_LABELS.get(item.get("category"), "待分类")
+        item["user_status_label"] = user_status_label(str(item.get("status") or "pending"))
+        item["terminal_outcome_label"] = (
+            "自动误抓" if item.get("is_auto_false_positive")
+            else "重复问题" if item.get("status") == "duplicate"
+            else "已知限制，暂不处理" if item.get("status") == "accepted_limitation"
+            else "已解决" if item.get("status") == "closed"
+            else ""
+        )
+        item["record_layer_label"] = (
+            "系统观察" if item.get("is_system_observation")
+            else "历史待核验" if item.get("is_history_insufficient")
+            else "当前问题"
+        )
     # Keep aliases for older callers, but both aliases now contain lightweight
     # list rows only; long evidence remains detail-only.
     return {**result, "badcases": result["items"], "count": result["total"]}
@@ -760,6 +790,7 @@ async def classify_badcase(case_id: int, request: ClassifyRequest = ClassifyRequ
         },
         case["status"],
         new_status,
+        "ai_flash" if request.auto else "operator",
     )
     return {
         "badcase": _enrich_badcase(updated),
@@ -1625,6 +1656,7 @@ async def darwin_fix(case_id: int, request: DarwinFixRequest = DarwinFixRequest(
         },
         before,
         new_status,
+        "ai_expert",
     )
     persist_darwin_operation(
         trace_id=darwin_trace_id,
@@ -1908,8 +1940,33 @@ async def reject_badcase(case_id: int, request: RejectRequest = RejectRequest())
 
     new_status = "rejected"
     updated = db_update_badcase(case_id, status=new_status, rejected_reason=request.rejected_reason.strip())
-    _record_action(case_id, "reject", {"reason": request.rejected_reason.strip()}, case["status"], new_status)
+    action_type = "mark-auto-false-positive" if request.review_result == "automatic_false_positive" else "reject"
+    _record_action(
+        case_id,
+        action_type,
+        {"reason": request.rejected_reason.strip(), "review_result": request.review_result},
+        case["status"],
+        new_status,
+        "operator",
+    )
     return {"badcase": _enrich_badcase(updated)}
+
+
+@router.post("/{case_id}/system-observation")
+async def mark_system_observation(case_id: int, request: SystemObservationRequest):
+    """Keep a historical record but remove it from the current-problem view."""
+    case = _load_case(case_id)
+    if not request.reason.strip():
+        raise HTTPException(status_code=400, detail="reason required")
+    _record_action(
+        case_id,
+        "system-observation",
+        {"reason": request.reason.strip()},
+        case["status"],
+        case["status"],
+        "operator",
+    )
+    return {"badcase": _enrich_badcase(_load_case(case_id))}
 
 
 @router.post("/{case_id}/accept-limitation")

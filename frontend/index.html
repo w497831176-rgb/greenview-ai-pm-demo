@@ -660,8 +660,8 @@
           unavailable: '不可得',
           provider_reported: 'Provider账单',
           estimated_tokenization: '本地估算'
-        }[usageSource] || '未知',
-        title: `usage_source: ${usageSource || 'unknown'}`
+      }[usageSource] || '用量待核验',
+        title: usageSource ? `用量来源：${usageSource}` : '用量来源待核验'
       };
     }
 
@@ -677,7 +677,8 @@
       const tags = [];
       const allTools = tools || [];
       const controlledWriteCalls = allTools.filter(isControlledWorkOrderCall);
-      const ordinaryTools = allTools.filter(call => !isControlledWorkOrderCall(call));
+      const isSkillLoader = call => toolCallName(call) === 'get_skill_instructions';
+      const ordinaryTools = allTools.filter(call => !isControlledWorkOrderCall(call) && !isSkillLoader(call));
       if (modelId) {
         const modelLabel = modelId === 'deepseek-v4-pro' ? 'Pro' : (modelId === 'deepseek-v4-flash' ? 'Flash' : modelId);
         const thinkingText = thinkingEnabled ? '· thinking' : '';
@@ -685,7 +686,12 @@
       }
       if (routeReason) tags.push(`<span class="px-1.5 py-0.5 bg-slate-100 text-slate-600 rounded text-[10px]" title="${escapeHtml(routeIntent || '')}">路由原因：${escapeHtml(routeReason)}</span>`);
       if (agent) tags.push(`<span class="px-1.5 py-0.5 bg-indigo-50 text-indigo-600 rounded text-[10px]" title="agent_id: ${escapeHtml(currentAgentId || '')}">当前处理 Agent：${escapeHtml(agent)}</span>`);
-      if (skills && skills.length) tags.push(`<span class="px-1.5 py-0.5 bg-brand-50 text-brand-600 rounded text-[10px]" title="Skill 提供可复用的业务规则与执行方法；它不是知识库引用。">已命中 Skill（业务规则）：${escapeHtml(skills.map(s => (typeof s === 'object' && s !== null ? (s.name || JSON.stringify(s)) : String(s))).join('、'))}</span>`);
+      if (skills && skills.length) {
+        const loaded = skills.map(s => typeof s === 'object' && s !== null ? (s.name || `Skill ${s.skill_id || ''}`) : String(s));
+        const evidenceLabels = skills.filter(s => typeof s === 'object' && s !== null && s.evidence).map(s => `${s.name || `Skill ${s.skill_id || ''}`} Skill v${s.version || '未标版本'}`);
+        tags.push(`<span class="px-1.5 py-0.5 bg-brand-50 text-brand-600 rounded text-[10px]" title="这是当次能力快照真实激活的业务规则，不是知识库引用。">已加载业务规则：${escapeHtml(loaded.join('、'))}</span>`);
+        if (evidenceLabels.length) tags.push(`<span class="px-1.5 py-0.5 bg-emerald-50 text-emerald-700 rounded text-[10px]">业务规则依据：${escapeHtml(evidenceLabels.join('、'))}</span>`);
+      }
       if (ordinaryTools.length) tags.push(`<span class="px-1.5 py-0.5 bg-gold-50 text-gold-600 rounded text-[10px]">已调用工具：${escapeHtml(ordinaryTools.map(t => typeof t === 'string' ? t : (t.name || t.tool_name || JSON.stringify(t))).join('、'))}</span>`);
       if (mcpCalls && mcpCalls.length) {
         const okCount = mcpCalls.filter(c => c.status === 'success').length;
@@ -697,7 +703,7 @@
       }
       if (traceId) {
         const traceUsage = traceUsagePresentation(usageSource, allTools);
-        tags.push(`<button type="button" class="px-1.5 py-0.5 bg-slate-50 text-slate-500 rounded text-[10px] hover:bg-slate-100 hover:text-slate-700 transition-colors" title="${escapeHtml(traceUsage.title)} · trace_id: ${escapeHtml(traceId)}" onclick="openTraceDrawer('${escapeHtml(traceId)}')">Trace · ${escapeHtml(traceUsage.label)}</button>`);
+        tags.push(`<button type="button" class="px-1.5 py-0.5 bg-slate-50 text-slate-500 rounded text-[10px] hover:bg-slate-100 hover:text-slate-700 transition-colors" title="${escapeHtml(traceUsage.title)} · trace_id: ${escapeHtml(traceId)}" onclick="openTraceDrawer('${escapeHtml(traceId)}')">技术追踪 · ${escapeHtml(traceUsage.label)}</button>`);
       }
       const tagHtml = tags.length ? `<div class="flex flex-wrap items-center gap-1 mt-2">${tags.join('')}</div>` : '';
       const controlledWriteHtml = controlledWriteCalls.length ? `<div class="mt-2 space-y-2">${controlledWriteCalls.map(renderControlledWriteCard).join('')}</div>` : '';
@@ -2714,20 +2720,18 @@
     }
 
     async function renderBadcasesPage(container) {
-      const state = { page: 1, pageSize: 20 };
+      const state = { page: 1, pageSize: 20, viewScope: 'current' };
       const categoryLabels = { knowledge_gap: '知识库缺口', skill_prompt: 'Skill/Prompt 问题', mcp_capability: 'MCP/能力缺口', routing: '路由问题', response_quality: '模型回答质量', other: '其他', pending: '待分类' };
-      const sourceLabels = { manual: '人工反馈', auto: '自动发现', user_feedback: '用户反馈', evaluation: '评估失败', mcp_failure: '工具监测', handoff: '人工协同复盘' };
-      const rootLabels = { unknown: '待归因', routing: '意图/路由', knowledge_rag: '知识/RAG', model_instruction: '模型/指令/Skill', tool_mcp: 'Tool/MCP', authority_safety: '权限/安全', human_collaboration: '人机协同', ux: '产品体验', external_dependency: '外部依赖' };
+      const sourceLabels = { manual: '运营登记', auto: '自动发现', user_feedback: '业主上报', evaluation: '固定评估', mcp_failure: '工具异常', tool_failure: '工具异常', runtime_contract: '自动发现', provider_failure: '模型服务异常', handoff: '人工协同复盘' };
       container.innerHTML = `
         <div class="max-w-6xl mx-auto p-4 md:p-6 space-y-5">
-          <div><h2 class="text-xl font-semibold text-slate-900">Badcase 工作台</h2><p class="text-sm text-slate-500 mt-1">列表只加载处理决策需要的摘要；完整证据在进入详情后按需读取。</p></div>
+          <div class="flex flex-wrap justify-between gap-3"><div><h2 class="text-xl font-semibold text-slate-900">问题工作台</h2><p class="text-sm text-slate-500 mt-1">自动发现只是疑似问题；产品负责人审核后才能确认原因和结论。</p></div><div class="inline-flex rounded-xl bg-slate-100 p-1"><button id="badcase-current-tab" class="px-3 py-1.5 rounded-lg text-sm bg-white text-slate-900 shadow-sm">当前问题</button><button id="badcase-history-tab" class="px-3 py-1.5 rounded-lg text-sm text-slate-500">历史记录</button></div></div>
           <div class="bg-white rounded-2xl shadow-soft border border-slate-200 p-4 space-y-3">
             <div class="flex flex-wrap gap-3 items-end">
               <div class="min-w-[220px] flex-1"><label class="block text-xs text-slate-500 mb-1">搜索</label><input id="badcase-filter-search" type="search" placeholder="ID / 问题 / 反馈 / Trace" class="w-full px-3 py-2 border border-slate-200 rounded-xl text-sm"></div>
               <div class="min-w-[135px]"><label class="block text-xs text-slate-500 mb-1">来源</label><select id="badcase-filter-source" class="w-full px-3 py-2 bg-white border border-slate-200 rounded-xl text-sm"><option value="">全部来源</option><option value="evaluation">评估失败</option><option value="manual">人工反馈</option><option value="auto">自动发现</option><option value="user_feedback">用户反馈</option></select></div>
               <div class="min-w-[135px]"><label class="block text-xs text-slate-500 mb-1">分类</label><select id="badcase-filter-category" class="w-full px-3 py-2 bg-white border border-slate-200 rounded-xl text-sm"><option value="">全部分类</option>${Object.entries(categoryLabels).map(([value,label]) => `<option value="${value}">${label}</option>`).join('')}</select></div>
-              <div class="min-w-[135px]"><label class="block text-xs text-slate-500 mb-1">根因域</label><select id="badcase-filter-root" class="w-full px-3 py-2 bg-white border border-slate-200 rounded-xl text-sm"><option value="">全部根因域</option>${Object.entries(rootLabels).map(([value,label]) => `<option value="${value}">${label}</option>`).join('')}</select></div>
-              <div class="min-w-[135px]"><label class="block text-xs text-slate-500 mb-1">状态</label><select id="badcase-filter-status" class="w-full px-3 py-2 bg-white border border-slate-200 rounded-xl text-sm"><option value="">全部状态</option><option value="pending">待处理</option><option value="classified">已分类</option><option value="investigating">归因中</option><option value="fixing">修复中</option><option value="verifying">验证中</option><option value="released">发布观察中</option><option value="closed">已关闭</option><option value="rejected">已驳回</option><option value="duplicate">重复记录</option><option value="accepted_limitation">接受的能力边界</option></select></div>
+              <div class="min-w-[135px]"><label class="block text-xs text-slate-500 mb-1">状态</label><select id="badcase-filter-user-status" class="w-full px-3 py-2 bg-white border border-slate-200 rounded-xl text-sm"><option value="">全部状态</option><option value="review">待审核</option><option value="processing">处理中</option><option value="verifying">待验证</option><option value="ended">已结束</option></select></div>
               <div class="min-w-[105px]"><label class="block text-xs text-slate-500 mb-1">优先级</label><select id="badcase-filter-priority" class="w-full px-3 py-2 bg-white border border-slate-200 rounded-xl text-sm"><option value="">全部</option><option value="high">高</option><option value="medium">中</option><option value="low">低</option></select></div>
               <button id="badcase-filter-btn" class="px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white rounded-xl text-sm">查询</button>
             </div>
@@ -2745,8 +2749,8 @@
       const priorityBadge = priority => `<span class="inline-flex items-center gap-1 text-xs text-slate-600"><span class="w-2 h-2 rounded-full ${priority === 'high' ? 'bg-red-500' : priority === 'medium' ? 'bg-amber-500' : 'bg-slate-300'}"></span>${priority === 'high' ? '高' : priority === 'medium' ? '中' : '低'}</span>`;
       const evidenceFlags = item => `<div class="flex flex-wrap gap-1">${item.has_darwin ? '<span class="text-[10px] px-1.5 py-0.5 rounded bg-violet-50 text-violet-700">Darwin</span>' : ''}${item.has_fix_draft ? '<span class="text-[10px] px-1.5 py-0.5 rounded bg-amber-50 text-amber-700">草稿</span>' : ''}${item.has_retest ? '<span class="text-[10px] px-1.5 py-0.5 rounded bg-emerald-50 text-emerald-700">复测</span>' : ''}${!item.has_darwin && !item.has_fix_draft && !item.has_retest ? '<span class="text-xs text-slate-400">暂无</span>' : ''}</div>`;
       function params() {
-        const result = new URLSearchParams({ page: String(state.page), page_size: String(state.pageSize) });
-        const values = { status: '#badcase-filter-status', category: '#badcase-filter-category', source: '#badcase-filter-source', root_cause_domain: '#badcase-filter-root', priority: '#badcase-filter-priority', search: '#badcase-filter-search', has_trace: '#badcase-filter-has-trace', has_retest: '#badcase-filter-has-retest' };
+        const result = new URLSearchParams({ page: String(state.page), page_size: String(state.pageSize), view_scope: state.viewScope });
+        const values = { user_status: '#badcase-filter-user-status', category: '#badcase-filter-category', source: '#badcase-filter-source', priority: '#badcase-filter-priority', search: '#badcase-filter-search', has_trace: '#badcase-filter-has-trace', has_retest: '#badcase-filter-has-retest' };
         Object.entries(values).forEach(([key, selector]) => { const value = $(selector).value.trim(); if (value) result.set(key, value); });
         const start = $('#badcase-filter-start').value;
         const end = $('#badcase-filter-end').value;
@@ -2768,8 +2772,8 @@
           $('#badcases-content').innerHTML = `
             <div class="bg-white rounded-2xl shadow-soft border border-slate-200 overflow-hidden">
               <div class="px-4 py-3 border-b border-slate-100 flex flex-wrap items-center justify-between gap-2"><span class="text-sm text-slate-600">共 <b class="text-slate-900">${data.total || 0}</b> 条</span><span class="text-xs text-slate-400">第 ${data.page} / ${data.total_pages} 页 · 本页 ${cases.length} 条</span></div>
-              <div class="overflow-x-auto"><table class="w-full text-sm"><thead><tr class="bg-slate-50 border-b border-slate-200"><th class="px-4 py-3 text-left text-slate-600">问题摘要</th><th class="px-4 py-3 text-left text-slate-600">分类 / 根因</th><th class="px-4 py-3 text-left text-slate-600">来源 / 优先级</th><th class="px-4 py-3 text-left text-slate-600">状态</th><th class="px-4 py-3 text-left text-slate-600">闭环证据</th><th class="px-4 py-3 text-left text-slate-600">更新时间</th><th></th></tr></thead><tbody class="divide-y divide-slate-100">
-                ${cases.map(item => `<tr class="hover:bg-slate-50/70"><td class="px-4 py-3 max-w-md"><div class="text-[11px] text-slate-400 mb-1">#${item.id}</div><div class="font-medium text-slate-900 line-clamp-2">${escapeHtml(item.summary || '-')}</div></td><td class="px-4 py-3"><div class="text-xs text-slate-700">${escapeHtml(categoryLabels[item.category] || item.category || '-')}</div><div class="text-[11px] text-slate-400 mt-1">${escapeHtml(rootLabels[item.root_cause_domain] || item.root_cause_domain || '待归因')}</div></td><td class="px-4 py-3"><div class="text-xs text-slate-600">${escapeHtml(sourceLabels[item.source] || item.source || '-')}</div><div class="mt-1">${priorityBadge(item.priority)}</div></td><td class="px-4 py-3">${statusBadge(item.status)}</td><td class="px-4 py-3">${evidenceFlags(item)}</td><td class="px-4 py-3 text-xs text-slate-500">${formatTimeLabel(item.updated_at || item.created_at)}</td><td class="px-4 py-3"><button data-id="${item.id}" class="badcase-process-btn text-xs px-3 py-1.5 bg-brand-600 hover:bg-brand-700 text-white rounded-lg">查看详情</button></td></tr>`).join('')}
+              <div class="overflow-x-auto"><table class="w-full text-sm"><thead><tr class="bg-slate-50 border-b border-slate-200"><th class="px-4 py-3 text-left text-slate-600">问题摘要</th><th class="px-4 py-3 text-left text-slate-600">问题分类</th><th class="px-4 py-3 text-left text-slate-600">发现方式</th><th class="px-4 py-3 text-left text-slate-600">状态</th><th class="px-4 py-3 text-left text-slate-600">已有证据</th><th class="px-4 py-3 text-left text-slate-600">更新时间</th><th></th></tr></thead><tbody class="divide-y divide-slate-100">
+                ${cases.map(item => `<tr class="hover:bg-slate-50/70"><td class="px-4 py-3 max-w-md"><div class="text-[11px] text-slate-400 mb-1">#${item.id} · ${escapeHtml(item.record_layer_label || '当前问题')}</div><div class="font-medium text-slate-900 line-clamp-2">${escapeHtml(item.summary || '-')}</div></td><td class="px-4 py-3"><div class="text-xs text-slate-700">${escapeHtml(item.category_label || categoryLabels[item.category] || '待分类')}</div></td><td class="px-4 py-3"><div class="text-xs text-slate-600">${escapeHtml(sourceLabels[item.source] || '自动发现')}</div><div class="mt-1">${priorityBadge(item.priority)}</div></td><td class="px-4 py-3"><span class="text-xs px-2 py-1 rounded-full bg-slate-100 text-slate-700">${escapeHtml(item.user_status_label || '待审核')}</span>${item.terminal_outcome_label ? `<div class="text-[11px] text-slate-500 mt-1">${escapeHtml(item.terminal_outcome_label)}</div>` : ''}</td><td class="px-4 py-3">${evidenceFlags(item)}</td><td class="px-4 py-3 text-xs text-slate-500">${formatTimeLabel(item.updated_at || item.created_at)}</td><td class="px-4 py-3"><button data-id="${item.id}" class="badcase-process-btn text-xs px-3 py-1.5 bg-brand-600 hover:bg-brand-700 text-white rounded-lg">查看详情</button></td></tr>`).join('')}
               </tbody></table></div>
               <div class="px-4 py-3 border-t border-slate-100 flex items-center justify-between"><button id="badcase-prev" class="px-3 py-1.5 rounded-lg text-xs bg-slate-100 text-slate-700 disabled:opacity-40" ${data.page <= 1 ? 'disabled' : ''}>上一页</button><span class="text-xs text-slate-500">${data.page} / ${data.total_pages}</span><button id="badcase-next" class="px-3 py-1.5 rounded-lg text-xs bg-slate-100 text-slate-700 disabled:opacity-40" ${data.page >= data.total_pages ? 'disabled' : ''}>下一页</button></div>
             </div>`;
@@ -2781,6 +2785,8 @@
       $('#badcase-filter-btn').addEventListener('click', () => loadBadcases(1));
       $('#badcase-filter-search').addEventListener('keydown', event => { if (event.key === 'Enter') loadBadcases(1); });
       $('#badcase-page-size').addEventListener('change', event => { state.pageSize = Number(event.target.value); loadBadcases(1); });
+      $('#badcase-current-tab').addEventListener('click', () => { state.viewScope = 'current'; $('#badcase-current-tab').className = 'px-3 py-1.5 rounded-lg text-sm bg-white text-slate-900 shadow-sm'; $('#badcase-history-tab').className = 'px-3 py-1.5 rounded-lg text-sm text-slate-500'; loadBadcases(1); });
+      $('#badcase-history-tab').addEventListener('click', () => { state.viewScope = 'history'; $('#badcase-history-tab').className = 'px-3 py-1.5 rounded-lg text-sm bg-white text-slate-900 shadow-sm'; $('#badcase-current-tab').className = 'px-3 py-1.5 rounded-lg text-sm text-slate-500'; loadBadcases(1); });
       await loadBadcases(1);
     }
 
@@ -3251,9 +3257,7 @@
           category = bc.category || 'pending';
           const headerStatus = $('#badcase-detail-header-status');
           if (headerStatus) {
-            const appliedHint = bc.last_applied_at ? ` · 修复应用时间：${formatTimeLabel(bc.last_applied_at)}` : '';
-            const retestHint = bc.last_retest_at ? ` · 最近复测时间：${formatTimeLabel(bc.last_retest_at)}` : '';
-            headerStatus.innerHTML = `状态：${statusBadge(bc.status)} <span class="text-slate-700 font-medium">${escapeHtml(bc.status_label || '')}</span>${appliedHint}${retestHint}`;
+            headerStatus.innerHTML = `状态：<span class="text-slate-700 font-medium">${escapeHtml(bc.user_status_label || '待审核')}</span>${bc.terminal_outcome_label ? ` · ${escapeHtml(bc.terminal_outcome_label)}` : ''}`;
           }
 	          const kDrafts = bc.knowledge_drafts || [];
 	          const sDrafts = bc.skill_prompt_drafts || [];
@@ -3331,6 +3335,13 @@
 	          $('#badcase-detail-content').innerHTML = `
 	            <div class="space-y-4">
 	              <section class="bg-white rounded-2xl shadow-soft border border-slate-200 p-5">
+	                <div class="flex flex-wrap justify-between gap-3 mb-4"><div><h3 class="font-semibold text-slate-900">问题处理说明</h3><p class="text-xs text-slate-500 mt-1">系统与 AI 只提供线索和建议，人工审核后才形成确认结论。</p></div><div class="flex gap-2"><span class="text-xs px-2 py-1 rounded-full bg-slate-100 text-slate-700">${escapeHtml(bc.user_status_label || '待审核')}</span>${bc.terminal_outcome_label ? `<span class="text-xs px-2 py-1 rounded-full bg-emerald-50 text-emerald-700">${escapeHtml(bc.terminal_outcome_label)}</span>` : ''}</div></div>
+	                <div class="grid grid-cols-1 md:grid-cols-2 gap-3">${((bc.presentation || {}).sections || []).map(section => `<div class="rounded-xl border border-slate-200 p-4"><div class="text-xs font-medium text-slate-500 mb-2">${escapeHtml(section.title)}</div><div class="text-sm text-slate-800 whitespace-pre-wrap">${escapeHtml(section.text || '暂无记录')}</div></div>`).join('')}</div>
+	                <div class="mt-4"><div class="text-xs text-slate-500 mb-2">处理进度</div><div class="grid grid-cols-3 md:grid-cols-6 gap-2">${((bc.presentation || {}).business_timeline || []).map(node => `<div class="rounded-lg px-2 py-2 text-center text-xs ${node.done ? 'bg-emerald-50 text-emerald-700' : 'bg-slate-50 text-slate-400'}">${escapeHtml(node.label)}</div>`).join('')}</div></div>
+	              </section>
+
+	              <details class="bg-white rounded-2xl shadow-soft border border-slate-200 p-5"><summary class="font-semibold text-slate-900 cursor-pointer">查看处理草稿与操作入口</summary><div class="mt-4 space-y-4">
+	              <section class="bg-white rounded-2xl shadow-soft border border-slate-200 p-5">
 	                <div class="flex flex-wrap items-center justify-between gap-3 mb-4"><h3 class="font-semibold text-slate-900">1. 问题概览</h3><div class="flex flex-wrap items-center gap-2">${statusBadge(bc.status)} ${sourceBadgeDetail(bc.source_label)} <span class="text-xs text-slate-500">优先级：${escapeHtml(({high:'高',medium:'中',low:'低'})[bc.priority] || '默认')}</span></div></div>
 	                <div class="grid grid-cols-1 md:grid-cols-4 gap-3 mb-4 text-sm"><div><span class="text-xs text-slate-400">编号</span><div class="font-medium">#${bc.id}</div></div><div><span class="text-xs text-slate-400">分类</span><div class="font-medium">${escapeHtml(bc.category_label || categoryLabels[category] || category)}</div></div><div><span class="text-xs text-slate-400">创建</span><div>${formatTimeLabel(bc.created_at)}</div></div><div><span class="text-xs text-slate-400">更新</span><div>${formatTimeLabel(bc.updated_at || bc.created_at)}</div></div></div>
 	                <div class="space-y-4"><div><div class="text-xs text-slate-500 mb-1">原问题</div>${renderReadableText(bc.query, '未记录原问题')}</div><div><div class="text-xs text-slate-500 mb-1">原 AI 回答</div>${renderReadableText(bc.ai_response, '未保存原回答')}</div><div><div class="text-xs text-slate-500 mb-1">为什么成为 Badcase</div>${renderReadableText(bc.feedback_reason || bc.symptom || bc.description || bc.evidence, '未记录失败原因')}</div></div>
@@ -3338,7 +3349,7 @@
 	              </section>
 
 	              <div class="grid grid-cols-1 lg:grid-cols-3 gap-4">
-	                <section class="lg:col-span-2 bg-white rounded-2xl shadow-soft border border-slate-200 p-5"><h3 class="font-semibold text-slate-900 mb-4">2. 根因结论</h3><div class="grid grid-cols-1 md:grid-cols-2 gap-3"><div class="bg-slate-50 rounded-xl p-3"><div class="text-xs text-slate-500 mb-1">根因域</div><div class="font-medium text-slate-900">${escapeHtml(bc.root_cause_domain_label || '待归因')}</div></div><div class="bg-slate-50 rounded-xl p-3"><div class="text-xs text-slate-500 mb-1">影响范围 / Owner</div><div class="text-sm">${escapeHtml(bc.impact_scope || '待评估')} · ${escapeHtml(bc.owner || '未指定')}</div></div></div><div class="mt-4"><div class="text-xs text-slate-500 mb-1">人工确认的根因</div>${renderReadableText(bc.root_cause, '待人工确认')}</div>${darwinParsed ? `<div class="mt-4 grid grid-cols-1 md:grid-cols-2 gap-3"><div class="bg-violet-50 rounded-xl p-3 border border-violet-100"><div class="text-xs text-violet-600 mb-1">Darwin 根因假设</div>${renderReadableText(darwinParsed.root_cause_hypothesis, '未返回')}</div><div class="bg-amber-50 rounded-xl p-3 border border-amber-100"><div class="text-xs text-amber-700 mb-1">证据限制</div>${renderReadableText(darwinParsed.evidence_uncertainties, '未记录')}</div></div>` : '<p class="mt-4 text-sm text-slate-400">尚未运行 Darwin 专家分析。</p>'}</section>
+	                <section class="lg:col-span-2 bg-white rounded-2xl shadow-soft border border-slate-200 p-5"><h3 class="font-semibold text-slate-900 mb-4">2. 分析记录</h3><div class="grid grid-cols-1 md:grid-cols-2 gap-3"><div class="bg-slate-50 rounded-xl p-3"><div class="text-xs text-slate-500 mb-1">技术分类</div><div class="font-medium text-slate-900">${escapeHtml(bc.root_cause_domain_label || '待归因')}</div></div><div class="bg-slate-50 rounded-xl p-3"><div class="text-xs text-slate-500 mb-1">影响范围 / 负责人</div><div class="text-sm">${escapeHtml(bc.impact_scope || '待评估')} · ${escapeHtml(bc.owner || '未指定')}</div></div></div><div class="mt-4"><div class="text-xs text-slate-500 mb-1">系统记录的分析文本（未必经人工确认）</div>${renderReadableText(bc.root_cause, '待人工确认')}</div>${darwinParsed ? `<div class="mt-4 grid grid-cols-1 md:grid-cols-2 gap-3"><div class="bg-violet-50 rounded-xl p-3 border border-violet-100"><div class="text-xs text-violet-600 mb-1">AI 专家建议</div>${renderReadableText(darwinParsed.root_cause_hypothesis, '未返回')}</div><div class="bg-amber-50 rounded-xl p-3 border border-amber-100"><div class="text-xs text-amber-700 mb-1">证据限制</div>${renderReadableText(darwinParsed.evidence_uncertainties, '未记录')}</div></div>` : '<p class="mt-4 text-sm text-slate-400">尚无 AI 专家建议。</p>'}</section>
 	                <section class="bg-white rounded-2xl shadow-soft border border-slate-200 p-5"><h3 class="font-semibold text-slate-900 mb-3">当前操作</h3>${bc.status === 'pending' ? `<form id="badcase-classify-form" class="space-y-2 mb-4"><label class="block text-xs text-slate-500">人工分类</label><select id="badcase-category" class="w-full px-3 py-2 bg-white border border-slate-200 rounded-xl text-sm"><option value="routing">路由问题</option><option value="knowledge_gap">知识库缺口</option><option value="skill_prompt">Skill/Prompt 问题</option><option value="mcp_capability">MCP/能力缺口</option><option value="response_quality">模型回答质量</option><option value="other">其他</option></select><label class="block text-xs text-slate-500 pt-2">根因域</label><select id="badcase-root-domain" class="w-full px-3 py-2 bg-white border border-slate-200 rounded-xl text-sm">${['unknown','routing','knowledge_rag','model_instruction','tool_mcp','authority_safety','human_collaboration','ux','external_dependency'].map(domain => `<option value="${domain}" ${bc.root_cause_domain === domain ? 'selected' : ''}>${domain}</option>`).join('')}</select></form>` : ''}<div class="space-y-2">${actionButtonsHtml || '<p class="text-sm text-slate-400">当前无可执行操作</p>'}</div></section>
 	              </div>
 
@@ -3352,7 +3363,8 @@
 
 	              <section class="bg-white rounded-2xl shadow-soft border border-slate-200 p-5"><h3 class="font-semibold text-slate-900 mb-4">5. 生命周期时间线</h3>${actions.length ? `<div class="relative border-l border-slate-200 ml-2 space-y-4">${actions.map(action => `<div class="pl-5 relative"><span class="absolute -left-[5px] top-1.5 w-2.5 h-2.5 rounded-full bg-brand-400 border-2 border-white"></span><div class="flex flex-wrap items-center gap-2 text-xs text-slate-500"><span>${formatTimeLabel(action.created_at)}</span><span>·</span><span>${escapeHtml(action.created_by || '系统')}</span>${action.status_before !== null && action.status_before !== undefined ? `<span>·</span>${transitionBadge(action.status_before, action.status_before_label, action.status_after, action.status_after_label)}` : ''}</div><div class="mt-1 text-sm font-medium text-slate-900">${escapeHtml(actionTypeLabels[action.action_type] || action.action_type)}</div><div class="text-xs text-slate-600 mt-1">${escapeHtml(lifecycleSummary(action))}</div></div>`).join('')}</div>` : '<p class="text-sm text-slate-400">暂无生命周期动作。</p>'}</section>
 
-	              <details class="bg-white rounded-2xl shadow-soft border border-slate-200 p-5"><summary class="font-semibold text-slate-900 cursor-pointer">技术证据（默认收起）</summary><div class="mt-4 space-y-4"><div><div class="text-xs text-slate-500 mb-2">原始上下文 JSON</div>${renderKeyValue(bc.context)}</div><div><div class="text-xs text-slate-500 mb-2">完整 Darwin 输出</div>${darwinParsed ? renderKeyValue(darwinParsed) : '<p class="text-sm text-slate-400">不可得</p>'}</div><div><div class="text-xs text-slate-500 mb-2">断言预期 / 实际</div>${renderKeyValue({ expected_behavior: bc.expected_behavior, actual_behavior: bc.actual_behavior, evidence: bc.evidence })}</div><div><div class="text-xs text-slate-500 mb-2">操作原始明细</div>${actions.length ? actions.map(action => `<details class="border border-slate-100 rounded-lg p-2 mb-2"><summary class="text-xs cursor-pointer">${escapeHtml(actionTypeLabels[action.action_type] || action.action_type)} · ${formatTimeLabel(action.created_at)}</summary><div class="mt-2">${renderDetail(action.action_detail_parsed)}</div></details>`).join('') : '<p class="text-sm text-slate-400">不可得</p>'}</div><p class="text-xs text-slate-500">Provider Usage、模型阶段和 Evidence Ledger 请通过上方 Darwin / 复测 Trace 进入可观测性详情核验。</p></div></details>
+	              </div></details>
+	              <details class="bg-white rounded-2xl shadow-soft border border-slate-200 p-5"><summary class="font-semibold text-slate-900 cursor-pointer">查看技术证据</summary><div class="mt-4 space-y-4"><div><div class="text-xs text-slate-500 mb-2">原始上下文 JSON</div>${renderKeyValue(bc.context)}</div><div><div class="text-xs text-slate-500 mb-2">完整 AI 专家输出</div>${darwinParsed ? renderKeyValue(darwinParsed) : '<p class="text-sm text-slate-400">不可得</p>'}</div><div><div class="text-xs text-slate-500 mb-2">断言预期 / 实际</div>${renderKeyValue({ expected_behavior: bc.expected_behavior, actual_behavior: bc.actual_behavior, evidence: bc.evidence })}</div><div><div class="text-xs text-slate-500 mb-2">操作原始明细</div>${actions.length ? actions.map(action => `<details class="border border-slate-100 rounded-lg p-2 mb-2"><summary class="text-xs cursor-pointer">${escapeHtml(actionTypeLabels[action.action_type] || action.action_type)} · ${formatTimeLabel(action.created_at)}</summary><div class="mt-2">${renderDetail(action.action_detail_parsed)}</div></details>`).join('') : '<p class="text-sm text-slate-400">不可得</p>'}</div><p class="text-xs text-slate-500">模型用量、技术阶段和运行证据可通过关联的技术追踪核验。</p></div></details>
 	            </div>`;
 
           if (bc.status === 'pending') {

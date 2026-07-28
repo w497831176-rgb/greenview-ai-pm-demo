@@ -2854,6 +2854,8 @@ def list_badcases_page(
     has_retest: Optional[bool] = None,
     created_after: Optional[str] = None,
     created_before: Optional[str] = None,
+    view_scope: str = "current",
+    user_status: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Return one lightweight Badcase page without loading long evidence fields.
 
@@ -2864,6 +2866,32 @@ def list_badcases_page(
     page_size = 50 if int(page_size or 20) == 50 else 20
     where = ["1=1"]
     params: List[Any] = []
+
+    linked_ledger = """EXISTS (
+        SELECT 1 FROM run_evidence_ledgers rel
+        WHERE rel.trace_id = b.trace_id
+           OR rel.trace_id = b.darwin_trace_id
+           OR rel.trace_id = b.retest_trace_id
+    )"""
+    history_insufficient = f"(b.source IN ('auto', 'manual') AND NOT ({linked_ledger}))"
+    system_observation = "EXISTS (SELECT 1 FROM badcase_actions ba WHERE ba.badcase_id = b.id AND ba.action_type = 'system-observation')"
+    false_positive = "EXISTS (SELECT 1 FROM badcase_actions ba WHERE ba.badcase_id = b.id AND ba.action_type = 'mark-auto-false-positive')"
+    history_record = f"(({history_insufficient}) OR ({system_observation}) OR ({false_positive}))"
+    if view_scope == "history":
+        where.append(history_record)
+    elif view_scope == "current":
+        where.append(f"NOT ({history_record})")
+
+    user_statuses = {
+        "review": ["pending"],
+        "processing": ["classified", "investigating", "fixing"],
+        "verifying": ["verifying", "released"],
+        "ended": ["closed", "rejected", "duplicate", "accepted_limitation"],
+    }.get(str(user_status or ""))
+    if user_statuses:
+        placeholders = ",".join("?" for _ in user_statuses)
+        where.append(f"b.status IN ({placeholders})")
+        params.extend(user_statuses)
 
     for column, value in [
         ("b.status", status),
@@ -2920,7 +2948,10 @@ def list_badcases_page(
             CASE WHEN EXISTS (SELECT 1 FROM knowledge_drafts kd WHERE kd.badcase_id = b.id)
                        OR EXISTS (SELECT 1 FROM skill_prompt_drafts sd WHERE sd.badcase_id = b.id)
                        OR EXISTS (SELECT 1 FROM capability_gap_drafts cd WHERE cd.badcase_id = b.id)
-                 THEN 1 ELSE 0 END AS has_fix_draft
+                 THEN 1 ELSE 0 END AS has_fix_draft,
+            CASE WHEN {history_insufficient} THEN 1 ELSE 0 END AS is_history_insufficient,
+            CASE WHEN {system_observation} THEN 1 ELSE 0 END AS is_system_observation,
+            CASE WHEN {false_positive} THEN 1 ELSE 0 END AS is_auto_false_positive
         FROM badcases b
         WHERE {where_sql}
         ORDER BY COALESCE(b.updated_at, b.created_at) DESC, b.id DESC
@@ -2934,6 +2965,9 @@ def list_badcases_page(
         item["has_darwin"] = bool(item.get("has_darwin"))
         item["has_retest"] = bool(item.get("has_retest"))
         item["has_fix_draft"] = bool(item.get("has_fix_draft"))
+        item["is_history_insufficient"] = bool(item.get("is_history_insufficient"))
+        item["is_system_observation"] = bool(item.get("is_system_observation"))
+        item["is_auto_false_positive"] = bool(item.get("is_auto_false_positive"))
     return {
         "items": items,
         "total": total,

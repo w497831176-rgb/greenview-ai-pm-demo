@@ -28,6 +28,7 @@ class AgentBuild:
     activated_skills: List[SkillActivation]
     skill_decisions: List[Dict[str, Any]]
     skill_tool_calls: List[Dict[str, Any]]
+    skill_evidence_sources: List[Dict[str, Any]]
 
 
 def _preload_skill_instructions(
@@ -322,6 +323,17 @@ def build_agent_from_snapshot(
         activated_skills=activations,
         skill_decisions=decisions,
         skill_tool_calls=skill_tool_calls,
+        skill_evidence_sources=[
+            {
+                "skill_id": int(item["skill_id"]),
+                "name": str(item.get("name") or f"Skill {item['skill_id']}"),
+                "version": str(item.get("version") or ""),
+                "snapshot_id": snapshot.snapshot_id,
+                "content_hash": str(item.get("content_hash") or ""),
+                "content_snapshot": str(item.get("instructions_fallback") or ""),
+            }
+            for item in selected
+        ],
     )
 
 

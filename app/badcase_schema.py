@@ -75,6 +75,26 @@ STATUS_LABELS = {
     "accepted_limitation": "已接受限制",
 }
 
+USER_STATUS_LABELS = {
+    "pending": "待审核",
+    "classified": "处理中",
+    "investigating": "处理中",
+    "fixing": "处理中",
+    "verifying": "待验证",
+    "released": "待验证",
+    "closed": "已结束",
+    "rejected": "已结束",
+    "duplicate": "已结束",
+    "accepted_limitation": "已结束",
+}
+
+USER_STATUS_GROUPS = {
+    "review": {"pending"},
+    "processing": {"classified", "investigating", "fixing"},
+    "verifying": {"verifying", "released"},
+    "ended": {"closed", "rejected", "duplicate", "accepted_limitation"},
+}
+
 ACTION_LABELS = {
     "classify": "分类",
     "darwin-fix": "Darwin 深度分析",
@@ -92,6 +112,10 @@ ACTION_LABELS = {
     "mark-duplicate": "关联重复案例",
     "reject": "驳回",
     "transition": "状态跳转",
+    "mark-auto-false-positive": "确认自动误抓",
+    "system-observation": "转为系统观察",
+    "auto-capture-v2": "系统自动发现",
+    "auto-duplicate-occurrence": "关联重复发现",
 }
 
 # Canonical state machine transitions.
@@ -302,6 +326,114 @@ def _format_action(action: Dict[str, Any]) -> Dict[str, Any]:
     return formatted
 
 
+def user_status_label(status: str) -> str:
+    return USER_STATUS_LABELS.get(status, "待审核")
+
+
+def _action_by_type(actions: List[Dict[str, Any]], action_type: str) -> Optional[Dict[str, Any]]:
+    return next((item for item in reversed(actions) if item.get("action_type") == action_type), None)
+
+
+def _action_text(action: Optional[Dict[str, Any]]) -> str:
+    if not action:
+        return ""
+    detail = action.get("action_detail_parsed") or _parse_json_field(action.get("action_detail"))
+    if not isinstance(detail, dict):
+        return str(detail or "")
+    return str(
+        detail.get("reason")
+        or detail.get("note")
+        or detail.get("observation_note")
+        or detail.get("analysis")
+        or ""
+    )
+
+
+def _terminal_outcome(badcase: Dict[str, Any], actions: List[Dict[str, Any]]) -> str:
+    status = str(badcase.get("status") or "pending")
+    if _action_by_type(actions, "mark-auto-false-positive"):
+        return "自动误抓"
+    if status == "duplicate":
+        return "重复问题"
+    if status == "accepted_limitation":
+        return "已知限制，暂不处理"
+    if status == "closed":
+        return "已解决"
+    return ""
+
+
+def _cause_presentation(badcase: Dict[str, Any], actions: List[Dict[str, Any]]) -> Dict[str, str]:
+    human_actions = [
+        item
+        for item in actions
+        if str(item.get("created_by") or "").lower() in {"operator", "user", "admin"}
+        and item.get("action_type")
+        in {"classify", "confirm-root-cause", "mark-auto-false-positive", "accept-limitation", "mark-duplicate"}
+    ]
+    if human_actions:
+        action = human_actions[-1]
+        return {
+            "source": "人工确认",
+            "text": _action_text(action) or "已由产品负责人完成审核",
+            "actor": str(action.get("created_by") or "operator"),
+            "time": str(action.get("created_at") or ""),
+        }
+    if badcase.get("darwin_analysis"):
+        return {
+            "source": "AI专家建议",
+            "text": str(badcase.get("root_cause") or badcase.get("darwin_analysis") or ""),
+            "actor": "",
+            "time": "",
+        }
+    if badcase.get("root_cause"):
+        return {
+            "source": "AI分析建议",
+            "text": str(badcase.get("root_cause") or ""),
+            "actor": "",
+            "time": "",
+        }
+    return {"source": "待人工确认", "text": "尚未确认原因", "actor": "", "time": ""}
+
+
+def build_badcase_presentation(badcase: Dict[str, Any], actions: List[Dict[str, Any]]) -> Dict[str, Any]:
+    outcome = _terminal_outcome(badcase, actions)
+    cause = _cause_presentation(badcase, actions)
+    source = str(badcase.get("source_label") or "自动发现")
+    discovery = str(
+        badcase.get("feedback_reason")
+        or badcase.get("symptom")
+        or badcase.get("description")
+        or "系统记录了一条待审核线索"
+    )
+    advice = str(badcase.get("fix_plan") or "待产品负责人确认是否需要处理")
+    action_texts = [
+        f"{ACTION_LABELS.get(str(item.get('action_type') or ''), '处理记录')}：{_action_text(item)}".rstrip("：")
+        for item in actions
+        if item.get("action_type") not in {"auto-capture", "auto-capture-v2", "transition"}
+    ]
+    actual_action = "；".join(text for text in action_texts if text) or "尚未执行实际修改"
+    result = outcome or "尚未形成最终结论"
+    return {
+        "sections": [
+            {"title": "怎么发现", "text": f"{source}：{discovery}"},
+            {"title": "问题分类", "text": str(badcase.get("category_label") or "待分类")},
+            {"title": "确认原因", "text": f"{cause['source']}：{cause['text']}", "cause": cause},
+            {"title": "处理建议", "text": advice},
+            {"title": "实际行动及理由", "text": actual_action},
+            {"title": "最终结果", "text": result},
+        ],
+        "business_timeline": [
+            {"label": "发现", "done": True},
+            {"label": "分类", "done": badcase.get("status") != "pending"},
+            {"label": "分析原因", "done": bool(badcase.get("root_cause") or badcase.get("darwin_analysis"))},
+            {"label": "确定方案", "done": str(badcase.get("status")) in {"fixing", "verifying", "released", "closed"}},
+            {"label": "执行并复测", "done": bool(badcase.get("retest_trace_id") or badcase.get("verified_by"))},
+            {"label": "结束", "done": bool(outcome)},
+        ],
+        "terminal_outcome": outcome,
+    }
+
+
 def _enrich_badcase(badcase: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     """Add frontend-compatible aliases to a badcase record.
 
@@ -356,6 +488,23 @@ def _enrich_badcase(badcase: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any
     # Action history formatting.
     actions = enriched.get("actions") or []
     enriched["actions"] = [_format_action(a) for a in actions]
+    enriched["is_system_observation"] = bool(
+        enriched.get("is_system_observation")
+        or _action_by_type(enriched["actions"], "system-observation")
+    )
+    enriched["is_auto_false_positive"] = bool(
+        enriched.get("is_auto_false_positive")
+        or _action_by_type(enriched["actions"], "mark-auto-false-positive")
+    )
+    enriched["user_status_label"] = user_status_label(str(enriched.get("status") or "pending"))
+    enriched["terminal_outcome_label"] = _terminal_outcome(enriched, enriched["actions"])
+    if enriched.get("is_system_observation"):
+        enriched["record_layer_label"] = "系统观察"
+    elif enriched.get("is_history_insufficient"):
+        enriched["record_layer_label"] = "历史待核验"
+    else:
+        enriched["record_layer_label"] = "当前问题"
+    enriched["presentation"] = build_badcase_presentation(enriched, enriched["actions"])
 
     # Allowed actions for the current status (frontend button guidance).
     enriched["allowed_actions"] = effective_allowed_actions(enriched)

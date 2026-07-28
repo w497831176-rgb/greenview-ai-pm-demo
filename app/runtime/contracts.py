@@ -286,6 +286,7 @@ class RunEvidenceLedger(BaseModel):
     config_snapshot: Dict[str, Any]
     route_decision: Optional[Dict[str, Any]] = None
     activated_skills: List[Dict[str, Any]] = Field(default_factory=list)
+    skill_evidence: List[Dict[str, Any]] = Field(default_factory=list)
     retrieval_evidence: List[Dict[str, Any]] = Field(default_factory=list)
     tool_invocations: List[Dict[str, Any]] = Field(default_factory=list)
     action_proposals: List[Dict[str, Any]] = Field(default_factory=list)
@@ -296,4 +297,5 @@ class RunEvidenceLedger(BaseModel):
     cost_entries: List[Dict[str, Any]] = Field(default_factory=list)
     evaluation_results: List[Dict[str, Any]] = Field(default_factory=list)
     contract_violations: List[Dict[str, Any]] = Field(default_factory=list)
+    system_observations: List[Dict[str, Any]] = Field(default_factory=list)
     badcase_links: List[Dict[str, Any]] = Field(default_factory=list)
