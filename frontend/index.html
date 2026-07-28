@@ -3742,6 +3742,7 @@
         rangeKey: 'today',
         customStart: '',
         customEnd: '',
+        resolvedScope: null,
         pagination: { page: 1, pages: 1, total: 0, limit: 20, hasPrevious: false, hasNext: false },
         overview: null,
         traces: [],
@@ -3796,22 +3797,29 @@
         return '<span class="text-slate-500">' + escapeHtml(s || '-') + '</span>';
       }
 
-      async function loadAll() {
+      async function loadAll({ refreshSummary = true } = {}) {
         const overviewParams = scopeParams();
-        const traceParams = scopeParams();
+        if (refreshSummary || !state.overview || !state.resolvedScope) {
+          const [overview, prices, budget] = await Promise.all([
+            apiGet(`/api/observability/overview?${overviewParams.toString()}`).catch(() => ({})),
+            apiGet('/api/observability/prices').catch(() => ({ prices: [] })),
+            apiGet('/api/observability/budget').catch(() => ({ budget: {} })),
+          ]);
+          state.overview = overview;
+          state.resolvedScope = overview.scope || null;
+          state.prices = prices.prices || [];
+          state.budget = budget.budget || {};
+        }
+        const scope = state.resolvedScope || {};
+        const traceParams = scope.start && scope.end
+          ? new URLSearchParams({ start: scope.start, end: scope.end })
+          : scopeParams();
         if (state.filters.model) traceParams.set('model_id', state.filters.model);
         if (state.filters.stage) traceParams.set('stage', state.filters.stage);
         if (state.filters.search) traceParams.set('trace_id', state.filters.search);
         traceParams.set('limit', String(state.pagination.limit));
         traceParams.set('offset', String((state.pagination.page - 1) * state.pagination.limit));
-        const [overview, traces, prices, budget] = await Promise.all([
-          apiGet(`/api/observability/overview?${overviewParams.toString()}`).catch(() => ({})),
-          apiGet(`/api/observability/traces?${traceParams.toString()}`).catch(() => ({ traces: [], total: 0, page: 1, pages: 1 })),
-          apiGet('/api/observability/prices').catch(() => ({ prices: [] })),
-          apiGet('/api/observability/budget').catch(() => ({ budget: {} })),
-        ]);
-        const scope = overview.scope || {};
-        state.overview = overview;
+        const traces = await apiGet(`/api/observability/traces?${traceParams.toString()}`).catch(() => ({ traces: [], total: 0, page: 1, pages: 1 }));
         state.traces = traces.traces || [];
         state.traceRange = { start: traces.start || scope.start, end: traces.end || scope.end };
         state.pagination = {
@@ -3824,8 +3832,6 @@
         };
         state.trends = [];
         state.distribution = [];
-        state.prices = prices.prices || [];
-        state.budget = budget.budget || {};
       }
 
       function renderOverview() {
@@ -4374,7 +4380,7 @@
           state.filters.stage = $('#cg-stage').value;
           state.pagination.page = 1;
           container.innerHTML = loadingState();
-          await loadAll();
+          await loadAll({ refreshSummary: false });
           renderPage();
         });
         $$('.cg-range-btn').forEach(btn => btn.addEventListener('click', async () => {
@@ -4383,6 +4389,7 @@
             state.customStart = beijingToday();
             state.customEnd = state.customStart;
           }
+          state.resolvedScope = null;
           state.pagination.page = 1;
           container.innerHTML = loadingState();
           await loadAll();
@@ -4396,6 +4403,7 @@
           if (customStart > customEnd) return showToast('开始日期不能晚于结束日期', 'error');
           state.customStart = customStart;
           state.customEnd = customEnd;
+          state.resolvedScope = null;
           state.pagination.page = 1;
           container.innerHTML = loadingState();
           await loadAll();
@@ -4405,14 +4413,14 @@
         if (previousPage && state.pagination.hasPrevious) previousPage.addEventListener('click', async () => {
           state.pagination.page -= 1;
           container.innerHTML = loadingState();
-          await loadAll();
+          await loadAll({ refreshSummary: false });
           renderPage();
         });
         const nextPage = $('#cg-next-page');
         if (nextPage && state.pagination.hasNext) nextPage.addEventListener('click', async () => {
           state.pagination.page += 1;
           container.innerHTML = loadingState();
-          await loadAll();
+          await loadAll({ refreshSummary: false });
           renderPage();
         });
         $$('.cg-trace-detail').forEach(btn => btn.addEventListener('click', () => showTraceDetail(btn.dataset.trace)));

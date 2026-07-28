@@ -264,6 +264,8 @@ def assert_frontend() -> None:
         "['last_month', '上月']",
         "['custom', '自定义']",
         "state.rangeKey === 'custom'",
+        "state.resolvedScope || {}",
+        "new URLSearchParams({ start: scope.start, end: scope.end })",
         "traceParams.set('limit', String(state.pagination.limit))",
         "traceParams.set('offset', String((state.pagination.page - 1) * state.pagination.limit))",
         "每页20条",
@@ -274,6 +276,7 @@ def assert_frontend() -> None:
     ):
         assert token in section
     assert section.count("state.pagination.page = 1") >= 3
+    assert section.count("loadAll({ refreshSummary: false })") >= 3
     assert ".slice(0, 10)" not in section
     assert "今日调用记录" not in section
     assert all(part in rendered for part in (
