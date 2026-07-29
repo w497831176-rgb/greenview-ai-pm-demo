@@ -219,7 +219,7 @@
     // ==========================================
     const API_BASE = '';
     const DEFAULT_ROOM_ID = '3-2-1201';
-    const APP_VERSION = 'V1.8.1-rc.6';
+    let APP_VERSION = 'RuntimeRelease（运行版本）加载中';
 
     const STATE = {
       topTab: 'owner',
@@ -256,15 +256,15 @@
         { id: 'handoff-orders', label: '人工接管', icon: 'handoff' }
       ],
       platform: [
-        { id: 'runtime', label: '运行时发布', icon: 'release' },
-        { id: 'agents', label: 'Agent 管理', icon: 'agent' },
-        { id: 'models', label: '模型配置', icon: 'model' },
-        { id: 'skills', label: 'Skill 管理', icon: 'skill' },
-        { id: 'mcp', label: 'MCP Server 管理', icon: 'mcp' },
-        { id: 'knowledge', label: '知识库管理', icon: 'knowledge' },
-        { id: 'badcases', label: 'Badcase 库', icon: 'badcase' },
-        { id: 'evaluations', label: '评估中心', icon: 'evaluation' },
-        { id: 'cost-governance', label: '调用与成本治理', icon: 'cost' }
+        { id: 'agents', label: 'Agent（AI处理角色）', icon: 'agent', group: '能力配置' },
+        { id: 'skills', label: 'Skill（业务规则）', icon: 'skill', group: '能力配置' },
+        { id: 'knowledge', label: 'RAG（知识依据）', icon: 'knowledge', group: '能力配置' },
+        { id: 'mcp', label: 'MCP Server（外部接入）/ Tool', icon: 'mcp', group: '能力配置' },
+        { id: 'models', label: '模型策略', icon: 'model', group: '能力配置' },
+        { id: 'runtime', label: 'RuntimeRelease（运行版本）', icon: 'release', group: '版本发布' },
+        { id: 'badcases', label: 'Badcase（问题案例）', icon: 'badcase', group: '质量闭环' },
+        { id: 'evaluations', label: 'Evaluation / Golden Set（评估）', icon: 'evaluation', group: '质量闭环' },
+        { id: 'cost-governance', label: 'Trace（运行调用记录）与成本', icon: 'cost', group: '调用与成本' }
       ]
     };
 
@@ -680,8 +680,9 @@
       const ordinaryTools = allTools.filter(call => !isControlledWorkOrderCall(call) && !isSkillLoader(call));
       if (modelId) {
         const modelLabel = modelId === 'deepseek-v4-pro' ? 'Pro' : (modelId === 'deepseek-v4-flash' ? 'Flash' : modelId);
-        const thinkingText = thinkingEnabled ? '· thinking' : '';
-        tags.push(`<span class="px-1.5 py-0.5 bg-purple-50 text-purple-600 rounded text-[10px]" title="${escapeHtml(modelSelectionReason || '')}">模型：${escapeHtml(modelId)}${thinkingText}</span>`);
+        const thinkingText = thinkingEnabled === true ? ' · Thinking开启' : (thinkingEnabled === false ? ' · Thinking关闭' : '');
+        const modelTitle = `${modelSelectionReason || '模型身份来自本次运行记录'}；Thinking表示推理模式，不改变Flash/Pro模型身份。`;
+        tags.push(`<span class="px-1.5 py-0.5 bg-purple-50 text-purple-600 rounded text-[10px]" title="${escapeHtml(modelTitle)}">模型：${escapeHtml(modelLabel)}${thinkingText}</span>`);
       }
       if (routeReason) tags.push(`<span class="px-1.5 py-0.5 bg-slate-100 text-slate-600 rounded text-[10px]" title="${escapeHtml(routeIntent || '')}">路由原因：${escapeHtml(routeReason)}</span>`);
       if (agent) tags.push(`<span class="px-1.5 py-0.5 bg-indigo-50 text-indigo-600 rounded text-[10px]" title="agent_id: ${escapeHtml(currentAgentId || '')}">当前处理 Agent：${escapeHtml(agent)}</span>`);
@@ -696,13 +697,13 @@
         const okCount = mcpCalls.filter(c => c.status === 'success').length;
         const expectedCount = mcpCalls.filter(c => ['empty', 'not_found', 'invalid_input', 'unauthorized'].includes(c.status)).length;
         const issueCount = mcpCalls.filter(c => ['timeout', 'upstream_error', 'failed'].includes(c.status)).length;
-        const statusText = `success ${okCount} / expected ${expectedCount} / issue ${issueCount}`;
+        const statusText = `成功 ${okCount} / 正常结果 ${expectedCount} / 异常 ${issueCount}`;
         const summary = mcpCalls.map(c => `[${escapeHtml(c.server_name || 'unknown')}] ${escapeHtml(c.tool_name || '')} outcome=${escapeHtml(c.status || 'unknown')} ${c.latency_ms || 0}ms`).join('\n');
         tags.push(`<span class="px-1.5 py-0.5 bg-cyan-50 text-cyan-600 rounded text-[10px] cursor-help" title="${escapeHtml(summary)}">MCP 调用：${statusText}</span>`);
       }
       if (traceId) {
         const traceUsage = traceUsagePresentation(usageSource, allTools);
-        tags.push(`<button type="button" class="px-1.5 py-0.5 bg-slate-50 text-slate-500 rounded text-[10px] hover:bg-slate-100 hover:text-slate-700 transition-colors" title="${escapeHtml(traceUsage.title)} · trace_id: ${escapeHtml(traceId)}" onclick="openTraceDrawer('${escapeHtml(traceId)}')">技术追踪 · ${escapeHtml(traceUsage.label)}</button>`);
+        tags.push(`<button type="button" class="px-1.5 py-0.5 bg-slate-50 text-slate-500 rounded text-[10px] hover:bg-slate-100 hover:text-slate-700 transition-colors" title="${escapeHtml(traceUsage.title)} · trace_id: ${escapeHtml(traceId)}" onclick="openTraceDrawer('${escapeHtml(traceId)}')">查看Trace证据 · ${escapeHtml(traceUsage.label)}</button>`);
       }
       const tagHtml = tags.length ? `<div class="flex flex-wrap items-center gap-1 mt-2">${tags.join('')}</div>` : '';
       const controlledWriteHtml = controlledWriteCalls.length ? `<div class="mt-2 space-y-2">${controlledWriteCalls.map(renderControlledWriteCard).join('')}</div>` : '';
@@ -860,9 +861,11 @@
             <div class="mt-1 text-xs text-slate-700">Proposal ${proposals.length} · Approval ${approvals.length} · Receipt ${receipts.length} · Contract violation ${violations.length}</div>
             ${violations.length ? `<details class="mt-2"><summary class="text-xs cursor-pointer">查看契约违规</summary><pre class="mt-1 text-[10px] bg-white/70 p-2 rounded overflow-x-auto">${escapeHtml(safeTraceJson(violations))}</pre></details>` : ''}
           </div>` : '';
-        const summaryText = maskTraceText([`Trace ID：${traceId}`, `Release：${config.release_id || '-'}`, `Snapshot：${config.snapshot_id || '-'}`, `当前 Agent：${currentAgent} (${currentAgentId})`, `激活 Skill：${skills.join('、') || '无'}`, `模型调用：${modelCalls.length} 次`, `MCP 调用：${mcpCalls.length} 次`, `受控写入：${isControlledWorkOrderTrace ? '创建维修工单（ActionGateway）' : '无'}`, `回答实际引用：${usedCitations.map(c => `《${c.doc_title}》分片${c.chunk_index}`).join('、') || '无'}`, `契约违规：${violations.length}`, `链路事件：${traceEvents.map(e => spanLabels[e.span_name] || e.span_name).join(' → ') || '历史 Trace 无 span 记录'}`].join('\n'));
-        const html = `<div class="space-y-5"><div class="bg-slate-50 rounded-xl p-3 border border-slate-200 text-sm space-y-1"><div><span class="text-slate-500">Trace：</span><span class="font-mono">${escapeHtml(traceId)}</span></div><div><span class="text-slate-500">当前 Agent：</span>${escapeHtml(currentAgent)} <span class="text-xs text-slate-400">(${escapeHtml(currentAgentId)})</span></div><div><span class="text-slate-500">激活 Skill：</span>${escapeHtml(skills.join('、') || '无')}</div></div>${runtimeContractHtml}${evaluationHtml}${controlledWriteEvidenceHtml}${workflowHtml ? `<div><h4 class="font-medium text-slate-900 mb-2">业务工作流</h4>${workflowHtml}</div>` : ''}<div><h4 class="font-medium text-slate-900 mb-2">链路事件（Span）</h4>${eventHtml}</div><div><h4 class="font-medium text-slate-900 mb-2">模型调用与成本</h4>${costSummaryHtml}<div class="space-y-2">${modelCards}</div></div><div><h4 class="font-medium text-slate-900 mb-2">MCP 工具证据</h4><div class="space-y-2">${mcpHtml}</div></div><div><h4 class="font-medium text-slate-900 mb-2">RAG 证据</h4><p class="text-xs text-slate-500 mb-1">回答实际引用</p>${citationList(usedCitations)}<details class="mt-3"><summary class="text-xs text-slate-500 cursor-pointer">仅检索到、未写入回答的候选（${candidateCitations.length}）</summary>${citationList(candidateCitations)}</details></div><button type="button" id="trace-copy-summary" class="w-full px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white rounded-xl text-sm transition-colors">复制可读摘要</button></div>`;
-        openDrawer('Trace 详情', html);
+        const summaryText = maskTraceText([`Trace ID：${traceId}`, `Release：${config.release_id || '-'}`, `Snapshot：${config.snapshot_id || '-'}`, `当前 Agent：${currentAgent} (${currentAgentId})`, `激活 Skill：${skills.join('、') || '无'}`, `Provider 请求：${modelCalls.length} 次`, `MCP 调用：${mcpCalls.length} 次`, `受控写入：${isControlledWorkOrderTrace ? '创建维修工单（ActionGateway）' : '无'}`, `回答实际引用：${usedCitations.map(c => `《${c.doc_title}》分片${c.chunk_index}`).join('、') || '无'}`, `契约违规：${violations.length}`, `链路事件：${traceEvents.map(e => spanLabels[e.span_name] || e.span_name).join(' → ') || '历史 Trace 无 span 记录'}`].join('\n'));
+        const controlledWriteConfirmed = Boolean(controlledReceipt && controlledReceipt.status === 'committed' && controlledReceipt.receipt_id && controlledReceipt.resource_id);
+        const controlledWriteSummaryHtml = isControlledWorkOrderTrace ? `<div class="rounded-xl border ${controlledWriteConfirmed ? 'border-emerald-200 bg-emerald-50' : 'border-amber-200 bg-amber-50'} p-3 text-sm"><div class="font-medium text-slate-900">受控业务写入</div><div class="mt-1 text-xs text-slate-700">本轮通过 ActionGateway（受控业务写入网关）执行维修工单操作；${controlledWriteConfirmed ? '正式回执证明写入成功。' : '当前证据不足以证明写入成功。'}</div><div class="mt-1 text-xs text-slate-600">它不是 MCP/Tool 调用；业主确认也不等同于人工接管。</div></div>` : '';
+        const html = `<div class="space-y-5"><section class="rounded-xl border border-blue-200 bg-blue-50 p-4"><h4 class="font-semibold text-blue-950">本轮发生了什么</h4><p class="mt-1 text-sm text-blue-900">由 Agent（AI处理角色）“${escapeHtml(currentAgent)}”处理；加载 ${skills.length} 项 Skill（业务规则），产生 ${modelCalls.length} 次 Provider 请求、${mcpCalls.length} 次 MCP/Tool 调用，回答采用 ${usedCitations.length} 条 RAG（知识依据）。</p><div class="mt-3 grid gap-2 sm:grid-cols-3 text-xs"><div class="rounded-lg bg-white/70 p-2"><span class="text-slate-500">处理角色</span><div class="mt-1 font-medium text-slate-900">${escapeHtml(currentAgent)}</div></div><div class="rounded-lg bg-white/70 p-2"><span class="text-slate-500">已加载业务规则</span><div class="mt-1 font-medium text-slate-900">${escapeHtml(skills.join('、') || '无')}</div></div><div class="rounded-lg bg-white/70 p-2"><span class="text-slate-500">回答依据</span><div class="mt-1 font-medium text-slate-900">${usedCitations.length ? `采用 ${usedCitations.length} 条 RAG 证据` : '未采用RAG证据'}</div></div></div><p class="mt-3 text-xs text-blue-800">数据来自本次真实运行记录。Trace是系统运行证据，不等于供应商账单；它能证明系统记录到的调用，不能证明供应商日账已完成对账。</p><div class="mt-2 text-[10px] text-blue-700">辅助编号：${escapeHtml(traceId)}</div></section><section><h4 class="font-medium text-slate-900 mb-2">模型调用与费用结论</h4>${costSummaryHtml}</section>${controlledWriteSummaryHtml}<section><h4 class="font-medium text-slate-900 mb-2">回答实际采用的RAG证据</h4>${citationList(usedCitations)}<p class="mt-2 text-xs text-slate-500">仅检索到但未写入回答的候选不能证明回答有依据。</p></section><details class="rounded-xl border border-slate-200 bg-slate-50 p-4"><summary class="font-medium text-slate-800 cursor-pointer">高级信息：查看ID、Snapshot、Span与逐次技术证据</summary><div class="mt-4 space-y-5">${runtimeContractHtml}${evaluationHtml}${controlledWriteEvidenceHtml}${workflowHtml ? `<div><h4 class="font-medium text-slate-900 mb-2">业务工作流</h4>${workflowHtml}</div>` : ''}<div><h4 class="font-medium text-slate-900 mb-2">链路事件（Span）</h4>${eventHtml}</div><div><h4 class="font-medium text-slate-900 mb-2">逐次Provider请求、Token与计算明细</h4><div class="space-y-2">${modelCards}</div></div><div><h4 class="font-medium text-slate-900 mb-2">MCP Server / Tool 技术证据</h4><div class="space-y-2">${mcpHtml}</div></div><div><h4 class="font-medium text-slate-900 mb-2">未采用的RAG候选</h4>${citationList(candidateCitations)}</div></div></details><button type="button" id="trace-copy-summary" class="w-full px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white rounded-xl text-sm transition-colors">复制Trace证据摘要</button></div>`;
+        openDrawer('Trace（运行调用记录）证据', html);
         setTimeout(() => { const button = $('#trace-copy-summary'); if (button) button.addEventListener('click', async () => { try { await navigator.clipboard.writeText(summaryText); showToast('Trace 摘要已复制', 'success'); } catch (_) { showToast('复制失败', 'error'); } }); }, 0);
       } catch (err) {
         showToast('加载 Trace 失败：' + (err && err.message ? err.message : err), 'error');
@@ -982,9 +985,15 @@
 
       const menu = MENU[STATE.topTab];
       if (!menu) throw new Error(`renderSidebar: 无菜单配置 "${STATE.topTab}"`);
+      let previousGroup = '';
       requireElement('#sub-menu', 'renderSidebar').innerHTML = menu.map(item => {
         const active = item.id === STATE.subTab;
+        const groupHeader = item.group && item.group !== previousGroup
+          ? `<div class="px-3 pt-4 pb-1 text-[11px] font-semibold tracking-wide text-slate-500">${escapeHtml(item.group)}</div>`
+          : '';
+        previousGroup = item.group || previousGroup;
         return `
+          ${groupHeader}
           <button data-sub="${item.id}" class="w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-medium transition-all ${active ? 'bg-brand-600 text-white shadow-md' : 'text-slate-300 hover:bg-slate-800 hover:text-white'}">
             <span class="${active ? 'text-white' : 'text-slate-400'}">${ICONS[item.icon]}</span>
             ${item.label}
@@ -2328,24 +2337,25 @@
     async function renderKnowledgePage(container) {
       container.innerHTML = `
         <div class="max-w-6xl mx-auto p-4 md:p-6 space-y-5">
-          <div class="max-w-6xl mx-auto pb-4 flex items-end justify-between">
+          <div class="max-w-6xl mx-auto pb-1">
             <div>
-              <h2 class="text-xl font-semibold text-slate-900">知识库管理</h2>
-              <p class="text-sm text-slate-500 mt-1">物业维修、服务规范、收费标准等知识文档与检索配置</p>
+              <h2 class="text-xl font-semibold text-slate-900">能力配置 · RAG（知识依据）</h2>
+              <p class="text-sm text-slate-500 mt-1">RAG只把本轮实际采用的知识分片作为回答依据；仅召回但未采用的候选不等于最终证据。</p>
             </div>
-            <button id="knowledge-add-btn" class="px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white rounded-xl text-sm transition-colors flex items-center gap-1.5">
-              <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"></path></svg>
-              新增
-            </button>
           </div>
+          <div class="rounded-2xl border border-indigo-200 bg-indigo-50 p-4 text-sm text-indigo-950"><b>数据与边界：</b>文档和检索设置来自平台配置；保存形成Draft，发布RuntimeRelease后才进入下一新会话Snapshot。引用成功以回答中的引用和Trace证据为准，不能仅凭“文档存在”证明已使用。</div>
           <div class="max-w-6xl mx-auto">
             <div class="flex gap-1 bg-slate-100 p-1 rounded-xl inline-flex">
               <button type="button" data-tab="docs" class="knowledge-tab-btn px-4 py-1.5 rounded-lg text-sm font-medium transition-all">知识文档</button>
               <button type="button" data-tab="settings" class="knowledge-tab-btn px-4 py-1.5 rounded-lg text-sm font-medium transition-all">检索设置</button>
-              <button type="button" data-tab="debug" class="knowledge-tab-btn px-4 py-1.5 rounded-lg text-sm font-medium transition-all">检索调试</button>
             </div>
           </div>
           <div id="knowledge-content">${loadingState()}</div>
+          <details class="rounded-2xl border border-slate-200 bg-slate-50 p-4">
+            <summary class="cursor-pointer text-sm font-semibold text-slate-800">高级管理：新增文档与检索调试</summary>
+            <p class="mt-2 text-xs text-slate-500">新增、编辑、删除或重建索引会修改知识Draft；检索调试不调用模型，也不能证明最终回答采用了候选内容。</p>
+            <div class="mt-3 flex flex-wrap gap-2"><button id="knowledge-add-btn" class="px-4 py-2 bg-brand-600 text-white rounded-xl text-sm">新增RAG知识Draft</button><button type="button" data-tab="debug" class="knowledge-tab-btn px-4 py-2 rounded-xl text-sm bg-slate-200 text-slate-700">打开检索调试</button></div>
+          </details>
         </div>
       `;
 
@@ -2405,14 +2415,9 @@
                     </div>
                     <span class="text-xs px-2 py-1 bg-slate-100 text-slate-600 rounded-full">${escapeHtml(doc.category || '未分类')}</span>
                   </div>
-                  <p class="text-sm text-slate-600 line-clamp-4 whitespace-pre-line">${escapeHtml(doc.content)}</p>
+                  <p class="text-sm text-slate-600 line-clamp-3 whitespace-pre-line">${escapeHtml(doc.content)}</p>
                   <div class="mt-3 flex items-center gap-2 flex-wrap">${indexStatusBadge(doc)}<span class="text-[10px] text-slate-400">分片：${escapeHtml(doc.split_strategy || 'auto')} / ${escapeHtml(String(doc.chunk_size || 512))} 字</span></div>
-                  <div class="mt-4 pt-4 border-t border-slate-100 flex flex-wrap gap-2">
-                    <button data-id="${doc.id}" class="knowledge-edit-btn text-xs px-3 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg transition-colors">编辑</button>
-                    <button data-id="${doc.id}" class="knowledge-chunks-btn text-xs px-3 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg transition-colors">查看分片</button>
-                    <button data-id="${doc.id}" class="knowledge-reindex-btn text-xs px-3 py-1.5 bg-brand-50 hover:bg-brand-100 text-brand-700 rounded-lg transition-colors">重新索引</button>
-                    <button data-id="${doc.id}" class="knowledge-delete-btn text-xs px-3 py-1.5 border border-red-200 hover:bg-red-50 text-red-600 rounded-lg transition-colors">删除</button>
-                  </div>
+                  <details class="mt-4 pt-4 border-t border-slate-100"><summary class="cursor-pointer text-xs font-medium text-slate-600">高级管理与技术证据</summary><p class="mt-2 text-[11px] text-slate-500">查看分片只读；编辑、重建索引和删除会修改RAG知识Draft，不调用模型、不自动发布。</p><div class="mt-3 flex flex-wrap gap-2"><button data-id="${doc.id}" class="knowledge-edit-btn text-xs px-3 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg transition-colors">查看/编辑知识Draft</button><button data-id="${doc.id}" class="knowledge-chunks-btn text-xs px-3 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg transition-colors">查看RAG分片</button><button data-id="${doc.id}" class="knowledge-reindex-btn text-xs px-3 py-1.5 bg-brand-50 hover:bg-brand-100 text-brand-700 rounded-lg transition-colors">重建该文档索引</button><button data-id="${doc.id}" class="knowledge-delete-btn text-xs px-3 py-1.5 border border-red-200 hover:bg-red-50 text-red-600 rounded-lg transition-colors">从Draft删除文档</button></div></details>
                 </div>
               `).join('')}
             </div>
@@ -2724,7 +2729,8 @@
       const sourceLabels = { manual: '运营登记', auto: '自动发现', user_feedback: '业主上报', evaluation: '固定评估', mcp_failure: '工具异常', tool_failure: '工具异常', runtime_contract: '自动发现', provider_failure: '模型服务异常', handoff: '人工协同复盘' };
       container.innerHTML = `
         <div class="max-w-6xl mx-auto p-4 md:p-6 space-y-5">
-          <div class="flex flex-wrap justify-between gap-3"><div><h2 class="text-xl font-semibold text-slate-900">问题工作台</h2><p class="text-sm text-slate-500 mt-1">自动发现只是疑似问题；产品负责人审核后才能确认原因和结论。</p></div><div class="inline-flex rounded-xl bg-slate-100 p-1"><button id="badcase-current-tab" class="px-3 py-1.5 rounded-lg text-sm bg-white text-slate-900 shadow-sm">当前问题</button><button id="badcase-history-tab" class="px-3 py-1.5 rounded-lg text-sm text-slate-500">历史记录</button></div></div>
+          <div class="flex flex-wrap justify-between gap-3"><div><h2 class="text-xl font-semibold text-slate-900">质量闭环 · Badcase（问题案例）</h2><p class="text-sm text-slate-500 mt-1">系统自动发现或用户上报Badcase，经人工审核、修复、Evaluation复测后才能结束。</p></div><div class="inline-flex rounded-xl bg-slate-100 p-1"><button id="badcase-current-tab" class="px-3 py-1.5 rounded-lg text-sm bg-white text-slate-900 shadow-sm">当前问题</button><button id="badcase-history-tab" class="px-3 py-1.5 rounded-lg text-sm text-slate-500">历史记录</button></div></div>
+          <div class="rounded-2xl border border-indigo-200 bg-indigo-50 p-4 text-sm text-indigo-950"><b>判断边界：</b>自动发现和AI分析只提供待审核线索；AI分析建议不等于人工确认根因。只有关联真实修复、Evaluation复测和人工结束理由，才能证明闭环完成。</div>
           <div class="bg-white rounded-2xl shadow-soft border border-slate-200 p-4 space-y-3">
             <div class="flex flex-wrap gap-3 items-end">
               <div class="min-w-[220px] flex-1"><label class="block text-xs text-slate-500 mb-1">搜索</label><input id="badcase-filter-search" type="search" placeholder="ID / 问题 / 反馈 / Trace" class="w-full px-3 py-2 border border-slate-200 rounded-xl text-sm"></div>
@@ -2734,13 +2740,13 @@
               <div class="min-w-[105px]"><label class="block text-xs text-slate-500 mb-1">优先级</label><select id="badcase-filter-priority" class="w-full px-3 py-2 bg-white border border-slate-200 rounded-xl text-sm"><option value="">全部</option><option value="high">高</option><option value="medium">中</option><option value="low">低</option></select></div>
               <button id="badcase-filter-btn" class="px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white rounded-xl text-sm">查询</button>
             </div>
-            <div class="flex flex-wrap gap-3 items-end">
+            <details class="rounded-xl bg-slate-50 p-3"><summary class="cursor-pointer text-xs font-medium text-slate-600">高级筛选：Trace、复测与日期</summary><div class="mt-3 flex flex-wrap gap-3 items-end">
               <div><label class="block text-xs text-slate-500 mb-1">Trace</label><select id="badcase-filter-has-trace" class="px-3 py-2 bg-white border border-slate-200 rounded-xl text-sm"><option value="">全部</option><option value="true">有 Trace</option><option value="false">无 Trace</option></select></div>
               <div><label class="block text-xs text-slate-500 mb-1">复测</label><select id="badcase-filter-has-retest" class="px-3 py-2 bg-white border border-slate-200 rounded-xl text-sm"><option value="">全部</option><option value="true">已复测</option><option value="false">未复测</option></select></div>
               <div><label class="block text-xs text-slate-500 mb-1">开始时间</label><input id="badcase-filter-start" type="date" class="px-3 py-2 bg-white border border-slate-200 rounded-xl text-sm"></div>
               <div><label class="block text-xs text-slate-500 mb-1">结束时间</label><input id="badcase-filter-end" type="date" class="px-3 py-2 bg-white border border-slate-200 rounded-xl text-sm"></div>
               <div><label class="block text-xs text-slate-500 mb-1">每页</label><select id="badcase-page-size" class="px-3 py-2 bg-white border border-slate-200 rounded-xl text-sm"><option value="20">20</option><option value="50">50</option></select></div>
-            </div>
+            </div></details>
           </div>
           <div id="badcases-content">${loadingState()}</div>
         </div>`;
@@ -2881,7 +2887,7 @@
               <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"></path></svg>
             </button>
             <div>
-              <h2 class="text-xl font-semibold text-slate-900">Badcase #${id}</h2>
+              <h2 class="text-xl font-semibold text-slate-900">Badcase（问题案例）#${id}</h2>
               <p id="badcase-detail-header-status" class="text-sm text-slate-500">状态：加载中…</p>
             </div>
           </div>
@@ -3344,7 +3350,7 @@
 	                <div class="flex flex-wrap items-center justify-between gap-3 mb-4"><h3 class="font-semibold text-slate-900">1. 问题概览</h3><div class="flex flex-wrap items-center gap-2">${statusBadge(bc.status)} ${sourceBadgeDetail(bc.source_label)} <span class="text-xs text-slate-500">优先级：${escapeHtml(({high:'高',medium:'中',low:'低'})[bc.priority] || '默认')}</span></div></div>
 	                <div class="grid grid-cols-1 md:grid-cols-4 gap-3 mb-4 text-sm"><div><span class="text-xs text-slate-400">编号</span><div class="font-medium">#${bc.id}</div></div><div><span class="text-xs text-slate-400">分类</span><div class="font-medium">${escapeHtml(bc.category_label || categoryLabels[category] || category)}</div></div><div><span class="text-xs text-slate-400">创建</span><div>${formatTimeLabel(bc.created_at)}</div></div><div><span class="text-xs text-slate-400">更新</span><div>${formatTimeLabel(bc.updated_at || bc.created_at)}</div></div></div>
 	                <div class="space-y-4"><div><div class="text-xs text-slate-500 mb-1">原问题</div>${renderReadableText(bc.query, '未记录原问题')}</div><div><div class="text-xs text-slate-500 mb-1">原 AI 回答</div>${renderReadableText(bc.ai_response, '未保存原回答')}</div><div><div class="text-xs text-slate-500 mb-1">为什么成为 Badcase</div>${renderReadableText(bc.feedback_reason || bc.symptom || bc.description || bc.evidence, '未记录失败原因')}</div></div>
-	                <div class="mt-4 flex flex-wrap gap-3 text-xs">${bc.trace_id ? `<a href="#observability?trace_id=${encodeURIComponent(bc.trace_id)}" class="text-brand-600 font-mono">原 Trace ${escapeHtml(bc.trace_id)}</a>` : '<span class="text-slate-400">原 Trace 不可得</span>'}${bc.linked_evaluation_case ? `<span class="text-slate-500">Golden Set ${escapeHtml(bc.linked_evaluation_case.case_key || String(bc.linked_evaluation_case.id))}</span>` : ''}</div>
+	                <div class="mt-4 flex flex-wrap gap-3 text-xs">${bc.trace_id ? `<a href="#observability?trace_id=${encodeURIComponent(bc.trace_id)}" class="text-brand-600 font-mono">查看原Trace证据 ${escapeHtml(bc.trace_id)}</a>` : '<span class="text-slate-400">原Trace证据不可得</span>'}${bc.linked_evaluation_case ? `<span class="text-slate-500">Golden Set ${escapeHtml(bc.linked_evaluation_case.case_key || String(bc.linked_evaluation_case.id))}</span>` : ''}</div>
 	              </section>
 
 	              <div class="grid grid-cols-1 lg:grid-cols-3 gap-4">
@@ -3723,10 +3729,11 @@
       function renderPage() {
         const summary = state.summary || {};
         container.innerHTML = `<div class="max-w-6xl mx-auto p-4 md:p-6 space-y-5">
-          <div class="flex flex-wrap items-end justify-between gap-3"><div><h2 class="text-xl font-semibold text-slate-900">评估中心（Golden Set）</h2><p class="text-sm text-slate-500 mt-1">把关键业务链路固定成可重复的产品门槛：规则检查 + 人工 Rubric，而不是只看一次回答好不好。</p></div><button id="evaluation-create" class="px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white rounded-xl text-sm">新增 Golden Set</button></div>
+          <div><h2 class="text-xl font-semibold text-slate-900">质量闭环 · Evaluation / Golden Set（评估 / 固定评估集）</h2><p class="text-sm text-slate-500 mt-1">把关键业务链路固定成可重复门槛；规则断言来自真实运行证据，需要人工判断的业务质量仍由操作员确认。</p></div>
           <div class="grid grid-cols-1 md:grid-cols-4 gap-3"><div class="bg-white border border-slate-200 rounded-2xl p-4"><div class="text-xs text-slate-500">黄金集用例</div><div class="text-2xl font-semibold text-slate-900 mt-1">${summary.golden_cases_total || 0}</div><div class="text-[11px] text-slate-400 mt-1">受控失败探针 ${summary.controlled_failure_canary_runs || 0} 次，不计入</div></div><div class="bg-emerald-50 border border-emerald-200 rounded-2xl p-4"><div class="text-xs text-emerald-700">每个用例最新结果</div><div class="text-lg font-semibold text-emerald-900 mt-1">${summary.latest_golden_runs_passed || 0} / ${summary.latest_golden_cases_total || 0} 通过</div><div class="text-[11px] text-emerald-700 mt-1">当前通过率 ${summary.latest_golden_pass_rate == null ? '—' : summary.latest_golden_pass_rate + '%'}</div></div><div class="bg-white border border-slate-200 rounded-2xl p-4"><div class="text-xs text-slate-500">累计运行历史</div><div class="text-lg font-semibold text-slate-900 mt-1">${summary.golden_runs_passed || 0} 通过 / ${summary.golden_runs_failed || 0} 失败</div><div class="text-[11px] text-slate-400 mt-1">共 ${summary.golden_runs_total || 0} 次 · 历史通过率 ${summary.golden_pass_rate == null ? '—' : summary.golden_pass_rate + '%'}</div></div><div class="bg-white border border-slate-200 rounded-2xl p-4"><div class="text-xs text-slate-500">Golden Set Trace 模型直接成本</div><div class="text-2xl font-semibold text-slate-900 mt-1">${money(summary.model_direct_cost_cny)}</div><div class="text-[11px] text-slate-400 mt-1">来自关联 Trace；不是供应商账单。</div></div></div>
-          <div class="bg-violet-50 border border-violet-200 rounded-2xl p-4 text-sm text-violet-900"><div class="font-medium">质量运营闭环</div><div class="mt-1 text-violet-800">Trace 记录这一次怎样发生；Badcase 保存真实失败与修复；Golden Set 将关键修复固化为可重复门槛。运行评估必须由操作员主动点击，系统不自动消耗模型，也不伪造线上 SLA。</div></div>
-          <div class="bg-white rounded-2xl border border-slate-200 overflow-hidden"><div class="overflow-x-auto"><table class="w-full text-sm"><thead><tr class="bg-slate-50 border-b border-slate-200"><th class="px-4 py-3 text-left text-slate-600">用例</th><th class="px-4 py-3 text-left text-slate-600">来源 / 风险</th><th class="px-4 py-3 text-left text-slate-600">预期路径</th><th class="px-4 py-3 text-left text-slate-600">状态</th><th class="px-4 py-3 text-left text-slate-600">最近运行</th><th class="px-4 py-3 text-left text-slate-600"></th></tr></thead><tbody class="divide-y divide-slate-100">${state.cases.length ? state.cases.map(item => `<tr class="hover:bg-slate-50"><td class="px-4 py-3"><div class="font-medium text-slate-900">${escapeHtml(item.title || '-')}</div><div class="font-mono text-[11px] text-slate-500">${escapeHtml(item.case_key || '')}</div></td><td class="px-4 py-3">${badge(item.source || '-', 'bg-slate-100 text-slate-600')} ${badge(item.risk_level || '-', 'bg-violet-50 text-violet-700')}</td><td class="px-4 py-3 text-xs text-slate-600">${escapeHtml([item.expected_agent_id, ...(item.expected_tools || []), ...(item.expected_citation_docs || [])].filter(Boolean).join(' · ') || '人工 Rubric / 无硬门槛')}</td><td class="px-4 py-3">${badge(caseStateLabel[item.status] || item.status, colorForCase(item.status))}</td><td class="px-4 py-3 text-xs text-slate-500">${item.last_run_status ? `${badge(runStateLabel[item.last_run_status] || item.last_run_status, colorForRun(item.last_run_status))}<div class="mt-1">${escapeHtml(formatTimeLabel(item.last_run_at))}</div>` : '未运行'}</td><td class="px-4 py-3"><button class="evaluation-open-case px-3 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg text-xs" data-case-id="${item.id}">查看</button></td></tr>`).join('') : `<tr><td colspan="6" class="px-4 py-10 text-center text-slate-400">还没有 Golden Set。先把一个高风险或高频业务链路写成可重复用例。</td></tr>`}</tbody></table></div></div></div>`;
+          <div class="bg-violet-50 border border-violet-200 rounded-2xl p-4 text-sm text-violet-900"><div class="font-medium">质量运营闭环</div><div class="mt-1 text-violet-800">Trace记录这一次怎样发生；Badcase保存真实失败与修复；Golden Set将关键修复固化为可重复门槛。历史结果不能证明未来永远正确，也不等于线上SLA。</div></div>
+          <details class="rounded-2xl border border-slate-200 bg-slate-50 p-4"><summary class="cursor-pointer text-sm font-semibold text-slate-800">高级管理：新增Evaluation用例</summary><p class="mt-2 text-xs text-slate-500">创建用例会写入评估配置但不调用模型；只有在用例详情中主动点击“运行真实链路”才会调用Flash并产生费用。</p><button id="evaluation-create" class="mt-3 px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white rounded-xl text-sm">新增Golden Set用例</button></details>
+          <div class="bg-white rounded-2xl border border-slate-200 overflow-hidden"><div class="overflow-x-auto"><table class="w-full text-sm"><thead><tr class="bg-slate-50 border-b border-slate-200"><th class="px-4 py-3 text-left text-slate-600">用例</th><th class="px-4 py-3 text-left text-slate-600">来源 / 风险</th><th class="px-4 py-3 text-left text-slate-600">预期路径</th><th class="px-4 py-3 text-left text-slate-600">状态</th><th class="px-4 py-3 text-left text-slate-600">最近运行</th><th class="px-4 py-3 text-left text-slate-600"></th></tr></thead><tbody class="divide-y divide-slate-100">${state.cases.length ? state.cases.map(item => `<tr class="hover:bg-slate-50"><td class="px-4 py-3"><div class="font-medium text-slate-900">${escapeHtml(item.title || '-')}</div><div class="font-mono text-[11px] text-slate-500">${escapeHtml(item.case_key || '')}</div></td><td class="px-4 py-3">${badge(item.source || '-', 'bg-slate-100 text-slate-600')} ${badge(item.risk_level || '-', 'bg-violet-50 text-violet-700')}</td><td class="px-4 py-3 text-xs text-slate-600">${escapeHtml([item.expected_agent_id, ...(item.expected_tools || []), ...(item.expected_citation_docs || [])].filter(Boolean).join(' · ') || '人工 Rubric / 无硬门槛')}</td><td class="px-4 py-3">${badge(caseStateLabel[item.status] || item.status, colorForCase(item.status))}</td><td class="px-4 py-3 text-xs text-slate-500">${item.last_run_status ? `${badge(runStateLabel[item.last_run_status] || item.last_run_status, colorForRun(item.last_run_status))}<div class="mt-1">${escapeHtml(formatTimeLabel(item.last_run_at))}</div>` : '未运行'}</td><td class="px-4 py-3"><button class="evaluation-open-case px-3 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg text-xs" data-case-id="${item.id}">查看评估证据</button></td></tr>`).join('') : `<tr><td colspan="6" class="px-4 py-10 text-center text-slate-400">还没有Golden Set。先把一个高风险或高频业务链路写成可重复用例。</td></tr>`}</tbody></table></div></div></div>`;
         $('#evaluation-create').addEventListener('click', openCreateModal);
         $$('.evaluation-open-case').forEach(button => button.addEventListener('click', () => openCase(Number(button.dataset.caseId))));
       }
@@ -4068,7 +4075,7 @@
                   <div><div class="text-slate-400">总Token</div><div class="mt-0.5 font-medium text-slate-700">${t.no_model_calls ? '不适用' : fmtTokens(t.total_tokens)}</div></div>
                   <div><div class="text-slate-400">费用</div><div class="mt-0.5 font-medium ${t.cost_status === 'provider_actual' ? 'text-emerald-700' : 'text-slate-700'}">${costText}</div></div>
                 </div>
-                <button type="button" data-trace="${escapeHtml(t.trace_id)}" class="cg-trace-detail shrink-0 px-3 py-2 bg-brand-50 text-brand-600 rounded-lg text-xs hover:bg-brand-100">查看详情</button>
+                <button type="button" data-trace="${escapeHtml(t.trace_id)}" class="cg-trace-detail shrink-0 px-3 py-2 bg-brand-50 text-brand-600 rounded-lg text-xs hover:bg-brand-100">查看Trace成本证据</button>
               </div>
             </div>
           `;
@@ -4373,11 +4380,11 @@
       function renderPage() {
         container.innerHTML = `
           <div class="max-w-6xl mx-auto p-4 md:p-6 space-y-5">
-            ${pageHeader('调用与成本治理', '十秒看懂所选时段花了多少、钱花在哪、下一步怎么优化').replace('sticky top-0 z-10', 'relative')}
+            ${pageHeader('调用与成本 · Trace（运行调用记录）', '按时间查看Trace与Provider Usage（模型服务真实用量），区分真实费用、本地估算和金额不可计算。').replace('sticky top-0 z-10', 'relative')}
             ${renderOverview()}
             ${renderTraces()}
             ${renderGovernancePrinciples()}
-            <details class="rounded-2xl border border-slate-200 bg-slate-50 p-3"><summary class="cursor-pointer text-sm font-medium text-slate-700">高级信息：价格、预算与策略说明</summary><div class="mt-3 space-y-4">${renderPrices()}${renderBudget()}${renderStrategy()}</div></details>
+            <details class="rounded-2xl border border-slate-200 bg-slate-50 p-3"><summary class="cursor-pointer text-sm font-medium text-slate-700">高级信息：价格、预算与策略说明</summary><div class="mt-3 space-y-4">${renderPrices()}${renderBudget()}${renderStrategy()}<div class="rounded-xl border border-slate-200 bg-white p-3"><p class="text-xs text-slate-500">以下入口保留历史成本策略与无模型预览能力，不属于5分钟默认演示路径。</p><button id="cg-open-cost-strategy" type="button" class="mt-2 px-3 py-1.5 bg-slate-800 text-white rounded-lg text-xs">查看高级成本策略</button></div></div></details>
           </div>
         `;
         bindEvents();
@@ -4440,6 +4447,11 @@
           btn.addEventListener('click', () => openPriceModal(price));
         });
         $('#cg-edit-budget').addEventListener('click', openBudgetModal);
+        $('#cg-open-cost-strategy').addEventListener('click', () => {
+          STATE.subTab = 'cost-strategy';
+          renderSidebar();
+          renderContent();
+        });
       }
 
       await loadAll();
@@ -4845,14 +4857,15 @@
         <div class="max-w-6xl mx-auto p-4 md:p-6 space-y-5">
           <div class="flex flex-col md:flex-row md:items-end md:justify-between gap-3">
             <div>
-              <h2 class="text-xl font-semibold text-slate-900">RuntimeRelease 发布中心</h2>
-              <p class="text-sm text-slate-500 mt-1">看清配置变化、发布校验、生效范围与回滚版本；默认不下载完整历史快照。</p>
+              <h2 class="text-xl font-semibold text-slate-900">版本发布 · RuntimeRelease（运行版本）</h2>
+              <p class="text-sm text-slate-500 mt-1">比较修改前后并发布RuntimeRelease；新会话使用新版本，旧会话保持原Snapshot（会话配置快照）。</p>
             </div>
             <div class="flex flex-wrap gap-2">
-              <button id="runtime-preview-btn" class="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl text-sm">重新预览</button>
-              <button id="runtime-publish-btn" class="px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white rounded-xl text-sm disabled:opacity-40 disabled:cursor-not-allowed">校验并发布</button>
+              <button id="runtime-preview-btn" class="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl text-sm">重新检查Draft变化</button>
+              <button id="runtime-publish-btn" class="px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white rounded-xl text-sm disabled:opacity-40 disabled:cursor-not-allowed">发布当前Draft</button>
             </div>
           </div>
+          <div class="rounded-2xl border border-indigo-200 bg-indigo-50 p-4 text-sm text-indigo-950"><b>按钮后果：</b>检查Draft只读取并比较配置，不调用模型；发布会创建新的RuntimeRelease，不修改旧Snapshot，只对下一新会话生效。</div>
           <div id="runtime-content">${loadingState()}</div>
         </div>`;
 
@@ -5267,18 +5280,17 @@
             <div class="flex flex-wrap items-start justify-between gap-3">
               <div>
                 <div class="flex items-center gap-2">
-                  <h3 class="font-semibold text-slate-900">Release #${escapeHtml(String(release.version || '-'))}</h3>
-                  <span class="text-xs px-2 py-1 rounded-full ${current ? 'bg-emerald-50 text-emerald-700' : 'bg-slate-100 text-slate-600'}">${current ? '当前运行' : escapeHtml(release.status || '-')}</span>
+                  <h3 class="font-semibold text-slate-900">RuntimeRelease v${escapeHtml(String(release.version || '-'))}</h3>
+                  <span class="text-xs px-2 py-1 rounded-full ${current ? 'bg-emerald-50 text-emerald-700' : 'bg-slate-100 text-slate-600'}">${current ? 'Published（当前运行）' : escapeHtml(release.status || '-')}</span>
                 </div>
-                <div class="text-xs font-mono text-slate-500 mt-1">${escapeHtml(release.release_id || '')}</div>
                 <div class="text-xs text-slate-500 mt-1">发布时间：${escapeHtml(release.published_at || '未发布')} · 发布人：${escapeHtml(release.created_by || '-')}</div>
               </div>
               <div class="text-right">
-                <div class="text-xs font-mono text-slate-500">${escapeHtml((release.config_hash || '').slice(0, 12))}</div>
                 <div class="text-[11px] text-slate-500 mt-1">Agent ${counts.agents || 0} · Skill ${counts.skills || 0} · RAG ${counts.knowledge_docs || 0} · MCP ${counts.mcp_servers || 0}</div>
               </div>
             </div>
             ${current ? '<div class="mt-3 rounded-xl bg-indigo-50 border border-indigo-100 p-3 text-xs text-indigo-800">发布后仅下一新会话使用新版本；旧会话继续保持原 Snapshot。</div>' : ''}
+            <details class="mt-3 text-xs text-slate-500"><summary class="cursor-pointer">高级信息：Release ID与配置Hash</summary><div class="mt-2 font-mono break-all">${escapeHtml(release.release_id || '-')} · ${escapeHtml(release.config_hash || '-')}</div></details>
           </div>`;
       };
 
@@ -5295,7 +5307,7 @@
                   ${draft?.can_publish ? '允许发布' : (draft?.block_reason === 'no_changes' ? '当前没有待发布变更' : '存在阻塞错误')}
                 </p>
               </div>
-              <div class="text-xs text-slate-500">errors ${errors.length} · warnings ${warnings.length}</div>
+              <div class="text-xs text-slate-500">阻塞问题 ${errors.length} · 非阻塞提醒 ${warnings.length}</div>
             </div>
             ${errors.length ? `<div class="mt-3 space-y-1">${errors.map(item => `<div class="text-xs text-red-700 bg-red-50 rounded-lg p-2">${escapeHtml(item.code || JSON.stringify(item))}</div>`).join('')}</div>` : ''}
             ${warnings.length ? `<details class="mt-3"><summary class="cursor-pointer text-xs text-amber-700">查看 ${warnings.length} 条非阻塞警告</summary><div class="space-y-1 mt-2">${warnings.map(item => `<div class="text-xs text-amber-700 bg-amber-50 rounded-lg p-2">${escapeHtml(item.code || JSON.stringify(item))}</div>`).join('')}</div></details>` : ''}
@@ -5308,11 +5320,11 @@
           <div class="flex flex-col md:flex-row md:items-center md:justify-between gap-3">
             <div>
               <div class="flex items-center gap-2">
-                <span class="font-medium text-sm text-slate-800">#${escapeHtml(String(release.version || '-'))}</span>
+                <span class="font-medium text-sm text-slate-800">RuntimeRelease v${escapeHtml(String(release.version || '-'))}</span>
                 <span class="text-xs text-slate-500">${escapeHtml(release.status || '-')}</span>
                 <span class="text-xs text-slate-400">${escapeHtml(release.change_summary?.label || '配置变化')}</span>
               </div>
-              <div class="text-[11px] text-slate-500 mt-1">${escapeHtml(release.release_id || '')} · ${escapeHtml((release.config_hash || '').slice(0, 12))} · ${escapeHtml(release.published_at || release.created_at || '')}</div>
+              <div class="text-[11px] text-slate-500 mt-1">${escapeHtml(release.published_at || release.created_at || '')} · 完整ID和Hash按需查看</div>
             </div>
             <div class="flex flex-wrap gap-2">
               <button class="runtime-history-diff text-xs px-3 py-1.5 rounded-lg border border-indigo-200 text-indigo-700" data-release-id="${escapeHtml(release.release_id)}">${release.parent_release_id ? `与 #${escapeHtml(releaseVersionFromId(release.parent_release_id) || '上一版本')} 比较` : '初始版本（无上版）'}</button>
@@ -5376,14 +5388,14 @@
           requireElement('#runtime-content', 'RuntimeRelease 发布中心').innerHTML = `
             <div class="space-y-5">
               <section>
-                <h3 class="text-sm font-semibold text-slate-700 mb-2">当前运行版本</h3>
+                <h3 class="text-sm font-semibold text-slate-700 mb-2">当前真实运行版本</h3>
                 ${renderReleaseSummary(current, true)}
               </section>
               <section class="bg-slate-50 rounded-2xl border border-slate-200 p-4 md:p-5">
                 <div class="flex flex-wrap items-center justify-between gap-3 mb-4">
                   <div>
                     <h3 class="font-semibold text-slate-900">待发布变更</h3>
-                    <p class="text-xs text-slate-500 mt-1">当前平台 Draft vs Published RuntimeRelease</p>
+                    <p class="text-xs text-slate-500 mt-1">当前平台Draft（待发布配置）与Published RuntimeRelease（已发布配置）的差异</p>
                   </div>
                   ${draft.has_changes ? '<button id="runtime-full-preview-btn" class="text-xs px-3 py-2 rounded-lg border border-indigo-200 text-indigo-700 bg-white">查看完整参数差异</button>' : ''}
                 </div>
@@ -5486,17 +5498,24 @@
     async function renderAgentsPage(container) {
       container.innerHTML = `
         <div class="max-w-6xl mx-auto p-4 md:p-6 space-y-5">
-          <div class="max-w-6xl mx-auto pb-4 flex items-end justify-between">
+          <div class="max-w-6xl mx-auto pb-1">
             <div>
-              <h2 class="text-xl font-semibold text-slate-900">Agent 管理</h2>
-              <p class="text-sm text-slate-500 mt-1">配置路由 Agent 与垂直 Agent 的能力边界</p>
+              <h2 class="text-xl font-semibold text-slate-900">能力配置 · Agent（AI处理角色）</h2>
+              <p class="text-sm text-slate-500 mt-1">组合Agent、Skill、RAG和MCP Server/Tool；修改先形成Draft，发布RuntimeRelease后才对新会话生效。</p>
             </div>
-            <button id="agent-add-btn" class="px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white rounded-xl text-sm transition-colors flex items-center gap-1.5">
-              <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"></path></svg>
-              新增
-            </button>
           </div>
+          <div class="rounded-2xl border border-indigo-200 bg-indigo-50 p-4 text-sm text-indigo-950">
+            <div class="font-semibold">本页说明</div>
+            <p class="mt-1">Agent决定“由谁处理”，挂载的Skill、RAG和MCP Server/Tool决定“可依据什么、可调用什么”。当前列表来自平台配置；真正运行以会话Snapshot中的Published配置为准。</p>
+            <p class="mt-2 text-xs text-indigo-700">MCP Server负责接入外部能力，Tool是其中可调用的具体能力；业务写入必须经过应用层ActionGateway，本Demo不会把MCP/Tool直接当作受控写入。</p>
+          </div>
+          <div id="agent-release-status">${loadingState()}</div>
           <div id="agents-content">${loadingState()}</div>
+          <details class="rounded-2xl border border-slate-200 bg-slate-50 p-4">
+            <summary class="cursor-pointer text-sm font-semibold text-slate-800">高级管理：新增Agent Draft</summary>
+            <p class="mt-2 text-xs text-slate-500">新增或保存只修改Draft，不调用模型、不发布RuntimeRelease；必须另行发布后才对新会话生效。</p>
+            <button id="agent-add-btn" class="mt-3 px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white rounded-xl text-sm transition-colors">新增Agent Draft</button>
+          </details>
         </div>
       `;
 
@@ -5505,8 +5524,18 @@
       async function loadAgents() {
         $('#agents-content').innerHTML = loadingState();
         try {
-          const data = await apiGet('/api/agents');
+          const [data, runtimeOverview] = await Promise.all([
+            apiGet('/api/agents'),
+            apiGet('/api/runtime/releases/overview').catch(() => ({ current: {}, draft: {} }))
+          ]);
           const agents = data.agents || [];
+          const currentRelease = runtimeOverview.current || {};
+          const draft = runtimeOverview.draft || {};
+          $('#agent-release-status').innerHTML = `
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+              <div class="rounded-xl border border-emerald-200 bg-emerald-50 p-4"><div class="text-xs text-emerald-700">Published（已发布配置）</div><div class="mt-1 font-semibold text-emerald-900">RuntimeRelease v${escapeHtml(String(currentRelease.version || '-'))}</div><div class="mt-1 text-xs text-emerald-700">当前新会话使用；旧会话继续固定各自Snapshot。</div></div>
+              <div class="rounded-xl border ${draft.has_changes ? 'border-amber-200 bg-amber-50' : 'border-slate-200 bg-slate-50'} p-4"><div class="text-xs ${draft.has_changes ? 'text-amber-700' : 'text-slate-500'}">Draft（待发布配置）</div><div class="mt-1 font-semibold text-slate-900">${draft.has_changes ? '存在待发布变化' : '当前没有待发布变化'}</div><div class="mt-1 text-xs text-slate-600">保存配置不会热切换旧会话，也不会自动发布。</div></div>
+            </div>`;
           cachedAgents = agents;
           if (agents.length === 0) {
             $('#agents-content').innerHTML = emptyState('暂无 Agent');
@@ -5521,8 +5550,9 @@
                       <th class="px-4 py-3 text-left font-semibold text-slate-600">名称</th>
                       <th class="px-4 py-3 text-left font-semibold text-slate-600">描述</th>
                       <th class="px-4 py-3 text-left font-semibold text-slate-600">类型</th>
+                      <th class="px-4 py-3 text-left font-semibold text-slate-600">挂载能力</th>
                       <th class="px-4 py-3 text-left font-semibold text-slate-600">状态</th>
-                      <th class="px-4 py-3 text-left font-semibold text-slate-600">操作</th>
+                      <th class="px-4 py-3 text-left font-semibold text-slate-600">下一步</th>
                     </tr>
                   </thead>
                   <tbody class="divide-y divide-slate-100">
@@ -5533,19 +5563,11 @@
                         <td class="px-4 py-3 font-medium text-slate-900">${escapeHtml(a.name)}</td>
                         <td class="px-4 py-3 text-slate-600 max-w-xs truncate" title="${escapeHtml(a.description)}">${escapeHtml(a.description || '-')}</td>
                         <td class="px-4 py-3"><span class="text-xs px-2 py-1 rounded-full ${a.is_router ? 'bg-indigo-50 text-indigo-600' : 'bg-brand-50 text-brand-600'}">${a.is_router ? '路由' : '垂直'}</span></td>
+                        <td class="px-4 py-3 text-xs text-slate-600 min-w-[230px]"><div><b>Skill：</b>${escapeHtml((a.available_skills || []).map(item => item.name || item.id).join('、') || '无')}</div><div class="mt-1"><b>RAG：</b>${Number((a.knowledge_doc_ids || []).length)}份知识</div><div class="mt-1"><b>MCP Server：</b>${escapeHtml((a.available_mcp_tools || []).join('、') || '无')}</div><div class="mt-1"><b>模型：</b>${escapeHtml(a.model_id || 'deepseek-v4-flash（默认）')}</div></td>
+                        <td class="px-4 py-3"><span class="text-xs px-2 py-1 rounded-full ${a.enabled ? 'bg-emerald-50 text-emerald-700' : 'bg-slate-100 text-slate-500'}">${a.enabled ? 'Draft中启用' : 'Draft中停用'}</span></td>
                         <td class="px-4 py-3">
-                          ${isSeededRouter ? `<span class="text-xs text-slate-400">${a.enabled ? '启用' : '禁用'}</span>` : `
-                          <label class="relative inline-flex items-center cursor-pointer">
-                            <input type="checkbox" class="agent-toggle sr-only peer" data-id="${a.id}" ${a.enabled ? 'checked' : ''}>
-                            <div class="w-9 h-5 bg-slate-200 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-brand-600"></div>
-                          </label>
-                          `}
-                        </td>
-                        <td class="px-4 py-3">
-                          <div class="flex gap-2">
-                            <button data-id="${a.id}" class="agent-edit-btn text-xs px-3 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg transition-colors">${isSeededRouter ? '编辑路由策略' : '编辑'}</button>
-                            ${isSeededRouter ? '' : `<button data-id="${a.id}" class="agent-delete-btn text-xs px-3 py-1.5 border border-red-200 hover:bg-red-50 text-red-600 rounded-lg transition-colors">删除</button>`}
-                          </div>
+                          <button data-id="${a.id}" class="agent-edit-btn text-xs px-3 py-1.5 bg-brand-50 hover:bg-brand-100 text-brand-700 rounded-lg transition-colors">${isSeededRouter ? '查看/编辑路由Draft' : '查看/编辑Agent Draft'}</button>
+                          ${isSeededRouter ? '' : `<details class="mt-2"><summary class="text-[11px] text-slate-400 cursor-pointer">高级操作</summary><button data-id="${a.id}" class="agent-delete-btn mt-2 text-xs px-3 py-1.5 border border-red-200 hover:bg-red-50 text-red-600 rounded-lg transition-colors">从Draft删除Agent</button></details>`}
                         </td>
                       </tr>
                     `}).join('')}
@@ -5758,15 +5780,11 @@
     async function renderModelsPage(container) {
       container.innerHTML = `
         <div class="max-w-6xl mx-auto p-4 md:p-6 space-y-5">
-          <div class="max-w-6xl mx-auto pb-4 flex items-end justify-between">
+          <div class="max-w-6xl mx-auto pb-1">
             <div>
-              <h2 class="text-xl font-semibold text-slate-900">模型配置</h2>
-              <p class="text-sm text-slate-500 mt-1">查看运行时模型状态与 A/B 测试工具</p>
+              <h2 class="text-xl font-semibold text-slate-900">能力配置 · 模型策略</h2>
+              <p class="text-sm text-slate-500 mt-1">普通业务默认使用Flash，只有Darwin/AI专家深度分析使用Pro；Thinking是思考模式，不会改变Flash/Pro模型身份。</p>
             </div>
-            <button id="model-ab-btn" class="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl text-sm transition-colors flex items-center gap-1.5">
-              <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"></path></svg>
-              A/B 测试
-            </button>
           </div>
           <div class="bg-blue-50 rounded-2xl border border-blue-100 p-4 text-sm text-slate-700">
             <h3 class="font-semibold text-slate-900 mb-2">模型分层说明</h3>
@@ -5776,6 +5794,7 @@
             </ul>
           </div>
           <div id="models-content">${loadingState()}</div>
+          <details class="rounded-2xl border border-slate-200 bg-slate-50 p-4"><summary class="cursor-pointer text-sm font-semibold text-slate-800">高级管理：模型A/B测试</summary><p class="mt-2 text-xs text-red-600">运行A/B测试会分别调用真实模型并产生费用；结果只是人工比较材料，不会自动修改模型策略或发布RuntimeRelease。</p><button id="model-ab-btn" class="mt-3 px-4 py-2 bg-slate-800 text-white rounded-xl text-sm">进入模型A/B测试</button></details>
         </div>
       `;
 
@@ -5803,16 +5822,7 @@
                   </div>
                   ${m.is_default ? '<span class="px-2 py-1 bg-brand-50 text-brand-600 text-xs rounded-full border border-brand-100">运行时默认</span>' : ''}
                 </div>
-                <div class="space-y-2 text-sm">
-                  <div class="flex items-center gap-2">
-                    <span class="w-2 h-2 rounded-full ${isConfigured ? 'bg-brand-500' : 'bg-slate-300'}"></span>
-                    <span class="text-slate-600">${isConfigured ? 'DeepSeek 服务端凭证已配置（共享）' : '服务端凭证缺失'}</span>
-                  </div>
-                  <div class="flex items-center gap-2">
-                    <span class="w-2 h-2 rounded-full ${m.thinking_enabled ? 'bg-brand-500' : 'bg-slate-300'}"></span>
-                    <span class="text-slate-600">${m.thinking_enabled ? 'thinking 已启用' : 'thinking 未启用'}</span>
-                  </div>
-                </div>
+                <div class="space-y-2 text-sm"><div class="flex items-center gap-2"><span class="w-2 h-2 rounded-full ${m.thinking_enabled ? 'bg-brand-500' : 'bg-slate-300'}"></span><span class="text-slate-600">Thinking ${m.thinking_enabled ? '已开启' : '未开启'}（不改变模型身份）</span></div><div class="text-xs text-slate-500">${m.is_default ? '用于普通业主问答、Router与垂直Agent。' : '只用于Darwin/AI专家分析或人工发起的A/B测试。'}</div><details class="pt-2 text-xs text-slate-500"><summary class="cursor-pointer">高级信息：服务连接状态</summary><div class="mt-2">${isConfigured ? '模型服务凭证已由服务端配置。' : '模型服务凭证不可用。'}</div></details></div>
               </div>
             `;
           }).join('');
@@ -5937,23 +5947,19 @@
     async function renderSkillsPage(container) {
       container.innerHTML = `
         <div class="max-w-6xl mx-auto p-4 md:p-6 space-y-5">
-          <div class="max-w-6xl mx-auto pb-4 flex items-end justify-between">
+          <div class="max-w-6xl mx-auto pb-1">
             <div>
-              <h2 class="text-xl font-semibold text-slate-900">Skill 管理</h2>
-              <p class="text-sm text-slate-500 mt-1">管理 AI Agent 可调用的技能能力（V1.1 支持 Agent Skills 标准导入）</p>
-            </div>
-            <div class="flex gap-2">
-              <button id="skill-import-btn" class="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl text-sm transition-colors flex items-center gap-1.5">
-                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12"></path></svg>
-                导入
-              </button>
-              <button id="skill-add-btn" class="px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white rounded-xl text-sm transition-colors flex items-center gap-1.5">
-                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"></path></svg>
-                新增
-              </button>
+              <h2 class="text-xl font-semibold text-slate-900">能力配置 · Skill（业务规则）</h2>
+              <p class="text-sm text-slate-500 mt-1">Skill把可审核的业务规则按条件注入Agent；只有已绑定、命中触发条件且属于会话Snapshot的版本才是回答依据。</p>
             </div>
           </div>
+          <div class="rounded-2xl border border-indigo-200 bg-indigo-50 p-4 text-sm text-indigo-950"><b>数据与边界：</b>卡片来自当前平台配置，保存、启停、导入或回滚只修改Draft，不调用模型，也不会自动发布RuntimeRelease；旧会话仍使用原Snapshot。</div>
           <div id="skills-content">${loadingState()}</div>
+          <details class="rounded-2xl border border-slate-200 bg-slate-50 p-4">
+            <summary class="cursor-pointer text-sm font-semibold text-slate-800">高级管理：新增或导入Skill Draft</summary>
+            <p class="mt-2 text-xs text-slate-500">这些操作修改Draft；Skill测试是能力预览，不代表真实会话已命中。</p>
+            <div class="mt-3 flex gap-2"><button id="skill-import-btn" class="px-4 py-2 bg-slate-200 text-slate-700 rounded-xl text-sm">导入Skill Draft</button><button id="skill-add-btn" class="px-4 py-2 bg-brand-600 text-white rounded-xl text-sm">新增Skill Draft</button></div>
+          </details>
         </div>
       `;
 
@@ -5988,15 +5994,19 @@
                     ${((skill.runtime_contract || {}).negative_triggers || []).length ? `<p>不触发：${escapeHtml((skill.runtime_contract || {}).negative_triggers.join('、'))}</p>` : ''}
                     <p>优先级 ${(skill.runtime_contract || {}).priority ?? 50} · ${((skill.runtime_contract || {}).legacy_mode) ? '旧版 Prompt 模式，建议补齐治理字段' : '治理契约已配置'}</p>
                   </div>
-                  <div class="text-xs text-slate-500 bg-slate-50 rounded-lg p-2 line-clamp-3 whitespace-pre-line">${escapeHtml(skill.instructions)}</div>
-                  <div class="mt-4 pt-4 border-t border-slate-100 flex flex-wrap gap-2">
-                    <button data-id="${skill.id}" class="skill-edit-btn text-xs px-3 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg transition-colors">编辑</button>
-                    <button data-id="${skill.id}" class="skill-versions-btn text-xs px-3 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg transition-colors">版本</button>
-                    <button data-id="${skill.id}" class="skill-files-btn text-xs px-3 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg transition-colors">文件</button>
-                    <button data-id="${skill.id}" class="skill-test-btn text-xs px-3 py-1.5 bg-brand-50 hover:bg-brand-100 text-brand-700 rounded-lg transition-colors">测试</button>
-                    <button data-id="${skill.id}" class="skill-export-btn text-xs px-3 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg transition-colors">导出</button>
-                    <button data-id="${skill.id}" class="skill-delete-btn text-xs px-3 py-1.5 border border-red-200 hover:bg-red-50 text-red-600 rounded-lg transition-colors">删除</button>
-                  </div>
+                  <details class="text-xs text-slate-500 bg-slate-50 rounded-lg p-2"><summary class="cursor-pointer font-medium text-slate-700">查看Skill指令原文</summary><div class="mt-2 whitespace-pre-line">${escapeHtml(skill.instructions)}</div></details>
+                  <details class="mt-4 pt-4 border-t border-slate-100">
+                    <summary class="cursor-pointer text-xs font-medium text-slate-600">高级管理：修改、预览或删除</summary>
+                    <p class="mt-2 text-[11px] text-slate-500">编辑、回滚和删除会修改Draft；“预览触发结果”不调用真实模型、不代表已在Published会话中生效。</p>
+                    <div class="mt-3 flex flex-wrap gap-2">
+                      <button data-id="${skill.id}" class="skill-edit-btn text-xs px-3 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg transition-colors">查看/编辑Skill Draft</button>
+                      <button data-id="${skill.id}" class="skill-versions-btn text-xs px-3 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg transition-colors">查看Skill版本</button>
+                      <button data-id="${skill.id}" class="skill-files-btn text-xs px-3 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg transition-colors">管理Skill文件</button>
+                      <button data-id="${skill.id}" class="skill-test-btn text-xs px-3 py-1.5 bg-brand-50 hover:bg-brand-100 text-brand-700 rounded-lg transition-colors">预览触发结果</button>
+                      <button data-id="${skill.id}" class="skill-export-btn text-xs px-3 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg transition-colors">导出Skill</button>
+                      <button data-id="${skill.id}" class="skill-delete-btn text-xs px-3 py-1.5 border border-red-200 hover:bg-red-50 text-red-600 rounded-lg transition-colors">从Draft删除Skill</button>
+                    </div>
+                  </details>
                 </div>
               `).join('')}
             </div>
@@ -6331,20 +6341,19 @@
     async function renderMcpPage(container) {
       container.innerHTML = `
         <div class="max-w-6xl mx-auto p-4 md:p-6 space-y-5">
-          <div class="max-w-6xl mx-auto pb-4 flex items-end justify-between">
+          <div class="max-w-6xl mx-auto pb-1">
             <div>
-              <h2 class="text-xl font-semibold text-slate-900">MCP Server 管理</h2>
-              <p class="text-sm text-slate-500 mt-1">从 Git 导入、连接测试、发现 Tool，再绑定 Agent 并发布</p>
-            </div>
-            <div class="flex gap-2">
-              <button id="mcp-advanced-add-btn" class="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl text-sm transition-colors">高级手动配置</button>
-              <button id="mcp-git-import-btn" class="px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white rounded-xl text-sm transition-colors flex items-center gap-1.5">
-                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"></path></svg>
-                从 Git 导入
-              </button>
+              <h2 class="text-xl font-semibold text-slate-900">能力配置 · MCP Server（外部能力接入服务）/ Tool</h2>
+              <p class="text-sm text-slate-500 mt-1">MCP Server负责接入外部能力，Tool是其中可调用的具体能力；Agent绑定与RuntimeRelease共同决定新会话能否使用。</p>
             </div>
           </div>
+          <div class="rounded-2xl border border-indigo-200 bg-indigo-50 p-4 text-sm text-indigo-950"><b>能力边界：</b>MCP/Tool不等于ActionGateway。MCP/Tool负责读取或准备外部结果；本Demo的工单写入由应用层ActionGateway执行，必须经过用户确认并返回正式Receipt（回执）。</div>
           <div id="mcp-content">${loadingState()}</div>
+          <details class="rounded-2xl border border-slate-200 bg-slate-50 p-4">
+            <summary class="cursor-pointer text-sm font-semibold text-slate-800">高级管理：接入新的MCP Server</summary>
+            <p class="mt-2 text-xs text-slate-500">导入、连接、配置Tool模板或启停只修改Draft和接入状态，不调用模型、不发布RuntimeRelease；发布后仅新会话可用。</p>
+            <div class="mt-3 flex gap-2"><button id="mcp-advanced-add-btn" class="px-4 py-2 bg-slate-200 text-slate-700 rounded-xl text-sm">手动配置MCP Server</button><button id="mcp-git-import-btn" class="px-4 py-2 bg-brand-600 text-white rounded-xl text-sm">从Git导入MCP Server</button></div>
+          </details>
         </div>
       `;
 
@@ -6417,18 +6426,7 @@
                       </div>
                     </details>
                   </div>
-                  <div class="flex flex-col items-end gap-3 shrink-0">
-                    <label class="relative inline-flex items-center cursor-pointer">
-                      <input type="checkbox" class="mcp-toggle sr-only peer" data-id="${server.id}" ${server.enabled ? 'checked' : ''}>
-                      <div class="w-9 h-5 bg-slate-200 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-brand-600"></div>
-                    </label>
-                    <div class="flex gap-2">
-                      <button data-id="${server.id}" class="mcp-discover-btn text-xs px-3 py-1.5 bg-brand-50 hover:bg-brand-100 text-brand-700 rounded-lg transition-colors">连接并刷新 Tool</button>
-                      <button data-id="${server.id}" class="mcp-tools-btn text-xs px-3 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg transition-colors">查看 Tool</button>
-                      <button data-id="${server.id}" class="mcp-edit-btn text-xs px-3 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg transition-colors">编辑</button>
-                      <button data-id="${server.id}" class="mcp-delete-btn text-xs px-3 py-1.5 border border-red-200 hover:bg-red-50 text-red-600 rounded-lg transition-colors">删除</button>
-                    </div>
-                  </div>
+                  <div class="md:w-56 shrink-0"><div class="text-right"><span class="text-xs px-2 py-1 rounded-full ${server.enabled ? 'bg-emerald-50 text-emerald-700' : 'bg-slate-100 text-slate-500'}">${server.enabled ? 'Draft中启用' : 'Draft中停用'}</span></div><details class="mt-3 rounded-xl border border-slate-200 bg-slate-50 p-3"><summary class="cursor-pointer text-xs font-medium text-slate-700">高级管理与Tool证据</summary><p class="mt-2 text-[11px] text-slate-500">查看Tool只读；连接刷新会访问该MCP Server；启停、编辑和删除会修改Draft，但不发布RuntimeRelease。</p><label class="mt-3 flex items-center gap-2 text-xs text-slate-600"><input type="checkbox" class="mcp-toggle" data-id="${server.id}" ${server.enabled ? 'checked' : ''}>启用该MCP Server Draft</label><div class="mt-3 flex flex-col gap-2"><button data-id="${server.id}" class="mcp-discover-btn text-xs px-3 py-1.5 bg-brand-50 hover:bg-brand-100 text-brand-700 rounded-lg transition-colors">连接并刷新Tool清单</button><button data-id="${server.id}" class="mcp-tools-btn text-xs px-3 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg transition-colors">查看Tool与调用契约</button><button data-id="${server.id}" class="mcp-edit-btn text-xs px-3 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg transition-colors">查看/编辑MCP Draft</button><button data-id="${server.id}" class="mcp-delete-btn text-xs px-3 py-1.5 border border-red-200 hover:bg-red-50 text-red-600 rounded-lg transition-colors">从Draft删除MCP Server</button></div></details></div>
                 </div>
               `; }).join('')}
             </div>
@@ -6815,6 +6813,22 @@
     // ==========================================
     // Initialization
     // ==========================================
+    async function loadRuntimeVersionLabel() {
+      const versionEl = $('#app-version');
+      try {
+        const overview = await apiGet('/api/runtime/releases/overview');
+        const current = overview.current || {};
+        APP_VERSION = current.version ? `RuntimeRelease v${current.version}` : 'RuntimeRelease 暂不可得';
+        if (versionEl) {
+          versionEl.textContent = APP_VERSION;
+          versionEl.title = current.release_id || '当前已发布运行版本';
+        }
+      } catch (err) {
+        APP_VERSION = 'RuntimeRelease 暂不可得';
+        if (versionEl) versionEl.textContent = APP_VERSION;
+      }
+    }
+
     async function init() {
       try {
         // Restore persisted chat session so history survives reloads/tab switches.
@@ -6826,6 +6840,7 @@
         ['#main-content', '#sub-menu', '#role-title'].forEach(sel => requireElement(sel, 'init'));
         const versionEl = $('#app-version');
         if (versionEl) versionEl.textContent = APP_VERSION;
+        await loadRuntimeVersionLabel();
         renderTopTabs();
         renderSidebar();
         await renderContent();
