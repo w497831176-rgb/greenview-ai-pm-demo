@@ -178,6 +178,10 @@ def build_cost_entry(
 def cost_entry_usage_payload(
     cost: CostEntry,
     provider_request_id: Optional[str] = None,
+    provider_request_sequence: Optional[int] = None,
+    provider_request_key: Optional[str] = None,
+    provider_request_identity_source: Optional[str] = None,
+    evidence_source: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Serialize new evidence into the existing model_calls JSON column."""
     actual = cost.usage_source == UsageSource.PROVIDER_ACTUAL
@@ -185,6 +189,10 @@ def cost_entry_usage_payload(
         "requested_model": cost.requested_model,
         "provider_response_model": cost.provider_response_model,
         "provider_request_id": provider_request_id,
+        "provider_request_sequence": provider_request_sequence,
+        "provider_request_key": provider_request_key,
+        "provider_request_identity_source": provider_request_identity_source,
+        "evidence_source": evidence_source,
         "thinking_enabled": cost.thinking_enabled,
         "input_cache_hit_tokens": cost.input_cache_hit_tokens if actual else None,
         "input_cache_miss_tokens": cost.input_cache_miss_tokens if actual else None,

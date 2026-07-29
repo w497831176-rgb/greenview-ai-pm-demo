@@ -89,6 +89,14 @@ def _preload_skill_instructions(
     return contexts, calls
 
 
+def _skills_exposed_to_model(
+    skills: Any,
+    preload_calls: List[Dict[str, Any]],
+) -> Any:
+    """Hide a Skill tool after the same Skill was deterministically preloaded."""
+    return None if preload_calls else skills
+
+
 def _find_agent(config: Dict[str, Any], agent_id: str) -> Dict[str, Any]:
     for item in config.get("agents") or []:
         if item.get("agent_id") == agent_id and item.get("enabled"):
@@ -268,11 +276,12 @@ def build_agent_from_snapshot(
         agno_skills,
         activations,
     )
+    model_skills = _skills_exposed_to_model(agno_skills, skill_tool_calls)
 
     instructions = [
         str(agent_config.get("instructions") or ""),
         "你只能使用本次已发布快照装配的能力。",
-        "若有可用 Skill，先调用 get_skill_instructions 读取命中 Skill，再回答。",
+        "若运行时已加载业务 Skill，请直接依据已加载的 Skill 原文回答，不要重复调用 Skill 工具。",
         "不得自行创建、更新、删除业务数据；写操作只能描述为待确认 Proposal。",
         "只有后端 ActionReceipt.status=committed 且包含真实 resource_id 时，才能声称操作成功。",
     ]
@@ -312,7 +321,7 @@ def build_agent_from_snapshot(
         db=agent_db,
         instructions=instructions,
         tools=list(tools or []),
-        skills=agno_skills,
+        skills=model_skills,
         markdown=True,
         add_history_to_context=True,
         num_history_runs=5,

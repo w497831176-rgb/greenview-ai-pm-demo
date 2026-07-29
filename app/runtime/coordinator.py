@@ -40,7 +40,10 @@ from app.runtime.mcp_executor import (
 )
 from app.runtime.snapshot_resolver import resolve_snapshot
 from app.runtime.tool_planner import plan_tools, unique_write_plan
-from app.runtime.provider_evidence import provider_evidence_from_run
+from app.runtime.provider_evidence import (
+    provider_evidence_from_run,
+    provider_requests_from_model,
+)
 from app.settings import MODEL_ID, USE_THINKING, build_model
 from app.work_order_workflow import (
     action_gateway,
@@ -62,6 +65,7 @@ from db.property_db import (
     now_cn,
     record_mcp_call_audit,
     record_model_call,
+    record_model_call_idempotent,
     record_trace_event,
     request_handoff,
     resume_handoff_after_owner_message,
@@ -470,8 +474,19 @@ def _thinking_for_snapshot(snapshot_config: Dict[str, Any], model_id: str) -> bo
 def _usage_for_observability(
     cost: Any,
     provider_request_id: Optional[str] = None,
+    provider_request_sequence: Optional[int] = None,
+    provider_request_key: Optional[str] = None,
+    provider_request_identity_source: Optional[str] = None,
+    evidence_source: Optional[str] = None,
 ) -> Dict[str, Any]:
-    return cost_entry_usage_payload(cost, provider_request_id=provider_request_id)
+    return cost_entry_usage_payload(
+        cost,
+        provider_request_id=provider_request_id,
+        provider_request_sequence=provider_request_sequence,
+        provider_request_key=provider_request_key,
+        provider_request_identity_source=provider_request_identity_source,
+        evidence_source=evidence_source,
+    )
 
 
 def _results_from_snapshot(
@@ -1985,6 +2000,32 @@ class RuntimeCoordinator:
                 )
                 last_progress_at = time.time()
 
+        provider_requests = (
+            provider_requests_from_model(build.agent.model, consume=True)
+            if model_invoked
+            else []
+        )
+        if model_invoked and not provider_requests:
+            fallback_usage = final_provider_evidence.get("usage") or final_metrics
+            provider_requests = [
+                {
+                    **final_provider_evidence,
+                    "usage": dict(fallback_usage or {}),
+                    "provider_request_sequence": 1,
+                    "provider_request_key": (
+                        f"request_id:{final_provider_evidence['provider_request_id']}"
+                        if final_provider_evidence.get("provider_request_id")
+                        else "run_sequence:1"
+                    ),
+                    "provider_request_identity_source": (
+                        "provider_request_id"
+                        if final_provider_evidence.get("provider_request_id")
+                        else "run_sequence"
+                    ),
+                    "status": "success",
+                }
+            ]
+
         provider_failure_reason = _provider_failure_reason(full_content)
         if (
             provisional_buffer
@@ -2111,68 +2152,91 @@ class RuntimeCoordinator:
             ).get("model_id")
             or MODEL_ID
         )
-        vertical_cost = None
-        vertical_usage_source = "not_invoked"
         if model_invoked:
-            vertical_usage = final_provider_evidence.get("usage") or final_metrics
-            vertical_response_model = final_provider_evidence.get(
-                "provider_response_model"
-            )
-            vertical_billing_model = vertical_response_model or model_id
             vertical_thinking = _thinking_for_snapshot(snapshot.config, model_id)
-            vertical_cost = build_cost_entry(
-                stage="vertical_agent",
-                provider=_model_provider(snapshot.config, model_id),
-                requested_model=model_id,
-                response_model=None,
-                provider_response_model=vertical_response_model,
-                thinking_enabled=vertical_thinking,
-                model_policy_version=str(
-                    (snapshot.config.get("model_policy") or {}).get("version") or "v1.8"
-                ),
-                provider_usage=vertical_usage if vertical_usage else None,
-                price_row=_price_for_snapshot(snapshot.config, vertical_billing_model),
-                local_estimate_tokens=_estimate_tokens(contextual_message + rendered),
-            )
-            vertical_usage_source = vertical_cost.usage_source.value
-            state.cost_entries.append(vertical_cost)
-            state.model_calls.append(
-                {
-                    "stage": "vertical_agent",
-                    "model_id": model_id,
-                    "requested_model": model_id,
-                    "provider_response_model": vertical_response_model,
-                    "thinking_enabled": vertical_thinking,
-                    "latency_ms": int((time.time() - agent_started) * 1000),
-                    "usage": vertical_usage,
-                    "usage_source": vertical_usage_source,
-                }
-            )
-            record_model_call(
-                trace_id=trace_id,
-                stage="vertical_agent",
-                model_id=model_id,
-                model_selection_reason=f"agent model from snapshot:{selected}",
-                latency_ms=int((time.time() - agent_started) * 1000),
-                input_tokens=vertical_cost.input_tokens,
-                output_tokens=vertical_cost.output_tokens,
-                reasoning_tokens=vertical_cost.reasoning_tokens,
-                cached_tokens=vertical_cost.cached_input_tokens,
-                total_tokens=vertical_cost.total_tokens,
-                usage_source=vertical_usage_source,
-                price_snapshot=(
-                    vertical_cost.price_snapshot.model_dump(mode="json")
-                    if vertical_cost.price_snapshot
-                    else None
-                ),
-                estimated_cost_cny=vertical_cost.amount,
-                usage_normalized=_usage_for_observability(
-                    vertical_cost,
-                    provider_request_id=final_provider_evidence.get(
-                        "provider_request_id"
+            for index, request_evidence in enumerate(provider_requests, start=1):
+                sequence = int(
+                    request_evidence.get("provider_request_sequence") or index
+                )
+                request_id = request_evidence.get("provider_request_id")
+                request_key = request_evidence.get("provider_request_key") or (
+                    f"request_id:{request_id}"
+                    if request_id
+                    else f"run_sequence:{sequence}"
+                )
+                identity_source = request_evidence.get(
+                    "provider_request_identity_source"
+                ) or ("provider_request_id" if request_id else "run_sequence")
+                vertical_usage = dict(request_evidence.get("usage") or {})
+                vertical_response_model = request_evidence.get(
+                    "provider_response_model"
+                )
+                vertical_billing_model = vertical_response_model or model_id
+                vertical_cost = build_cost_entry(
+                    stage="vertical_agent",
+                    provider=_model_provider(snapshot.config, model_id),
+                    requested_model=model_id,
+                    response_model=None,
+                    provider_response_model=vertical_response_model,
+                    thinking_enabled=vertical_thinking,
+                    model_policy_version=str(
+                        (snapshot.config.get("model_policy") or {}).get("version")
+                        or "v1.8"
                     ),
-                ),
-            )
+                    provider_usage=vertical_usage if vertical_usage else None,
+                    price_row=_price_for_snapshot(
+                        snapshot.config,
+                        vertical_billing_model,
+                    ),
+                    local_estimate_tokens=None,
+                )
+                vertical_usage_source = vertical_cost.usage_source.value
+                state.cost_entries.append(vertical_cost)
+                state.model_calls.append(
+                    {
+                        "stage": "vertical_agent",
+                        "model_id": model_id,
+                        "requested_model": model_id,
+                        "provider_response_model": vertical_response_model,
+                        "provider_request_id": request_id,
+                        "provider_request_sequence": sequence,
+                        "thinking_enabled": vertical_thinking,
+                        "latency_ms": None,
+                        "usage": vertical_usage,
+                        "usage_source": vertical_usage_source,
+                        "status": request_evidence.get("status") or "success",
+                    }
+                )
+                record_model_call_idempotent(
+                    trace_id=trace_id,
+                    stage="vertical_agent",
+                    model_id=model_id,
+                    model_selection_reason=(
+                        f"agent model from snapshot:{selected}; "
+                        f"Provider request {sequence}/{len(provider_requests)}"
+                    ),
+                    latency_ms=None,
+                    input_tokens=vertical_cost.input_tokens,
+                    output_tokens=vertical_cost.output_tokens,
+                    reasoning_tokens=vertical_cost.reasoning_tokens,
+                    cached_tokens=vertical_cost.cached_input_tokens,
+                    total_tokens=vertical_cost.total_tokens,
+                    usage_source=vertical_usage_source,
+                    price_snapshot=(
+                        vertical_cost.price_snapshot.model_dump(mode="json")
+                        if vertical_cost.price_snapshot
+                        else None
+                    ),
+                    estimated_cost_cny=vertical_cost.amount,
+                    usage_normalized=_usage_for_observability(
+                        vertical_cost,
+                        provider_request_id=request_id,
+                        provider_request_sequence=sequence,
+                        provider_request_key=request_key,
+                        provider_request_identity_source=identity_source,
+                        evidence_source="provider_response",
+                    ),
+                )
 
         state.status = RunStatus.COMPLETED
         state.next_step = None

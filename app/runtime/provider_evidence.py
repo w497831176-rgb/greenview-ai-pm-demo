@@ -8,7 +8,8 @@ infers one token class from another.
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from copy import deepcopy
+from typing import Any, Dict, List, Optional
 
 
 def _value(source: Any, name: str) -> Any:
@@ -107,3 +108,65 @@ def provider_evidence_from_run(value: Any) -> Dict[str, Any]:
         "provider_request_id": str(request_id) if request_id else None,
         "usage": dict(usage),
     }
+
+
+def remember_provider_request(
+    journal: List[Dict[str, Any]],
+    evidence: Dict[str, Any],
+) -> None:
+    """Merge one parsed Provider response into a per-model request journal.
+
+    Streaming adapters may expose the same Provider request over many deltas.
+    A real request id is therefore the primary identity.  Providers without an
+    id are appended only when Usage arrives and receive a stable run ordinal.
+    """
+    request_id = evidence.get("provider_request_id")
+    response_model = evidence.get("provider_response_model")
+    usage = dict(evidence.get("usage") or {})
+    has_usage = any(value is not None for value in usage.values())
+    if not request_id and not has_usage:
+        return
+
+    existing = None
+    if request_id:
+        existing = next(
+            (
+                item
+                for item in journal
+                if item.get("provider_request_id") == str(request_id)
+            ),
+            None,
+        )
+    if existing is None:
+        sequence = len(journal) + 1
+        existing = {
+            "provider_request_id": str(request_id) if request_id else None,
+            "provider_request_sequence": sequence,
+            "provider_request_key": (
+                f"request_id:{request_id}"
+                if request_id
+                else f"run_sequence:{sequence}"
+            ),
+            "provider_request_identity_source": (
+                "provider_request_id" if request_id else "run_sequence"
+            ),
+            "provider_response_model": None,
+            "usage": {},
+            "status": "success",
+        }
+        journal.append(existing)
+    if response_model:
+        existing["provider_response_model"] = str(response_model)
+    if usage:
+        existing["usage"].update(usage)
+
+
+def provider_requests_from_model(model: Any, *, consume: bool = False) -> List[Dict[str, Any]]:
+    """Return every captured Provider request for one model instance."""
+    journal = getattr(model, "_provider_request_journal", None)
+    if not isinstance(journal, list):
+        return []
+    result = deepcopy(journal)
+    if consume:
+        journal.clear()
+    return result

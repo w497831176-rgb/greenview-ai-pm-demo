@@ -904,6 +904,9 @@ def _enrich_model_call(call: Dict[str, Any], session_id: Optional[str]) -> Dict[
     enriched["provider_request_id"] = enriched["usage_normalized"].get(
         "provider_request_id"
     )
+    enriched["provider_request_sequence"] = enriched["usage_normalized"].get(
+        "provider_request_sequence"
+    )
     enriched["provider_usage"] = {
         "input_cache_hit_tokens": enriched["usage_normalized"].get(
             "input_cache_hit_tokens"
@@ -1033,6 +1036,10 @@ def _trace_cost_explanation(calls: List[Dict[str, Any]]) -> Dict[str, Any]:
                 "price_snapshot": call.get("price_snapshot") or {},
                 "formula": call.get("cost_formula"),
                 "bucket": bucket,
+                "provider_request_id": usage.get("provider_request_id"),
+                "provider_request_sequence": usage.get(
+                    "provider_request_sequence"
+                ),
             }
         )
 
@@ -1067,6 +1074,7 @@ def _trace_cost_explanation(calls: List[Dict[str, Any]]) -> Dict[str, Any]:
     return {
         "summary": summary,
         "model_call_count": len(chain),
+        "provider_request_count": len(chain),
         "total_tokens": total_tokens if chain else None,
         "chain": chain,
         "cost_scope": {

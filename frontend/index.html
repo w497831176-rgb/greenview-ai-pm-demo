@@ -3843,14 +3843,17 @@
           || Number(knownUsage.input_cache_hit_tokens || 0) + Number(knownUsage.input_cache_miss_tokens || 0) + Number(knownUsage.output_tokens || 0);
         const estimatedCalls = Number(o.estimated_calls || 0);
         const unavailableCalls = Number(o.unavailable_calls || 0);
-        const modelRows = Object.values(o.by_model || {});
-        const flashCalls = modelRows.filter(row => String(row.model_id || row.model_name || '').includes('flash')).reduce((sum, row) => sum + Number(row.calls || 0), 0);
-        const proCalls = modelRows.filter(row => String(row.model_id || row.model_name || '').includes('pro')).reduce((sum, row) => sum + Number(row.calls || 0), 0);
+        const modelRows = Object.entries(o.by_model || {}).map(([modelId, row]) => ({ ...row, actual_model_id: String(modelId || '').toLowerCase() }));
+        const flashCalls = modelRows.filter(row => row.actual_model_id === 'deepseek-v4-flash').reduce((sum, row) => sum + Number(row.calls || 0), 0);
+        const proCalls = modelRows.filter(row => row.actual_model_id === 'deepseek-v4-pro').reduce((sum, row) => sum + Number(row.calls || 0), 0);
+        const unknownModelCalls = Math.max(0, calls - flashCalls - proCalls);
         const darwinCalls = Number(((o.by_stage || {}).darwin || {}).calls || 0);
         const unexpectedPro = Math.max(0, proCalls - darwinCalls);
         const modelSummary = calls === 0
           ? '未调用模型'
-          : (flashCalls === calls ? '全部使用Flash' : (proCalls === calls ? '全部使用Pro' : '使用Flash与Pro'));
+          : unknownModelCalls > 0
+            ? '模型身份待确认'
+            : (flashCalls === calls ? '全部使用Flash' : (proCalls === calls ? '全部使用Pro' : '使用Flash与Pro'));
         const evidenceSummary = estimatedCalls === 0 && unavailableCalls === 0
           ? '当前没有估算费用和金额无法计算记录。'
           : `其中本地估算 ${estimatedCalls} 次，金额无法计算 ${unavailableCalls} 次。`;
@@ -3876,11 +3879,11 @@
             </div>
             ${state.rangeKey === 'custom' ? `<div class="mt-3 flex flex-wrap items-end gap-2"><label class="text-xs text-slate-500">开始日期<input id="cg-custom-start" type="date" value="${escapeHtml(state.customStart)}" class="block mt-1 px-3 py-2 border border-slate-200 rounded-lg text-sm text-slate-700"></label><label class="text-xs text-slate-500">结束日期<input id="cg-custom-end" type="date" value="${escapeHtml(state.customEnd)}" class="block mt-1 px-3 py-2 border border-slate-200 rounded-lg text-sm text-slate-700"></label><button id="cg-custom-apply" type="button" class="px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white rounded-lg text-sm">查询</button></div>` : ''}
             <h2 id="cg-summary-title" class="mt-4 text-sm font-semibold text-brand-700">一句话结论</h2>
-            <p class="mt-2 text-lg font-semibold text-slate-900">${sentenceLead}调用模型${calls.toLocaleString()}次，${modelSummary}，共${tokens.toLocaleString()} Token，Provider真实费用${Number(o.provider_actual_calls || 0) ? fmtCost(o.provider_actual_cost_cny) : '暂无'}。${evidenceSummary}</p>
+            <p class="mt-2 text-lg font-semibold text-slate-900">${sentenceLead}发起Provider请求${calls.toLocaleString()}次，${modelSummary}，共${tokens.toLocaleString()} Token，Provider真实费用${Number(o.provider_actual_calls || 0) ? fmtCost(o.provider_actual_cost_cny) : '暂无'}。${evidenceSummary}</p>
             <p class="mt-2 text-xs text-slate-500">统计范围：${escapeHtml(scope.start || '-')} 至 ${escapeHtml(scope.end || '-')} · 时区 ${escapeHtml(scope.timezone || 'Asia/Shanghai')}</p>
             <div class="grid grid-cols-1 sm:grid-cols-3 gap-3 mt-4">
               <div class="rounded-xl border border-emerald-200 bg-emerald-50 p-3"><div class="text-xs text-emerald-700">${cardPrefix}真实费用</div><div class="mt-1 text-xl font-semibold text-emerald-800">${Number(o.provider_actual_calls || 0) ? fmtCost(o.provider_actual_cost_cny) : '暂无'}</div></div>
-              <div class="rounded-xl border border-slate-200 bg-slate-50 p-3"><div class="text-xs text-slate-500">${cardPrefix}模型调用</div><div class="mt-1 text-xl font-semibold text-slate-900">${calls.toLocaleString()}次</div></div>
+              <div class="rounded-xl border border-slate-200 bg-slate-50 p-3"><div class="text-xs text-slate-500">${cardPrefix}Provider请求</div><div class="mt-1 text-xl font-semibold text-slate-900">${calls.toLocaleString()}次</div></div>
               <div class="rounded-xl border p-3 ${attention.tone}"><div class="text-xs">需要关注</div><div class="mt-1 text-lg font-semibold">${attention.label}</div></div>
             </div>
           </section>
@@ -4028,10 +4031,15 @@
           ? `<span class="text-xs text-slate-500">${escapeHtml(range.start || '')} 至 ${escapeHtml(range.end || '')}</span>`
           : '';
         const rows = items.map(t => {
-          const models = String(t.model_summary || '').toLowerCase();
+          const modelIds = (t.models || []).map(model => String(model || '').toLowerCase());
+          const hasFlashModel = modelIds.includes('deepseek-v4-flash');
+          const hasProModel = modelIds.includes('deepseek-v4-pro');
+          const hasUnknownModel = modelIds.some(model => !['deepseek-v4-flash', 'deepseek-v4-pro'].includes(model));
           const modelLabel = t.no_model_calls
             ? '未调用模型'
-            : (models.includes('pro') && models.includes('flash') ? 'Flash + Pro' : (models.includes('pro') ? 'Pro' : 'Flash'));
+            : hasUnknownModel
+              ? '模型身份待确认'
+              : (hasProModel && hasFlashModel ? 'Flash + Pro' : (hasProModel ? 'Pro' : (hasFlashModel ? 'Flash' : '模型身份待确认')));
           const callCount = Number(t.model_call_count || 0);
           const partialCosts = [
             Number(t.provider_actual_priced_calls || 0) ? `Provider真实费用 ${fmtCost(t.provider_actual_cost_cny)}` : '',
@@ -4056,7 +4064,7 @@
                 </div>
                 <div class="grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs md:w-[520px]">
                   <div><div class="text-slate-400">使用模型</div><div class="mt-0.5 font-medium text-slate-700">${modelLabel}</div></div>
-                  <div><div class="text-slate-400">调用次数</div><div class="mt-0.5 font-medium text-slate-700">${t.no_model_calls ? '0次' : `${callCount}次`}</div></div>
+                  <div><div class="text-slate-400">Provider请求次数</div><div class="mt-0.5 font-medium text-slate-700">${t.no_model_calls ? '0次' : `${callCount}次`}</div></div>
                   <div><div class="text-slate-400">总Token</div><div class="mt-0.5 font-medium text-slate-700">${t.no_model_calls ? '不适用' : fmtTokens(t.total_tokens)}</div></div>
                   <div><div class="text-slate-400">费用</div><div class="mt-0.5 font-medium ${t.cost_status === 'provider_actual' ? 'text-emerald-700' : 'text-slate-700'}">${costText}</div></div>
                 </div>
@@ -4089,12 +4097,13 @@
           const chain = explanation.chain || [];
           const scope = explanation.cost_scope || {};
           const recommendation = explanation.recommendation || {};
-          const noModel = Number(explanation.model_call_count || 0) === 0;
+          const noModel = Number(explanation.provider_request_count ?? explanation.model_call_count ?? 0) === 0;
           const hasUnavailable = Number(scope.unavailable_calls || 0) > 0;
           const stageLabels = { router: '路由判断', vertical_agent: '业务回答', darwin: 'AI专家分析', badcase_classify: '问题分类', retest: '复测分析' };
-          const modelLabel = model => String(model || '').includes('pro') ? 'Pro' : (String(model || '').includes('flash') ? 'Flash' : '未返回');
+          const modelLabel = model => String(model || '').toLowerCase() === 'deepseek-v4-pro' ? 'Pro' : (String(model || '').toLowerCase() === 'deepseek-v4-flash' ? 'Flash' : '模型身份待确认');
           const hasDarwin = chain.some(c => c.stage === 'darwin');
-          const hasPro = chain.some(c => String(c.provider_response_model || c.requested_model || '').includes('pro'));
+          const hasPro = chain.some(c => String(c.provider_response_model || c.requested_model || '').toLowerCase() === 'deepseek-v4-pro');
+          const agentStageCount = new Set(chain.map(c => c.stage || 'unknown')).size;
           const totalTokens = chain.reduce((sum, c) => sum + Number(c.total_tokens || 0), 0);
           const knownCost = Number(scope.provider_actual_cost_cny || 0) + Number(scope.estimated_cost_cny || 0);
           const selectionText = hasDarwin
@@ -4103,13 +4112,14 @@
               ? '本轮使用了Pro，请核对是否属于AI专家分析；Thinking只是思考模式，不会改变模型身份。'
               : '普通业务使用Flash即可满足质量要求；本轮没有使用Pro。Thinking只是思考模式，不会改变Flash模型身份。';
           const happenedText = hasDarwin
-            ? `本轮执行AI专家根因分析，使用Pro调用${chain.length}次，共${totalTokens.toLocaleString()} Token，费用${fmtCost(knownCost)}。`
+            ? `本轮执行AI专家根因分析，涉及${agentStageCount}个业务阶段，发起${chain.length}次Pro Provider请求，共${totalTokens.toLocaleString()} Token，费用${fmtCost(knownCost)}。`
             : chain.some(c => c.stage === 'router') && chain.some(c => c.stage === 'vertical_agent')
-              ? `为回答这次物业问题，系统先用Flash判断由谁处理，再用Flash生成业务回答。本轮共调用${chain.length}次，费用${fmtCost(knownCost)}。`
-              : `本轮共调用模型${chain.length}次，共${totalTokens.toLocaleString()} Token，费用${fmtCost(knownCost)}。`;
+              ? `为回答这次物业问题，系统先用Flash判断由谁处理，再用Flash生成业务回答。共${agentStageCount}个业务阶段、${chain.length}次Provider请求，费用${fmtCost(knownCost)}。`
+              : `本轮涉及${agentStageCount}个业务阶段，发起${chain.length}次Provider请求，共${totalTokens.toLocaleString()} Token，费用${fmtCost(knownCost)}。`;
           const costRows = chain.map(c => {
             const amount = c.bucket === 'unavailable' || c.amount_cny === null || c.amount_cny === undefined ? '金额无法计算' : fmtCost(c.amount_cny);
-            return `<tr class="border-b border-slate-100 last:border-0"><td class="py-2">${escapeHtml(stageLabels[c.stage] || c.stage_name || '模型调用')}</td><td class="py-2">${modelLabel(c.provider_response_model || c.requested_model)}</td><td class="py-2">${fmtTokens(c.total_tokens)}</td><td class="py-2">${amount}</td></tr>`;
+            const sequence = c.provider_request_sequence ? ` · 第${Number(c.provider_request_sequence)}次Provider请求` : '';
+            return `<tr class="border-b border-slate-100 last:border-0"><td class="py-2">${escapeHtml(stageLabels[c.stage] || c.stage_name || '模型调用')}${sequence}</td><td class="py-2">${modelLabel(c.provider_response_model || c.requested_model)}</td><td class="py-2">${fmtTokens(c.total_tokens)}</td><td class="py-2">${amount}</td></tr>`;
           }).join('');
           const technicalCalls = chain.map(c => {
             const thinking = c.thinking_enabled === true ? '开启' : (c.thinking_enabled === false ? '关闭' : '未采集');

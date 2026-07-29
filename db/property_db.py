@@ -5056,8 +5056,9 @@ def record_model_call(
     estimated_cost_cny: Optional[float] = None,
     context_breakdown: Optional[Dict[str, Any]] = None,
     usage_normalized: Optional[Dict[str, Any]] = None,
+    created_at: Optional[str] = None,
 ) -> Dict[str, Any]:
-    now = now_cn()
+    now = created_at or now_cn()
     conn = _get_conn()
     cursor = conn.cursor()
     cursor.execute(
@@ -5095,6 +5096,53 @@ def record_model_call(
     return get_model_call(call_id) or {"id": call_id}
 
 
+def record_model_call_idempotent(**model_call: Any) -> Dict[str, Any]:
+    """Insert one Provider request once using id or the stable run sequence.
+
+    The identity is stored in the existing ``usage_normalized`` JSON column,
+    so this adds no schema. Legacy callers without either identity retain the
+    original append-only behavior.
+    """
+    usage = dict(model_call.get("usage_normalized") or {})
+    request_id = usage.get("provider_request_id")
+    sequence = usage.get("provider_request_sequence")
+    if not request_id and sequence is None:
+        return record_model_call(**model_call)
+
+    trace_id = str(model_call.get("trace_id") or "")
+    stage = str(model_call.get("stage") or "")
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT * FROM model_calls WHERE trace_id = ? AND stage = ? ORDER BY id ASC",
+        (trace_id, stage),
+    )
+    rows = cursor.fetchall()
+    conn.close()
+    for row in rows:
+        existing = dict(row)
+        normalized = existing.get("usage_normalized") or {}
+        if isinstance(normalized, str):
+            try:
+                normalized = json.loads(normalized)
+            except Exception:
+                normalized = {}
+        same_request = bool(
+            request_id
+            and normalized.get("provider_request_id") == str(request_id)
+        )
+        same_sequence = bool(
+            not request_id
+            and normalized.get("provider_request_id") in (None, "")
+            and normalized.get("provider_request_sequence") == sequence
+        )
+        if same_request or same_sequence:
+            existing["usage_normalized"] = normalized
+            existing["deduplicated"] = True
+            return existing
+    return record_model_call(**model_call)
+
+
 def get_model_call(call_id: int) -> Optional[Dict[str, Any]]:
     conn = _get_conn()
     cursor = conn.cursor()
@@ -5104,7 +5152,7 @@ def get_model_call(call_id: int) -> Optional[Dict[str, Any]]:
     if not row:
         return None
     msg = dict(row)
-    for json_col in ("price_snapshot", "context_breakdown"):
+    for json_col in ("price_snapshot", "context_breakdown", "usage_normalized"):
         if msg.get(json_col):
             try:
                 msg[json_col] = json.loads(msg[json_col])
@@ -5125,7 +5173,7 @@ def get_model_calls_for_trace(trace_id: str) -> List[Dict[str, Any]]:
     calls = []
     for r in rows:
         msg = dict(r)
-        for json_col in ("price_snapshot", "context_breakdown"):
+        for json_col in ("price_snapshot", "context_breakdown", "usage_normalized"):
             if msg.get(json_col):
                 try:
                     msg[json_col] = json.loads(msg[json_col])
