@@ -5,7 +5,7 @@ Agent Management API
 REST endpoints for creating and managing Router and Vertical Agents.
 """
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
@@ -38,6 +38,7 @@ class AgentCreate(BaseModel):
     # Alias is optional; when omitted it must not erase ``instructions``.
     system_prompt: Optional[str] = None
     category: Optional[str] = "vertical"  # "router" or "vertical"
+    domain_scope: Literal["property", "isolated_general"] = "property"
     is_router: Optional[bool] = False  # frontend alias for category
     enabled: Optional[bool] = True
     model_id: Optional[str] = None
@@ -56,6 +57,7 @@ class AgentUpdate(BaseModel):
     instructions: Optional[str] = None
     system_prompt: Optional[str] = None  # frontend alias for instructions
     category: Optional[str] = None
+    domain_scope: Optional[Literal["property", "isolated_general"]] = None
     is_router: Optional[bool] = None
     enabled: Optional[bool] = None
     model_id: Optional[str] = None
@@ -110,6 +112,7 @@ def _serialize_agent(agent: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]
         t.get("tool_name") for t in agent["tools"] if t.get("tool_name")
     ]
     agent["knowledge_doc_ids"] = get_agent_knowledge_bindings(agent["agent_id"])
+    agent["domain_scope"] = agent.get("domain_scope") or "property"
     agent["knowledge_scope_mode"] = (
         "legacy_all_published"
         if agent["knowledge_doc_ids"] is None
@@ -144,6 +147,7 @@ def _get_router_members() -> List[Dict[str, Any]]:
             "name": a.get("name"),
             "description": a.get("description") or "",
             "enabled": a.get("enabled"),
+            "domain_scope": a.get("domain_scope") or "property",
             "skills": skills,
             "mcp_tools": tools,
         })
@@ -187,6 +191,7 @@ async def create_agent(request: AgentCreate):
         description=request.description,
         instructions=instructions,
         category=category,
+        domain_scope=request.domain_scope,
         enabled=request.enabled if request.enabled is not None else True,
         model_id=request.model_id,
     )
@@ -241,7 +246,7 @@ async def update_agent(agent_id: str, request: AgentUpdate):
     # 3. Router-only restrictions.
     if is_router:
         # Router cannot change category, enabled, model, skills or tools.
-        if any(f in fields_set for f in ("category", "is_router", "enabled", "model_id", "skill_ids", "available_skills", "tool_names", "available_mcp_tools", "knowledge_doc_ids")):
+        if any(f in fields_set for f in ("category", "domain_scope", "is_router", "enabled", "model_id", "skill_ids", "available_skills", "tool_names", "available_mcp_tools", "knowledge_doc_ids")):
             raise HTTPException(status_code=400, detail="router agent can only edit name/description/system_prompt")
         category = agent.get("category")
         enabled = agent.get("enabled")
@@ -252,6 +257,7 @@ async def update_agent(agent_id: str, request: AgentUpdate):
             description=description,
             instructions=instructions,
             category=category,
+            domain_scope="property",
             enabled=enabled,
             model_id=model_id,
         )
@@ -261,6 +267,11 @@ async def update_agent(agent_id: str, request: AgentUpdate):
     enabled = request.enabled if "enabled" in fields_set else agent.get("enabled")
     model_id = request.model_id if "model_id" in fields_set else agent.get("model_id")
     category = "vertical"
+    domain_scope = (
+        request.domain_scope
+        if "domain_scope" in fields_set
+        else (agent.get("domain_scope") or "property")
+    )
 
     updated = db_update_agent(
         agent_row_id=agent["id"],
@@ -268,6 +279,7 @@ async def update_agent(agent_id: str, request: AgentUpdate):
         description=description,
         instructions=instructions,
         category=category,
+        domain_scope=domain_scope,
         enabled=enabled,
         model_id=model_id,
     )

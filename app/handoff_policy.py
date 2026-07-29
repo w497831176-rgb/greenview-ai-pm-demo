@@ -78,6 +78,11 @@ def evaluate_handoff_policy(
         "起火",
         "火灾",
         "触电",
+        "水漫插座",
+        "漫到插座",
+        "插座被水淹",
+        "插座进水",
+        "电线进水",
         "电梯困人",
         "电梯里有人被困",
         "被困电梯",
@@ -85,6 +90,9 @@ def evaluate_handoff_policy(
         "电梯被困",
         "人身受伤",
         "有人受伤",
+        "把物业炸了",
+        "炸物业",
+        "爆炸威胁",
     ]
     safety_matched = _contains_any(text, safety_terms)
     negated_terms = [

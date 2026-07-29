@@ -318,6 +318,7 @@ def _compile_graph() -> Tuple[Dict[str, Any], List[ToolPolicy]]:
                 "description": agent.get("description") or "",
                 "instructions": agent.get("instructions") or "",
                 "category": agent.get("category") or "vertical",
+                "domain_scope": agent.get("domain_scope") or "property",
                 "enabled": bool(agent.get("enabled")),
                 "model_id": agent.get("model_id"),
                 "skill_ids": bound_skill_ids,
@@ -370,6 +371,7 @@ _AGENT_FIELD_LABELS = {
     "model_id": "模型",
     "enabled": "启用状态",
     "category": "Agent 类型",
+    "domain_scope": "业务域",
 }
 
 _SKILL_FIELD_LABELS = {
@@ -873,6 +875,14 @@ def validate_release_graph(graph: Dict[str, Any], policies: List[ToolPolicy]) ->
     for agent in agents:
         if not agent.get("enabled") or agent.get("category") in {"router", "orchestration"}:
             continue
+        if agent.get("domain_scope") not in {"property", "isolated_general"}:
+            errors.append(
+                {
+                    "code": "agent_domain_scope_invalid",
+                    "agent_id": agent.get("agent_id"),
+                    "domain_scope": agent.get("domain_scope"),
+                }
+            )
         if not str(agent.get("instructions") or "").strip():
             warnings.append({"code": "agent_instructions_empty", "agent_id": agent.get("agent_id")})
         missing_skills = set(agent.get("skill_ids") or []) - enabled_skill_ids

@@ -196,6 +196,7 @@ def vertical_agent_cards(config: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "name": agent.get("name") or agent["agent_id"],
                 "description": agent.get("description") or "",
                 "instructions": agent.get("instructions") or "",
+                "domain_scope": agent.get("domain_scope") or "property",
                 "enabled": True,
                 "skills": [
                     {
@@ -210,6 +211,7 @@ def vertical_agent_cards(config: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "mcp_tools": list(agent.get("mcp_server_names") or []),
                 "capability_card": {
                     "service_scope": agent.get("description") or "",
+                    "domain_scope": agent.get("domain_scope") or "property",
                     "routing_hints": agent.get("instructions") or "",
                     "skills": skill_cards,
                     "mcp_servers": server_cards,
@@ -285,6 +287,18 @@ def build_agent_from_snapshot(
         "不得自行创建、更新、删除业务数据；写操作只能描述为待确认 Proposal。",
         "只有后端 ActionReceipt.status=committed 且包含真实 resource_id 时，才能声称操作成功。",
     ]
+    if (agent_config.get("domain_scope") or "property") == "isolated_general":
+        instructions.extend(
+            [
+                "你处于非物业隔离域：不得把通用回答表述为物业官方结论。",
+                "只能使用本Agent在当前Snapshot中真实绑定的Skill、RAG和只读Tool；不得调用物业ActionGateway。",
+                "没有实时Tool时不得确认当前天气、价格、名额等实时事实；医疗、法律、金融或暴力风险只给保守边界和求助建议。",
+            ]
+        )
+    else:
+        instructions.append(
+            "你处于物业业务域：价格、时效、责任、服务是否存在等受控事实必须来自本轮合法Skill、RAG、成功Tool或Receipt证据。"
+        )
     instructions.extend(skill_contexts)
     if evidence_prompt:
         instructions.append(evidence_prompt)

@@ -210,6 +210,7 @@ def init_db():
             description TEXT,
             instructions TEXT,
             category TEXT,
+            domain_scope TEXT NOT NULL DEFAULT 'property',
             enabled INTEGER DEFAULT 1,
             model_id TEXT,
             created_at TEXT,
@@ -650,6 +651,12 @@ def init_db():
     # additive migration only: existing platform configuration and business
     # records are never rewritten during startup.
     _migrate_v1_8_runtime_convergence(cursor)
+    conn.commit()
+
+    # V1.8.2-S10-B.2: make the property/non-property boundary an explicit
+    # Agent Draft field. Existing Agents remain property-scoped until an
+    # operator deliberately changes and publishes them.
+    _migrate_agent_domain_scope_v182_s10b2(cursor)
     conn.commit()
 
     # V1.5.2: create a non-destructive baseline snapshot for existing Skills.
@@ -1553,6 +1560,25 @@ def _migrate_runtime_contract_v143(cursor):
         )
 
     _mark_migration_applied(cursor, "v143_runtime_contract", now)
+
+
+def _migrate_agent_domain_scope_v182_s10b2(cursor):
+    """Add the minimal two-value Agent domain boundary without rewriting data."""
+
+    cursor.execute("PRAGMA table_info(agents)")
+    columns = {row[1] for row in cursor.fetchall()}
+    if "domain_scope" not in columns:
+        cursor.execute(
+            "ALTER TABLE agents ADD COLUMN domain_scope TEXT NOT NULL DEFAULT 'property'"
+        )
+    cursor.execute(
+        """
+        UPDATE agents
+        SET domain_scope = 'property'
+        WHERE domain_scope IS NULL
+           OR domain_scope NOT IN ('property', 'isolated_general')
+        """
+    )
 
 
 def _migrate_runtime_contract(cursor):
@@ -5443,6 +5469,7 @@ def create_agent(
     description: str = "",
     instructions: str = "",
     category: str = "vertical",
+    domain_scope: str = "property",
     enabled: bool = True,
     model_id: Optional[str] = None,
 ) -> Dict[str, Any]:
@@ -5452,10 +5479,21 @@ def create_agent(
     cursor.execute(
         """
         INSERT INTO agents
-        (agent_id, name, description, instructions, category, enabled, model_id, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (agent_id, name, description, instructions, category, domain_scope, enabled, model_id, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (agent_id, name, description, instructions, category, 1 if enabled else 0, model_id, now, now),
+        (
+            agent_id,
+            name,
+            description,
+            instructions,
+            category,
+            domain_scope,
+            1 if enabled else 0,
+            model_id,
+            now,
+            now,
+        ),
     )
     row_id = cursor.lastrowid
     conn.commit()
@@ -5502,6 +5540,7 @@ def update_agent(
     description: Optional[str] = None,
     instructions: Optional[str] = None,
     category: Optional[str] = None,
+    domain_scope: Optional[str] = None,
     enabled: Optional[bool] = None,
     model_id: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
@@ -5515,6 +5554,7 @@ def update_agent(
         ("description", description),
         ("instructions", instructions),
         ("category", category),
+        ("domain_scope", domain_scope),
         ("model_id", model_id),
     ]:
         if val is not None:

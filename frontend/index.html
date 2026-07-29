@@ -163,7 +163,7 @@
         </nav>
         <div class="p-4 border-t border-slate-800/60">
           <div class="rounded-xl bg-gradient-to-br from-slate-800 to-slate-850 p-3 border border-slate-700/50">
-            <p class="text-xs text-slate-400 mb-1">当前版本</p>
+            <p class="text-xs text-slate-400 mb-1">产品版本</p>
             <p id="app-version" class="text-sm font-medium text-gold-400"></p>
           </div>
         </div>
@@ -219,6 +219,7 @@
     // ==========================================
     const API_BASE = '';
     const DEFAULT_ROOM_ID = '3-2-1201';
+    const PRODUCT_VERSION = 'YIAI物业 V1.8.2';
     let APP_VERSION = 'RuntimeRelease（运行版本）加载中';
 
     const STATE = {
@@ -230,6 +231,7 @@
       chatMessages: [],
       chatStreaming: false,
       chatHandoff: false,
+      chatRuntimeLabel: '运行版本暂不可得',
       currentAiMessage: null,
       currentRoute: null,
       staffOrderView: 'pending',
@@ -256,15 +258,15 @@
         { id: 'handoff-orders', label: '人工接管', icon: 'handoff' }
       ],
       platform: [
-        { id: 'agents', label: 'Agent（AI处理角色）', icon: 'agent', group: '能力配置' },
-        { id: 'skills', label: 'Skill（业务规则）', icon: 'skill', group: '能力配置' },
-        { id: 'knowledge', label: 'RAG（知识依据）', icon: 'knowledge', group: '能力配置' },
-        { id: 'mcp', label: 'MCP Server（外部接入）/ Tool', icon: 'mcp', group: '能力配置' },
+        { id: 'agents', label: 'Agent', icon: 'agent', group: '能力配置' },
+        { id: 'skills', label: 'Skill', icon: 'skill', group: '能力配置' },
+        { id: 'knowledge', label: 'RAG', icon: 'knowledge', group: '能力配置' },
+        { id: 'mcp', label: 'MCP Server / Tool', icon: 'mcp', group: '能力配置' },
         { id: 'models', label: '模型策略', icon: 'model', group: '能力配置' },
-        { id: 'runtime', label: 'RuntimeRelease（运行版本）', icon: 'release', group: '版本发布' },
-        { id: 'badcases', label: 'Badcase（问题案例）', icon: 'badcase', group: '质量闭环' },
-        { id: 'evaluations', label: 'Evaluation / Golden Set（评估）', icon: 'evaluation', group: '质量闭环' },
-        { id: 'cost-governance', label: 'Trace（运行调用记录）与成本', icon: 'cost', group: '调用与成本' }
+        { id: 'runtime', label: 'RuntimeRelease', icon: 'release', group: '版本发布' },
+        { id: 'badcases', label: 'Badcase', icon: 'badcase', group: '质量闭环' },
+        { id: 'evaluations', label: 'Evaluation / Golden Set', icon: 'evaluation', group: '质量闭环' },
+        { id: 'cost-governance', label: 'Trace 与成本', icon: 'cost', group: '调用与成本' }
       ]
     };
 
@@ -1162,6 +1164,44 @@
       }
     }
 
+    async function refreshChatRuntimeLabel() {
+      const target = $('#chat-runtime-label');
+      const activeSession = (STATE.chatSessions || []).find(
+        item => item.session_id === STATE.chatSessionId
+      );
+      const hasRun = Boolean(
+        activeSession && (
+          activeSession.last_message_at || activeSession.last_message_preview
+        )
+      );
+      try {
+        if (STATE.chatSessionId && hasRun) {
+          const snapshotData = await apiGet(
+            `/api/runtime/sessions/${encodeURIComponent(STATE.chatSessionId)}/snapshot`
+          );
+          const snapshot = snapshotData.snapshot || {};
+          const releaseData = await apiGet(
+            `/api/runtime/releases/${encodeURIComponent(snapshot.release_id || '')}`
+          );
+          const release = releaseData.release || releaseData || {};
+          STATE.chatRuntimeLabel = release.version
+            ? `本会话 RuntimeRelease v${release.version}`
+            : '本会话 RuntimeRelease 暂不可得';
+        } else {
+          const overview = await apiGet('/api/runtime/releases/overview');
+          const current = overview.current || {};
+          STATE.chatRuntimeLabel = current.version
+            ? `新会话将使用 RuntimeRelease v${current.version}`
+            : '新会话运行版本暂不可得';
+        }
+      } catch (err) {
+        STATE.chatRuntimeLabel = hasRun
+          ? '本会话 RuntimeRelease 暂不可得'
+          : '新会话运行版本暂不可得';
+      }
+      if (target) target.textContent = STATE.chatRuntimeLabel;
+    }
+
     async function createNewSession() {
       if (STATE.chatStreaming) {
         showToast('流式回复中，请稍后再新建会话', 'error');
@@ -1198,7 +1238,7 @@
       STATE.currentAiMessage = null;
       STATE.currentRoute = null;
       await loadChatSessions();
-      renderContent();
+      await renderContent();
     }
 
     async function renderChatPage(container) {
@@ -1207,7 +1247,7 @@
         <div class="h-full flex">
           ${renderChatSessionsSidebar()}
           <div class="flex-1 flex flex-col min-w-0 max-w-4xl mx-auto w-full">
-            ${pageHeader('AI 物业维修助手', '24 小时在线，帮您解答维修、报修、收费等问题')
+            ${pageHeader('AI 物业维修助手', '<span id="chat-runtime-label">运行版本暂不可得</span> · 24 小时在线，帮您解答维修、报修、收费等问题')
               .replace('sticky top-0 z-10', 'relative')
               .replace('max-w-6xl mx-auto', 'max-w-4xl mx-auto')
               .replace('</p>', '</p><button id="chat-refresh-btn" type="button" class="absolute right-6 top-1/2 -translate-y-1/2 text-xs text-slate-500 hover:text-brand-600 flex items-center gap-1"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>刷新</button>')}
@@ -1316,6 +1356,7 @@
 
       await loadChatSessions();
       refreshSidebar();
+      await refreshChatRuntimeLabel();
       const newSessionBtn = $('#chat-new-session');
       if (newSessionBtn && !newSessionBtn.dataset.bound) {
         newSessionBtn.addEventListener('click', createNewSession);
@@ -1801,9 +1842,7 @@
         });
 
         if (!response.ok) {
-          let errText = '';
-          try { errText = await response.text(); } catch (e) {}
-          throw new Error(`服务暂时不可用（HTTP ${response.status}${errText ? ': ' + errText.slice(0, 200) : ''}）`);
+          throw new Error(`服务暂时不可用（HTTP ${response.status}）`);
         }
 
         const reader = response.body.getReader();
@@ -1897,7 +1936,10 @@
                 updateHandoffBanner(handoffStatus);
                 showToast(handoffStatus === 'active' ? '信息已同步给人工处理人' : '人工协同状态已更新', 'success');
               }
-              loadChatSessions().then(() => refreshSidebar());
+              loadChatSessions().then(async () => {
+                refreshSidebar();
+                await refreshChatRuntimeLabel();
+              });
               STATE.currentTraceId = null;
             } else if (eventType === 'error') {
               receivedDone = true;
@@ -1936,6 +1978,7 @@
         STATE.chatStreaming = false;
         const btn = $('#chat-send');
         if (btn) btn.disabled = false;
+        await refreshChatRuntimeLabel();
       }
     }
 
@@ -5571,6 +5614,7 @@
                       <th class="px-4 py-3 text-left font-semibold text-slate-600">名称</th>
                       <th class="px-4 py-3 text-left font-semibold text-slate-600">描述</th>
                       <th class="px-4 py-3 text-left font-semibold text-slate-600">类型</th>
+                      <th class="px-4 py-3 text-left font-semibold text-slate-600">业务域</th>
                       <th class="px-4 py-3 text-left font-semibold text-slate-600">挂载能力</th>
                       <th class="px-4 py-3 text-left font-semibold text-slate-600">状态</th>
                       <th class="px-4 py-3 text-left font-semibold text-slate-600">下一步</th>
@@ -5584,6 +5628,7 @@
                         <td class="px-4 py-3 font-medium text-slate-900">${escapeHtml(a.name)}</td>
                         <td class="px-4 py-3 text-slate-600 max-w-xs truncate" title="${escapeHtml(a.description)}">${escapeHtml(a.description || '-')}</td>
                         <td class="px-4 py-3"><span class="text-xs px-2 py-1 rounded-full ${a.is_router ? 'bg-indigo-50 text-indigo-600' : 'bg-brand-50 text-brand-600'}">${a.is_router ? '路由' : '垂直'}</span></td>
+                        <td class="px-4 py-3"><span class="text-xs px-2 py-1 rounded-full ${a.domain_scope === 'isolated_general' ? 'bg-violet-50 text-violet-700' : 'bg-emerald-50 text-emerald-700'}">${a.domain_scope === 'isolated_general' ? '非物业隔离' : '物业业务'}</span></td>
                         <td class="px-4 py-3 text-xs text-slate-600 min-w-[230px]"><div><b>Skill：</b>${escapeHtml((a.available_skills || []).map(item => item.name || item.id).join('、') || '无')}</div><div class="mt-1"><b>RAG：</b>${Number((a.knowledge_doc_ids || []).length)}份知识</div><div class="mt-1"><b>已绑定Tool：</b>${escapeHtml((a.available_mcp_tools || []).join('、') || '无')}</div><div class="mt-1"><b>模型：</b>${escapeHtml(a.model_id || 'deepseek-v4-flash（默认）')}</div></td>
                         <td class="px-4 py-3"><span class="text-xs px-2 py-1 rounded-full ${a.enabled ? 'bg-emerald-50 text-emerald-700' : 'bg-slate-100 text-slate-500'}">${a.enabled ? 'Draft中启用' : 'Draft中停用'}</span></td>
                         <td class="px-4 py-3">
@@ -5739,6 +5784,11 @@
           ${runtimeNote}
           ${formInput('名称', 'agent-name', agent ? agent.name : '', '如：维修报修 Agent')}
           ${formInput('描述', 'agent-description', agent ? agent.description : '', '简短描述 Agent 职责')}
+          ${formSelect('业务域', 'agent-domain-scope', [
+            { value: 'property', label: 'property｜物业业务（默认强治理）' },
+            { value: 'isolated_general', label: 'isolated_general｜非物业隔离回答' }
+          ], agent ? (agent.domain_scope || 'property') : 'property')}
+          <p class="-mt-2 mb-3 text-xs text-slate-500">修改会进入Agent Draft，不调用模型、不自动发布；发布RuntimeRelease后仅新会话生效，旧会话保持原Snapshot。</p>
           ${formTextarea('System Prompt', 'agent-system-prompt', agent ? agent.system_prompt : '', '定义该 Agent 的系统提示词', 5)}
           ${formCheckboxGroup('可用 Skill', 'agent-skills', skills, agent ? selectedSkillNames : [])}
           ${formCheckboxGroup('可用 MCP Server（展开查看可调用工具）', 'agent-mcp-tools', mcpTools, agent ? agent.available_mcp_tools : [])}
@@ -5748,6 +5798,7 @@
           const payload = {
             name: $('#agent-name').value.trim(),
             description: $('#agent-description').value.trim(),
+            domain_scope: $('#agent-domain-scope').value,
             system_prompt: $('#agent-system-prompt').value.trim(),
             available_skills: Array.from(document.querySelectorAll('input[name="agent-skills"]:checked')).map(cb => cb.value),
             available_mcp_tools: Array.from(document.querySelectorAll('input[name="agent-mcp-tools"]:checked')).map(cb => cb.value),
@@ -6839,18 +6890,12 @@
     // Initialization
     // ==========================================
     async function loadRuntimeVersionLabel() {
-      const versionEl = $('#app-version');
       try {
         const overview = await apiGet('/api/runtime/releases/overview');
         const current = overview.current || {};
         APP_VERSION = current.version ? `RuntimeRelease v${current.version}` : 'RuntimeRelease 暂不可得';
-        if (versionEl) {
-          versionEl.textContent = APP_VERSION;
-          versionEl.title = current.release_id || '当前已发布运行版本';
-        }
       } catch (err) {
         APP_VERSION = 'RuntimeRelease 暂不可得';
-        if (versionEl) versionEl.textContent = APP_VERSION;
       }
     }
 
@@ -6864,7 +6909,7 @@
 
         ['#main-content', '#sub-menu', '#role-title'].forEach(sel => requireElement(sel, 'init'));
         const versionEl = $('#app-version');
-        if (versionEl) versionEl.textContent = APP_VERSION;
+        if (versionEl) versionEl.textContent = PRODUCT_VERSION;
         await loadRuntimeVersionLabel();
         renderTopTabs();
         renderSidebar();

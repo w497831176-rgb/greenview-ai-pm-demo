@@ -82,6 +82,7 @@ coordinator_symbols = _load_source_symbols(
     {
         "PROVIDER_FAILURE_MARKERS",
         "PROVIDER_FAILURE_PUBLIC_MESSAGE",
+        "RUNTIME_FAILURE_PUBLIC_MESSAGE",
         "ProviderFailureError",
         "_provider_failure_prefix",
         "_provider_failure_reason",
@@ -89,6 +90,9 @@ coordinator_symbols = _load_source_symbols(
 )
 PROVIDER_FAILURE_PUBLIC_MESSAGE = coordinator_symbols[
     "PROVIDER_FAILURE_PUBLIC_MESSAGE"
+]
+RUNTIME_FAILURE_PUBLIC_MESSAGE = coordinator_symbols[
+    "RUNTIME_FAILURE_PUBLIC_MESSAGE"
 ]
 ProviderFailureError = coordinator_symbols["ProviderFailureError"]
 _provider_failure_prefix = coordinator_symbols["_provider_failure_prefix"]
@@ -242,6 +246,8 @@ def test_coordinator_provider_failure_terminal_behavior():
         "EvidenceLedger": EvidenceLedger,
         "ProviderFailureError": ProviderFailureError,
         "PROVIDER_FAILURE_PUBLIC_MESSAGE": PROVIDER_FAILURE_PUBLIC_MESSAGE,
+        "RUNTIME_FAILURE_PUBLIC_MESSAGE": RUNTIME_FAILURE_PUBLIC_MESSAGE,
+        "_external_high_risk": lambda _message: False,
         "ensure_chat_session": lambda _session_id: None,
         "resolve_snapshot": lambda _session_id: SimpleNamespace(
             config={},

@@ -85,6 +85,7 @@ PROVIDER_FAILURE_MARKERS = (
     "authentication fails",
 )
 PROVIDER_FAILURE_PUBLIC_MESSAGE = "模型服务暂时不可用，请稍后重试或检查模型账户状态。"
+RUNTIME_FAILURE_PUBLIC_MESSAGE = "系统暂时无法完成本次请求，请稍后重试；如问题持续，可选择转人工核实。"
 STRUCTURED_WORKORDER_TOOLS = {
     "get_my_work_order_by_id",
     "get_my_recent_work_orders",
@@ -100,8 +101,6 @@ KNOWLEDGE_EVIDENCE_TERMS = (
     "标准",
     "依据",
     "引用",
-    "怎么办",
-    "如何处理",
     "允许",
     "收费",
 )
@@ -119,6 +118,9 @@ KNOWLEDGE_GOVERNED_TERMS = (
     "免费",
     "费用",
     "价格",
+    "多少钱",
+    "物业费",
+    "停车费",
     "权限",
     "允许",
     "禁止",
@@ -134,8 +136,39 @@ KNOWLEDGE_GOVERNED_TERMS = (
     "多长时间",
     "几分钟",
     "几小时",
-    "怎么办",
-    "如何处理",
+)
+PROPERTY_BUSINESS_TERMS = (
+    "物业",
+    "小区",
+    "业主",
+    "管理处",
+    "报修",
+    "维修",
+    "工单",
+    "物业费",
+    "停车费",
+    "门禁",
+    "电梯",
+    "燃气",
+    "漏水",
+    "搬家服务",
+    "保洁服务",
+    "宠物托管",
+    "服务中心",
+    "公共区域",
+)
+ISOLATED_GENERAL_MARKERS = (
+    "通用",
+    "闲聊",
+    "物业场景无关",
+    "奇奇怪怪",
+    "乱七八糟",
+)
+EXTERNAL_HIGH_RISK_PATTERNS = (
+    re.compile(r"(?:胸口很痛|胸痛|心口痛)(?:.{0,8}(?:呼吸困难|喘不上气))?"),
+    re.compile(r"(?:大量出血|昏迷不醒|失去意识)"),
+    re.compile(r"(?:想轻生|要自杀|准备自杀)"),
+    re.compile(r"(?:有人持刀|正在行凶|入室抢劫|正在打人)"),
 )
 KNOWLEDGE_SERVICE_FACT_PATTERNS = (
     re.compile(
@@ -152,6 +185,15 @@ KNOWLEDGE_INSUFFICIENT_RESPONSE = (
     "当前知识依据不足，无法确认具体结论。我不能将“未检索到”表述为"
     "“文档没有规定”，也不会补充知识库之外的行业经验、时间范围或处理步骤。"
     "你可以补充问题，或选择转人工核实。"
+)
+NON_PROPERTY_SAFETY_RESPONSE = (
+    "这超出物业 AI 的专业处理范围。请先确保自身安全；如存在人身危险或"
+    "正在发生的违法暴力行为，请立即联系 110、120 等当地紧急服务或身边"
+    "可信人员。我不会把这类问题表述成物业已经接管。"
+)
+OUT_OF_SCOPE_RESPONSE = (
+    "这个问题不属于当前物业服务能力范围，且当前没有匹配的非物业处理角色。"
+    "我可以继续协助物业报修、服务咨询或工单查询。"
 )
 
 
@@ -267,6 +309,27 @@ def _estimate_tokens(text: str) -> Optional[int]:
     return max(1, len(text) // 4)
 
 
+def _aggregate_cost_field(entries: List[Any], field: str) -> Optional[int]:
+    """Sum one Provider-usage field only when every request reported it."""
+
+    if not entries:
+        return None
+    values = [getattr(item, field, None) for item in entries]
+    if any(value is None for value in values):
+        return None
+    return sum(int(value) for value in values)
+
+
+def _aggregate_usage_source(sources: List[str], *, model_invoked: bool) -> str:
+    if not model_invoked:
+        return "not_applicable"
+    if not sources or "unavailable" in sources:
+        return "unavailable"
+    if len(set(sources)) == 1:
+        return sources[0]
+    return "mixed"
+
+
 def _claims_business_success(text: str) -> bool:
     normalized = text or ""
     return bool(
@@ -299,9 +362,46 @@ def _requires_rag_citations(message: str) -> bool:
 
 def _requires_direct_knowledge_evidence(message: str) -> bool:
     compact = re.sub(r"\s+", "", message or "")
-    return any(marker in compact for marker in KNOWLEDGE_GOVERNED_TERMS) or any(
+    return _is_property_business_query(compact) and (
+        any(marker in compact for marker in KNOWLEDGE_GOVERNED_TERMS) or any(
+            pattern.search(compact) for pattern in KNOWLEDGE_SERVICE_FACT_PATTERNS
+        )
+    )
+
+
+def _is_property_business_query(message: str) -> bool:
+    compact = re.sub(r"\s+", "", message or "")
+    return any(term in compact for term in PROPERTY_BUSINESS_TERMS) or any(
         pattern.search(compact) for pattern in KNOWLEDGE_SERVICE_FACT_PATTERNS
     )
+
+
+def _agent_domain_scope(agent: Optional[Dict[str, Any]]) -> str:
+    value = str((agent or {}).get("domain_scope") or "property")
+    return value if value in {"property", "isolated_general"} else "property"
+
+
+def _isolated_general_fallback(cards: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Choose only a configuration-declared general fallback, never a sentence patch."""
+
+    for card in cards:
+        if _agent_domain_scope(card) != "isolated_general":
+            continue
+        searchable = " ".join(
+            [
+                str(card.get("name") or ""),
+                str(card.get("description") or ""),
+                str((card.get("capability_card") or {}).get("service_scope") or ""),
+            ]
+        )
+        if any(marker in searchable for marker in ISOLATED_GENERAL_MARKERS):
+            return card
+    return None
+
+
+def _external_high_risk(message: str) -> bool:
+    compact = re.sub(r"\s+", "", message or "")
+    return any(pattern.search(compact) for pattern in EXTERNAL_HIGH_RISK_PATTERNS)
 
 
 def _knowledge_evidence_decision(
@@ -309,29 +409,45 @@ def _knowledge_evidence_decision(
     evidence_count: int,
     structured_realtime_query: bool,
     allowed_document_ids: Optional[set[int]] = None,
+    *,
+    domain_scope: str = "property",
+    skill_evidence_count: int = 0,
+    tool_evidence_count: int = 0,
 ) -> Dict[str, Any]:
     """Return the lightweight evidence gate decision used by runtime and Trace."""
 
     count = max(0, int(evidence_count or 0))
+    skill_count = max(0, int(skill_evidence_count or 0))
+    tool_count = max(0, int(tool_evidence_count or 0))
+    accepted_count = count + skill_count + tool_count
     required = bool(
-        not structured_realtime_query
+        domain_scope == "property"
+        and not structured_realtime_query
         and _requires_direct_knowledge_evidence(message)
     )
-    blocked = bool(required and count == 0)
+    blocked = bool(required and accepted_count == 0)
     return {
         "required": required,
         "blocked": blocked,
         "evidence_count": count,
+        "skill_evidence_count": skill_count,
+        "tool_evidence_count": tool_count,
+        "accepted_evidence_count": accepted_count,
+        "domain_scope": domain_scope,
         "allowed_document_ids": sorted(allowed_document_ids or set()),
         "evidence_decision": (
             "rejected_insufficient"
             if blocked
-            else ("accepted" if count else "not_required")
+            else ("accepted" if accepted_count else "not_required")
         ),
         "reason": (
             "no_accepted_evidence"
             if blocked
-            else ("accepted_direct_evidence" if count else "knowledge_not_required")
+            else (
+                "accepted_direct_evidence"
+                if accepted_count
+                else "knowledge_not_required"
+            )
         ),
         "model_invoked": not blocked,
     }
@@ -655,6 +771,18 @@ class RuntimeCoordinator:
             },
         )
         try:
+            if _external_high_risk(message):
+                async for event in self._stream_external_safety_boundary(
+                    session_id,
+                    trace_id,
+                    snapshot,
+                    state,
+                    ledger,
+                    started,
+                ):
+                    yield event
+                return
+
             handoff = await self._maybe_handoff(
                 message, session_id, trace_id, snapshot.release_id
             )
@@ -783,7 +911,7 @@ class RuntimeCoordinator:
             public_error = (
                 PROVIDER_FAILURE_PUBLIC_MESSAGE
                 if failure_code == "provider_failure"
-                else str(exc)
+                else RUNTIME_FAILURE_PUBLIC_MESSAGE
             )
             state.status = RunStatus.FAILED
             state.next_step = None
@@ -868,6 +996,118 @@ class RuntimeCoordinator:
             return RuntimePath.CONTROLLED_ACTION
         return RuntimePath.CONSULTATION
 
+    async def _stream_external_safety_boundary(
+        self,
+        session_id: str,
+        trace_id: str,
+        snapshot: Any,
+        state: RunState,
+        ledger: EvidenceLedger,
+        started: float,
+    ) -> AsyncIterator[str]:
+        """End a non-property high-risk request safely without a model or handoff."""
+
+        decision_summary = {
+            "agent": _decision("skipped", "external_safety_boundary"),
+            "skill": _decision("skipped", "external_safety_boundary"),
+            "rag": _decision("skipped", "external_safety_boundary"),
+            "tool": _decision("skipped", "external_safety_boundary"),
+            "handoff": _decision(
+                "skipped",
+                "use_public_emergency_service",
+                domain_scope="isolated_general",
+            ),
+        }
+        state.status = RunStatus.COMPLETED
+        state.next_step = None
+        ledger.capture_state(state)
+        ledger.append(
+            "evaluation_results",
+            {
+                "case": "external_safety_boundary",
+                "passed": True,
+                "model_invoked": False,
+                "handoff_created": False,
+            },
+        )
+        ledger.append(
+            "evaluation_results",
+            {
+                "case": "capability_decision",
+                "passed": True,
+                "decision_summary": decision_summary,
+            },
+        )
+        ledger.persist("complete")
+        saved = save_chat_message(
+            session_id=session_id,
+            role="assistant",
+            content=NON_PROPERTY_SAFETY_RESPONSE,
+            token_count=0,
+            round_token_count=0,
+            token_detail={
+                "input_tokens": None,
+                "output_tokens": None,
+                "reasoning_tokens": None,
+                "cached_tokens": None,
+                "total_tokens": None,
+                "local_estimate_tokens": None,
+                "model_invoked": False,
+            },
+            current_agent="安全边界",
+            current_agent_id="external_safety_boundary",
+            trace_id=trace_id,
+            status="success",
+            thinking_enabled=False,
+            usage_source="not_applicable",
+        )
+        update_chat_trace(
+            trace_id,
+            intent="external_safety_boundary",
+            agent_name="安全边界",
+            agent_id="external_safety_boundary",
+            status="complete",
+        )
+        record_trace_event(
+            trace_id,
+            "external_safety_boundary",
+            "success",
+            latency_ms=int((time.time() - started) * 1000),
+            output_summary="non-property high-risk request ended without model",
+            metadata={
+                "domain_scope": "isolated_general",
+                "model_invoked": False,
+                "decision_summary": decision_summary,
+            },
+        )
+        yield _sse(
+            "final",
+            {
+                "content": NON_PROPERTY_SAFETY_RESPONSE,
+                "current_agent": "安全边界",
+                "current_agent_id": "external_safety_boundary",
+            },
+        )
+        yield _sse(
+            "done",
+            {
+                "status": "complete",
+                "message_id": saved.get("id"),
+                "trace_id": trace_id,
+                "runtime_path": RuntimePath.CONSULTATION.value,
+                "release_id": snapshot.release_id,
+                "snapshot_id": snapshot.snapshot_id,
+                "current_agent": "安全边界",
+                "current_agent_id": "external_safety_boundary",
+                "domain_scope": "isolated_general",
+                "decision_summary": decision_summary,
+                "cost_entries": [],
+                "usage_source": "not_applicable",
+                "token_count": 0,
+                "round_token_count": 0,
+            },
+        )
+
     @staticmethod
     def _is_work_order_action_context(session_id: str, message: str) -> bool:
         pending = get_pending_action_proposal(session_id)
@@ -945,9 +1185,18 @@ class RuntimeCoordinator:
                     "policy": policy,
                 },
             )
+            reply = (
+                "请先远离危险源并确保人身安全；如有火灾、燃气或人身危险，请立即联系"
+                "119、物业值班人员等现场应急渠道。已为您发起人工协同，AI 不会代替"
+                "工作人员作出处置决定。"
+                if policy.get("reason_code") == "safety_risk"
+                else (
+                    "已为您发起人工协同处理。AI 不会代替工作人员作出后续处理决定；"
+                    "您可以继续补充信息，内容会进入接管包。"
+                )
+            )
             return (
-                "已为您发起人工协同处理。AI 不会代替工作人员作出后续处理决定；"
-                "您可以继续补充信息，内容会进入接管包。",
+                reply,
                 str(session.get("handoff_status") or "requested"),
                 policy,
             )
@@ -1472,10 +1721,30 @@ class RuntimeCoordinator:
         )
         if selected not in candidates:
             selected = "customer_service" if "customer_service" in candidates else candidates[0]
+        selected_card = next(
+            item for item in cards if str(item.get("agent_id")) == selected
+        )
+        property_query = _is_property_business_query(message)
+        fallback = None
+        if _agent_domain_scope(selected_card) == "property" and not property_query:
+            fallback = _isolated_general_fallback(cards)
+            if fallback:
+                selected = str(fallback["agent_id"])
+                selected_card = fallback
+        domain_scope = _agent_domain_scope(selected_card)
+        out_of_scope_without_agent = bool(
+            domain_scope == "property" and not property_query and not fallback
+        )
+        route_reason = str(route_result.get("reason") or "Router selected published agent")
+        if fallback:
+            route_reason = (
+                f"{route_reason}; deterministic domain fallback selected configured "
+                "isolated_general Agent"
+            )
         route = RouteDecision(
             candidates=candidates,
             selected_agent_id=selected,
-            reason=str(route_result.get("reason") or "Router selected published agent"),
+            reason=route_reason,
             confidence=(
                 float(route_result["confidence"])
                 if route_result.get("confidence") is not None
@@ -1494,6 +1763,7 @@ class RuntimeCoordinator:
                 "reason": route.reason,
                 "current_agent": state.selected_agent.get("name"),
                 "current_agent_id": selected,
+                "domain_scope": domain_scope,
                 "trace_id": trace_id,
             },
         )
@@ -1573,6 +1843,7 @@ class RuntimeCoordinator:
         )
         direct_knowledge_required = bool(
             not structured_realtime_query
+            and domain_scope == "property"
             and _requires_direct_knowledge_evidence(message)
         )
         state.next_step = "retrieve"
@@ -1771,14 +2042,6 @@ class RuntimeCoordinator:
                 invocation_mode="policy_preinvoke",
             )
 
-        knowledge_gate = _knowledge_evidence_decision(
-            message,
-            len(evidence.items),
-            structured_realtime_query,
-            allowed_doc_ids,
-        )
-        direct_knowledge_required = bool(knowledge_gate["required"])
-        knowledge_evidence_blocked = bool(knowledge_gate["blocked"])
         evidence_prompt = prompt_evidence_allowlist(evidence)
         build = build_agent_from_snapshot(
             snapshot,
@@ -1800,6 +2063,23 @@ class RuntimeCoordinator:
                 ),
                 metadata=call,
             )
+        successful_tool_evidence = [
+            invocation
+            for invocation in invocations
+            if invocation.invocation_status == "success"
+            and invocation.business_status == "success"
+        ]
+        knowledge_gate = _knowledge_evidence_decision(
+            message,
+            len(evidence.items),
+            structured_realtime_query,
+            allowed_doc_ids,
+            domain_scope=domain_scope,
+            skill_evidence_count=len(build.skill_evidence_sources),
+            tool_evidence_count=len(successful_tool_evidence),
+        )
+        direct_knowledge_required = bool(knowledge_gate["required"])
+        knowledge_evidence_blocked = bool(knowledge_gate["blocked"])
         handoff_reason_code = str(
             handoff_policy.get("reason_code") or "ai_direct"
         )
@@ -1808,6 +2088,13 @@ class RuntimeCoordinator:
                 "selected",
                 "matched_intent",
                 agent_id=selected,
+                domain_scope=domain_scope,
+                property_query=property_query,
+                answer_channel=(
+                    "property_governed"
+                    if domain_scope == "property"
+                    else "isolated_general"
+                ),
             ),
             "skill": _decision(
                 "skipped" if not build.activated_skills else "selected",
@@ -1841,6 +2128,8 @@ class RuntimeCoordinator:
                 ),
                 retrieval_status=retrieval_status,
                 evidence_count=len(evidence.items),
+                skill_evidence_count=len(build.skill_evidence_sources),
+                tool_evidence_count=len(successful_tool_evidence),
                 direct_knowledge_required=direct_knowledge_required,
                 evidence_decision=knowledge_gate["evidence_decision"],
             ),
@@ -1888,17 +2177,31 @@ class RuntimeCoordinator:
             metadata={"decision_summary": decision_summary},
         )
         state.next_step = "answer"
-        model_invoked = bool(knowledge_gate["model_invoked"])
-        if knowledge_evidence_blocked:
+        model_invoked = bool(
+            knowledge_gate["model_invoked"] and not out_of_scope_without_agent
+        )
+        if knowledge_evidence_blocked or out_of_scope_without_agent:
             record_trace_event(
                 trace_id,
                 "evidence_gate",
                 "success",
-                output_summary="knowledge evidence insufficient; vertical model skipped",
+                output_summary=(
+                    "no matching isolated Agent; vertical model skipped"
+                    if out_of_scope_without_agent
+                    else "knowledge evidence insufficient; vertical model skipped"
+                ),
                 metadata={
                     "direct_knowledge_required": direct_knowledge_required,
-                    "decision": knowledge_gate["evidence_decision"],
-                    "reason": knowledge_gate["reason"],
+                    "decision": (
+                        "out_of_scope_no_matching_agent"
+                        if out_of_scope_without_agent
+                        else knowledge_gate["evidence_decision"]
+                    ),
+                    "reason": (
+                        "no_matching_isolated_general_agent"
+                        if out_of_scope_without_agent
+                        else knowledge_gate["reason"]
+                    ),
                     "retrieval_status": retrieval_status,
                     "evidence_count": 0,
                     "allowed_document_ids": knowledge_gate[
@@ -1944,7 +2247,11 @@ class RuntimeCoordinator:
                 stream_events=True,
             )
             if model_invoked
-            else _static_response_stream(KNOWLEDGE_INSUFFICIENT_RESPONSE)
+            else _static_response_stream(
+                OUT_OF_SCOPE_RESPONSE
+                if out_of_scope_without_agent
+                else KNOWLEDGE_INSUFFICIENT_RESPONSE
+            )
         )
         async for chunk in response_stream:
             content = getattr(chunk, "content", None) or getattr(chunk, "delta", None)
@@ -2129,8 +2436,12 @@ class RuntimeCoordinator:
                     ),
                 }
             )
+        answer_has_governed_evidence = bool(
+            citations or linked_skill_evidence or successful_tool_evidence
+        )
         knowledge_grounding_failed = bool(
-            direct_knowledge_required and citation_violations
+            direct_knowledge_required
+            and (citation_violations or not answer_has_governed_evidence)
         )
         if knowledge_grounding_failed:
             rendered = KNOWLEDGE_INSUFFICIENT_RESPONSE
@@ -2152,6 +2463,9 @@ class RuntimeCoordinator:
             ).get("model_id")
             or MODEL_ID
         )
+        vertical_cost_entries = []
+        vertical_usage_sources: List[str] = []
+        vertical_usage_source = "not_applicable"
         if model_invoked:
             vertical_thinking = _thinking_for_snapshot(snapshot.config, model_id)
             for index, request_evidence in enumerate(provider_requests, start=1):
@@ -2191,6 +2505,8 @@ class RuntimeCoordinator:
                     local_estimate_tokens=None,
                 )
                 vertical_usage_source = vertical_cost.usage_source.value
+                vertical_cost_entries.append(vertical_cost)
+                vertical_usage_sources.append(vertical_usage_source)
                 state.cost_entries.append(vertical_cost)
                 state.model_calls.append(
                     {
@@ -2281,6 +2597,9 @@ class RuntimeCoordinator:
                 ),
                 "required": direct_knowledge_required,
                 "evidence_count": len(evidence.items),
+                "skill_evidence_count": len(build.skill_evidence_sources),
+                "tool_evidence_count": len(successful_tool_evidence),
+                "domain_scope": domain_scope,
                 "model_invoked": model_invoked,
                 "decision": (
                     "rejected_insufficient"
@@ -2324,6 +2643,7 @@ class RuntimeCoordinator:
                 ),
                 "citation_violations": citation_violations,
                 "model_invoked": model_invoked,
+                "domain_scope": domain_scope,
             },
         )
 
@@ -2369,29 +2689,35 @@ class RuntimeCoordinator:
                 else "policy_preinvoke"
             )
             mcp_payload.append(payload)
-        token_count = (
-            vertical_cost.total_tokens or 0
-            if vertical_cost is not None
-            else 0
+        vertical_usage_source = _aggregate_usage_source(
+            vertical_usage_sources,
+            model_invoked=model_invoked,
         )
+        vertical_total_tokens = _aggregate_cost_field(
+            vertical_cost_entries,
+            "total_tokens",
+        )
+        token_count = vertical_total_tokens or 0
         vertical_token_detail = (
             {
-                "input_tokens": vertical_cost.input_tokens,
-                "output_tokens": vertical_cost.output_tokens,
-                "reasoning_tokens": vertical_cost.reasoning_tokens,
-                "cached_tokens": vertical_cost.cached_input_tokens,
-                "total_tokens": vertical_cost.total_tokens,
-                "local_estimate_tokens": vertical_cost.local_estimate_tokens,
+                "input_tokens": _aggregate_cost_field(vertical_cost_entries, "input_tokens"),
+                "output_tokens": _aggregate_cost_field(vertical_cost_entries, "output_tokens"),
+                "reasoning_tokens": _aggregate_cost_field(vertical_cost_entries, "reasoning_tokens"),
+                "cached_tokens": _aggregate_cost_field(vertical_cost_entries, "cached_input_tokens"),
+                "total_tokens": vertical_total_tokens,
+                "local_estimate_tokens": None,
+                "provider_request_count": len(vertical_cost_entries),
                 "model_invoked": True,
             }
-            if vertical_cost is not None
+            if model_invoked
             else {
                 "input_tokens": None,
                 "output_tokens": None,
                 "reasoning_tokens": None,
                 "cached_tokens": None,
-                "total_tokens": 0,
+                "total_tokens": None,
                 "local_estimate_tokens": None,
+                "provider_request_count": 0,
                 "model_invoked": False,
             }
         )
@@ -2409,8 +2735,12 @@ class RuntimeCoordinator:
             current_agent=str(state.selected_agent.get("name") or selected),
             current_agent_id=selected,
             tool_calls=tool_calls or None,
-            model_id=model_id,
-            thinking_enabled=USE_THINKING,
+            model_id=model_id if model_invoked else None,
+            thinking_enabled=(
+                _thinking_for_snapshot(snapshot.config, model_id)
+                if model_invoked
+                else False
+            ),
             model_selection_reason=f"published snapshot:{snapshot.release_id}",
             trace_id=trace_id,
             status="success",
@@ -2452,6 +2782,7 @@ class RuntimeCoordinator:
                 "citations": citations_payload,
                 "current_agent": state.selected_agent.get("name"),
                 "current_agent_id": selected,
+                "domain_scope": domain_scope,
             },
         )
         if tool_calls:
@@ -2480,6 +2811,7 @@ class RuntimeCoordinator:
                 ],
                 "usage_source": vertical_usage_source,
                 "token_count": token_count,
+                "vertical_provider_request_count": len(vertical_cost_entries),
                 "round_token_count": (router_cost.total_tokens or 0) + token_count,
                 "auto_badcase_id": (
                     auto_badcase.get("id") if auto_badcase else None
