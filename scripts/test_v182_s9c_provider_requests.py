@@ -12,7 +12,11 @@ from pathlib import Path
 import db.property_db as property_db
 from app.observability import _aggregate_model_calls, _trace_cost_explanation
 from app.runtime.cost_ledger import build_cost_entry, cost_entry_usage_payload
-from app.runtime.provider_evidence import remember_provider_request
+from app.runtime.provider_evidence import (
+    provider_request_journal,
+    provider_requests_from_model,
+    remember_provider_request,
+)
 
 
 PRICE = {
@@ -80,6 +84,21 @@ def model_call(trace_id: str, stage: str, evidence: dict) -> dict:
 
 
 def assert_journal_and_aggregation() -> None:
+    class AgnoStyleModel:
+        pass
+
+    model = AgnoStyleModel()
+    assert provider_request_journal(model) == []
+    remember_provider_request(
+        provider_request_journal(model),
+        request("adapter-request", 1, 2, 3),
+    )
+    assert len(provider_requests_from_model(model)) == 1
+    assert provider_requests_from_model(model, consume=True)[0][
+        "provider_request_id"
+    ] == "adapter-request"
+    assert provider_requests_from_model(model) == []
+
     journal: list[dict] = []
     remember_provider_request(journal, request("router-1", 384, 1845, 191))
     remember_provider_request(journal, request("vertical-1", 0, 2203, 85))

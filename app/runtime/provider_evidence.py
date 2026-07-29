@@ -161,9 +161,24 @@ def remember_provider_request(
         existing["usage"].update(usage)
 
 
+def provider_request_journal(model: Any) -> List[Dict[str, Any]]:
+    """Return an instance-local journal without assuming a Pydantic model.
+
+    Agno 2.6.21 model classes are not guaranteed to initialize Pydantic
+    ``PrivateAttr`` descriptors. Keeping this ordinary instance attribute
+    works for both its dataclass-style models and test doubles.
+    """
+    namespace = getattr(model, "__dict__", {})
+    journal = namespace.get("_provider_request_journal")
+    if not isinstance(journal, list):
+        journal = []
+        object.__setattr__(model, "_provider_request_journal", journal)
+    return journal
+
+
 def provider_requests_from_model(model: Any, *, consume: bool = False) -> List[Dict[str, Any]]:
     """Return every captured Provider request for one model instance."""
-    journal = getattr(model, "_provider_request_journal", None)
+    journal = getattr(model, "__dict__", {}).get("_provider_request_journal")
     if not isinstance(journal, list):
         return []
     result = deepcopy(journal)

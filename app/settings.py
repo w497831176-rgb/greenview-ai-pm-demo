@@ -8,16 +8,16 @@ so all agents share the same resources.
 
 import json
 from os import getenv
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 from agno.models.deepseek import DeepSeek
-from pydantic import PrivateAttr
 
 from db import get_postgres_db
 from db.property_db import get_default_model_config, get_model_config_by_model_id
 from app.runtime.provider_evidence import (
     capture_provider_response,
     provider_evidence_from_run,
+    provider_request_journal,
     remember_provider_request,
 )
 
@@ -38,13 +38,9 @@ USE_THINKING = True
 class EvidenceDeepSeek(DeepSeek):
     """DeepSeek adapter that preserves fields dropped by Agno 2.6.21."""
 
-    _provider_request_journal: List[Dict[str, Any]] = PrivateAttr(
-        default_factory=list
-    )
-
     def _capture_request_evidence(self, parsed):
         remember_provider_request(
-            self._provider_request_journal,
+            provider_request_journal(self),
             provider_evidence_from_run(parsed),
         )
         return parsed
