@@ -113,6 +113,29 @@ PROPERTY_AGENT_UNAVAILABLE_RESPONSE = (
 )
 
 
+def build_lane_agent_unavailable_decision(*, property_lane: bool) -> CapabilityDecision:
+    """Return the canonical capability state when no same-domain Agent is selected.
+
+    Skill/RAG/Tool may be skipped. Write and Handoff deliberately use their
+    own contract vocabulary instead of reusing the generic ``skipped`` state.
+    """
+
+    return CapabilityDecision(
+        selected_agent_id=None,
+        skill={"status": "skipped", "reason_code": "no_lane_agent"},
+        rag={"status": "skipped", "reason_code": "no_lane_agent"},
+        tool={"status": "skipped", "reason_code": "no_lane_agent"},
+        write={
+            "status": "not_required",
+            "reason_code": "no_lane_agent" if property_lane else "isolated_general",
+        },
+        handoff={
+            "status": "available" if property_lane else "not_required",
+            "reason_code": "owner_can_request" if property_lane else "isolated_general",
+        },
+    )
+
+
 class ProviderFailureError(RuntimeError):
     """A Provider failure returned as model text instead of an exception."""
 
@@ -1692,19 +1715,8 @@ class RuntimeCoordinator:
         boundary_name = "物业角色边界" if property_lane else "通用边界"
         domain_scope = "property" if property_lane else "isolated_general"
 
-        state.capability_decision = CapabilityDecision(
-            selected_agent_id=None,
-            skill={"status": "skipped", "reason_code": "no_lane_agent"},
-            rag={"status": "skipped", "reason_code": "no_lane_agent"},
-            tool={"status": "skipped", "reason_code": "no_lane_agent"},
-            write={
-                "status": "not_required" if property_lane else "skipped",
-                "reason_code": "no_lane_agent" if property_lane else "isolated_general",
-            },
-            handoff={
-                "status": "available" if property_lane else "skipped",
-                "reason_code": "owner_can_request" if property_lane else "isolated_general",
-            },
+        state.capability_decision = build_lane_agent_unavailable_decision(
+            property_lane=property_lane
         )
         state.status = RunStatus.COMPLETED
         state.next_step = None
