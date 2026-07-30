@@ -1348,11 +1348,13 @@
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ session_id: STATE.chatSessionId, reason: '业主主动点击转人工按钮' })
           });
-          if (!res.ok) throw new Error('请求失败');
-          STATE.chatHandoff = true;
-          updateHandoffBanner('requested');
-          appendSystemMessage('您已发起转人工请求，物业工作人员会尽快回复。');
-          showToast('已转人工，请等待工作人员回复', 'success');
+          if (!res.ok) throw new Error(await res.text() || '请求失败');
+          const payload = await res.json();
+          const handoffState = payload.handoff_state || (payload.session || {}).handoff_status || 'requested';
+          STATE.chatHandoff = ['requested', 'active', 'waiting_user'].includes(handoffState);
+          updateHandoffBanner(handoffState);
+          appendSystemMessage(payload.message || '已发起人工协同：等待工作人员领取。');
+          showToast(payload.message || '已发起人工协同', 'success');
           await loadChatSessions();
           refreshSidebar();
         } catch (err) {

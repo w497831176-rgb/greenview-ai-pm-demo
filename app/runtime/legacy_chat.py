@@ -464,9 +464,33 @@ async def chat_feedback(request: FeedbackRequest):
 async def chat_handoff(request: HandoffRequest):
     """Owner-facing explicit transfer request with an inspectable context package."""
     reason = (request.reason or "业主主动请求人工服务").strip()
-    policy = evaluate_handoff_policy("", explicit_reason=reason)
+    before = get_chat_session(request.session_id) or {}
+    before_status = str(before.get("handoff_status") or "none")
+    policy = {
+        **evaluate_handoff_policy("", explicit_reason=reason),
+        "reason_code": "user_requested",
+        "matched_signals": ["explicit_handoff_button"],
+    }
     session = _request_handoff_with_context(request.session_id, policy, actor="owner")
-    return {"status": "ok", "session": session, "policy": policy, "package_available": True}
+    handoff_state = str(session.get("handoff_status") or "requested")
+    message = (
+        "工作人员已领取，当前正在人工协同处理中。"
+        if handoff_state == "active"
+        else "已发起人工协同：等待工作人员领取。"
+        if handoff_state == "requested"
+        and before_status in {"none", "cancelled", "closed", "resolved"}
+        else "人工协同已在等待领取。"
+        if handoff_state == "requested"
+        else f"人工协同当前状态：{handoff_state}。"
+    )
+    return {
+        "status": "ok",
+        "session": session,
+        "handoff_state": handoff_state,
+        "message": message,
+        "policy": policy,
+        "package_available": True,
+    }
 
 
 @router.post("/handoff-policy")

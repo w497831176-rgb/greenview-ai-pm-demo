@@ -1862,24 +1862,27 @@ class RuntimeCoordinator:
         release_id: str,
         decision: Optional[LaneDecision] = None,
     ) -> Optional[Tuple[str, str, Dict[str, Any]]]:
+        requested_by_user = bool(
+            decision
+            and str(decision.business_intent or "").strip()
+            == "user_requested_handoff"
+        )
         policy: Dict[str, Any] = {
-            "should_request_handoff": bool(
-                decision
-                and decision.lane == RuntimeLane.PROPERTY_GOVERNED
-                and decision.business_intent == "owner_handoff_request"
-            ),
+            "should_request_handoff": requested_by_user,
             "reason": (decision.reason if decision else ""),
-            "level": "L2",
-            "reason_code": "owner_requested",
+            "level": "L3",
+            "reason_code": "user_requested",
             "queue": "property_service",
-            "matched_signals": ["semantic_owner_handoff"] if decision else [],
+            "matched_signals": ["semantic_user_requested_handoff"] if requested_by_user else [],
         }
         if policy.get("should_request_handoff"):
+            before = get_chat_session(session_id) or {}
+            before_status = str(before.get("handoff_status") or "none")
             session = request_handoff(
                 session_id,
                 str(policy.get("reason") or "需要人工协同"),
                 risk_level=str(policy.get("level") or "L3"),
-                reason_code=str(policy.get("reason_code") or "owner_requested"),
+                reason_code=str(policy.get("reason_code") or "user_requested"),
                 queue=policy.get("queue"),
                 handoff_package={
                     "trace_id": trace_id,
@@ -1888,19 +1891,16 @@ class RuntimeCoordinator:
                     "policy": policy,
                 },
             )
-            reply = (
-                "请先远离危险源并确保人身安全；如有火灾、燃气或人身危险，请立即联系"
-                "119、物业值班人员等现场应急渠道。已为您发起人工协同，AI 不会代替"
-                "工作人员作出处置决定。"
-                if policy.get("reason_code") == "safety_risk"
-                else (
-                    "已为您发起人工协同处理。AI 不会代替工作人员作出后续处理决定；"
-                    "您可以继续补充信息，内容会进入接管包。"
-                )
-            )
+            status = str(session.get("handoff_status") or "requested")
+            if status == "active":
+                reply = "工作人员已领取，当前正在人工协同处理中。"
+            elif before_status == "requested" and status == "requested":
+                reply = "人工协同已在等待领取。"
+            else:
+                reply = "已发起人工协同：等待工作人员领取。"
             return (
                 reply,
-                str(session.get("handoff_status") or "requested"),
+                status,
                 policy,
             )
         current = get_chat_session(session_id) or {}
@@ -1918,7 +1918,11 @@ class RuntimeCoordinator:
             )
         if status in {"requested", "active"}:
             return (
-                "当前会话正在人工协同处理中。补充信息已保存，AI 不会重复作出处理决定。",
+                (
+                    "人工协同已在等待领取。"
+                    if status == "requested"
+                    else "工作人员已领取，当前正在人工协同处理中。"
+                ),
                 status,
                 {
                     "level": "L3",
