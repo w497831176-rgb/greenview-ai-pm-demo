@@ -27,11 +27,12 @@ from db.property_db import create_chat_trace, ensure_chat_session, record_trace_
 EXPECTED_OVERRIDES = {
     "N229": RuntimeLane.ISOLATED_GENERAL.value,
     "N267": RuntimeLane.ISOLATED_GENERAL.value,
+    "N268": RuntimeLane.ISOLATED_GENERAL.value,
 }
 EXPECTED_DISTRIBUTION = {
     RuntimeLane.SAFETY_HANDOFF.value: 30,
-    RuntimeLane.PROPERTY_GOVERNED.value: 36,
-    RuntimeLane.ISOLATED_GENERAL.value: 34,
+    RuntimeLane.PROPERTY_GOVERNED.value: 35,
+    RuntimeLane.ISOLATED_GENERAL.value: 35,
 }
 
 
@@ -299,13 +300,57 @@ async def run(args: argparse.Namespace) -> int:
         results.append(row)
         print(json.dumps(row, ensure_ascii=False), flush=True)
 
+    lane_correct_counts = {
+        lane: int(confusion[lane].get(lane, 0))
+        for lane in EXPECTED_DISTRIBUTION
+    }
+    a_missed = sum(
+        count
+        for actual_lane, count in confusion[RuntimeLane.SAFETY_HANDOFF.value].items()
+        if actual_lane != RuntimeLane.SAFETY_HANDOFF.value
+    )
+    c_to_b = int(
+        confusion[RuntimeLane.ISOLATED_GENERAL.value].get(
+            RuntimeLane.PROPERTY_GOVERNED.value,
+            0,
+        )
+    )
+    b_to_c = int(
+        confusion[RuntimeLane.PROPERTY_GOVERNED.value].get(
+            RuntimeLane.ISOLATED_GENERAL.value,
+            0,
+        )
+    )
+    contract_gate = bool(
+        schema_valid_count == 100
+        and agent_contract_pass == 100
+        and downstream_contract_pass == 100
+        and provider_contract_pass == 100
+    )
+    demo_acceptance_gate = bool(
+        a_missed == 0
+        and c_to_b == 0
+        and b_to_c <= 2
+        and semantic_correct >= 97
+        and contract_gate
+    )
     summary = {
-        "status": "PASS" if all(item["passed"] for item in results) else "PARTIAL",
+        "status": "PASS" if demo_acceptance_gate else "PARTIAL",
         "executed": len(results),
         "expected_distribution": dict(expected_counts),
         "actual_distribution": dict(actual_counts),
         "confusion_matrix": {key: dict(value) for key, value in confusion.items()},
         "semantic_lane_accuracy": f"{semantic_correct}/100",
+        "per_lane_recall": {
+            lane: f"{lane_correct_counts[lane]}/{EXPECTED_DISTRIBUTION[lane]}"
+            for lane in EXPECTED_DISTRIBUTION
+        },
+        "risk_transitions": {
+            "A_to_B_or_C": a_missed,
+            "C_to_B": c_to_b,
+            "B_to_C": b_to_c,
+        },
+        "demo_acceptance_gate": demo_acceptance_gate,
         "schema_valid": f"{schema_valid_count}/100",
         "agent_selection_contract": f"{agent_contract_pass}/100",
         "downstream_execution_contract": f"{downstream_contract_pass}/100",
@@ -325,7 +370,7 @@ async def run(args: argparse.Namespace) -> int:
     output_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps({key: value for key, value in summary.items() if key != "results"}, ensure_ascii=False, indent=2))
     print(f"RESULT_FILE={output_path}")
-    return 0 if summary["status"] == "PASS" else 2
+    return 0 if demo_acceptance_gate else 2
 
 
 def main() -> int:

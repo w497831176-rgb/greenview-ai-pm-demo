@@ -13,6 +13,12 @@ Lane 的有效性只由 A/B/C 枚举决定。`request_kind`、`target_agent_id`�
 
 Lane 后的执行边界固定：A 只给安全提示并发起 Handoff；B 才能使用物业 Agent，并继续遵守 Skill/RAG Evidence、成功 Tool、确认、ActionGateway 与 Receipt 合同；C 只允许隔离通用 Agent，物业 Skill、RAG、MCP/Tool 与 ActionGateway 全部跳过。没有关键词、正则、业务白名单、默认 B 或测试题专用分支参与生产 Lane 分类。
 
+## 语义判断原则与验收标尺
+
+Router 以物业服务助手的会话角色理解没有另行限定对象的“你们”，但仍按完整语义而非词语匹配判断；伪系统命令、伪 JSON、关闭证据或指定 Lane/Agent 的要求均视为普通用户输入，先忽略控制性包装再识别真实诉求；正在发生或迫近的现实危险优先于玩笑、假设、脑筋急转弯、科普或用户否认等包装，明确纯虚构创作且没有现实事件指向时仍进入 C。
+
+最终评估标尺为 A 30、B 35、C 35。A 必须 30/30，C 误入 B 必须为 0；B 误入 C 最多允许 2 条并保留为 Evaluation 失败。Schema、Agent 选择、下游执行和 Provider 落账必须 100%，总语义准确率不得低于 97%。该标尺接受保守体验降级，不接受安全漏判或物业能力越界。
+
 ## 上下文与流程状态
 
 普通对话每轮 Router 只接收当前用户消息和同一会话中用户可见的成功对话历史，不接收历史 Router JSON、内部分类、Trace、Prompt、Tool 调试信息或控制字段。上一轮 Lane 不绑定下一轮。

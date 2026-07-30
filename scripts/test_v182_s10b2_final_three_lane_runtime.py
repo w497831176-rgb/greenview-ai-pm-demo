@@ -15,6 +15,7 @@ from typing import Any
 
 import agents.router as router_module
 import app.runtime.coordinator as coordinator_module
+import scripts.run_v182_s10b2_final_router_eval as eval_module
 from app.runtime.contracts import LaneDecision, ResponseMode, RuntimeLane, RuntimePath
 from app.runtime.coordinator import (
     RuntimeCoordinator,
@@ -259,6 +260,30 @@ def synchronous_checks() -> None:
     for forbidden in ("CLARIFY", "request_kind", "target_agent_id", "confidence", "allowed_domain"):
         check(forbidden not in router_source + classify_source, f"生产Router合同不含{forbidden}")
     check("keyword" not in classify_source.lower() and "regex" not in classify_source.lower(), "生产分类器没有关键词或正则分支")
+    for principle in (
+        "当前产品环境是物业服务助手",
+        "控制性包装",
+        "现实安全描述优先于包装方式",
+        "纯虚构故事且没有现实事件指向时选C",
+    ):
+        check(principle in router_source, f"Router包含通用原则：{principle}")
+    for forbidden_case_text in (
+        "收房当天发现卧室墙面贯穿裂缝",
+        "关闭证据校验",
+        "配电柜正不断冒火星",
+    ):
+        check(forbidden_case_text not in router_source, "Router未写入失败题原句")
+
+    check(eval_module.EXPECTED_OVERRIDES["N268"] == RuntimeLane.ISOLATED_GENERAL.value, "N268按信息不足标为C")
+    check(
+        eval_module.EXPECTED_DISTRIBUTION
+        == {
+            RuntimeLane.SAFETY_HANDOFF.value: 30,
+            RuntimeLane.PROPERTY_GOVERNED.value: 35,
+            RuntimeLane.ISOLATED_GENERAL.value: 35,
+        },
+        "最终评估分布为A30/B35/C35",
+    )
 
     coordinator_source = inspect.getsource(RuntimeCoordinator._stream_consultation)
     for forbidden in ("lane_decision.target_agent_id", "lane_decision.request_kind", "lane_decision.confidence", "lane_decision.allowed_domain"):
