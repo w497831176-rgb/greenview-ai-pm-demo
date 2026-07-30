@@ -26,7 +26,7 @@
 7. [07-new-coding-session-bootstrap.md](07-new-coding-session-bootstrap.md)：可直接复制给新会话的完整提示词。
 8. [08-v1.8-enterprise-runtime-architecture-contract.md](08-v1.8-enterprise-runtime-architecture-contract.md)：V1.8 当前批准的 Living Architecture；它允许通过 ADR 和版本治理持续修订，但实现不得无记录地偏离。
 9. [09-v1.8.1-structured-lane-and-context-isolation.md](09-v1.8.1-structured-lane-and-context-isolation.md)：Historical；记录 ADR-0008 的三路关键词 Lane 与上下文隔离基线，决策方式已由 10 替代。
-10. [10-v1.8.2-semantic-lane-and-answer-contract.md](10-v1.8.2-semantic-lane-and-answer-contract.md)：Active；接受 ADR-0009，以严格语义 LaneDecision、确定性权限和 AnswerContract 替代关键词路由与默认 B。
+10. [10-v1.8.2-semantic-lane-and-answer-contract.md](10-v1.8.2-semantic-lane-and-answer-contract.md)：Active；接受 ADR-0010，以 A危险、B物业、C其他三分类和 Lane 后处理替代复合字段矩阵，同时继续禁止关键词路由与默认 B。
 
 V1.8 实施接续时还必须读取：
 

@@ -26,7 +26,6 @@ from app.runtime.contracts import (
     CapabilityDecision,
     LaneDecision,
     LaneDecisionSource,
-    RequestKind,
     ResponseMode,
     RiskLevel,
     RouteDecision,
@@ -52,6 +51,7 @@ from app.runtime.provider_evidence import (
 )
 from app.settings import MODEL_ID, USE_THINKING, build_model
 from app.work_order_workflow import (
+    _is_draft_follow_up,
     action_gateway,
     advance_work_order_workflow,
     is_cancel_request,
@@ -106,6 +106,10 @@ NON_PROPERTY_SAFETY_RESPONSE = (
 OUT_OF_SCOPE_RESPONSE = (
     "这个问题不属于当前物业服务能力范围，且当前没有匹配的非物业处理角色。"
     "我可以继续协助物业报修、服务咨询或工单查询。"
+)
+PROPERTY_AGENT_UNAVAILABLE_RESPONSE = (
+    "我能确认这是物业相关问题，但当前没有可靠选中同域处理角色。"
+    "我不会跨域调用其他Agent，也不会编造物业流程；请补充具体服务对象或诉求后再试。"
 )
 
 
@@ -257,7 +261,7 @@ def _claims_business_success(text: str) -> bool:
 def _lane_candidates(
     cards: List[Dict[str, Any]], lane: RuntimeLane
 ) -> List[Dict[str, Any]]:
-    if lane in {RuntimeLane.SAFETY_HANDOFF, RuntimeLane.CLARIFY}:
+    if lane == RuntimeLane.SAFETY_HANDOFF:
         return []
     scope = "property" if lane == RuntimeLane.PROPERTY_GOVERNED else "isolated_general"
     return [card for card in cards if _agent_domain_scope(card) == scope]
@@ -339,11 +343,10 @@ def _lane_explanation(decision: LaneDecision) -> str:
         RuntimeLane.SAFETY_HANDOFF: "安全人工协同",
         RuntimeLane.PROPERTY_GOVERNED: "物业受控回答",
         RuntimeLane.ISOLATED_GENERAL: "隔离通用回答",
-        RuntimeLane.CLARIFY: "需要澄清",
     }
     return (
         f"进入{labels[decision.lane]}路径；识别任务为"
-        f"{decision.business_intent}。{decision.reason}"
+        f"{decision.business_intent or '未命名意图'}。{decision.reason or 'Router未返回判断理由。'}"
     )
 
 
@@ -400,8 +403,11 @@ def _knowledge_evidence_decision(
     }
 
 
-def _answer_contract_for(decision: LaneDecision) -> AnswerContract:
-    """Compile deterministic execution permissions from validated semantics."""
+def _answer_contract_for(
+    decision: LaneDecision,
+    runtime_path: RuntimePath = RuntimePath.CONSULTATION,
+) -> AnswerContract:
+    """Compile fixed downstream permissions from A/B/C and workflow state."""
 
     common_forbidden = [
         "unsupported_property_fact",
@@ -420,61 +426,20 @@ def _answer_contract_for(decision: LaneDecision) -> AnswerContract:
             forbidden_claims=common_forbidden,
             decision_reason="现实安全风险优先，语义判断后立即发起安全人工协同。",
         )
-    if decision.lane == RuntimeLane.CLARIFY:
-        return AnswerContract(
-            response_mode=ResponseMode.CLARIFY_ONLY,
-            evidence_required=False,
-            skill_policy="skipped",
-            rag_policy="skipped",
-            tool_policy="skipped",
-            write_policy="forbidden",
-            handoff_policy="skipped",
-            forbidden_claims=common_forbidden + ["property_process_or_capability"],
-            decision_reason="关键信息不足，只提出一个能够决定下一步的问题。",
-        )
     if decision.lane == RuntimeLane.ISOLATED_GENERAL:
-        unsafe = decision.request_kind == RequestKind.UNSAFE_REQUEST
         return AnswerContract(
-            response_mode=(ResponseMode.SAFE_REFUSAL if unsafe else ResponseMode.SAFE_GENERAL),
+            response_mode=ResponseMode.SAFE_GENERAL,
             evidence_required=False,
             skill_policy="skipped",
             rag_policy="skipped",
             tool_policy="skipped",
             write_policy="forbidden",
             handoff_policy="skipped",
-            forbidden_claims=common_forbidden + (["harmful_instructions"] if unsafe else ["property_official_fact"]),
-            decision_reason=(
-                "非物业危险请求只做安全拒绝。"
-                if unsafe
-                else "低风险非物业请求由隔离通用Agent回答，物业能力全部跳过。"
-            ),
+            forbidden_claims=common_forbidden
+            + ["property_official_fact", "harmful_instructions"],
+            decision_reason="C只允许隔离通用回答；物业能力全部跳过，危险或越权内容由回答安全边界拒绝。",
         )
-    if decision.request_kind == RequestKind.UNSAFE_REQUEST:
-        return AnswerContract(
-            response_mode=ResponseMode.SAFE_REFUSAL,
-            evidence_required=False,
-            skill_policy="skipped",
-            rag_policy="skipped",
-            tool_policy="skipped",
-            write_policy="forbidden",
-            handoff_policy="optional",
-            forbidden_claims=common_forbidden + ["harmful_instructions"],
-            decision_reason="物业域中的危险请求只做安全拒绝，不调用业务能力或执行写入。",
-        )
-    if decision.request_kind == RequestKind.REALTIME_READ:
-        return AnswerContract(
-            response_mode=ResponseMode.REALTIME_READ,
-            evidence_required=True,
-            evidence_requirements=["successful_current_tool_result"],
-            skill_policy="skipped",
-            rag_policy="skipped",
-            tool_policy="selected",
-            write_policy="forbidden",
-            handoff_policy="optional",
-            forbidden_claims=common_forbidden + ["realtime_value_without_successful_tool"],
-            decision_reason="实时物业事实只能来自本轮成功Tool结果。",
-        )
-    if decision.request_kind == RequestKind.STATE_CHANGE:
+    if runtime_path == RuntimePath.CONTROLLED_ACTION:
         return AnswerContract(
             response_mode=ResponseMode.CONTROLLED_WRITE,
             evidence_required=True,
@@ -485,7 +450,7 @@ def _answer_contract_for(decision: LaneDecision) -> AnswerContract:
             write_policy="allowed_after_confirmation",
             handoff_policy="optional",
             forbidden_claims=common_forbidden + ["write_success_without_receipt"],
-            decision_reason="状态变更必须经过Proposal、权限、确认、ActionGateway和Receipt。",
+            decision_reason="已存在的受控业务状态继续原流程，并保持Proposal、权限、确认、ActionGateway和Receipt边界。",
         )
     return AnswerContract(
         response_mode=ResponseMode.GROUNDED_ANSWER,
@@ -493,11 +458,15 @@ def _answer_contract_for(decision: LaneDecision) -> AnswerContract:
         evidence_requirements=["activated_skill_or_adopted_rag_or_successful_tool"],
         skill_policy="selected",
         rag_policy="selected",
-        tool_policy="skipped",
+        tool_policy="selected",
         write_policy="forbidden",
         handoff_policy="optional",
-        forbidden_claims=common_forbidden + ["property_process_or_timing_without_evidence"],
-        decision_reason="物业事实必须由当次合法Skill、采用的RAG或成功Tool支撑。",
+        forbidden_claims=common_forbidden
+        + [
+            "property_process_or_timing_without_evidence",
+            "realtime_value_without_successful_tool",
+        ],
+        decision_reason="B只允许物业Agent；物业事实依赖Skill/RAG，实时状态依赖成功Tool，写入另走受控流程。",
     )
 
 
@@ -846,16 +815,6 @@ class RuntimeCoordinator:
                     yield event
                 return
 
-            if state.answer_contract.response_mode in {
-                ResponseMode.CLARIFY_ONLY,
-                ResponseMode.SAFE_REFUSAL,
-            }:
-                async for event in self._stream_contract_static_answer(
-                    session_id, trace_id, snapshot, state, ledger, started
-                ):
-                    yield event
-                return
-
             if state.answer_contract.response_mode == ResponseMode.CONTROLLED_WRITE:
                 path = RuntimePath.CONTROLLED_ACTION
                 state.path = path
@@ -1111,7 +1070,11 @@ class RuntimeCoordinator:
         # Persisted state may continue deterministically. New natural-language
         # requests are not promoted to a write path by words or regexes here;
         # the semantic LaneDecision/AnswerContract owns that decision.
-        if get_pending_action_proposal(session_id) or get_work_order_draft(session_id):
+        pending = get_pending_action_proposal(session_id)
+        draft = get_work_order_draft(session_id)
+        if pending and (is_confirmation(message) or is_cancel_request(message)):
+            return RuntimePath.CONTROLLED_ACTION
+        if draft and _is_draft_follow_up(message, draft):
             return RuntimePath.CONTROLLED_ACTION
         if RuntimeCoordinator._latest_committed_dynamic_action(session_id, message):
             return RuntimePath.CONTROLLED_ACTION
@@ -1149,12 +1112,7 @@ class RuntimeCoordinator:
             state.lane_decision = LaneDecision(
                 lane=RuntimeLane.PROPERTY_GOVERNED,
                 business_intent="continue_controlled_action",
-                reason_code="property_service_required",
                 reason="会话中存在未完成的受控业务状态，继续原状态机。",
-                confidence=1.0,
-                request_kind=RequestKind.STATE_CHANGE,
-                allowed_domain="property",
-                target_agent_id=str(selected_card.get("agent_id")),
                 decision_source=LaneDecisionSource.STRUCTURED_STATE,
             )
         else:
@@ -1258,7 +1216,12 @@ class RuntimeCoordinator:
                 raise RuntimeError("semantic LaneDecision schema validation failed")
             state.lane_decision = result["decision"]
 
-        state.answer_contract = _answer_contract_for(state.lane_decision)
+        if (
+            state.lane_decision.lane == RuntimeLane.PROPERTY_GOVERNED
+            and self._is_work_order_action_context(session_id, message)
+        ):
+            state.path = RuntimePath.CONTROLLED_ACTION
+        state.answer_contract = _answer_contract_for(state.lane_decision, state.path)
         lane_payload = state.lane_decision.model_dump(mode="json")
         lane_payload["explanation"] = _lane_explanation(state.lane_decision)
         ledger.set("lane_decision", lane_payload)
@@ -1274,6 +1237,124 @@ class RuntimeCoordinator:
             },
         )
 
+    async def _select_agent_after_lane(
+        self,
+        message: str,
+        session_id: str,
+        user_id: str,
+        trace_id: str,
+        snapshot: Any,
+        state: RunState,
+        cards: List[Dict[str, Any]],
+        visible_history: List[Dict[str, str]],
+    ) -> Dict[str, Any]:
+        """Select a same-domain Agent without changing or invalidating the Lane."""
+
+        from agents.router import select_lane_agent
+
+        default_model = (snapshot.config.get("model_policy") or {}).get("default") or {}
+        selector_model_id = str(default_model.get("model_id") or MODEL_ID)
+        if selector_model_id.lower() != "deepseek-v4-flash":
+            return {
+                "selected_agent_id": None,
+                "reason": "Agent选择器未使用允许的Flash模型。",
+                "selection_source": "selector_policy_blocked",
+                "provider_status": "not_applicable",
+                "candidate_count": len(cards),
+            }
+        started = time.time()
+        selection = await select_lane_agent(
+            message,
+            lane=state.lane_decision.lane,
+            vertical_agents=cards,
+            user_id=user_id,
+            session_id=f"{session_id}::agent_selector::{trace_id}",
+            model=_build_model_from_snapshot(snapshot.config, selector_model_id),
+            visible_history=visible_history,
+        )
+        provider_status = str(selection.get("provider_status") or "not_applicable")
+        if provider_status != "not_applicable":
+            evidence = selection.get("provider_evidence") or {}
+            usage = evidence.get("usage") or selection.get("metrics") or {}
+            response_model = evidence.get("provider_response_model")
+            billing_model = response_model or selector_model_id
+            thinking = _thinking_for_snapshot(snapshot.config, selector_model_id)
+            cost = build_cost_entry(
+                stage="agent_selector",
+                provider=_model_provider(snapshot.config, selector_model_id),
+                requested_model=selector_model_id,
+                response_model=None,
+                provider_response_model=response_model,
+                thinking_enabled=thinking,
+                model_policy_version=str(
+                    (snapshot.config.get("model_policy") or {}).get("version") or "v1.8"
+                ),
+                provider_usage=usage if usage else None,
+                price_row=_price_for_snapshot(snapshot.config, billing_model),
+                local_estimate_tokens=_estimate_tokens(message),
+                provider_succeeded=provider_status == "success",
+            )
+            state.cost_entries.append(cost)
+            state.model_calls.append(
+                {
+                    "stage": "agent_selector",
+                    "model_id": selector_model_id,
+                    "requested_model": selector_model_id,
+                    "provider_response_model": response_model,
+                    "provider_request_id": evidence.get("provider_request_id"),
+                    "thinking_enabled": thinking,
+                    "latency_ms": int((time.time() - started) * 1000),
+                    "usage": usage,
+                    "usage_source": cost.usage_source.value,
+                    "status": provider_status,
+                }
+            )
+            record_model_call(
+                trace_id=trace_id,
+                stage="agent_selector",
+                model_id=selector_model_id,
+                model_selection_reason="same-domain Agent selection after fixed Lane",
+                status=provider_status,
+                error_summary=selection.get("validation_error"),
+                latency_ms=int((time.time() - started) * 1000),
+                input_tokens=cost.input_tokens,
+                output_tokens=cost.output_tokens,
+                reasoning_tokens=cost.reasoning_tokens,
+                cached_tokens=cost.cached_input_tokens,
+                total_tokens=cost.total_tokens,
+                usage_source=cost.usage_source.value,
+                price_snapshot=(
+                    cost.price_snapshot.model_dump(mode="json")
+                    if cost.price_snapshot
+                    else None
+                ),
+                estimated_cost_cny=cost.amount,
+                usage_normalized=_usage_for_observability(
+                    cost,
+                    provider_request_id=evidence.get("provider_request_id"),
+                ),
+            )
+        selected = selection.get("selected_agent_id")
+        record_trace_event(
+            trace_id,
+            "agent_selection",
+            "success" if selected else "skipped",
+            latency_ms=int((time.time() - started) * 1000),
+            output_summary=(
+                f"selected={selected}"
+                if selected
+                else f"no Agent selected: {selection.get('selection_source')}"
+            ),
+            metadata={
+                "lane": state.lane_decision.lane.value,
+                "selected_agent_id": selected,
+                "selection_source": selection.get("selection_source"),
+                "candidate_count": selection.get("candidate_count"),
+                "validation_error": selection.get("validation_error"),
+            },
+        )
+        return selection
+
     async def _stream_contract_static_answer(
         self,
         session_id: str,
@@ -1283,17 +1364,12 @@ class RuntimeCoordinator:
         ledger: EvidenceLedger,
         started: float,
     ) -> AsyncIterator[str]:
-        """Complete CLARIFY and safe-refusal contracts without a business Agent."""
+        """Complete a static safety refusal without a business Agent."""
 
         if state.answer_contract is None or state.lane_decision is None:
             raise RuntimeError("static answer started without contracts")
-        clarify = state.answer_contract.response_mode == ResponseMode.CLARIFY_ONLY
-        content = (
-            str(state.lane_decision.clarification_question or "请补充具体对象和发生地点。")
-            if clarify
-            else "这个请求可能造成现实伤害，我不能提供危险配方、比例或实施步骤。我可以改为说明安全处置与风险预防原则。"
-        )
-        reason = "clarification_only" if clarify else "unsafe_request_refused"
+        content = "这个请求可能造成现实伤害，我不能提供危险配方、比例或实施步骤。我可以改为说明安全处置与风险预防原则。"
+        reason = "unsafe_request_refused"
         state.capability_decision = CapabilityDecision(
             selected_agent_id=None,
             skill={"status": "skipped", "reason_code": reason},
@@ -1383,7 +1459,7 @@ class RuntimeCoordinator:
             raise RuntimeError("safety handoff started without contracts")
         handoff = request_handoff(
             session_id,
-            state.lane_decision.reason,
+            state.lane_decision.reason or "检测到明确、现实的安全风险。",
             risk_level="L3",
             reason_code="safety_risk",
             queue="emergency",
@@ -1588,7 +1664,7 @@ class RuntimeCoordinator:
             },
         )
 
-    async def _stream_unconfigured_general_boundary(
+    async def _stream_unconfigured_lane_boundary(
         self,
         session_id: str,
         trace_id: str,
@@ -1597,15 +1673,38 @@ class RuntimeCoordinator:
         ledger: EvidenceLedger,
         started: float,
     ) -> AsyncIterator[str]:
-        """Return a truthful static boundary when no C-lane Agent is published."""
+        """Complete truthfully when a valid Lane has no usable same-domain Agent."""
+
+        property_lane = (
+            state.lane_decision is not None
+            and state.lane_decision.lane == RuntimeLane.PROPERTY_GOVERNED
+        )
+        content = (
+            PROPERTY_AGENT_UNAVAILABLE_RESPONSE
+            if property_lane
+            else OUT_OF_SCOPE_RESPONSE
+        )
+        boundary_id = (
+            "property_agent_unavailable"
+            if property_lane
+            else "isolated_general_boundary"
+        )
+        boundary_name = "物业角色边界" if property_lane else "通用边界"
+        domain_scope = "property" if property_lane else "isolated_general"
 
         state.capability_decision = CapabilityDecision(
             selected_agent_id=None,
             skill={"status": "skipped", "reason_code": "no_lane_agent"},
             rag={"status": "skipped", "reason_code": "no_lane_agent"},
             tool={"status": "skipped", "reason_code": "no_lane_agent"},
-            write={"status": "not_required", "reason_code": "isolated_general"},
-            handoff={"status": "available", "reason_code": "owner_can_request"},
+            write={
+                "status": "not_required" if property_lane else "skipped",
+                "reason_code": "no_lane_agent" if property_lane else "isolated_general",
+            },
+            handoff={
+                "status": "available" if property_lane else "skipped",
+                "reason_code": "owner_can_request" if property_lane else "isolated_general",
+            },
         )
         state.status = RunStatus.COMPLETED
         state.next_step = None
@@ -1613,51 +1712,54 @@ class RuntimeCoordinator:
         ledger.append(
             "evaluation_results",
             {
-                "case": "isolated_general_no_agent_boundary",
+                "case": "lane_valid_agent_unavailable_boundary",
                 "passed": True,
-                "model_invoked": False,
+                "lane": state.lane_decision.lane.value if state.lane_decision else None,
+                "boundary_model_invoked": False,
+                "provider_request_count": len(state.model_calls),
             },
         )
         ledger.persist("complete")
         saved = save_chat_message(
             session_id=session_id,
             role="assistant",
-            content=OUT_OF_SCOPE_RESPONSE,
+            content=content,
             trace_id=trace_id,
-            current_agent="通用边界",
-            current_agent_id="isolated_general_boundary",
+            current_agent=boundary_name,
+            current_agent_id=boundary_id,
             status="success",
             usage_source="not_applicable",
         )
         update_chat_trace(
             trace_id,
-            intent="isolated_general_boundary",
-            agent_name="通用边界",
-            agent_id="isolated_general_boundary",
+            intent=boundary_id,
+            agent_name=boundary_name,
+            agent_id=boundary_id,
             status="complete",
         )
         record_trace_event(
             trace_id,
-            "isolated_general_boundary",
+            "lane_agent_boundary",
             "success",
             latency_ms=int((time.time() - started) * 1000),
-            output_summary="no published C-lane Agent; static boundary returned",
+            output_summary="Lane remained valid; no same-domain Agent was selected",
             metadata={
                 "lane_decision": (
                     state.lane_decision.model_dump(mode="json")
                     if state.lane_decision
                     else None
                 ),
-                "model_invoked": False,
+                "boundary_model_invoked": False,
+                "provider_request_count": len(state.model_calls),
             },
         )
         yield _sse(
             "final",
             {
-                "content": OUT_OF_SCOPE_RESPONSE,
-                "current_agent": "通用边界",
-                "current_agent_id": "isolated_general_boundary",
-                "domain_scope": "isolated_general",
+                "content": content,
+                "current_agent": boundary_name,
+                "current_agent_id": boundary_id,
+                "domain_scope": domain_scope,
             },
         )
         yield _sse(
@@ -1669,8 +1771,9 @@ class RuntimeCoordinator:
                 "runtime_path": RuntimePath.CONSULTATION.value,
                 "release_id": snapshot.release_id,
                 "snapshot_id": snapshot.snapshot_id,
-                "current_agent": "通用边界",
-                "current_agent_id": "isolated_general_boundary",
+                "current_agent": boundary_name,
+                "current_agent_id": boundary_id,
+                "domain_scope": domain_scope,
                 "lane_decision": (
                     state.lane_decision.model_dump(mode="json")
                     if state.lane_decision
@@ -1679,26 +1782,36 @@ class RuntimeCoordinator:
                 "capability_decision": state.capability_decision.model_dump(
                     mode="json"
                 ),
-                "cost_entries": [],
-                "usage_source": "not_applicable",
-                "token_count": 0,
-                "round_token_count": 0,
+                "cost_entries": [
+                    item.model_dump(mode="json") for item in state.cost_entries
+                ],
+                "usage_source": (
+                    state.cost_entries[-1].usage_source.value
+                    if state.cost_entries
+                    else "not_applicable"
+                ),
+                "token_count": sum(item.total_tokens or 0 for item in state.cost_entries),
+                "round_token_count": sum(
+                    item.total_tokens or 0 for item in state.cost_entries
+                ),
             },
         )
 
     @staticmethod
     def _is_work_order_action_context(session_id: str, message: str) -> bool:
         pending = get_pending_action_proposal(session_id)
+        draft = get_work_order_draft(session_id)
         latest = (
             get_latest_action_proposal(session_id, "work_order.create")
             if is_confirmation(message)
             else None
         )
         return bool(
-            get_work_order_draft(session_id)
+            (draft and _is_draft_follow_up(message, draft))
             or (
                 pending
                 and pending.get("action_type") == "work_order.create"
+                and (is_confirmation(message) or is_cancel_request(message))
             )
             or is_explicit_work_order_request(message)
             or latest
@@ -2284,22 +2397,31 @@ class RuntimeCoordinator:
         )
         all_cards = vertical_agent_cards(snapshot.config)
         cards = _lane_candidates(all_cards, state.lane_decision.lane)
-        if (
-            not cards
-            and state.lane_decision.lane == RuntimeLane.ISOLATED_GENERAL
-        ):
-            async for event in self._stream_unconfigured_general_boundary(
+        if not cards:
+            async for event in self._stream_unconfigured_lane_boundary(
                 session_id, trace_id, snapshot, state, ledger, started
             ):
                 yield event
             return
-        if not cards:
-            raise RuntimeError("published RuntimeRelease has no enabled vertical agent")
 
         candidates = [str(item["agent_id"]) for item in cards]
-        selected = str(state.lane_decision.target_agent_id or "")
+        selection = await self._select_agent_after_lane(
+            message,
+            session_id,
+            user_id,
+            trace_id,
+            snapshot,
+            state,
+            all_cards,
+            visible_history,
+        )
+        selected = str(selection.get("selected_agent_id") or "")
         if selected not in candidates:
-            raise RuntimeError("lane_agent_scope_mismatch")
+            async for event in self._stream_unconfigured_lane_boundary(
+                session_id, trace_id, snapshot, state, ledger, started
+            ):
+                yield event
+            return
         selected_card = next(
             item for item in cards if str(item.get("agent_id")) == selected
         )
@@ -2309,8 +2431,8 @@ class RuntimeCoordinator:
         route = RouteDecision(
             candidates=candidates,
             selected_agent_id=selected,
-            reason=state.lane_decision.reason,
-            confidence=state.lane_decision.confidence,
+            reason=str(selection.get("reason") or state.lane_decision.reason or "同域Agent选择完成。"),
+            confidence=None,
             required_capability_types=["agent", "skill", "rag", "readonly_tool"],
         )
         state.route_decision = route

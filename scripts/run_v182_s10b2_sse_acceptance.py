@@ -291,16 +291,20 @@ def run_single_chat(args: argparse.Namespace) -> int:
         raise ValueError("--question or --question-base64 is required")
 
     base_url = args.base_url.rstrip("/")
-    session_payload = request_json(
-        f"{base_url}/api/chat/sessions?{urllib.parse.urlencode({'user_id': args.user_id})}",
-        method="POST",
-        body={},
-        timeout=args.timeout,
-    )
-    session = session_payload.get("session") or {}
-    session_id = session.get("session_id")
-    if not session_id:
-        raise RuntimeError("session creation returned no session_id")
+    if args.session_id:
+        session_id = args.session_id
+        session = {"session_id": session_id, "reused_for_visible_history": True}
+    else:
+        session_payload = request_json(
+            f"{base_url}/api/chat/sessions?{urllib.parse.urlencode({'user_id': args.user_id})}",
+            method="POST",
+            body={},
+            timeout=args.timeout,
+        )
+        session = session_payload.get("session") or {}
+        session_id = session.get("session_id")
+        if not session_id:
+            raise RuntimeError("session creation returned no session_id")
 
     body = json.dumps(
         {"message": question, "session_id": session_id, "user_id": args.user_id},
@@ -370,6 +374,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--question-base64")
     parser.add_argument("--label", default="case")
     parser.add_argument("--user-id", default="web-user")
+    parser.add_argument("--session-id", help="reuse one existing session for a follow-up turn")
     parser.add_argument("--timeout", type=int, default=360)
     parser.add_argument("--output-dir", default="/tmp/s10b2-acceptance")
     parser.add_argument("--inspect-evidence-file")

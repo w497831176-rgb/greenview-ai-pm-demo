@@ -149,7 +149,7 @@ def _semantic_agent_catalog(vertical_agents: List[Dict[str, Any]]) -> List[Dict[
 
 
 def create_semantic_lane_router(*, model: Any) -> Agent:
-    """Create the one-call semantic control-plane Router used by production."""
+    """Create the one-call A/B/C domain Router used by production."""
 
     return Agent(
         id="semantic_lane_router",
@@ -158,14 +158,13 @@ def create_semantic_lane_router(*, model: Any) -> Agent:
         model=model,
         db=agent_db,
         instructions=[
-            "你是YIAI物业运行时的语义控制器。理解整句话、对象、地点、真实目的、否定关系、多意图优先级和可见会话上下文，不使用词语命中捷径。",
-            "先判断是否有正在发生或迫近的人身、消防、燃气、电气、结构、公共安全或自伤风险；现实风险优先于用户的否定或淡化。",
-            "非安全请求中，只有真实诉求需要物业提供信息、服务、查询、办理或协助时才属于物业域。出现物业相关词但实际任务是翻译、技术、数学、创作或娱乐，不属于物业域。",
-            "明确属于非物业的一般知识、创作、娱乐、生活建议或技术帮助，进入隔离通用域；其中危险配方、绕过系统、隐私侵犯等仍标为不安全请求。",
-            "对象、地点、场景或诉求不足以决定以上路径时必须澄清，不得默认进入物业域，也不得猜成通用域。",
-            "用户明确要求由真人工作人员接管时属于物业域的state_change，并将business_intent设为owner_handoff_request；这不是安全A，除非同时存在现实紧急风险。",
-            "仅B/C可选择业务Agent；目标必须来自输入候选中相同domain_scope。A和CLARIFY的target_agent_id必须为null。",
-            "business_intent使用简短稳定的snake_case语义，不复制用户原句。只输出一个JSON对象，不输出Markdown或解释文字。",
+            "你只负责把本轮完整诉求分成A、B、C三类，不选择Agent，不决定Tool、证据、写入或回答方式。",
+            "A_SAFETY_HANDOFF：存在明确、现实、正在发生或迫近的人身、消防、燃气、电气、结构、公共安全或自伤危险。用户要求不转人工也不能覆盖A。",
+            "B_PROPERTY_GOVERNED：用户明确需要物业回答、查询、办理或协助。只有真实诉求属于物业服务时才选B。",
+            "C_ISOLATED_GENERAL：其他全部，包括明确非物业、信息不足、对象不清或暂时无法判断。用户补充信息后，下一轮结合可见对话重新判断。",
+            "理解整句话、对象、地点、真实目的、否定关系、多意图优先级和可见对话，不使用关键词、正则、白名单或默认B。",
+            "出现物业相关字样但实际任务是翻译、技术、数学、创作或娱乐时仍选C；危险配方、违法、越权或侵犯隐私但没有正在发生的现实危险时也选C，由下游安全边界拒绝。",
+            "business_intent只写简短业务意图；reason只写一句中文判断理由。只输出一个JSON对象，不输出Markdown或解释文字。",
         ],
         add_datetime_to_context=True,
         add_history_to_context=False,
@@ -175,8 +174,10 @@ def create_semantic_lane_router(*, model: Any) -> Agent:
     )
 
 
-def _strict_json_object(raw: str) -> Dict[str, Any]:
-    value = str(raw or "").strip()
+def _strict_json_object(raw: Any) -> Dict[str, Any]:
+    if isinstance(raw, dict):
+        return raw
+    value = str(raw or "").strip().lstrip("\ufeff").strip()
     if value.startswith("```") and value.endswith("```"):
         lines = value.splitlines()
         if len(lines) >= 3 and lines[0].strip().lower() in {"```", "```json"} and lines[-1].strip() == "```":
@@ -187,23 +188,6 @@ def _strict_json_object(raw: str) -> Dict[str, Any]:
     return parsed
 
 
-def _validate_semantic_target(
-    decision: LaneDecision,
-    catalog: List[Dict[str, Any]],
-) -> None:
-    if decision.lane in {RuntimeLane.SAFETY_HANDOFF, RuntimeLane.CLARIFY}:
-        return
-    by_id = {str(item["agent_id"]): item for item in catalog}
-    target = by_id.get(str(decision.target_agent_id or ""))
-    expected_scope = (
-        "property"
-        if decision.lane == RuntimeLane.PROPERTY_GOVERNED
-        else "isolated_general"
-    )
-    if target is None or str(target.get("domain_scope")) != expected_scope:
-        raise ValueError("lane_agent_scope_mismatch")
-
-
 async def classify_lane_decision(
     message: str,
     vertical_agents: Optional[List[Dict[str, Any]]] = None,
@@ -212,9 +196,8 @@ async def classify_lane_decision(
     model: Any = None,
     visible_history: Optional[List[Dict[str, str]]] = None,
 ) -> Dict[str, Any]:
-    """Call the production semantic Router exactly once; never apply a fallback."""
+    """Call the production A/B/C Router exactly once; never apply a fallback."""
 
-    catalog = _semantic_agent_catalog(vertical_agents or [])
     history = [
         {
             "role": "user" if item.get("role") == "user" else "assistant",
@@ -226,18 +209,10 @@ async def classify_lane_decision(
     prompt_payload = {
         "visible_conversation": history,
         "current_user_message": message,
-        "published_agent_candidates": catalog,
         "decision_schema": {
-            "lane": "A_SAFETY_HANDOFF | B_PROPERTY_GOVERNED | C_ISOLATED_GENERAL | CLARIFY",
-            "business_intent": "snake_case semantic intent",
-            "reason_code": "imminent_safety_risk | property_service_required | non_property_general | unsafe_non_property_request | insufficient_context",
+            "lane": "A_SAFETY_HANDOFF | B_PROPERTY_GOVERNED | C_ISOLATED_GENERAL",
+            "business_intent": "简短业务意图",
             "reason": "简短中文理由",
-            "confidence": "0.0..1.0",
-            "requires_clarification": "boolean",
-            "clarification_question": "one useful question or null",
-            "request_kind": "emergency | fact | realtime_read | state_change | general | unsafe_request | ambiguous",
-            "allowed_domain": "safety | property | isolated_general | none",
-            "target_agent_id": "candidate agent_id or null",
         },
     }
     result: Dict[str, Any] = {
@@ -256,8 +231,9 @@ async def classify_lane_decision(
             session_id=session_id or f"semantic-router-{id(message)}",
             stream=False,
         )
-        raw = str(getattr(response_obj, "content", "") or "").strip()
-        result["raw"] = raw
+        response_content = getattr(response_obj, "content", "")
+        raw = response_content if isinstance(response_content, dict) else str(response_content or "").strip()
+        result["raw"] = raw if isinstance(raw, str) else json.dumps(raw, ensure_ascii=False)
         result["provider_evidence"] = provider_evidence_from_run(response_obj)
         if result["provider_evidence"].get("usage"):
             result["metrics"] = dict(result["provider_evidence"]["usage"])
@@ -273,12 +249,128 @@ async def classify_lane_decision(
             }
         result["provider_status"] = "success"
         decision = LaneDecision.model_validate(_strict_json_object(raw))
-        _validate_semantic_target(decision, catalog)
         result["decision"] = decision
         return result
     except Exception as exc:
         result["validation_error"] = f"{type(exc).__name__}: {str(exc)[:240]}"
         return result
+
+
+def create_lane_agent_selector(*, model: Any) -> Agent:
+    """Select one same-domain Agent after the A/B/C Lane is already fixed."""
+
+    return Agent(
+        id="lane_agent_selector",
+        name="Lane后Agent选择器",
+        description="在既定Lane内选择处理角色，不得改变Lane。",
+        model=model,
+        db=agent_db,
+        instructions=[
+            "A/B/C Lane已经由上游确定。你只在给定的同域候选Agent中选择最适合处理本轮完整诉求的一个角色，不得改变Lane。",
+            "结合当前消息与可见对话理解真实诉求，不使用关键词、正则、白名单或跨域兜底。",
+            "如果没有可信匹配，target_agent_id返回null；Agent未选中不代表Lane错误。",
+            '只输出一个JSON对象：{"target_agent_id":"候选agent_id或null","reason":"一句中文理由"}。',
+        ],
+        add_datetime_to_context=True,
+        add_history_to_context=False,
+        read_chat_history=False,
+        num_history_runs=0,
+        markdown=False,
+    )
+
+
+async def select_lane_agent(
+    message: str,
+    *,
+    lane: RuntimeLane,
+    vertical_agents: List[Dict[str, Any]],
+    user_id: str = "web-user",
+    session_id: str = "",
+    model: Any = None,
+    visible_history: Optional[List[Dict[str, str]]] = None,
+) -> Dict[str, Any]:
+    """Select an Agent after Lane resolution; selection failure never changes Lane."""
+
+    expected_scope = (
+        "property"
+        if lane == RuntimeLane.PROPERTY_GOVERNED
+        else "isolated_general"
+    )
+    catalog = [
+        item
+        for item in _semantic_agent_catalog(vertical_agents)
+        if item.get("domain_scope") == expected_scope
+    ]
+    base: Dict[str, Any] = {
+        "selected_agent_id": None,
+        "reason": "",
+        "selection_source": "unavailable",
+        "raw": "",
+        "metrics": {},
+        "provider_evidence": {},
+        "provider_status": "not_applicable",
+        "validation_error": None,
+        "candidate_count": len(catalog),
+    }
+    if lane == RuntimeLane.SAFETY_HANDOFF or not catalog:
+        base["selection_source"] = "not_required" if lane == RuntimeLane.SAFETY_HANDOFF else "no_candidate"
+        return base
+    if len(catalog) == 1:
+        base.update(
+            {
+                "selected_agent_id": str(catalog[0]["agent_id"]),
+                "reason": "该Lane内只有一个已发布Agent，直接选择。",
+                "selection_source": "single_candidate",
+            }
+        )
+        return base
+
+    history = [
+        {
+            "role": "user" if item.get("role") == "user" else "assistant",
+            "content": str(item.get("content") or ""),
+        }
+        for item in visible_history or []
+        if str(item.get("content") or "").strip()
+    ]
+    prompt_payload = {
+        "fixed_lane": lane.value,
+        "visible_conversation": history,
+        "current_user_message": message,
+        "same_domain_agent_candidates": catalog,
+    }
+    try:
+        selector = create_lane_agent_selector(model=model or MODEL)
+        response_obj = await selector.arun(
+            json.dumps(prompt_payload, ensure_ascii=False),
+            user_id=user_id,
+            session_id=session_id or f"lane-agent-selector-{id(message)}",
+            stream=False,
+        )
+        raw = str(getattr(response_obj, "content", "") or "").strip()
+        base["raw"] = raw
+        evidence = provider_evidence_from_run(response_obj)
+        base["provider_evidence"] = evidence
+        base["metrics"] = dict(evidence.get("usage") or {})
+        base["provider_status"] = "success"
+        payload = _strict_json_object(raw)
+        target = payload.get("target_agent_id")
+        valid_ids = {str(item["agent_id"]) for item in catalog}
+        if target is not None and str(target) not in valid_ids:
+            raise ValueError("selected Agent is outside the fixed Lane")
+        base.update(
+            {
+                "selected_agent_id": str(target) if target is not None else None,
+                "reason": str(payload.get("reason") or "未返回Agent选择理由。"),
+                "selection_source": "selector_model" if target is not None else "selector_no_match",
+            }
+        )
+    except Exception as exc:
+        base["validation_error"] = f"{type(exc).__name__}: {str(exc)[:240]}"
+        if base["provider_status"] != "success":
+            base["provider_status"] = "failed"
+        base["selection_source"] = "selector_failed"
+    return base
 
 
 async def _collect_response(generator) -> str:

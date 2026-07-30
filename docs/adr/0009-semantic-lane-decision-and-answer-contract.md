@@ -1,6 +1,6 @@
 # ADR-0009｜结构化语义分流与 AnswerContract
 
-- 状态：Accepted
+- 状态：Superseded by ADR-0010
 - 日期：2026-07-30
 - 适用：V1.8.2-S10-B.2-Fix2
 - 替代：ADR-0008 中基于确定性关键词 Lane 与 Lane 内 fallback 的决策方式

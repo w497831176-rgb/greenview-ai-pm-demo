@@ -8,7 +8,7 @@ import uuid
 from enum import Enum
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field
 
 
 def canonical_json(value: Any) -> str:
@@ -34,7 +34,6 @@ class RuntimeLane(str, Enum):
     SAFETY_HANDOFF = "A_SAFETY_HANDOFF"
     PROPERTY_GOVERNED = "B_PROPERTY_GOVERNED"
     ISOLATED_GENERAL = "C_ISOLATED_GENERAL"
-    CLARIFY = "CLARIFY"
 
 
 class LaneDecisionSource(str, Enum):
@@ -123,70 +122,13 @@ class RouteDecision(ImmutableModel):
 
 
 class LaneDecision(ImmutableModel):
-    """One strictly validated semantic decision made before business execution."""
+    """The Router's coarse domain decision; downstream fields cannot invalidate it."""
 
+    model_config = ConfigDict(frozen=True, extra="ignore")
     lane: RuntimeLane
-    business_intent: str = Field(min_length=1, pattern=r"^[a-z][a-z0-9_]{1,63}$")
-    reason_code: LaneReasonCode
-    reason: str = Field(min_length=1, max_length=160)
-    confidence: float = Field(ge=0.0, le=1.0)
-    requires_clarification: bool = False
-    clarification_question: Optional[str] = Field(default=None, max_length=160)
-    request_kind: RequestKind
-    allowed_domain: AllowedDomain
-    target_agent_id: Optional[str] = Field(default=None, min_length=1, max_length=120)
+    business_intent: Optional[str] = Field(default=None, max_length=160)
+    reason: Optional[str] = Field(default=None, max_length=160)
     decision_source: LaneDecisionSource = LaneDecisionSource.ROUTER_MODEL
-
-    @model_validator(mode="after")
-    def validate_lane_contract(self) -> "LaneDecision":
-        matrix = {
-            RuntimeLane.SAFETY_HANDOFF: (
-                AllowedDomain.SAFETY,
-                {RequestKind.EMERGENCY},
-                {LaneReasonCode.IMMINENT_SAFETY_RISK},
-            ),
-            RuntimeLane.PROPERTY_GOVERNED: (
-                AllowedDomain.PROPERTY,
-                {
-                    RequestKind.FACT,
-                    RequestKind.REALTIME_READ,
-                    RequestKind.STATE_CHANGE,
-                    RequestKind.UNSAFE_REQUEST,
-                },
-                {LaneReasonCode.PROPERTY_SERVICE_REQUIRED},
-            ),
-            RuntimeLane.ISOLATED_GENERAL: (
-                AllowedDomain.ISOLATED_GENERAL,
-                {RequestKind.FACT, RequestKind.GENERAL, RequestKind.UNSAFE_REQUEST},
-                {
-                    LaneReasonCode.NON_PROPERTY_GENERAL,
-                    LaneReasonCode.UNSAFE_NON_PROPERTY_REQUEST,
-                },
-            ),
-            RuntimeLane.CLARIFY: (
-                AllowedDomain.NONE,
-                {RequestKind.AMBIGUOUS},
-                {LaneReasonCode.INSUFFICIENT_CONTEXT},
-            ),
-        }
-        domain, request_kinds, reason_codes = matrix[self.lane]
-        if self.allowed_domain != domain:
-            raise ValueError("allowed_domain is inconsistent with lane")
-        if self.request_kind not in request_kinds:
-            raise ValueError("request_kind is inconsistent with lane")
-        if self.reason_code not in reason_codes:
-            raise ValueError("reason_code is inconsistent with lane")
-        if self.lane in {RuntimeLane.SAFETY_HANDOFF, RuntimeLane.CLARIFY}:
-            if self.target_agent_id is not None:
-                raise ValueError("safety and clarify lanes cannot select a business Agent")
-        elif not self.target_agent_id:
-            raise ValueError("business lanes require a target_agent_id")
-        if self.lane == RuntimeLane.CLARIFY:
-            if not self.requires_clarification or not str(self.clarification_question or "").strip():
-                raise ValueError("clarify lane requires exactly one useful question")
-        elif self.requires_clarification or self.clarification_question:
-            raise ValueError("only clarify lane may request clarification")
-        return self
 
 
 class AnswerContract(ImmutableModel):

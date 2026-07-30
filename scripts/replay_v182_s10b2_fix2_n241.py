@@ -13,9 +13,8 @@ import json
 from pathlib import Path
 from typing import Any, Dict
 
-from agents.router import _strict_json_object, _validate_semantic_target
-from app.runtime.agent_factory import vertical_agent_cards
-from app.runtime.contracts import LaneDecision, RequestKind, ResponseMode, RuntimeLane
+from agents.router import _strict_json_object
+from app.runtime.contracts import LaneDecision, ResponseMode, RuntimeLane
 from app.runtime.coordinator import _answer_contract_for
 from app.runtime.snapshot_resolver import resolve_snapshot
 from db import get_postgres_db
@@ -49,15 +48,11 @@ def replay(args: argparse.Namespace) -> Dict[str, Any]:
         raise RuntimeError("source N241 raw Provider response is unavailable")
 
     snapshot = resolve_snapshot(args.chat_session_id)
-    catalog = vertical_agent_cards(snapshot.config)
     decision = LaneDecision.model_validate(_strict_json_object(raw))
-    _validate_semantic_target(decision, catalog)
     contract = _answer_contract_for(decision)
 
     if decision.lane != RuntimeLane.ISOLATED_GENERAL:
         raise RuntimeError("N241 replay Lane is not C_ISOLATED_GENERAL")
-    if decision.request_kind != RequestKind.FACT:
-        raise RuntimeError("N241 replay request_kind is not fact")
     if contract.response_mode != ResponseMode.SAFE_GENERAL:
         raise RuntimeError("N241 replay AnswerContract is not safe_general")
     if any(
