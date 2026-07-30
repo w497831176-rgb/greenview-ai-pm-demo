@@ -9,7 +9,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from agents.router import _capability_fallback
-from app.runtime.contracts import RuntimePath, ToolEffect
+from app.runtime.contracts import AnswerContract, ResponseMode, RuntimePath, ToolEffect
 from app.runtime.coordinator import _knowledge_evidence_decision
 from app.runtime.tool_planner import plan_tools
 
@@ -167,7 +167,18 @@ def main() -> None:
     )
 
     evidence_gate = _knowledge_evidence_decision(
-        CASE_2_QUESTION,
+        AnswerContract(
+            response_mode=ResponseMode.GROUNDED_ANSWER,
+            evidence_required=True,
+            evidence_requirements=["activated_skill", "accepted_rag", "successful_tool"],
+            skill_policy="selected",
+            rag_policy="selected",
+            tool_policy="selected",
+            write_policy="forbidden",
+            handoff_policy="optional",
+            forbidden_claims=["unsupported_property_fact"],
+            decision_reason="物业事实回答必须由当次运行的合法Evidence支撑。",
+        ),
         evidence_count=0,
         structured_realtime_query=False,
         allowed_document_ids={1},

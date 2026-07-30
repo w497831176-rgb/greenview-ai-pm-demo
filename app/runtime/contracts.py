@@ -8,7 +8,7 @@ import uuid
 from enum import Enum
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 def canonical_json(value: Any) -> str:
@@ -34,13 +34,47 @@ class RuntimeLane(str, Enum):
     SAFETY_HANDOFF = "A_SAFETY_HANDOFF"
     PROPERTY_GOVERNED = "B_PROPERTY_GOVERNED"
     ISOLATED_GENERAL = "C_ISOLATED_GENERAL"
+    CLARIFY = "CLARIFY"
 
 
 class LaneDecisionSource(str, Enum):
-    SAFETY_POLICY = "safety_policy"
-    DETERMINISTIC_RULE = "deterministic_rule"
     ROUTER_MODEL = "router_model"
-    FALLBACK = "fallback"
+    STRUCTURED_STATE = "structured_state"
+
+
+class LaneReasonCode(str, Enum):
+    IMMINENT_SAFETY_RISK = "imminent_safety_risk"
+    PROPERTY_SERVICE_REQUIRED = "property_service_required"
+    NON_PROPERTY_GENERAL = "non_property_general"
+    UNSAFE_NON_PROPERTY_REQUEST = "unsafe_non_property_request"
+    INSUFFICIENT_CONTEXT = "insufficient_context"
+
+
+class RequestKind(str, Enum):
+    EMERGENCY = "emergency"
+    FACT = "fact"
+    REALTIME_READ = "realtime_read"
+    STATE_CHANGE = "state_change"
+    GENERAL = "general"
+    UNSAFE_REQUEST = "unsafe_request"
+    AMBIGUOUS = "ambiguous"
+
+
+class AllowedDomain(str, Enum):
+    SAFETY = "safety"
+    PROPERTY = "property"
+    ISOLATED_GENERAL = "isolated_general"
+    NONE = "none"
+
+
+class ResponseMode(str, Enum):
+    EMERGENCY_HANDOFF = "emergency_handoff"
+    CLARIFY_ONLY = "clarify_only"
+    GROUNDED_ANSWER = "grounded_answer"
+    REALTIME_READ = "realtime_read"
+    CONTROLLED_WRITE = "controlled_write"
+    SAFE_GENERAL = "safe_general"
+    SAFE_REFUSAL = "safe_refusal"
 
 
 class RunStatus(str, Enum):
@@ -89,18 +123,80 @@ class RouteDecision(ImmutableModel):
 
 
 class LaneDecision(ImmutableModel):
-    """Control-plane decision made before any business Agent is selectable."""
+    """One strictly validated semantic decision made before business execution."""
 
     lane: RuntimeLane
-    reason_code: str = Field(min_length=1)
-    business_intent: str = Field(min_length=1)
+    business_intent: str = Field(min_length=1, pattern=r"^[a-z][a-z0-9_]{1,63}$")
+    reason_code: LaneReasonCode
+    reason: str = Field(min_length=1, max_length=160)
     confidence: float = Field(ge=0.0, le=1.0)
-    needs_clarification: bool = False
-    decision_source: LaneDecisionSource
-    matched_signals: List[str] = Field(default_factory=list)
-    allowed_domain_scopes: List[Literal["property", "isolated_general"]] = Field(
-        default_factory=list
-    )
+    requires_clarification: bool = False
+    clarification_question: Optional[str] = Field(default=None, max_length=160)
+    request_kind: RequestKind
+    allowed_domain: AllowedDomain
+    target_agent_id: Optional[str] = Field(default=None, min_length=1, max_length=120)
+    decision_source: LaneDecisionSource = LaneDecisionSource.ROUTER_MODEL
+
+    @model_validator(mode="after")
+    def validate_lane_contract(self) -> "LaneDecision":
+        matrix = {
+            RuntimeLane.SAFETY_HANDOFF: (
+                AllowedDomain.SAFETY,
+                {RequestKind.EMERGENCY},
+                {LaneReasonCode.IMMINENT_SAFETY_RISK},
+            ),
+            RuntimeLane.PROPERTY_GOVERNED: (
+                AllowedDomain.PROPERTY,
+                {RequestKind.FACT, RequestKind.REALTIME_READ, RequestKind.STATE_CHANGE},
+                {LaneReasonCode.PROPERTY_SERVICE_REQUIRED},
+            ),
+            RuntimeLane.ISOLATED_GENERAL: (
+                AllowedDomain.ISOLATED_GENERAL,
+                {RequestKind.GENERAL, RequestKind.UNSAFE_REQUEST},
+                {
+                    LaneReasonCode.NON_PROPERTY_GENERAL,
+                    LaneReasonCode.UNSAFE_NON_PROPERTY_REQUEST,
+                },
+            ),
+            RuntimeLane.CLARIFY: (
+                AllowedDomain.NONE,
+                {RequestKind.AMBIGUOUS},
+                {LaneReasonCode.INSUFFICIENT_CONTEXT},
+            ),
+        }
+        domain, request_kinds, reason_codes = matrix[self.lane]
+        if self.allowed_domain != domain:
+            raise ValueError("allowed_domain is inconsistent with lane")
+        if self.request_kind not in request_kinds:
+            raise ValueError("request_kind is inconsistent with lane")
+        if self.reason_code not in reason_codes:
+            raise ValueError("reason_code is inconsistent with lane")
+        if self.lane in {RuntimeLane.SAFETY_HANDOFF, RuntimeLane.CLARIFY}:
+            if self.target_agent_id is not None:
+                raise ValueError("safety and clarify lanes cannot select a business Agent")
+        elif not self.target_agent_id:
+            raise ValueError("business lanes require a target_agent_id")
+        if self.lane == RuntimeLane.CLARIFY:
+            if not self.requires_clarification or not str(self.clarification_question or "").strip():
+                raise ValueError("clarify lane requires exactly one useful question")
+        elif self.requires_clarification or self.clarification_question:
+            raise ValueError("only clarify lane may request clarification")
+        return self
+
+
+class AnswerContract(ImmutableModel):
+    """Deterministic response and evidence boundary derived from LaneDecision."""
+
+    response_mode: ResponseMode
+    evidence_required: bool
+    evidence_requirements: List[str] = Field(default_factory=list)
+    skill_policy: Literal["selected", "skipped"]
+    rag_policy: Literal["selected", "skipped"]
+    tool_policy: Literal["selected", "skipped"]
+    write_policy: Literal["allowed_after_confirmation", "forbidden"]
+    handoff_policy: Literal["required", "optional", "skipped"]
+    forbidden_claims: List[str] = Field(default_factory=list)
+    decision_reason: str = Field(min_length=1, max_length=240)
 
 
 class SkillCapabilityDecision(ImmutableModel):
@@ -331,6 +427,7 @@ class RunState(BaseModel):
     snapshot_id: str
     path: RuntimePath
     lane_decision: Optional[LaneDecision] = None
+    answer_contract: Optional[AnswerContract] = None
     route_decision: Optional[RouteDecision] = None
     capability_decision: Optional[CapabilityDecision] = None
     selected_agent: Optional[Dict[str, Any]] = None
@@ -354,6 +451,7 @@ class RunEvidenceLedger(BaseModel):
     session_id: str
     config_snapshot: Dict[str, Any]
     lane_decision: Optional[Dict[str, Any]] = None
+    answer_contract: Optional[Dict[str, Any]] = None
     route_decision: Optional[Dict[str, Any]] = None
     capability_decision: Optional[Dict[str, Any]] = None
     activated_skills: List[Dict[str, Any]] = Field(default_factory=list)

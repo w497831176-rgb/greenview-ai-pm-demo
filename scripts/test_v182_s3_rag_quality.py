@@ -11,14 +11,28 @@ from app.runtime.citation_renderer import (
     prompt_evidence_allowlist,
     render_citations,
 )
-from app.runtime.contracts import EvidenceItem, EvidenceSet
+from app.runtime.contracts import AnswerContract, EvidenceItem, EvidenceSet, ResponseMode
 from app.runtime.coordinator import (
     KNOWLEDGE_INSUFFICIENT_RESPONSE,
     _knowledge_evidence_decision,
-    _requires_direct_knowledge_evidence,
     _results_from_snapshot,
     _static_response_stream,
 )
+
+
+def _grounded_answer_contract():
+    return AnswerContract(
+        response_mode=ResponseMode.GROUNDED_ANSWER,
+        evidence_required=True,
+        evidence_requirements=["activated_skill", "accepted_rag", "successful_tool"],
+        skill_policy="selected",
+        rag_policy="selected",
+        tool_policy="selected",
+        write_policy="forbidden",
+        handoff_policy="optional",
+        forbidden_claims=["unsupported_property_fact"],
+        decision_reason="物业事实回答必须由当次运行的合法Evidence支撑。",
+    )
 
 
 def _result(doc_id, chunk_index, content, score=0.8, title="物业维修服务承诺"):
@@ -284,7 +298,7 @@ def test_unknown_service_is_blocked_without_bound_knowledge():
         "是否支持无人机上门维修？",
     ):
         decision = _knowledge_evidence_decision(
-            question,
+            _grounded_answer_contract(),
             evidence_count=0,
             structured_realtime_query=False,
             allowed_document_ids=set(),
@@ -299,7 +313,7 @@ def test_unknown_service_is_blocked_without_bound_knowledge():
 
 def test_supported_service_knowledge_allows_model_answer():
     decision = _knowledge_evidence_decision(
-        "小区是否提供预约上门维修服务？",
+        _grounded_answer_contract(),
         evidence_count=1,
         structured_realtime_query=False,
         allowed_document_ids={1},
@@ -412,7 +426,7 @@ def test_calculation_input_does_not_weaken_policy_value_citations():
 
 
 def test_knowledge_gate_contract_and_static_response():
-    assert _requires_direct_knowledge_evidence("维修期间是否免费安排酒店？")
+    assert _grounded_answer_contract().evidence_required
     assert KNOWLEDGE_INSUFFICIENT_RESPONSE.startswith("当前知识依据不足")
 
     async def consume():

@@ -61,6 +61,11 @@ class EvidenceLedger:
             self.contract.lane_decision = lane_payload
         else:
             self.contract.lane_decision = None
+        self.contract.answer_contract = (
+            state.answer_contract.model_dump(mode="json")
+            if state.answer_contract
+            else None
+        )
         self.contract.route_decision = (
             state.route_decision.model_dump(mode="json")
             if state.route_decision

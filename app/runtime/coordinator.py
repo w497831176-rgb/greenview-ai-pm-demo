@@ -10,7 +10,6 @@ import uuid
 from types import SimpleNamespace
 from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 
-from app.handoff_policy import evaluate_handoff_policy
 from app.runtime.agent_factory import build_agent_from_snapshot, vertical_agent_cards
 from app.runtime.badcase_capture import capture_runtime_badcase
 from app.runtime.citation_renderer import (
@@ -22,10 +21,13 @@ from app.runtime.citation_renderer import (
 from app.runtime.contracts import (
     ActionProposal,
     ActionReceipt,
+    AnswerContract,
     ApprovalEvent,
     CapabilityDecision,
     LaneDecision,
     LaneDecisionSource,
+    RequestKind,
+    ResponseMode,
     RiskLevel,
     RouteDecision,
     RunState,
@@ -91,101 +93,6 @@ PROVIDER_FAILURE_MARKERS = (
 )
 PROVIDER_FAILURE_PUBLIC_MESSAGE = "模型服务暂时不可用，请稍后重试或检查模型账户状态。"
 RUNTIME_FAILURE_PUBLIC_MESSAGE = "系统暂时无法完成本次请求，请稍后重试；如问题持续，可选择转人工核实。"
-STRUCTURED_WORKORDER_TOOLS = {
-    "get_my_work_order_by_id",
-    "get_my_recent_work_orders",
-    "count_my_open_work_orders",
-    "count_work_orders",
-}
-KNOWLEDGE_EVIDENCE_TERMS = (
-    "规定",
-    "制度",
-    "流程",
-    "时效",
-    "承诺",
-    "标准",
-    "依据",
-    "引用",
-    "允许",
-    "收费",
-)
-KNOWLEDGE_GOVERNED_TERMS = (
-    "规定",
-    "制度",
-    "流程",
-    "时效",
-    "响应",
-    "承诺",
-    "标准",
-    "依据",
-    "引用",
-    "收费",
-    "免费",
-    "费用",
-    "价格",
-    "多少钱",
-    "物业费",
-    "停车费",
-    "权限",
-    "允许",
-    "禁止",
-    "不得",
-    "必须",
-    "责任",
-    "安全",
-    "维修",
-    "保修",
-    "到场",
-    "上门",
-    "多久",
-    "多长时间",
-    "几分钟",
-    "几小时",
-)
-PROPERTY_BUSINESS_TERMS = (
-    "物业",
-    "小区",
-    "业主",
-    "管理处",
-    "报修",
-    "维修",
-    "工单",
-    "物业费",
-    "停车费",
-    "门禁",
-    "电梯",
-    "燃气",
-    "漏水",
-    "搬家服务",
-    "保洁服务",
-    "宠物托管",
-    "服务中心",
-    "公共区域",
-)
-ISOLATED_GENERAL_MARKERS = (
-    "通用",
-    "闲聊",
-    "物业场景无关",
-    "奇奇怪怪",
-    "乱七八糟",
-)
-EXTERNAL_HIGH_RISK_PATTERNS = (
-    re.compile(r"(?:胸口很痛|胸痛|心口痛)(?:.{0,8}(?:呼吸困难|喘不上气))?"),
-    re.compile(r"(?:大量出血|昏迷不醒|失去意识)"),
-    re.compile(r"(?:想轻生|要自杀|准备自杀)"),
-    re.compile(r"(?:有人持刀|正在行凶|入室抢劫|正在打人)"),
-)
-KNOWLEDGE_SERVICE_FACT_PATTERNS = (
-    re.compile(
-        r"(?:小区|物业).{0,16}"
-        r"(?:有没有|有无|是否(?:有|提供|支持|办理)|提供|支持).{0,24}"
-        r"(?:服务|维修|办理|安排)"
-    ),
-    re.compile(
-        r"(?:有没有|有无|是否(?:有|提供|支持)|支不支持|能否).{0,24}"
-        r"(?:服务|维修|办理|安排)"
-    ),
-)
 KNOWLEDGE_INSUFFICIENT_RESPONSE = (
     "当前知识依据不足，无法确认具体结论。我不能将“未检索到”表述为"
     "“文档没有规定”，也不会补充知识库之外的行业经验、时间范围或处理步骤。"
@@ -208,24 +115,6 @@ class ProviderFailureError(RuntimeError):
 
 class InternalControlPayloadLeakError(RuntimeError):
     """A control-plane JSON payload reached the user-answer boundary."""
-
-
-GENERAL_CREATIVE_PATTERNS = (
-    re.compile(r"(?:写|编|创作).{0,12}(?:故事|诗|段子|歌词)"),
-    re.compile(r"(?:讲个故事|作诗)"),
-)
-GENERAL_KNOWLEDGE_PATTERNS = (
-    re.compile(r"(?:奇门遁甲|起运|占卜|八字|风水)"),
-    re.compile(r"(?:量子纠缠|相对论|科普|为什么能飞|解释.{0,12}(?:原理|理论))"),
-)
-DIGITAL_LOSS_PATTERNS = (
-    re.compile(r"(?:游戏|社交|邮箱|平台).{0,6}(?:账号|帐号).{0,8}(?:丢|找不到|不见)"),
-    re.compile(r"(?:电脑|手机|云盘).{0,6}(?:文件|数据).{0,8}(?:丢|找不到|不见|删除)"),
-)
-PHYSICAL_LOSS_PATTERNS = (
-    re.compile(r"(?:不见了|找不到了|丢了|遗失|落在|掉在|捡到)"),
-    re.compile(r"(?:找不到|不见).{0,8}(?:怎么办|怎么处理)"),
-)
 
 
 def _json(value: Any) -> str:
@@ -259,20 +148,15 @@ def _provider_failure_prefix(text: str) -> bool:
 
 
 def _is_structured_realtime_query(
-    message: str,
+    answer_contract: AnswerContract,
     read_tool_plans: List[Any],
 ) -> bool:
-    """Identify a Tool-only realtime query without building a generic planner."""
+    """A realtime read is declared by the semantic contract, not message words."""
 
-    has_workorder_tool = any(
-        str(getattr(plan, "server_name", "")) == "workorder-server"
-        and str(getattr(plan, "tool_name", "")) in STRUCTURED_WORKORDER_TOOLS
-        for plan in read_tool_plans
+    return (
+        answer_contract.response_mode == ResponseMode.REALTIME_READ
+        and bool(read_tool_plans)
     )
-    needs_knowledge = any(
-        term in str(message or "") for term in KNOWLEDGE_EVIDENCE_TERMS
-    )
-    return has_workorder_tool and not needs_knowledge
 
 
 def _decision(status: str, reason: str, **details: Any) -> Dict[str, Any]:
@@ -370,156 +254,13 @@ def _claims_business_success(text: str) -> bool:
     )
 
 
-def _requires_rag_citations(message: str) -> bool:
-    compact = re.sub(r"\s+", "", message or "")
-    return any(
-        marker in compact
-        for marker in (
-            "可点击引用",
-            "给出引用",
-            "标注引用",
-            "知识库引用",
-            "依据《",
-            "根据《",
-            "根据手册",
-            "根据知识库",
-        )
-    )
-
-
-def _requires_direct_knowledge_evidence(message: str) -> bool:
-    compact = re.sub(r"\s+", "", message or "")
-    return _is_property_business_query(compact) and (
-        any(marker in compact for marker in KNOWLEDGE_GOVERNED_TERMS) or any(
-            pattern.search(compact) for pattern in KNOWLEDGE_SERVICE_FACT_PATTERNS
-        )
-    )
-
-
-def _is_property_business_query(message: str) -> bool:
-    compact = re.sub(r"\s+", "", message or "")
-    return any(term in compact for term in PROPERTY_BUSINESS_TERMS) or any(
-        pattern.search(compact) for pattern in KNOWLEDGE_SERVICE_FACT_PATTERNS
-    )
-
-
-def _decide_lane(message: str) -> LaneDecision:
-    """Choose one execution lane before any business Agent is selectable."""
-
-    compact = re.sub(r"\s+", "", str(message or "")).lower()
-    handoff = evaluate_handoff_policy(message)
-    if handoff.get("reason_code") == "safety_risk":
-        return LaneDecision(
-            lane=RuntimeLane.SAFETY_HANDOFF,
-            reason_code="safety_risk",
-            business_intent="safety_risk",
-            confidence=1.0,
-            needs_clarification=False,
-            decision_source=LaneDecisionSource.SAFETY_POLICY,
-            matched_signals=list(handoff.get("matched_signals") or []),
-            allowed_domain_scopes=[],
-        )
-
-    digital_match = next(
-        (pattern.pattern for pattern in DIGITAL_LOSS_PATTERNS if pattern.search(compact)),
-        None,
-    )
-    if digital_match:
-        return LaneDecision(
-            lane=RuntimeLane.ISOLATED_GENERAL,
-            reason_code="explicit_non_property_digital_task",
-            business_intent="digital_help",
-            confidence=0.98,
-            decision_source=LaneDecisionSource.DETERMINISTIC_RULE,
-            matched_signals=[digital_match],
-            allowed_domain_scopes=["isolated_general"],
-        )
-
-    property_signals = [term for term in PROPERTY_BUSINESS_TERMS if term in compact]
-    if property_signals:
-        if any(term in compact for term in ("工单", "报修", "维修", "漏水", "灯坏")):
-            intent = "maintenance_service"
-        elif any(term in compact for term in ("物业费", "停车费", "缴费", "账单")):
-            intent = "property_billing"
-        else:
-            intent = "property_service"
-        return LaneDecision(
-            lane=RuntimeLane.PROPERTY_GOVERNED,
-            reason_code="explicit_property_signal",
-            business_intent=intent,
-            confidence=0.99,
-            decision_source=LaneDecisionSource.DETERMINISTIC_RULE,
-            matched_signals=property_signals,
-            allowed_domain_scopes=["property"],
-        )
-
-    loss_match = next(
-        (pattern.pattern for pattern in PHYSICAL_LOSS_PATTERNS if pattern.search(compact)),
-        None,
-    )
-    if loss_match:
-        return LaneDecision(
-            lane=RuntimeLane.PROPERTY_GOVERNED,
-            reason_code="possible_physical_lost_and_found",
-            business_intent="lost_and_found",
-            confidence=0.82,
-            needs_clarification=True,
-            decision_source=LaneDecisionSource.DETERMINISTIC_RULE,
-            matched_signals=[loss_match],
-            allowed_domain_scopes=["property"],
-        )
-
-    general_match = next(
-        (
-            pattern.pattern
-            for pattern in (*GENERAL_CREATIVE_PATTERNS, *GENERAL_KNOWLEDGE_PATTERNS)
-            if pattern.search(compact)
-        ),
-        None,
-    )
-    if general_match:
-        return LaneDecision(
-            lane=RuntimeLane.ISOLATED_GENERAL,
-            reason_code="explicit_non_property_general_task",
-            business_intent="general_low_risk",
-            confidence=0.97,
-            decision_source=LaneDecisionSource.DETERMINISTIC_RULE,
-            matched_signals=[general_match],
-            allowed_domain_scopes=["isolated_general"],
-        )
-
-    return LaneDecision(
-        lane=RuntimeLane.PROPERTY_GOVERNED,
-        reason_code="unknown_scope_clarify_in_property_lane",
-        business_intent="property_scope_clarification",
-        confidence=0.55,
-        needs_clarification=True,
-        decision_source=LaneDecisionSource.FALLBACK,
-        matched_signals=[],
-        allowed_domain_scopes=["property"],
-    )
-
-
 def _lane_candidates(
     cards: List[Dict[str, Any]], lane: RuntimeLane
 ) -> List[Dict[str, Any]]:
-    if lane == RuntimeLane.SAFETY_HANDOFF:
+    if lane in {RuntimeLane.SAFETY_HANDOFF, RuntimeLane.CLARIFY}:
         return []
     scope = "property" if lane == RuntimeLane.PROPERTY_GOVERNED else "isolated_general"
     return [card for card in cards if _agent_domain_scope(card) == scope]
-
-
-def _lane_fallback_agent(
-    cards: List[Dict[str, Any]], lane: RuntimeLane
-) -> Optional[Dict[str, Any]]:
-    if lane == RuntimeLane.PROPERTY_GOVERNED:
-        return next(
-            (card for card in cards if str(card.get("agent_id")) == "customer_service"),
-            cards[0] if cards else None,
-        )
-    if lane == RuntimeLane.ISOLATED_GENERAL:
-        return _isolated_general_fallback(cards)
-    return None
 
 
 def _visible_chat_history(
@@ -586,7 +327,9 @@ def _is_internal_control_payload(text: str) -> bool:
         "lane",
         "reason_code",
         "business_intent",
-        "allowed_domain_scopes",
+        "allowed_domain",
+        "response_mode",
+        "evidence_required",
     }
     return bool(control_keys.intersection(payload))
 
@@ -596,10 +339,11 @@ def _lane_explanation(decision: LaneDecision) -> str:
         RuntimeLane.SAFETY_HANDOFF: "安全人工协同",
         RuntimeLane.PROPERTY_GOVERNED: "物业受控回答",
         RuntimeLane.ISOLATED_GENERAL: "隔离通用回答",
+        RuntimeLane.CLARIFY: "需要澄清",
     }
     return (
         f"进入{labels[decision.lane]}路径；识别任务为"
-        f"{decision.business_intent}，原因为{decision.reason_code}。"
+        f"{decision.business_intent}。{decision.reason}"
     )
 
 
@@ -608,31 +352,8 @@ def _agent_domain_scope(agent: Optional[Dict[str, Any]]) -> str:
     return value if value in {"property", "isolated_general"} else "property"
 
 
-def _isolated_general_fallback(cards: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    """Choose only a configuration-declared general fallback, never a sentence patch."""
-
-    for card in cards:
-        if _agent_domain_scope(card) != "isolated_general":
-            continue
-        searchable = " ".join(
-            [
-                str(card.get("name") or ""),
-                str(card.get("description") or ""),
-                str((card.get("capability_card") or {}).get("service_scope") or ""),
-            ]
-        )
-        if any(marker in searchable for marker in ISOLATED_GENERAL_MARKERS):
-            return card
-    return None
-
-
-def _external_high_risk(message: str) -> bool:
-    compact = re.sub(r"\s+", "", message or "")
-    return any(pattern.search(compact) for pattern in EXTERNAL_HIGH_RISK_PATTERNS)
-
-
 def _knowledge_evidence_decision(
-    message: str,
+    answer_contract: AnswerContract,
     evidence_count: int,
     structured_realtime_query: bool,
     allowed_document_ids: Optional[set[int]] = None,
@@ -647,12 +368,11 @@ def _knowledge_evidence_decision(
     skill_count = max(0, int(skill_evidence_count or 0))
     tool_count = max(0, int(tool_evidence_count or 0))
     accepted_count = count + skill_count + tool_count
-    required = bool(
-        domain_scope == "property"
-        and not structured_realtime_query
-        and _requires_direct_knowledge_evidence(message)
-    )
-    blocked = bool(required and accepted_count == 0)
+    required = bool(answer_contract.evidence_required)
+    if answer_contract.response_mode == ResponseMode.REALTIME_READ:
+        blocked = bool(required and tool_count == 0)
+    else:
+        blocked = bool(required and accepted_count == 0)
     return {
         "required": required,
         "blocked": blocked,
@@ -678,6 +398,95 @@ def _knowledge_evidence_decision(
         ),
         "model_invoked": not blocked,
     }
+
+
+def _answer_contract_for(decision: LaneDecision) -> AnswerContract:
+    """Compile deterministic execution permissions from validated semantics."""
+
+    common_forbidden = [
+        "unsupported_property_fact",
+        "unverified_execution_success",
+        "internal_control_payload",
+    ]
+    if decision.lane == RuntimeLane.SAFETY_HANDOFF:
+        return AnswerContract(
+            response_mode=ResponseMode.EMERGENCY_HANDOFF,
+            evidence_required=False,
+            skill_policy="skipped",
+            rag_policy="skipped",
+            tool_policy="skipped",
+            write_policy="forbidden",
+            handoff_policy="required",
+            forbidden_claims=common_forbidden,
+            decision_reason="现实安全风险优先，语义判断后立即发起安全人工协同。",
+        )
+    if decision.lane == RuntimeLane.CLARIFY:
+        return AnswerContract(
+            response_mode=ResponseMode.CLARIFY_ONLY,
+            evidence_required=False,
+            skill_policy="skipped",
+            rag_policy="skipped",
+            tool_policy="skipped",
+            write_policy="forbidden",
+            handoff_policy="skipped",
+            forbidden_claims=common_forbidden + ["property_process_or_capability"],
+            decision_reason="关键信息不足，只提出一个能够决定下一步的问题。",
+        )
+    if decision.lane == RuntimeLane.ISOLATED_GENERAL:
+        unsafe = decision.request_kind == RequestKind.UNSAFE_REQUEST
+        return AnswerContract(
+            response_mode=(ResponseMode.SAFE_REFUSAL if unsafe else ResponseMode.SAFE_GENERAL),
+            evidence_required=False,
+            skill_policy="skipped",
+            rag_policy="skipped",
+            tool_policy="skipped",
+            write_policy="forbidden",
+            handoff_policy="skipped",
+            forbidden_claims=common_forbidden + (["harmful_instructions"] if unsafe else ["property_official_fact"]),
+            decision_reason=(
+                "非物业危险请求只做安全拒绝。"
+                if unsafe
+                else "低风险非物业请求由隔离通用Agent回答，物业能力全部跳过。"
+            ),
+        )
+    if decision.request_kind == RequestKind.REALTIME_READ:
+        return AnswerContract(
+            response_mode=ResponseMode.REALTIME_READ,
+            evidence_required=True,
+            evidence_requirements=["successful_current_tool_result"],
+            skill_policy="skipped",
+            rag_policy="skipped",
+            tool_policy="selected",
+            write_policy="forbidden",
+            handoff_policy="optional",
+            forbidden_claims=common_forbidden + ["realtime_value_without_successful_tool"],
+            decision_reason="实时物业事实只能来自本轮成功Tool结果。",
+        )
+    if decision.request_kind == RequestKind.STATE_CHANGE:
+        return AnswerContract(
+            response_mode=ResponseMode.CONTROLLED_WRITE,
+            evidence_required=True,
+            evidence_requirements=["proposal", "permission", "owner_confirmation", "receipt"],
+            skill_policy="skipped",
+            rag_policy="skipped",
+            tool_policy="selected",
+            write_policy="allowed_after_confirmation",
+            handoff_policy="optional",
+            forbidden_claims=common_forbidden + ["write_success_without_receipt"],
+            decision_reason="状态变更必须经过Proposal、权限、确认、ActionGateway和Receipt。",
+        )
+    return AnswerContract(
+        response_mode=ResponseMode.GROUNDED_ANSWER,
+        evidence_required=True,
+        evidence_requirements=["activated_skill_or_adopted_rag_or_successful_tool"],
+        skill_policy="selected",
+        rag_policy="selected",
+        tool_policy="skipped",
+        write_policy="forbidden",
+        handoff_policy="optional",
+        forbidden_claims=common_forbidden + ["property_process_or_timing_without_evidence"],
+        decision_reason="物业事实必须由当次合法Skill、采用的RAG或成功Tool支撑。",
+    )
 
 
 def _append_runtime_evidence_summary(
@@ -998,27 +807,54 @@ class RuntimeCoordinator:
             },
         )
         try:
-            pre_handoff_policy = evaluate_handoff_policy(message)
-            if (
-                pre_handoff_policy.get("reason_code") == "safety_risk"
-                or not pre_handoff_policy.get("should_request_handoff")
-            ):
-                state.lane_decision = _decide_lane(message)
-                lane_payload = state.lane_decision.model_dump(mode="json")
-                lane_explanation = _lane_explanation(state.lane_decision)
-                lane_payload["explanation"] = lane_explanation
-                ledger.set("lane_decision", lane_payload)
-                record_trace_event(
-                    trace_id,
-                    "lane_decision",
-                    "success",
-                    output_summary=lane_explanation,
-                    metadata=lane_payload,
-                )
-                yield _sse("lane", {"trace_id": trace_id, **lane_payload})
+            await self._resolve_semantic_lane(
+                message,
+                session_id,
+                user_id,
+                trace_id,
+                snapshot,
+                state,
+                ledger,
+            )
+            lane_payload = state.lane_decision.model_dump(mode="json")
+            lane_payload["explanation"] = _lane_explanation(state.lane_decision)
+            yield _sse(
+                "lane",
+                {
+                    "trace_id": trace_id,
+                    **lane_payload,
+                    "answer_contract": state.answer_contract.model_dump(mode="json"),
+                },
+            )
+
+            if state.lane_decision.lane == RuntimeLane.SAFETY_HANDOFF:
+                async for event in self._stream_semantic_safety_handoff(
+                    message, session_id, trace_id, snapshot, state, ledger, started
+                ):
+                    yield event
+                return
+
+            if state.answer_contract.response_mode in {
+                ResponseMode.CLARIFY_ONLY,
+                ResponseMode.SAFE_REFUSAL,
+            }:
+                async for event in self._stream_contract_static_answer(
+                    session_id, trace_id, snapshot, state, ledger, started
+                ):
+                    yield event
+                return
+
+            if state.answer_contract.response_mode == ResponseMode.CONTROLLED_WRITE:
+                path = RuntimePath.CONTROLLED_ACTION
+                state.path = path
+                ledger.runtime_path = path.value
 
             handoff = await self._maybe_handoff(
-                message, session_id, trace_id, snapshot.release_id
+                message,
+                session_id,
+                trace_id,
+                snapshot.release_id,
+                decision=state.lane_decision,
             )
             if handoff:
                 reply, handoff_state, handoff_policy = handoff
@@ -1120,6 +956,7 @@ class RuntimeCoordinator:
                         "capability_decision": state.capability_decision.model_dump(
                             mode="json"
                         ),
+                        "answer_contract": state.answer_contract.model_dump(mode="json"),
                         "decision_summary": decision_summary,
                         "release_id": snapshot.release_id,
                         "snapshot_id": snapshot.snapshot_id,
@@ -1129,16 +966,6 @@ class RuntimeCoordinator:
                 return
 
             if path == RuntimePath.CONTROLLED_ACTION:
-                if state.lane_decision is None:
-                    state.lane_decision = LaneDecision(
-                        lane=RuntimeLane.PROPERTY_GOVERNED,
-                        reason_code="controlled_action_context",
-                        business_intent="controlled_property_action",
-                        confidence=1.0,
-                        decision_source=LaneDecisionSource.DETERMINISTIC_RULE,
-                        matched_signals=["controlled_action"],
-                        allowed_domain_scopes=["property"],
-                    )
                 state.capability_decision = CapabilityDecision(
                     selected_agent_id=None,
                     skill={"status": "skipped", "reason_code": "controlled_action"},
@@ -1269,21 +1096,373 @@ class RuntimeCoordinator:
         message: str,
         snapshot_config: Dict[str, Any],
     ) -> RuntimePath:
-        if (
-            get_pending_action_proposal(session_id)
-            or RuntimeCoordinator._is_work_order_action_context(
-                session_id,
-                message,
-            )
-            or RuntimeCoordinator._latest_committed_dynamic_action(
-                session_id,
-                message,
-            )
-        ):
+        # Persisted state may continue deterministically. New natural-language
+        # requests are not promoted to a write path by words or regexes here;
+        # the semantic LaneDecision/AnswerContract owns that decision.
+        if get_pending_action_proposal(session_id) or get_work_order_draft(session_id):
             return RuntimePath.CONTROLLED_ACTION
-        if RuntimeCoordinator._match_write_tool(snapshot_config, message):
+        if RuntimeCoordinator._latest_committed_dynamic_action(session_id, message):
             return RuntimePath.CONTROLLED_ACTION
         return RuntimePath.CONSULTATION
+
+    async def _resolve_semantic_lane(
+        self,
+        message: str,
+        session_id: str,
+        user_id: str,
+        trace_id: str,
+        snapshot: Any,
+        state: RunState,
+        ledger: EvidenceLedger,
+    ) -> None:
+        """Resolve one strict semantic decision and account for its Provider call."""
+
+        cards = vertical_agent_cards(snapshot.config)
+        if state.path == RuntimePath.CONTROLLED_ACTION:
+            pending = get_pending_action_proposal(session_id) or {}
+            payload = pending.get("payload") or {}
+            requested_agent_id = str(payload.get("agent_id") or "")
+            property_cards = _lane_candidates(cards, RuntimeLane.PROPERTY_GOVERNED)
+            selected_card = next(
+                (item for item in property_cards if str(item.get("agent_id")) == requested_agent_id),
+                None,
+            )
+            if selected_card is None:
+                selected_card = next(
+                    (item for item in property_cards if str(item.get("agent_id")) == "maintenance"),
+                    property_cards[0] if property_cards else None,
+                )
+            if selected_card is None:
+                raise RuntimeError("structured action state has no Published property Agent")
+            state.lane_decision = LaneDecision(
+                lane=RuntimeLane.PROPERTY_GOVERNED,
+                business_intent="continue_controlled_action",
+                reason_code="property_service_required",
+                reason="会话中存在未完成的受控业务状态，继续原状态机。",
+                confidence=1.0,
+                request_kind=RequestKind.STATE_CHANGE,
+                allowed_domain="property",
+                target_agent_id=str(selected_card.get("agent_id")),
+                decision_source=LaneDecisionSource.STRUCTURED_STATE,
+            )
+        else:
+            from agents.router import classify_lane_decision
+
+            router_config = next(
+                (
+                    item
+                    for item in snapshot.config.get("agents") or []
+                    if item.get("agent_id") == "router"
+                    or item.get("category") in {"router", "orchestration"}
+                ),
+                {},
+            )
+            default_model = (snapshot.config.get("model_policy") or {}).get("default") or {}
+            router_model_id = str(
+                router_config.get("model_id")
+                or default_model.get("model_id")
+                or MODEL_ID
+            )
+            if router_model_id.lower() != "deepseek-v4-flash":
+                raise RuntimeError("semantic Router must use deepseek-v4-flash")
+            visible_history = _visible_chat_history(
+                session_id,
+                current_trace_id=trace_id,
+                rounds=5,
+            )
+            router_started = time.time()
+            result = await classify_lane_decision(
+                message,
+                vertical_agents=cards,
+                user_id=user_id,
+                session_id=f"{session_id}::semantic_router::{trace_id}",
+                model=_build_model_from_snapshot(snapshot.config, router_model_id),
+                visible_history=visible_history,
+            )
+            evidence = result.get("provider_evidence") or {}
+            usage = evidence.get("usage") or result.get("metrics") or {}
+            response_model = evidence.get("provider_response_model")
+            provider_status = str(result.get("provider_status") or "failed")
+            billing_model = response_model or router_model_id
+            thinking = _thinking_for_snapshot(snapshot.config, router_model_id)
+            cost = build_cost_entry(
+                stage="router",
+                provider=_model_provider(snapshot.config, router_model_id),
+                requested_model=router_model_id,
+                response_model=None,
+                provider_response_model=response_model,
+                thinking_enabled=thinking,
+                model_policy_version=str(
+                    (snapshot.config.get("model_policy") or {}).get("version") or "v1.8"
+                ),
+                provider_usage=usage if usage else None,
+                price_row=_price_for_snapshot(snapshot.config, billing_model),
+                local_estimate_tokens=_estimate_tokens(message),
+                provider_succeeded=provider_status == "success",
+            )
+            state.cost_entries.append(cost)
+            state.model_calls.append(
+                {
+                    "stage": "router",
+                    "model_id": router_model_id,
+                    "requested_model": router_model_id,
+                    "provider_response_model": response_model,
+                    "provider_request_id": evidence.get("provider_request_id"),
+                    "thinking_enabled": thinking,
+                    "latency_ms": int((time.time() - router_started) * 1000),
+                    "usage": usage,
+                    "usage_source": cost.usage_source.value,
+                    "status": provider_status,
+                }
+            )
+            record_model_call(
+                trace_id=trace_id,
+                stage="router",
+                model_id=router_model_id,
+                model_selection_reason="semantic LaneDecision from Published Snapshot",
+                status=provider_status,
+                error_summary=result.get("validation_error"),
+                latency_ms=int((time.time() - router_started) * 1000),
+                input_tokens=cost.input_tokens,
+                output_tokens=cost.output_tokens,
+                reasoning_tokens=cost.reasoning_tokens,
+                cached_tokens=cost.cached_input_tokens,
+                total_tokens=cost.total_tokens,
+                usage_source=cost.usage_source.value,
+                price_snapshot=(
+                    cost.price_snapshot.model_dump(mode="json")
+                    if cost.price_snapshot
+                    else None
+                ),
+                estimated_cost_cny=cost.amount,
+                usage_normalized=_usage_for_observability(
+                    cost,
+                    provider_request_id=evidence.get("provider_request_id"),
+                ),
+            )
+            if result.get("decision") is None:
+                if provider_status != "success":
+                    raise ProviderFailureError("semantic Router Provider call failed")
+                raise RuntimeError("semantic LaneDecision schema validation failed")
+            state.lane_decision = result["decision"]
+
+        state.answer_contract = _answer_contract_for(state.lane_decision)
+        lane_payload = state.lane_decision.model_dump(mode="json")
+        lane_payload["explanation"] = _lane_explanation(state.lane_decision)
+        ledger.set("lane_decision", lane_payload)
+        ledger.set("answer_contract", state.answer_contract.model_dump(mode="json"))
+        record_trace_event(
+            trace_id,
+            "lane_decision",
+            "success",
+            output_summary=lane_payload["explanation"],
+            metadata={
+                **lane_payload,
+                "answer_contract": state.answer_contract.model_dump(mode="json"),
+            },
+        )
+
+    async def _stream_contract_static_answer(
+        self,
+        session_id: str,
+        trace_id: str,
+        snapshot: Any,
+        state: RunState,
+        ledger: EvidenceLedger,
+        started: float,
+    ) -> AsyncIterator[str]:
+        """Complete CLARIFY and safe-refusal contracts without a business Agent."""
+
+        if state.answer_contract is None or state.lane_decision is None:
+            raise RuntimeError("static answer started without contracts")
+        clarify = state.answer_contract.response_mode == ResponseMode.CLARIFY_ONLY
+        content = (
+            str(state.lane_decision.clarification_question or "请补充具体对象和发生地点。")
+            if clarify
+            else "这个请求可能造成现实伤害，我不能提供危险配方、比例或实施步骤。我可以改为说明安全处置与风险预防原则。"
+        )
+        reason = "clarification_only" if clarify else "unsafe_request_refused"
+        state.capability_decision = CapabilityDecision(
+            selected_agent_id=None,
+            skill={"status": "skipped", "reason_code": reason},
+            rag={"status": "skipped", "reason_code": reason},
+            tool={"status": "skipped", "reason_code": reason},
+            write={"status": "not_required", "reason_code": reason},
+            handoff={"status": "not_required", "reason_code": reason},
+        )
+        state.status = RunStatus.COMPLETED
+        state.next_step = None
+        ledger.capture_state(state)
+        ledger.append(
+            "evaluation_results",
+            {"case": "answer_contract", "passed": True, "response_mode": state.answer_contract.response_mode.value},
+        )
+        ledger.persist("complete")
+        agent_name = "语义澄清" if clarify else "安全回答边界"
+        agent_id = "semantic_clarifier" if clarify else "safe_refusal"
+        router_tokens = sum(int(item.total_tokens or 0) for item in state.cost_entries)
+        saved = save_chat_message(
+            session_id=session_id,
+            role="assistant",
+            content=content,
+            token_count=0,
+            round_token_count=router_tokens,
+            trace_id=trace_id,
+            current_agent=agent_name,
+            current_agent_id=agent_id,
+            status="success",
+            usage_source="not_applicable",
+        )
+        update_chat_trace(
+            trace_id,
+            intent=state.lane_decision.business_intent,
+            agent_name=agent_name,
+            agent_id=agent_id,
+            status="complete",
+        )
+        record_trace_event(
+            trace_id,
+            "final_response",
+            "success",
+            latency_ms=int((time.time() - started) * 1000),
+            output_summary=content[:240],
+            metadata={
+                "lane_decision": state.lane_decision.model_dump(mode="json"),
+                "answer_contract": state.answer_contract.model_dump(mode="json"),
+                "capability_decision": state.capability_decision.model_dump(mode="json"),
+                "vertical_model_invoked": False,
+            },
+        )
+        yield _sse("delta", {"content": content})
+        yield _sse("final", {"content": content, "current_agent": agent_name, "current_agent_id": agent_id})
+        yield _sse(
+            "done",
+            {
+                "status": "complete",
+                "message_id": saved.get("id"),
+                "trace_id": trace_id,
+                "runtime_path": RuntimePath.CONSULTATION.value,
+                "release_id": snapshot.release_id,
+                "snapshot_id": snapshot.snapshot_id,
+                "current_agent": agent_name,
+                "current_agent_id": agent_id,
+                "lane_decision": state.lane_decision.model_dump(mode="json"),
+                "answer_contract": state.answer_contract.model_dump(mode="json"),
+                "capability_decision": state.capability_decision.model_dump(mode="json"),
+                "cost_entries": [item.model_dump(mode="json") for item in state.cost_entries],
+                "vertical_provider_request_count": 0,
+                "round_token_count": router_tokens,
+            },
+        )
+
+    async def _stream_semantic_safety_handoff(
+        self,
+        message: str,
+        session_id: str,
+        trace_id: str,
+        snapshot: Any,
+        state: RunState,
+        ledger: EvidenceLedger,
+        started: float,
+    ) -> AsyncIterator[str]:
+        """Execute A lane after semantic validation; no business capability is eligible."""
+
+        if state.lane_decision is None or state.answer_contract is None:
+            raise RuntimeError("safety handoff started without contracts")
+        handoff = request_handoff(
+            session_id,
+            state.lane_decision.reason,
+            risk_level="L3",
+            reason_code="safety_risk",
+            queue="emergency",
+            handoff_package={
+                "trace_id": trace_id,
+                "release_id": snapshot.release_id,
+                "trigger_message": message,
+                "semantic_lane": state.lane_decision.model_dump(mode="json"),
+                "safety_override": True,
+            },
+        )
+        handoff_state = str(handoff.get("handoff_status") or "requested")
+        reply = (
+            "请立即远离危险源，不要触碰设备或积水，并提醒周围人员避开；如存在火灾、"
+            "触电、燃气或人身危险，请立即联系119、120、110等当地紧急渠道。系统已发起"
+            "安全人工协同，但物业协同不能替代现实紧急救援。"
+        )
+        state.capability_decision = CapabilityDecision(
+            selected_agent_id=None,
+            skill={"status": "skipped", "reason_code": "safety_lane"},
+            rag={"status": "skipped", "reason_code": "safety_lane"},
+            tool={"status": "skipped", "reason_code": "safety_lane"},
+            write={"status": "not_required", "reason_code": "safety_lane"},
+            handoff={"status": "required", "reason_code": "semantic_safety_risk"},
+        )
+        state.status = RunStatus.COMPLETED
+        state.next_step = None
+        ledger.capture_state(state)
+        ledger.append(
+            "handoff_events",
+            {
+                "status": handoff_state,
+                "reason_code": "safety_risk",
+                "safety_override": True,
+                "router_model_invoked": True,
+                "vertical_model_invoked": False,
+            },
+        )
+        ledger.persist("complete")
+        router_tokens = sum(int(item.total_tokens or 0) for item in state.cost_entries)
+        saved = save_chat_message(
+            session_id=session_id,
+            role="assistant",
+            content=reply,
+            trace_id=trace_id,
+            current_agent="人工协同控制器",
+            current_agent_id="human_copilot",
+            status="success",
+            token_count=0,
+            round_token_count=router_tokens,
+            usage_source="not_applicable",
+        )
+        update_chat_trace(
+            trace_id,
+            intent=state.lane_decision.business_intent,
+            agent_name="人工协同控制器",
+            agent_id="human_copilot",
+            status="complete",
+        )
+        record_trace_event(
+            trace_id,
+            "safety_handoff",
+            "success",
+            latency_ms=int((time.time() - started) * 1000),
+            output_summary="semantic safety lane created Handoff; business capabilities skipped",
+            metadata={
+                "safety_override": True,
+                "answer_contract": state.answer_contract.model_dump(mode="json"),
+                "capability_decision": state.capability_decision.model_dump(mode="json"),
+            },
+        )
+        yield _sse("delta", {"content": reply})
+        yield _sse("final", {"content": reply, "current_agent": "人工协同控制器", "current_agent_id": "human_copilot"})
+        yield _sse(
+            "done",
+            {
+                "status": "complete",
+                "message_id": saved.get("id"),
+                "trace_id": trace_id,
+                "handoff": True,
+                "handoff_state": handoff_state,
+                "lane_decision": state.lane_decision.model_dump(mode="json"),
+                "answer_contract": state.answer_contract.model_dump(mode="json"),
+                "capability_decision": state.capability_decision.model_dump(mode="json"),
+                "release_id": snapshot.release_id,
+                "snapshot_id": snapshot.snapshot_id,
+                "cost_entries": [item.model_dump(mode="json") for item in state.cost_entries],
+                "vertical_provider_request_count": 0,
+                "round_token_count": router_tokens,
+            },
+        )
 
     async def _stream_external_safety_boundary(
         self,
@@ -1556,8 +1735,20 @@ class RuntimeCoordinator:
         session_id: str,
         trace_id: str,
         release_id: str,
+        decision: Optional[LaneDecision] = None,
     ) -> Optional[Tuple[str, str, Dict[str, Any]]]:
-        policy = evaluate_handoff_policy(message)
+        policy: Dict[str, Any] = {
+            "should_request_handoff": bool(
+                decision
+                and decision.lane == RuntimeLane.PROPERTY_GOVERNED
+                and decision.business_intent == "owner_handoff_request"
+            ),
+            "reason": (decision.reason if decision else ""),
+            "level": "L2",
+            "reason_code": "owner_requested",
+            "queue": "property_service",
+            "matched_signals": ["semantic_owner_handoff"] if decision else [],
+        }
         if policy.get("should_request_handoff"):
             session = request_handoff(
                 session_id,
@@ -2072,6 +2263,13 @@ class RuntimeCoordinator:
         state.next_step = "route"
         if state.lane_decision is None:
             raise RuntimeError("consultation started without LaneDecision")
+        if state.answer_contract is None:
+            raise RuntimeError("consultation started without AnswerContract")
+        visible_history = _visible_chat_history(
+            session_id,
+            current_trace_id=trace_id,
+            rounds=5,
+        )
         all_cards = vertical_agent_cards(snapshot.config)
         cards = _lane_candidates(all_cards, state.lane_decision.lane)
         if (
@@ -2086,92 +2284,21 @@ class RuntimeCoordinator:
         if not cards:
             raise RuntimeError("published RuntimeRelease has no enabled vertical agent")
 
-        visible_history = _visible_chat_history(
-            session_id,
-            current_trace_id=trace_id,
-            rounds=5,
-        )
-
-        router_started = time.time()
-        from agents.router import classify_intent
-
-        router_config = next(
-            (
-                item
-                for item in snapshot.config.get("agents") or []
-                if item.get("agent_id") == "router"
-                or item.get("category") in {"router", "orchestration"}
-            ),
-            {},
-        )
-        default_model = (snapshot.config.get("model_policy") or {}).get("default") or {}
-        router_model_id = str(
-            router_config.get("model_id")
-            or default_model.get("model_id")
-            or MODEL_ID
-        )
-        route_result = await classify_intent(
-            message,
-            vertical_agents=cards,
-            user_id=user_id,
-            session_id=f"{session_id}::router::{trace_id}",
-            published_instructions=str(router_config.get("instructions") or ""),
-            model=_build_model_from_snapshot(snapshot.config, router_model_id),
-            visible_history=visible_history,
-        )
         candidates = [str(item["agent_id"]) for item in cards]
-        selected = str(
-            route_result.get("target_agent_id")
-            or route_result.get("intent")
-            or "customer_service"
-        )
+        selected = str(state.lane_decision.target_agent_id or "")
         if selected not in candidates:
-            selected = str((_lane_fallback_agent(cards, state.lane_decision.lane) or cards[0])["agent_id"])
-        if (
-            state.lane_decision.lane == RuntimeLane.PROPERTY_GOVERNED
-            and state.lane_decision.business_intent
-            in {"lost_and_found", "property_scope_clarification", "property_service"}
-            and "customer_service" in candidates
-        ):
-            selected = "customer_service"
+            raise RuntimeError("lane_agent_scope_mismatch")
         selected_card = next(
             item for item in cards if str(item.get("agent_id")) == selected
         )
         property_query = state.lane_decision.lane == RuntimeLane.PROPERTY_GOVERNED
         domain_scope = _agent_domain_scope(selected_card)
         out_of_scope_without_agent = False
-        route_reason = str(route_result.get("reason") or "Router selected published agent")
-        model_target = route_result.get("model_target_agent_id")
-        if model_target and str(model_target) not in candidates:
-            ledger.violation(
-                "lane_agent_scope_mismatch",
-                "Router proposed an Agent outside the selected Lane; within-Lane fallback applied.",
-                lane=state.lane_decision.lane.value,
-                proposed_agent_id=str(model_target),
-                allowed_agent_ids=candidates,
-                selected_agent_id=selected,
-            )
-            record_trace_event(
-                trace_id,
-                "lane_agent_scope_mismatch",
-                "blocked",
-                output_summary=f"blocked {model_target}; selected {selected}",
-                metadata={
-                    "lane": state.lane_decision.lane.value,
-                    "proposed_agent_id": str(model_target),
-                    "allowed_agent_ids": candidates,
-                },
-            )
-            route_reason += "; blocked cross-Lane Agent and applied within-Lane fallback"
         route = RouteDecision(
             candidates=candidates,
             selected_agent_id=selected,
-            reason=route_reason,
-            confidence=(
-                float(route_result["confidence"])
-                if route_result.get("confidence") is not None
-                else None
-            ),
+            reason=state.lane_decision.reason,
+            confidence=state.lane_decision.confidence,
             required_capability_types=["agent", "skill", "rag", "readonly_tool"],
         )
         state.route_decision = route
@@ -2192,89 +2319,43 @@ class RuntimeCoordinator:
             },
         )
 
-        router_evidence = route_result.get("provider_evidence") or {}
-        router_usage = router_evidence.get("usage") or route_result.get("metrics") or {}
-        router_response_model = router_evidence.get("provider_response_model")
-        router_status = route_result.get("provider_status") or "success"
-        router_billing_model = router_response_model or router_model_id
-        router_thinking = _thinking_for_snapshot(snapshot.config, router_model_id)
-        router_cost = build_cost_entry(
-            stage="router",
-            provider=_model_provider(snapshot.config, router_model_id),
-            requested_model=router_model_id,
-            response_model=None,
-            provider_response_model=router_response_model,
-            thinking_enabled=router_thinking,
-            model_policy_version=str(
-                (snapshot.config.get("model_policy") or {}).get("version") or "v1.8"
-            ),
-            provider_usage=router_usage if router_usage else None,
-            price_row=_price_for_snapshot(snapshot.config, router_billing_model),
-            local_estimate_tokens=_estimate_tokens(message),
-            provider_succeeded=router_status == "success",
+        router_cost = next(
+            (item for item in state.cost_entries if item.stage == "router"),
+            None,
         )
-        state.cost_entries.append(router_cost)
-        state.model_calls.append(
-            {
-                "stage": "router",
-                "model_id": router_model_id,
-                "requested_model": router_model_id,
-                "provider_response_model": router_response_model,
-                "thinking_enabled": router_thinking,
-                "latency_ms": int((time.time() - router_started) * 1000),
-                "usage": router_usage,
-                "usage_source": router_cost.usage_source.value,
-            }
-        )
-        record_model_call(
-            trace_id=trace_id,
-            stage="router",
-            model_id=router_model_id,
-            model_selection_reason=f"published snapshot route to {selected}",
-            status=router_status,
-            error_summary=route_result.get("provider_error_summary"),
-            latency_ms=int((time.time() - router_started) * 1000),
-            input_tokens=router_cost.input_tokens,
-            output_tokens=router_cost.output_tokens,
-            reasoning_tokens=router_cost.reasoning_tokens,
-            cached_tokens=router_cost.cached_input_tokens,
-            total_tokens=router_cost.total_tokens,
-            usage_source=router_cost.usage_source.value,
-            price_snapshot=(
-                router_cost.price_snapshot.model_dump(mode="json")
-                if router_cost.price_snapshot
-                else None
-            ),
-            estimated_cost_cny=router_cost.amount,
-            usage_normalized=_usage_for_observability(
-                router_cost,
-                provider_request_id=router_evidence.get("provider_request_id"),
-            ),
-        )
-
-        handoff_policy = evaluate_handoff_policy(message)
-        read_tool_plans = plan_tools(
-            snapshot.config,
-            selected,
-            message,
-            RuntimePath.CONSULTATION,
-            effects=[ToolEffect.READ],
-            execution_modes=["auto_preinvoke", "model_native"],
+        if router_cost is None:
+            raise RuntimeError("consultation has no accounted semantic Router request")
+        handoff_policy = {"reason_code": "semantic_no_handoff"}
+        read_tool_plans = (
+            plan_tools(
+                snapshot.config,
+                selected,
+                message,
+                RuntimePath.CONSULTATION,
+                effects=[ToolEffect.READ],
+                execution_modes=["auto_preinvoke", "model_native"],
+            )
+            if property_query
+            and state.answer_contract.tool_policy == "selected"
+            else []
         )
         structured_realtime_query = _is_structured_realtime_query(
-            message,
+            state.answer_contract,
             read_tool_plans,
         )
         direct_knowledge_required = bool(
-            not structured_realtime_query
-            and domain_scope == "property"
-            and _requires_direct_knowledge_evidence(message)
+            state.answer_contract.evidence_required
+            and state.answer_contract.response_mode == ResponseMode.GROUNDED_ANSWER
         )
         state.next_step = "retrieve"
         retrieval_started = time.time()
-        allowed_doc_ids = {
-            int(item) for item in state.selected_agent.get("knowledge_doc_ids") or []
-        }
+        allowed_doc_ids = (
+            {
+                int(item) for item in state.selected_agent.get("knowledge_doc_ids") or []
+            }
+            if property_query and state.answer_contract.rag_policy == "selected"
+            else set()
+        )
         knowledge_versions = {
             int(item["knowledge_doc_id"]): item
             for item in snapshot.config.get("knowledge") or []
@@ -2291,12 +2372,12 @@ class RuntimeCoordinator:
                 else "not_requested"
             )
         )
-        if not structured_realtime_query:
+        if property_query and not structured_realtime_query:
             yield _sse(
                 "progress",
                 {"trace_id": trace_id, "stage": "rag.retrieve", "status": "running"},
             )
-        if allowed_doc_ids and not structured_realtime_query:
+        if property_query and allowed_doc_ids and not structured_realtime_query:
             try:
                 import rag_retrieval
 
@@ -2416,20 +2497,27 @@ class RuntimeCoordinator:
                 "progress",
                 {"trace_id": trace_id, "stage": "mcp.invoke", "status": "running"},
             )
-        mcp_context, invocations = await preinvoke_read_tools(
-            snapshot.config, selected, message
-        )
+        if property_query and read_tool_plans:
+            mcp_context, invocations = await preinvoke_read_tools(
+                snapshot.config, selected, message
+            )
+        else:
+            mcp_context, invocations = "", []
         preinvoked_tools = {
             (invocation.server_name, invocation.tool_name)
             for invocation in invocations
             if invocation.tool_name != "discovery"
             and invocation.invocation_status == "success"
         }
-        model_native_toolkits = build_model_native_read_tools(
-            snapshot.config,
-            selected,
-            message,
-            excluded_tools=preinvoked_tools,
+        model_native_toolkits = (
+            build_model_native_read_tools(
+                snapshot.config,
+                selected,
+                message,
+                excluded_tools=preinvoked_tools,
+            )
+            if property_query and read_tool_plans
+            else []
         )
         state.tool_invocations = list(invocations)
         for invocation in invocations:
@@ -2466,14 +2554,24 @@ class RuntimeCoordinator:
                 invocation_mode="policy_preinvoke",
             )
 
-        evidence_prompt = prompt_evidence_allowlist(evidence)
+        evidence_prompt = prompt_evidence_allowlist(evidence) if property_query else ""
+        answer_boundary = (
+            "\n[回答边界] 这是隔离通用回答。不得调用或声称使用物业Skill、RAG、MCP/Tool、ActionGateway，"
+            "不得把一般建议表述为物业官方事实。"
+            if not property_query
+            else "\n[回答边界] 物业具体事实必须严格来自下方合法Evidence；没有依据不得补充流程、地点、时限或能力。"
+        )
         build = build_agent_from_snapshot(
             snapshot,
             selected,
             message,
             tools=model_native_toolkits,
-            evidence_prompt=evidence_prompt + mcp_context,
-            enable_skills=not structured_realtime_query,
+            evidence_prompt=evidence_prompt + mcp_context + answer_boundary,
+            enable_skills=(
+                property_query
+                and not structured_realtime_query
+                and state.answer_contract.skill_policy == "selected"
+            ),
         )
         state.activated_skills = build.activated_skills
         for call in build.skill_tool_calls:
@@ -2494,7 +2592,7 @@ class RuntimeCoordinator:
             and invocation.business_status == "success"
         ]
         knowledge_gate = _knowledge_evidence_decision(
-            message,
+            state.answer_contract,
             len(evidence.items),
             structured_realtime_query,
             allowed_doc_ids,
@@ -2821,21 +2919,6 @@ class RuntimeCoordinator:
             raise InternalControlPayloadLeakError(
                 "business Agent returned an internal control payload"
             )
-        if (
-            provisional_buffer
-            and not direct_knowledge_required
-            and not provider_failure_reason
-        ):
-            yield _sse(
-                "delta",
-                {
-                    "content": provisional_buffer,
-                    "provisional": True,
-                    "current_agent": state.selected_agent.get("name"),
-                    "current_agent_id": selected,
-                },
-            )
-
         model_native_invocations = []
         for toolkit in model_native_toolkits:
             model_native_invocations.extend(
@@ -2908,10 +2991,7 @@ class RuntimeCoordinator:
         citation_required = bool(
             evidence.items
             and not linked_skill_evidence
-            and (
-                direct_knowledge_required
-                or _requires_rag_citations(message)
-            )
+            and state.answer_contract.response_mode == ResponseMode.GROUNDED_ANSWER
         )
         if citation_required and not citations:
             citation_violations.append(
@@ -3132,6 +3212,7 @@ class RuntimeCoordinator:
                 "model_invoked": model_invoked,
                 "domain_scope": domain_scope,
                 "lane_decision": state.lane_decision.model_dump(mode="json"),
+                "answer_contract": state.answer_contract.model_dump(mode="json"),
                 "capability_decision": state.capability_decision.model_dump(mode="json"),
             },
         )
@@ -3296,6 +3377,7 @@ class RuntimeCoordinator:
                 "mcp_calls": mcp_payload,
                 "decision_summary": decision_summary,
                 "lane_decision": state.lane_decision.model_dump(mode="json"),
+                "answer_contract": state.answer_contract.model_dump(mode="json"),
                 "capability_decision": state.capability_decision.model_dump(mode="json"),
                 "cost_entries": [
                     item.model_dump(mode="json") for item in state.cost_entries

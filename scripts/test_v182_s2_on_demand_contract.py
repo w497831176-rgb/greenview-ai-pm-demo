@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from typing import Any, Dict, List
 
 from app.handoff_policy import evaluate_handoff_policy
+from app.runtime.contracts import ResponseMode
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -16,11 +17,7 @@ ROOT = Path(__file__).resolve().parents[1]
 def _load_coordinator_selector():
     source_path = ROOT / "app/runtime/coordinator.py"
     tree = ast.parse(source_path.read_text(encoding="utf-8"))
-    names = {
-        "STRUCTURED_WORKORDER_TOOLS",
-        "KNOWLEDGE_EVIDENCE_TERMS",
-        "_is_structured_realtime_query",
-    }
+    names = {"_is_structured_realtime_query"}
     selected = []
     for node in tree.body:
         if isinstance(node, ast.Assign):
@@ -35,6 +32,7 @@ def _load_coordinator_selector():
         "Any": Any,
         "Dict": Dict,
         "List": List,
+        "ResponseMode": ResponseMode,
     }
     exec(
         compile(
@@ -56,16 +54,18 @@ def _plan(server: str, tool: str):
 
 def test_exact_workorder_query_is_tool_only():
     plans = [_plan("workorder-server", "get_my_work_order_by_id")]
+    realtime = SimpleNamespace(response_mode=ResponseMode.REALTIME_READ)
+    grounded = SimpleNamespace(response_mode=ResponseMode.GROUNDED_ANSWER)
     assert is_structured_realtime_query(
-        "帮我查询工单 WO-20260714-001 现在是什么状态？",
+        realtime,
         plans,
     )
     assert not is_structured_realtime_query(
-        "请查询工单 WO-20260714-001，并依据制度说明处理时效。",
+        grounded,
         plans,
     )
     assert not is_structured_realtime_query(
-        "物业紧急维修响应时效是多少？",
+        realtime,
         [],
     )
 
@@ -98,7 +98,9 @@ def test_runtime_records_real_selected_and_skipped_reasons():
     agent_source = (ROOT / "app/runtime/agent_factory.py").read_text(
         encoding="utf-8"
     )
-    assert "enable_skills=not structured_realtime_query" in source
+    assert 'state.answer_contract.skill_policy == "selected"' in source
+    assert 'state.answer_contract.tool_policy == "selected"' in source
+    assert "answer_contract.response_mode == ResponseMode.REALTIME_READ" in source
     assert '"skipped_structured_realtime_query"' in source
     assert '"capability_decision"' in source
     assert '"decision_summary": decision_summary' in source

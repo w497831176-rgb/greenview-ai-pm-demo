@@ -12,6 +12,7 @@ from typing import Any, AsyncIterator, Dict, List, Optional
 
 from agno.agent import Agent
 
+from app.runtime.contracts import LaneDecision, RuntimeLane
 from app.runtime.provider_evidence import provider_evidence_from_run
 from app.settings import MODEL, agent_db
 from db.property_db import get_agent_by_agent_id
@@ -101,6 +102,183 @@ def create_router_agent(
         num_history_runs=0,
         markdown=False,
     )
+
+
+def _semantic_agent_catalog(vertical_agents: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Expose Published capability metadata without turning it into string rules."""
+
+    catalog: List[Dict[str, Any]] = []
+    for agent in vertical_agents:
+        agent_id = str(agent.get("agent_id") or "").strip()
+        if not agent_id or not agent.get("enabled"):
+            continue
+        scope = str(agent.get("domain_scope") or "property")
+        if scope not in {"property", "isolated_general"}:
+            scope = "property"
+        card = agent.get("capability_card") or {}
+        catalog.append(
+            {
+                "agent_id": agent_id,
+                "name": str(agent.get("name") or agent_id),
+                "domain_scope": scope,
+                "description": str(agent.get("description") or ""),
+                "service_scope": str(card.get("service_scope") or ""),
+                "skills": [
+                    str(item.get("name"))
+                    for item in card.get("skills") or []
+                    if item.get("name")
+                ],
+                "mcp_capabilities": [
+                    {
+                        "server": str(server.get("name") or ""),
+                        "description": str(server.get("description") or ""),
+                        "intents": [str(value) for value in server.get("natural_language_intents") or []],
+                    }
+                    for server in card.get("mcp_servers") or []
+                ],
+                "knowledge": [
+                    {
+                        "title": str(item.get("title") or ""),
+                        "category": str(item.get("category") or ""),
+                    }
+                    for item in card.get("knowledge_docs") or []
+                ],
+            }
+        )
+    return catalog
+
+
+def create_semantic_lane_router(*, model: Any) -> Agent:
+    """Create the one-call semantic control-plane Router used by production."""
+
+    return Agent(
+        id="semantic_lane_router",
+        name="结构化语义 Router",
+        description="理解完整诉求并输出严格的 LaneDecision。",
+        model=model,
+        db=agent_db,
+        instructions=[
+            "你是YIAI物业运行时的语义控制器。理解整句话、对象、地点、真实目的、否定关系、多意图优先级和可见会话上下文，不使用词语命中捷径。",
+            "先判断是否有正在发生或迫近的人身、消防、燃气、电气、结构、公共安全或自伤风险；现实风险优先于用户的否定或淡化。",
+            "非安全请求中，只有真实诉求需要物业提供信息、服务、查询、办理或协助时才属于物业域。出现物业相关词但实际任务是翻译、技术、数学、创作或娱乐，不属于物业域。",
+            "明确属于非物业的一般知识、创作、娱乐、生活建议或技术帮助，进入隔离通用域；其中危险配方、绕过系统、隐私侵犯等仍标为不安全请求。",
+            "对象、地点、场景或诉求不足以决定以上路径时必须澄清，不得默认进入物业域，也不得猜成通用域。",
+            "用户明确要求由真人工作人员接管时属于物业域的state_change，并将business_intent设为owner_handoff_request；这不是安全A，除非同时存在现实紧急风险。",
+            "仅B/C可选择业务Agent；目标必须来自输入候选中相同domain_scope。A和CLARIFY的target_agent_id必须为null。",
+            "business_intent使用简短稳定的snake_case语义，不复制用户原句。只输出一个JSON对象，不输出Markdown或解释文字。",
+        ],
+        add_datetime_to_context=True,
+        add_history_to_context=False,
+        read_chat_history=False,
+        num_history_runs=0,
+        markdown=False,
+    )
+
+
+def _strict_json_object(raw: str) -> Dict[str, Any]:
+    value = str(raw or "").strip()
+    if value.startswith("```") and value.endswith("```"):
+        lines = value.splitlines()
+        if len(lines) >= 3 and lines[0].strip().lower() in {"```", "```json"} and lines[-1].strip() == "```":
+            value = "\n".join(lines[1:-1]).strip()
+    parsed = json.loads(value)
+    if not isinstance(parsed, dict):
+        raise ValueError("LaneDecision response must be one JSON object")
+    return parsed
+
+
+def _validate_semantic_target(
+    decision: LaneDecision,
+    catalog: List[Dict[str, Any]],
+) -> None:
+    if decision.lane in {RuntimeLane.SAFETY_HANDOFF, RuntimeLane.CLARIFY}:
+        return
+    by_id = {str(item["agent_id"]): item for item in catalog}
+    target = by_id.get(str(decision.target_agent_id or ""))
+    expected_scope = (
+        "property"
+        if decision.lane == RuntimeLane.PROPERTY_GOVERNED
+        else "isolated_general"
+    )
+    if target is None or str(target.get("domain_scope")) != expected_scope:
+        raise ValueError("lane_agent_scope_mismatch")
+
+
+async def classify_lane_decision(
+    message: str,
+    vertical_agents: Optional[List[Dict[str, Any]]] = None,
+    user_id: str = "web-user",
+    session_id: str = "",
+    model: Any = None,
+    visible_history: Optional[List[Dict[str, str]]] = None,
+) -> Dict[str, Any]:
+    """Call the production semantic Router exactly once; never apply a fallback."""
+
+    catalog = _semantic_agent_catalog(vertical_agents or [])
+    history = [
+        {
+            "role": "user" if item.get("role") == "user" else "assistant",
+            "content": str(item.get("content") or ""),
+        }
+        for item in visible_history or []
+        if str(item.get("content") or "").strip()
+    ]
+    prompt_payload = {
+        "visible_conversation": history,
+        "current_user_message": message,
+        "published_agent_candidates": catalog,
+        "decision_schema": {
+            "lane": "A_SAFETY_HANDOFF | B_PROPERTY_GOVERNED | C_ISOLATED_GENERAL | CLARIFY",
+            "business_intent": "snake_case semantic intent",
+            "reason_code": "imminent_safety_risk | property_service_required | non_property_general | unsafe_non_property_request | insufficient_context",
+            "reason": "简短中文理由",
+            "confidence": "0.0..1.0",
+            "requires_clarification": "boolean",
+            "clarification_question": "one useful question or null",
+            "request_kind": "emergency | fact | realtime_read | state_change | general | unsafe_request | ambiguous",
+            "allowed_domain": "safety | property | isolated_general | none",
+            "target_agent_id": "candidate agent_id or null",
+        },
+    }
+    result: Dict[str, Any] = {
+        "decision": None,
+        "raw": "",
+        "metrics": {},
+        "provider_evidence": {},
+        "provider_status": "failed",
+        "validation_error": None,
+    }
+    try:
+        router_agent = create_semantic_lane_router(model=model or MODEL)
+        response_obj = await router_agent.arun(
+            json.dumps(prompt_payload, ensure_ascii=False),
+            user_id=user_id,
+            session_id=session_id or f"semantic-router-{id(message)}",
+            stream=False,
+        )
+        raw = str(getattr(response_obj, "content", "") or "").strip()
+        result["raw"] = raw
+        result["provider_evidence"] = provider_evidence_from_run(response_obj)
+        if result["provider_evidence"].get("usage"):
+            result["metrics"] = dict(result["provider_evidence"]["usage"])
+        elif getattr(response_obj, "metrics", None):
+            metrics = response_obj.metrics
+            read = lambda key: metrics.get(key) if isinstance(metrics, dict) else getattr(metrics, key, None)
+            result["metrics"] = {
+                "input_tokens": read("input_tokens"),
+                "output_tokens": read("output_tokens"),
+                "total_tokens": read("total_tokens"),
+                "reasoning_tokens": read("reasoning_tokens"),
+                "cached_tokens": read("cached_tokens"),
+            }
+        result["provider_status"] = "success"
+        decision = LaneDecision.model_validate(_strict_json_object(raw))
+        _validate_semantic_target(decision, catalog)
+        result["decision"] = decision
+        return result
+    except Exception as exc:
+        result["validation_error"] = f"{type(exc).__name__}: {str(exc)[:240]}"
+        return result
 
 
 async def _collect_response(generator) -> str:
