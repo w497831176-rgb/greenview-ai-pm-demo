@@ -143,6 +143,30 @@ def main() -> None:
             allowed_domain="property",
             target_agent_id="maintenance",
         ),
+        "B_REFUSE": lane(
+            lane="B_PROPERTY_GOVERNED",
+            business_intent="unsafe_property_access_request",
+            reason_code="property_service_required",
+            reason="请求在物业领域实施危险或越权操作。",
+            confidence=0.99,
+            requires_clarification=False,
+            clarification_question=None,
+            request_kind="unsafe_request",
+            allowed_domain="property",
+            target_agent_id="customer_service",
+        ),
+        "C_FACT": lane(
+            lane="C_ISOLATED_GENERAL",
+            business_intent="general_cultural_fact",
+            reason_code="non_property_general",
+            reason="真实诉求是非物业的一般知识事实。",
+            confidence=0.97,
+            requires_clarification=False,
+            clarification_question=None,
+            request_kind="fact",
+            allowed_domain="isolated_general",
+            target_agent_id="general-dynamic",
+        ),
         "C": lane(
             lane="C_ISOLATED_GENERAL",
             business_intent="general_cultural_question",
@@ -187,6 +211,8 @@ def main() -> None:
     check("B compiles grounded_answer", contracts["B"].response_mode == ResponseMode.GROUNDED_ANSWER and contracts["B"].evidence_required)
     check("B realtime requires successful Tool", contracts["B_REALTIME"].response_mode == ResponseMode.REALTIME_READ and contracts["B_REALTIME"].evidence_requirements == ["successful_current_tool_result"])
     check("B write preserves confirmation contract", contracts["B_WRITE"].response_mode == ResponseMode.CONTROLLED_WRITE and contracts["B_WRITE"].write_policy == "allowed_after_confirmation" and "receipt" in contracts["B_WRITE"].evidence_requirements)
+    check("unsafe B compiles safe_refusal", contracts["B_REFUSE"].response_mode == ResponseMode.SAFE_REFUSAL and contracts["B_REFUSE"].write_policy == "forbidden")
+    check("C fact compiles safe_general", contracts["C_FACT"].response_mode == ResponseMode.SAFE_GENERAL and not contracts["C_FACT"].evidence_required)
     check("C safe general skips property capabilities", contracts["C"].response_mode == ResponseMode.SAFE_GENERAL and contracts["C"].skill_policy == contracts["C"].rag_policy == contracts["C"].tool_policy == "skipped")
     check("unsafe C compiles safe_refusal", contracts["C_REFUSE"].response_mode == ResponseMode.SAFE_REFUSAL)
     check("CLARIFY selects no Agent", decisions["CLARIFY"].target_agent_id is None and contracts["CLARIFY"].response_mode == ResponseMode.CLARIFY_ONLY)
@@ -206,17 +232,32 @@ def main() -> None:
     check("realtime ignores non-Tool evidence", realtime_without_tool["blocked"])
     check("successful current Tool satisfies realtime", not realtime_with_tool["blocked"])
 
-    invalid_payloads = [
-        {**decisions["B"].model_dump(mode="json"), "lane": "CLARIFY"},
-        {**decisions["CLARIFY"].model_dump(mode="json"), "clarification_question": None},
-    ]
-    for index, payload in enumerate(invalid_payloads, start=1):
+    missing_request_kind = decisions["B"].model_dump(mode="json")
+    missing_request_kind.pop("request_kind")
+    invalid_payloads = {
+        "A general": {**decisions["A"].model_dump(mode="json"), "request_kind": "general"},
+        "A state_change": {**decisions["A"].model_dump(mode="json"), "request_kind": "state_change"},
+        "C property state_change": {
+            **decisions["C_FACT"].model_dump(mode="json"),
+            "request_kind": "state_change",
+            "allowed_domain": "property",
+            "target_agent_id": "maintenance",
+        },
+        "CLARIFY realtime_read": {**decisions["CLARIFY"].model_dump(mode="json"), "request_kind": "realtime_read"},
+        "CLARIFY state_change": {**decisions["CLARIFY"].model_dump(mode="json"), "request_kind": "state_change"},
+        "lane domain conflict": {**decisions["B"].model_dump(mode="json"), "allowed_domain": "isolated_general"},
+        "missing target": {**decisions["B"].model_dump(mode="json"), "target_agent_id": None},
+        "missing request_kind": missing_request_kind,
+        "illegal request_kind": {**decisions["B"].model_dump(mode="json"), "request_kind": "not_a_kind"},
+        "clarify missing question": {**decisions["CLARIFY"].model_dump(mode="json"), "clarification_question": None},
+    }
+    for name, payload in invalid_payloads.items():
         try:
             LaneDecision.model_validate(payload)
         except ValidationError:
-            checks.append(f"invalid schema rejected {index}")
+            checks.append(f"invalid schema rejected: {name}")
         else:
-            raise AssertionError(f"invalid schema rejected {index}")
+            raise AssertionError(f"invalid schema rejected: {name}")
 
     fake = FakeAgent(decisions["C"].model_dump_json())
     original_factory = router_module.create_semantic_lane_router
@@ -237,6 +278,21 @@ def main() -> None:
     check("dynamic Published Agent remains eligible", semantic["decision"].target_agent_id == "general-dynamic")
     check("visible conversation reaches Router only", "上一轮可见问题" in fake.prompt)
     check("Provider request evidence survives validation", semantic["provider_evidence"]["provider_request_id"] == "provider-request-test")
+
+    fenced_fact = FakeAgent(f"```json\n{decisions['C_FACT'].model_dump_json()}\n```")
+    router_module.create_semantic_lane_router = lambda **_: fenced_fact
+    try:
+        replay_shape = asyncio.run(
+            router_module.classify_lane_decision(
+                "任意非物业知识事实问题",
+                vertical_agents=CARDS,
+                model=object(),
+            )
+        )
+    finally:
+        router_module.create_semantic_lane_router = original_factory
+    check("C fact in an outer JSON fence passes strict schema", replay_shape["decision"] == decisions["C_FACT"])
+    check("C fact compiles safe_general after parsing", _answer_contract_for(replay_shape["decision"]).response_mode == ResponseMode.SAFE_GENERAL)
 
     cross_lane = FakeAgent(decisions["C"].model_copy(update={"target_agent_id": "maintenance"}).model_dump_json())
     router_module.create_semantic_lane_router = lambda **_: cross_lane

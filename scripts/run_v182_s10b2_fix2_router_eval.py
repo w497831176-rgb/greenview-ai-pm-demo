@@ -45,18 +45,102 @@ def load_cases(path: Path) -> List[Dict[str, Any]]:
     return rows
 
 
+def _resume_seed(
+    cases: List[Dict[str, Any]],
+    prior_result_path: str | None,
+    replay_result_path: str | None,
+) -> Dict[str, Any]:
+    """Validate the immutable N201-N241 breakpoint and seed final aggregation."""
+
+    if not prior_result_path and not replay_result_path:
+        return {
+            "results": [],
+            "start_index": 0,
+            "usage": Counter(),
+            "cost_cny": 0.0,
+            "provenance": {
+                "original_provider_cases": [],
+                "offline_replay_cases": [],
+                "continuation_provider_cases": [],
+            },
+        }
+    if not prior_result_path or not replay_result_path:
+        raise ValueError("resume requires both --prior-result and --replay-result")
+
+    prior = json.loads(Path(prior_result_path).read_text(encoding="utf-8"))
+    replay = json.loads(Path(replay_result_path).read_text(encoding="utf-8"))
+    prior_rows = list(prior.get("results") or [])
+    expected_prior_ids = [str(row["id"]) for row in cases[:41]]
+    if [str(row.get("id")) for row in prior_rows] != expected_prior_ids:
+        raise ValueError("prior result is not the immutable N201-N241 run")
+    if not all(bool(row.get("passed")) for row in prior_rows[:40]):
+        raise ValueError("prior N201-N240 must all be original one-pass successes")
+    if str(prior_rows[40].get("id")) != "N241" or bool(prior_rows[40].get("passed")):
+        raise ValueError("prior N241 must be the retained original schema failure")
+    if not (
+        replay.get("id") == "N241"
+        and replay.get("passed") is True
+        and replay.get("offline_replay") is True
+        and replay.get("provider_called") is False
+        and replay.get("provider_request_count") == 0
+        and replay.get("actual_lane") == "C_ISOLATED_GENERAL"
+        and (replay.get("decision") or {}).get("request_kind") == "fact"
+        and (replay.get("answer_contract") or {}).get("response_mode") == "safe_general"
+    ):
+        raise ValueError("saved-response N241 replay contract is invalid")
+
+    replay_row = {
+        "id": "N241",
+        "expected_lane": "C_ISOLATED_GENERAL",
+        "actual_lane": "C_ISOLATED_GENERAL",
+        "schema_valid": True,
+        "passed": True,
+        "trace_id": replay.get("source_trace_id"),
+        "session_id": replay.get("source_session_id"),
+        "failure": None,
+        "provider_request_count": 0,
+        "source_provider_request_count": 1,
+        "evaluation_origin": "saved_response_offline_replay",
+    }
+    seeded = [
+        {**row, "evaluation_origin": "original_provider_call"}
+        for row in prior_rows[:40]
+    ] + [replay_row]
+    return {
+        "results": seeded,
+        "start_index": 41,
+        "usage": Counter(prior.get("provider_usage") or {}),
+        "cost_cny": float(prior.get("cost_cny") or 0),
+        "provenance": {
+            "original_provider_cases": [str(row["id"]) for row in prior_rows],
+            "offline_replay_cases": ["N241"],
+            "continuation_provider_cases": [],
+            "offline_replay_provider_requests": 0,
+            "retained_original_failure_trace": replay.get("source_trace_id"),
+        },
+    }
+
+
 async def run(args: argparse.Namespace) -> int:
     cases = load_cases(Path(args.dataset))
     coordinator = RuntimeCoordinator()
-    results: List[Dict[str, Any]] = []
+    seed = _resume_seed(cases, args.prior_result, args.replay_result)
+    results: List[Dict[str, Any]] = list(seed["results"])
     confusion: Dict[str, Counter[str]] = defaultdict(Counter)
     expected_counts: Counter[str] = Counter()
     actual_counts: Counter[str] = Counter()
-    usage = Counter()
-    total_cost = 0.0
+    for row in results:
+        expected_counts[str(row["expected_lane"])] += 1
+        actual_counts[str(row["actual_lane"])] += 1
+        confusion[str(row["expected_lane"])][str(row["actual_lane"])] += 1
+    usage = Counter(seed["usage"])
+    continuation_usage = Counter()
+    total_cost = float(seed["cost_cny"])
+    continuation_cost = 0.0
     schema_failures = 0
+    provenance = dict(seed["provenance"])
 
-    for case in cases:
+    for case in cases[int(seed["start_index"]):]:
         case_id = str(case["id"])
         expected = str(case["effective_expected_lane"])
         expected_counts[expected] += 1
@@ -164,11 +248,17 @@ async def run(args: argparse.Namespace) -> int:
         confusion[expected][actual] += 1
         for cost in state.cost_entries:
             usage["provider_requests"] += 1
+            continuation_usage["provider_requests"] += 1
             usage["input_cache_hit_tokens"] += int(cost.input_cache_hit_tokens or 0)
+            continuation_usage["input_cache_hit_tokens"] += int(cost.input_cache_hit_tokens or 0)
             usage["input_cache_miss_tokens"] += int(cost.input_cache_miss_tokens or 0)
+            continuation_usage["input_cache_miss_tokens"] += int(cost.input_cache_miss_tokens or 0)
             usage["output_tokens"] += int(cost.output_tokens or 0)
+            continuation_usage["output_tokens"] += int(cost.output_tokens or 0)
             usage["total_tokens"] += int(cost.total_tokens or 0)
+            continuation_usage["total_tokens"] += int(cost.total_tokens or 0)
             total_cost += float(cost.amount or 0)
+            continuation_cost += float(cost.amount or 0)
         result = {
             "id": case_id,
             "expected_lane": expected,
@@ -179,8 +269,10 @@ async def run(args: argparse.Namespace) -> int:
             "session_id": session_id,
             "failure": failure,
             "provider_request_count": len(state.model_calls),
+            "evaluation_origin": "continuation_provider_call" if seed["start_index"] else "original_provider_call",
         }
         results.append(result)
+        provenance["continuation_provider_cases"].append(case_id)
         print(json.dumps(result, ensure_ascii=False), flush=True)
         if not passed:
             break
@@ -194,6 +286,10 @@ async def run(args: argparse.Namespace) -> int:
         "schema_failures": schema_failures,
         "provider_usage": dict(usage),
         "cost_cny": round(total_cost, 8),
+        "continuation_provider_usage": dict(continuation_usage),
+        "continuation_cost_cny": round(continuation_cost, 8),
+        "evaluation_provenance": provenance,
+        "historical_schema_failures_replayed": 1 if seed["start_index"] else 0,
         "pro_calls": 0,
         "darwin_calls": 0,
         "results": results,
@@ -209,6 +305,8 @@ async def run(args: argparse.Namespace) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", required=True)
+    parser.add_argument("--prior-result")
+    parser.add_argument("--replay-result")
     parser.add_argument("--output", default="/tmp/s10b2-fix2-router-eval.json")
     return asyncio.run(run(parser.parse_args()))
 

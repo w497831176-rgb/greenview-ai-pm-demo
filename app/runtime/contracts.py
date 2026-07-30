@@ -147,12 +147,17 @@ class LaneDecision(ImmutableModel):
             ),
             RuntimeLane.PROPERTY_GOVERNED: (
                 AllowedDomain.PROPERTY,
-                {RequestKind.FACT, RequestKind.REALTIME_READ, RequestKind.STATE_CHANGE},
+                {
+                    RequestKind.FACT,
+                    RequestKind.REALTIME_READ,
+                    RequestKind.STATE_CHANGE,
+                    RequestKind.UNSAFE_REQUEST,
+                },
                 {LaneReasonCode.PROPERTY_SERVICE_REQUIRED},
             ),
             RuntimeLane.ISOLATED_GENERAL: (
                 AllowedDomain.ISOLATED_GENERAL,
-                {RequestKind.GENERAL, RequestKind.UNSAFE_REQUEST},
+                {RequestKind.FACT, RequestKind.GENERAL, RequestKind.UNSAFE_REQUEST},
                 {
                     LaneReasonCode.NON_PROPERTY_GENERAL,
                     LaneReasonCode.UNSAFE_NON_PROPERTY_REQUEST,

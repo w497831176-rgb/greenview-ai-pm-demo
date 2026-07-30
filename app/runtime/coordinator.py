@@ -449,6 +449,18 @@ def _answer_contract_for(decision: LaneDecision) -> AnswerContract:
                 else "低风险非物业请求由隔离通用Agent回答，物业能力全部跳过。"
             ),
         )
+    if decision.request_kind == RequestKind.UNSAFE_REQUEST:
+        return AnswerContract(
+            response_mode=ResponseMode.SAFE_REFUSAL,
+            evidence_required=False,
+            skill_policy="skipped",
+            rag_policy="skipped",
+            tool_policy="skipped",
+            write_policy="forbidden",
+            handoff_policy="optional",
+            forbidden_claims=common_forbidden + ["harmful_instructions"],
+            decision_reason="物业域中的危险请求只做安全拒绝，不调用业务能力或执行写入。",
+        )
     if decision.request_kind == RequestKind.REALTIME_READ:
         return AnswerContract(
             response_mode=ResponseMode.REALTIME_READ,
