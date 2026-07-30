@@ -51,9 +51,24 @@ class EvidenceLedger:
         )
 
     def capture_state(self, state: RunState) -> None:
+        if state.lane_decision:
+            lane_payload = state.lane_decision.model_dump(mode="json")
+            existing_explanation = (self.contract.lane_decision or {}).get(
+                "explanation"
+            )
+            if existing_explanation:
+                lane_payload["explanation"] = existing_explanation
+            self.contract.lane_decision = lane_payload
+        else:
+            self.contract.lane_decision = None
         self.contract.route_decision = (
             state.route_decision.model_dump(mode="json")
             if state.route_decision
+            else None
+        )
+        self.contract.capability_decision = (
+            state.capability_decision.model_dump(mode="json")
+            if state.capability_decision
             else None
         )
         self.contract.activated_skills = [

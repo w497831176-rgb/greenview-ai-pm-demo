@@ -6,7 +6,7 @@ import hashlib
 import json
 import uuid
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -28,6 +28,19 @@ class RuntimePath(str, Enum):
     CONSULTATION = "consultation"
     CONTROLLED_ACTION = "controlled_action"
     EXTENSION_ACCEPTANCE = "extension_acceptance"
+
+
+class RuntimeLane(str, Enum):
+    SAFETY_HANDOFF = "A_SAFETY_HANDOFF"
+    PROPERTY_GOVERNED = "B_PROPERTY_GOVERNED"
+    ISOLATED_GENERAL = "C_ISOLATED_GENERAL"
+
+
+class LaneDecisionSource(str, Enum):
+    SAFETY_POLICY = "safety_policy"
+    DETERMINISTIC_RULE = "deterministic_rule"
+    ROUTER_MODEL = "router_model"
+    FALLBACK = "fallback"
 
 
 class RunStatus(str, Enum):
@@ -73,6 +86,60 @@ class RouteDecision(ImmutableModel):
     reason: str
     confidence: Optional[float] = None
     required_capability_types: List[str] = Field(default_factory=list)
+
+
+class LaneDecision(ImmutableModel):
+    """Control-plane decision made before any business Agent is selectable."""
+
+    lane: RuntimeLane
+    reason_code: str = Field(min_length=1)
+    business_intent: str = Field(min_length=1)
+    confidence: float = Field(ge=0.0, le=1.0)
+    needs_clarification: bool = False
+    decision_source: LaneDecisionSource
+    matched_signals: List[str] = Field(default_factory=list)
+    allowed_domain_scopes: List[Literal["property", "isolated_general"]] = Field(
+        default_factory=list
+    )
+
+
+class SkillCapabilityDecision(ImmutableModel):
+    status: Literal["selected", "skipped"]
+    reason_code: str = Field(min_length=1)
+    details: Dict[str, Any] = Field(default_factory=dict)
+
+
+class RagCapabilityDecision(ImmutableModel):
+    status: Literal["selected", "skipped"]
+    reason_code: str = Field(min_length=1)
+    details: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ToolCapabilityDecision(ImmutableModel):
+    status: Literal["selected", "skipped"]
+    reason_code: str = Field(min_length=1)
+    details: Dict[str, Any] = Field(default_factory=dict)
+
+
+class WriteCapabilityDecision(ImmutableModel):
+    status: Literal["required", "not_required"]
+    reason_code: str = Field(min_length=1)
+    details: Dict[str, Any] = Field(default_factory=dict)
+
+
+class HandoffCapabilityDecision(ImmutableModel):
+    status: Literal["available", "required", "not_required"]
+    reason_code: str = Field(min_length=1)
+    details: Dict[str, Any] = Field(default_factory=dict)
+
+
+class CapabilityDecision(ImmutableModel):
+    selected_agent_id: Optional[str] = None
+    skill: SkillCapabilityDecision
+    rag: RagCapabilityDecision
+    tool: ToolCapabilityDecision
+    write: WriteCapabilityDecision
+    handoff: HandoffCapabilityDecision
 
 
 class SkillActivation(ImmutableModel):
@@ -263,7 +330,9 @@ class RunState(BaseModel):
     session_id: str
     snapshot_id: str
     path: RuntimePath
+    lane_decision: Optional[LaneDecision] = None
     route_decision: Optional[RouteDecision] = None
+    capability_decision: Optional[CapabilityDecision] = None
     selected_agent: Optional[Dict[str, Any]] = None
     activated_skills: List[SkillActivation] = Field(default_factory=list)
     retrieval_evidence: EvidenceSet = Field(default_factory=EvidenceSet)
@@ -284,13 +353,16 @@ class RunEvidenceLedger(BaseModel):
     trace_id: str
     session_id: str
     config_snapshot: Dict[str, Any]
+    lane_decision: Optional[Dict[str, Any]] = None
     route_decision: Optional[Dict[str, Any]] = None
+    capability_decision: Optional[Dict[str, Any]] = None
     activated_skills: List[Dict[str, Any]] = Field(default_factory=list)
     skill_evidence: List[Dict[str, Any]] = Field(default_factory=list)
     retrieval_evidence: List[Dict[str, Any]] = Field(default_factory=list)
     tool_invocations: List[Dict[str, Any]] = Field(default_factory=list)
     action_proposals: List[Dict[str, Any]] = Field(default_factory=list)
     approval_events: List[Dict[str, Any]] = Field(default_factory=list)
+    handoff_events: List[Dict[str, Any]] = Field(default_factory=list)
     action_receipts: List[Dict[str, Any]] = Field(default_factory=list)
     model_calls: List[Dict[str, Any]] = Field(default_factory=list)
     citation_links: List[Dict[str, Any]] = Field(default_factory=list)

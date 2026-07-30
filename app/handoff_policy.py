@@ -72,56 +72,21 @@ def evaluate_handoff_policy(
             "matched_signals": ["owner_requested"],
         }
 
-    safety_terms = [
-        "燃气泄漏",
-        "煤气泄漏",
-        "起火",
-        "火灾",
-        "触电",
-        "水漫插座",
-        "漫到插座",
-        "插座被水淹",
-        "插座进水",
-        "电线进水",
-        "电梯困人",
-        "电梯里有人被困",
-        "被困电梯",
-        "困在电梯",
-        "电梯被困",
-        "人身受伤",
-        "有人受伤",
-        "把物业炸了",
-        "炸物业",
-        "爆炸威胁",
-    ]
-    safety_matched = _contains_any(text, safety_terms)
     negated_terms = [
         "暂时不用转人工",
         "不用转人工",
         "不需要转人工",
+        "不需要人工",
         "不要转人工",
         "无需人工",
         "不转人工",
+        "先别转人工",
     ]
     negated = _contains_any(text, negated_terms)
-    if safety_matched:
-        return {
-            "level": "L3",
-            "reason_code": "safety_risk",
-            "reason": "检测到人身或公共安全风险，需要人工承担处置责任",
-            "queue": "emergency_dispatch",
-            "should_request_handoff": True,
-            "human_task": "核实现场风险、通知应急责任人，并在会话中记录实际处置结果。",
-            "matched_signals": [
-                *safety_matched,
-                *(["safety_override"] if negated else []),
-            ],
-        }
-
-    # Remove only explicit negated phrases, then evaluate any remaining request.
-    # This keeps “不用转人工，但后来请帮我转人工” explainable without treating
-    # the first occurrence of the three characters as a positive request.
-    explicit_terms = ["转人工", "人工客服", "找人工", "人工处理", "我要人工", "人工介入", "接人工", "人工服务"]
+    explicit_terms = [
+        "转人工", "人工客服", "找人工", "找客服", "人工处理", "工作人员处理",
+        "我要人工", "人工介入", "接人工", "人工服务", "不想和ai沟通",
+    ]
     positive_text = text
     for phrase in negated_terms:
         positive_text = positive_text.replace(phrase, "")
@@ -135,6 +100,56 @@ def evaluate_handoff_policy(
             "should_request_handoff": True,
             "human_task": "由工作人员接管后确认诉求、给出处理结论并记录结果。",
             "matched_signals": matched,
+        }
+
+    safety_terms = [
+        "燃气泄漏",
+        "煤气泄漏",
+        "起火",
+        "火灾",
+        "触电",
+        "水漫插座",
+        "漫到插座",
+        "插座被水淹",
+        "插座进水",
+        "电线进水",
+        "电梯困人",
+        "电梯有人被困",
+        "电梯里有人被困",
+        "被困电梯",
+        "困在电梯",
+        "电梯被困",
+        "人身受伤",
+        "有人受伤",
+        "把物业炸了",
+        "炸物业",
+        "爆炸威胁",
+        "燃气味",
+        "煤气味",
+        "有人持刀",
+        "正在行凶",
+        "找不到孩子",
+        "孩子不见",
+        "老人不见",
+        "人员失踪",
+        "胸口很痛",
+        "呼吸困难",
+        "想轻生",
+        "要自杀",
+    ]
+    safety_matched = _contains_any(text, safety_terms)
+    if safety_matched:
+        return {
+            "level": "L3",
+            "reason_code": "safety_risk",
+            "reason": "检测到人身或公共安全风险，需要人工承担处置责任",
+            "queue": "emergency_dispatch",
+            "should_request_handoff": True,
+            "human_task": "核实现场风险、通知应急责任人，并在会话中记录实际处置结果。",
+            "matched_signals": [
+                *safety_matched,
+                *(["safety_override"] if negated else []),
+            ],
         }
 
     if negated:

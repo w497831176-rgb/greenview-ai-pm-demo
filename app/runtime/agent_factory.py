@@ -337,8 +337,10 @@ def build_agent_from_snapshot(
         tools=list(tools or []),
         skills=model_skills,
         markdown=True,
-        add_history_to_context=True,
-        num_history_runs=5,
+        # The coordinator injects only successful user-visible chat_messages.
+        # Agno stage history may contain Router control JSON and must stay off.
+        add_history_to_context=False,
+        num_history_runs=0,
     )
     return AgentBuild(
         agent=agent,

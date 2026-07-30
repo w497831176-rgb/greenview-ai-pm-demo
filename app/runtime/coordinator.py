@@ -23,10 +23,14 @@ from app.runtime.contracts import (
     ActionProposal,
     ActionReceipt,
     ApprovalEvent,
+    CapabilityDecision,
+    LaneDecision,
+    LaneDecisionSource,
     RiskLevel,
     RouteDecision,
     RunState,
     RunStatus,
+    RuntimeLane,
     RuntimePath,
     ToolEffect,
     ToolInvocation,
@@ -61,6 +65,7 @@ from db.property_db import (
     get_latest_action_proposal,
     get_pending_action_proposal,
     get_work_order_draft,
+    list_chat_messages,
     list_action_approvals,
     now_cn,
     record_mcp_call_audit,
@@ -199,6 +204,28 @@ OUT_OF_SCOPE_RESPONSE = (
 
 class ProviderFailureError(RuntimeError):
     """A Provider failure returned as model text instead of an exception."""
+
+
+class InternalControlPayloadLeakError(RuntimeError):
+    """A control-plane JSON payload reached the user-answer boundary."""
+
+
+GENERAL_CREATIVE_PATTERNS = (
+    re.compile(r"(?:写|编|创作).{0,12}(?:故事|诗|段子|歌词)"),
+    re.compile(r"(?:讲个故事|作诗)"),
+)
+GENERAL_KNOWLEDGE_PATTERNS = (
+    re.compile(r"(?:奇门遁甲|起运|占卜|八字|风水)"),
+    re.compile(r"(?:量子纠缠|相对论|科普|为什么能飞|解释.{0,12}(?:原理|理论))"),
+)
+DIGITAL_LOSS_PATTERNS = (
+    re.compile(r"(?:游戏|社交|邮箱|平台).{0,6}(?:账号|帐号).{0,8}(?:丢|找不到|不见)"),
+    re.compile(r"(?:电脑|手机|云盘).{0,6}(?:文件|数据).{0,8}(?:丢|找不到|不见|删除)"),
+)
+PHYSICAL_LOSS_PATTERNS = (
+    re.compile(r"(?:不见了|找不到了|丢了|遗失|落在|掉在|捡到)"),
+    re.compile(r"(?:找不到|不见).{0,8}(?:怎么办|怎么处理)"),
+)
 
 
 def _json(value: Any) -> str:
@@ -373,6 +400,206 @@ def _is_property_business_query(message: str) -> bool:
     compact = re.sub(r"\s+", "", message or "")
     return any(term in compact for term in PROPERTY_BUSINESS_TERMS) or any(
         pattern.search(compact) for pattern in KNOWLEDGE_SERVICE_FACT_PATTERNS
+    )
+
+
+def _decide_lane(message: str) -> LaneDecision:
+    """Choose one execution lane before any business Agent is selectable."""
+
+    compact = re.sub(r"\s+", "", str(message or "")).lower()
+    handoff = evaluate_handoff_policy(message)
+    if handoff.get("reason_code") == "safety_risk":
+        return LaneDecision(
+            lane=RuntimeLane.SAFETY_HANDOFF,
+            reason_code="safety_risk",
+            business_intent="safety_risk",
+            confidence=1.0,
+            needs_clarification=False,
+            decision_source=LaneDecisionSource.SAFETY_POLICY,
+            matched_signals=list(handoff.get("matched_signals") or []),
+            allowed_domain_scopes=[],
+        )
+
+    digital_match = next(
+        (pattern.pattern for pattern in DIGITAL_LOSS_PATTERNS if pattern.search(compact)),
+        None,
+    )
+    if digital_match:
+        return LaneDecision(
+            lane=RuntimeLane.ISOLATED_GENERAL,
+            reason_code="explicit_non_property_digital_task",
+            business_intent="digital_help",
+            confidence=0.98,
+            decision_source=LaneDecisionSource.DETERMINISTIC_RULE,
+            matched_signals=[digital_match],
+            allowed_domain_scopes=["isolated_general"],
+        )
+
+    property_signals = [term for term in PROPERTY_BUSINESS_TERMS if term in compact]
+    if property_signals:
+        if any(term in compact for term in ("工单", "报修", "维修", "漏水", "灯坏")):
+            intent = "maintenance_service"
+        elif any(term in compact for term in ("物业费", "停车费", "缴费", "账单")):
+            intent = "property_billing"
+        else:
+            intent = "property_service"
+        return LaneDecision(
+            lane=RuntimeLane.PROPERTY_GOVERNED,
+            reason_code="explicit_property_signal",
+            business_intent=intent,
+            confidence=0.99,
+            decision_source=LaneDecisionSource.DETERMINISTIC_RULE,
+            matched_signals=property_signals,
+            allowed_domain_scopes=["property"],
+        )
+
+    loss_match = next(
+        (pattern.pattern for pattern in PHYSICAL_LOSS_PATTERNS if pattern.search(compact)),
+        None,
+    )
+    if loss_match:
+        return LaneDecision(
+            lane=RuntimeLane.PROPERTY_GOVERNED,
+            reason_code="possible_physical_lost_and_found",
+            business_intent="lost_and_found",
+            confidence=0.82,
+            needs_clarification=True,
+            decision_source=LaneDecisionSource.DETERMINISTIC_RULE,
+            matched_signals=[loss_match],
+            allowed_domain_scopes=["property"],
+        )
+
+    general_match = next(
+        (
+            pattern.pattern
+            for pattern in (*GENERAL_CREATIVE_PATTERNS, *GENERAL_KNOWLEDGE_PATTERNS)
+            if pattern.search(compact)
+        ),
+        None,
+    )
+    if general_match:
+        return LaneDecision(
+            lane=RuntimeLane.ISOLATED_GENERAL,
+            reason_code="explicit_non_property_general_task",
+            business_intent="general_low_risk",
+            confidence=0.97,
+            decision_source=LaneDecisionSource.DETERMINISTIC_RULE,
+            matched_signals=[general_match],
+            allowed_domain_scopes=["isolated_general"],
+        )
+
+    return LaneDecision(
+        lane=RuntimeLane.PROPERTY_GOVERNED,
+        reason_code="unknown_scope_clarify_in_property_lane",
+        business_intent="property_scope_clarification",
+        confidence=0.55,
+        needs_clarification=True,
+        decision_source=LaneDecisionSource.FALLBACK,
+        matched_signals=[],
+        allowed_domain_scopes=["property"],
+    )
+
+
+def _lane_candidates(
+    cards: List[Dict[str, Any]], lane: RuntimeLane
+) -> List[Dict[str, Any]]:
+    if lane == RuntimeLane.SAFETY_HANDOFF:
+        return []
+    scope = "property" if lane == RuntimeLane.PROPERTY_GOVERNED else "isolated_general"
+    return [card for card in cards if _agent_domain_scope(card) == scope]
+
+
+def _lane_fallback_agent(
+    cards: List[Dict[str, Any]], lane: RuntimeLane
+) -> Optional[Dict[str, Any]]:
+    if lane == RuntimeLane.PROPERTY_GOVERNED:
+        return next(
+            (card for card in cards if str(card.get("agent_id")) == "customer_service"),
+            cards[0] if cards else None,
+        )
+    if lane == RuntimeLane.ISOLATED_GENERAL:
+        return _isolated_general_fallback(cards)
+    return None
+
+
+def _visible_chat_history(
+    session_id: str,
+    *,
+    current_trace_id: Optional[str] = None,
+    rounds: int = 5,
+) -> List[Dict[str, str]]:
+    """Return only successful user-visible messages; control-plane runs are excluded."""
+
+    visible: List[Dict[str, str]] = []
+    for item in list_chat_messages(session_id):
+        role = str(item.get("role") or "").lower()
+        status = str(item.get("status") or "success").lower()
+        content = str(item.get("content") or "").strip()
+        if role not in {"user", "owner", "assistant"} or not content:
+            continue
+        if status not in {"success", "complete", "completed"}:
+            continue
+        if current_trace_id and str(item.get("trace_id") or "") == current_trace_id:
+            continue
+        if _is_internal_control_payload(content):
+            continue
+        visible.append(
+            {"role": "user" if role in {"user", "owner"} else "assistant", "content": content}
+        )
+    return visible[-max(0, int(rounds)) * 2 :]
+
+
+def _render_visible_history_context(
+    history: List[Dict[str, str]],
+    current_message: str,
+    *,
+    boundary: str,
+) -> str:
+    lines = [f"[执行边界] {boundary}"]
+    if history:
+        lines.append("[最近成功可见对话]")
+        for item in history:
+            label = "用户" if item.get("role") == "user" else "助手"
+            lines.append(f"{label}：{item.get('content', '')}")
+    lines.extend(["[本轮用户问题]", current_message])
+    return "\n".join(lines)
+
+
+def _is_internal_control_payload(text: str) -> bool:
+    """Reject a whole response that is Router/Lane control JSON, not user prose."""
+
+    raw = str(text or "").strip()
+    if raw.startswith("```") and raw.endswith("```"):
+        raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.IGNORECASE)
+        raw = re.sub(r"\s*```$", "", raw).strip()
+    if not raw.startswith("{") or not raw.endswith("}"):
+        return False
+    try:
+        payload = json.loads(raw)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    control_keys = {
+        "target_agent_id",
+        "selected_agent_id",
+        "lane",
+        "reason_code",
+        "business_intent",
+        "allowed_domain_scopes",
+    }
+    return bool(control_keys.intersection(payload))
+
+
+def _lane_explanation(decision: LaneDecision) -> str:
+    labels = {
+        RuntimeLane.SAFETY_HANDOFF: "安全人工协同",
+        RuntimeLane.PROPERTY_GOVERNED: "物业受控回答",
+        RuntimeLane.ISOLATED_GENERAL: "隔离通用回答",
+    }
+    return (
+        f"进入{labels[decision.lane]}路径；识别任务为"
+        f"{decision.business_intent}，原因为{decision.reason_code}。"
     )
 
 
@@ -771,17 +998,24 @@ class RuntimeCoordinator:
             },
         )
         try:
-            if _external_high_risk(message):
-                async for event in self._stream_external_safety_boundary(
-                    session_id,
+            pre_handoff_policy = evaluate_handoff_policy(message)
+            if (
+                pre_handoff_policy.get("reason_code") == "safety_risk"
+                or not pre_handoff_policy.get("should_request_handoff")
+            ):
+                state.lane_decision = _decide_lane(message)
+                lane_payload = state.lane_decision.model_dump(mode="json")
+                lane_explanation = _lane_explanation(state.lane_decision)
+                lane_payload["explanation"] = lane_explanation
+                ledger.set("lane_decision", lane_payload)
+                record_trace_event(
                     trace_id,
-                    snapshot,
-                    state,
-                    ledger,
-                    started,
-                ):
-                    yield event
-                return
+                    "lane_decision",
+                    "success",
+                    output_summary=lane_explanation,
+                    metadata=lane_payload,
+                )
+                yield _sse("lane", {"trace_id": trace_id, **lane_payload})
 
             handoff = await self._maybe_handoff(
                 message, session_id, trace_id, snapshot.release_id
@@ -803,9 +1037,34 @@ class RuntimeCoordinator:
                         matched_signals=handoff_policy.get("matched_signals") or [],
                     ),
                 }
+                state.capability_decision = CapabilityDecision(
+                    selected_agent_id=None,
+                    skill={"status": "skipped", "reason_code": "handoff_preempted"},
+                    rag={"status": "skipped", "reason_code": "handoff_preempted"},
+                    tool={"status": "skipped", "reason_code": "handoff_preempted"},
+                    write={"status": "not_required", "reason_code": "handoff_preempted"},
+                    handoff={
+                        "status": "required",
+                        "reason_code": handoff_reason,
+                        "details": {
+                            "level": handoff_policy.get("level"),
+                            "matched_signals": handoff_policy.get("matched_signals") or [],
+                        },
+                    },
+                )
                 state.status = RunStatus.COMPLETED
                 state.next_step = None
                 ledger.capture_state(state)
+                ledger.append(
+                    "handoff_events",
+                    {
+                        "status": handoff_state,
+                        "reason_code": handoff_reason,
+                        "safety_override": "safety_override"
+                        in (handoff_policy.get("matched_signals") or []),
+                        "model_invoked": False,
+                    },
+                )
                 ledger.append(
                     "evaluation_results",
                     {"case": "handoff_policy", "passed": True, "state": handoff_state},
@@ -853,6 +1112,14 @@ class RuntimeCoordinator:
                         "handoff": True,
                         "handoff_state": handoff_state,
                         "handoff_reason": handoff_reason,
+                        "lane_decision": (
+                            state.lane_decision.model_dump(mode="json")
+                            if state.lane_decision
+                            else None
+                        ),
+                        "capability_decision": state.capability_decision.model_dump(
+                            mode="json"
+                        ),
                         "decision_summary": decision_summary,
                         "release_id": snapshot.release_id,
                         "snapshot_id": snapshot.snapshot_id,
@@ -862,6 +1129,24 @@ class RuntimeCoordinator:
                 return
 
             if path == RuntimePath.CONTROLLED_ACTION:
+                if state.lane_decision is None:
+                    state.lane_decision = LaneDecision(
+                        lane=RuntimeLane.PROPERTY_GOVERNED,
+                        reason_code="controlled_action_context",
+                        business_intent="controlled_property_action",
+                        confidence=1.0,
+                        decision_source=LaneDecisionSource.DETERMINISTIC_RULE,
+                        matched_signals=["controlled_action"],
+                        allowed_domain_scopes=["property"],
+                    )
+                state.capability_decision = CapabilityDecision(
+                    selected_agent_id=None,
+                    skill={"status": "skipped", "reason_code": "controlled_action"},
+                    rag={"status": "skipped", "reason_code": "controlled_action"},
+                    tool={"status": "skipped", "reason_code": "controlled_action"},
+                    write={"status": "required", "reason_code": "controlled_action"},
+                    handoff={"status": "available", "reason_code": "owner_can_request"},
+                )
                 async for event in self._stream_controlled_action(
                     message, session_id, trace_id, snapshot, state, ledger, started
                 ):
@@ -906,7 +1191,11 @@ class RuntimeCoordinator:
             failure_code = (
                 "provider_failure"
                 if isinstance(exc, ProviderFailureError)
-                else "runtime_failure"
+                else (
+                    "internal_control_payload_leak"
+                    if isinstance(exc, InternalControlPayloadLeakError)
+                    else "runtime_failure"
+                )
             )
             public_error = (
                 PROVIDER_FAILURE_PUBLIC_MESSAGE
@@ -1101,6 +1390,104 @@ class RuntimeCoordinator:
                 "current_agent_id": "external_safety_boundary",
                 "domain_scope": "isolated_general",
                 "decision_summary": decision_summary,
+                "cost_entries": [],
+                "usage_source": "not_applicable",
+                "token_count": 0,
+                "round_token_count": 0,
+            },
+        )
+
+    async def _stream_unconfigured_general_boundary(
+        self,
+        session_id: str,
+        trace_id: str,
+        snapshot: Any,
+        state: RunState,
+        ledger: EvidenceLedger,
+        started: float,
+    ) -> AsyncIterator[str]:
+        """Return a truthful static boundary when no C-lane Agent is published."""
+
+        state.capability_decision = CapabilityDecision(
+            selected_agent_id=None,
+            skill={"status": "skipped", "reason_code": "no_lane_agent"},
+            rag={"status": "skipped", "reason_code": "no_lane_agent"},
+            tool={"status": "skipped", "reason_code": "no_lane_agent"},
+            write={"status": "not_required", "reason_code": "isolated_general"},
+            handoff={"status": "available", "reason_code": "owner_can_request"},
+        )
+        state.status = RunStatus.COMPLETED
+        state.next_step = None
+        ledger.capture_state(state)
+        ledger.append(
+            "evaluation_results",
+            {
+                "case": "isolated_general_no_agent_boundary",
+                "passed": True,
+                "model_invoked": False,
+            },
+        )
+        ledger.persist("complete")
+        saved = save_chat_message(
+            session_id=session_id,
+            role="assistant",
+            content=OUT_OF_SCOPE_RESPONSE,
+            trace_id=trace_id,
+            current_agent="通用边界",
+            current_agent_id="isolated_general_boundary",
+            status="success",
+            usage_source="not_applicable",
+        )
+        update_chat_trace(
+            trace_id,
+            intent="isolated_general_boundary",
+            agent_name="通用边界",
+            agent_id="isolated_general_boundary",
+            status="complete",
+        )
+        record_trace_event(
+            trace_id,
+            "isolated_general_boundary",
+            "success",
+            latency_ms=int((time.time() - started) * 1000),
+            output_summary="no published C-lane Agent; static boundary returned",
+            metadata={
+                "lane_decision": (
+                    state.lane_decision.model_dump(mode="json")
+                    if state.lane_decision
+                    else None
+                ),
+                "model_invoked": False,
+            },
+        )
+        yield _sse(
+            "final",
+            {
+                "content": OUT_OF_SCOPE_RESPONSE,
+                "current_agent": "通用边界",
+                "current_agent_id": "isolated_general_boundary",
+                "domain_scope": "isolated_general",
+            },
+        )
+        yield _sse(
+            "done",
+            {
+                "status": "complete",
+                "message_id": saved.get("id"),
+                "trace_id": trace_id,
+                "runtime_path": RuntimePath.CONSULTATION.value,
+                "release_id": snapshot.release_id,
+                "snapshot_id": snapshot.snapshot_id,
+                "current_agent": "通用边界",
+                "current_agent_id": "isolated_general_boundary",
+                "lane_decision": (
+                    state.lane_decision.model_dump(mode="json")
+                    if state.lane_decision
+                    else None
+                ),
+                "capability_decision": state.capability_decision.model_dump(
+                    mode="json"
+                ),
                 "cost_entries": [],
                 "usage_source": "not_applicable",
                 "token_count": 0,
@@ -1683,9 +2070,27 @@ class RuntimeCoordinator:
         started: float,
     ) -> AsyncIterator[str]:
         state.next_step = "route"
-        cards = vertical_agent_cards(snapshot.config)
+        if state.lane_decision is None:
+            raise RuntimeError("consultation started without LaneDecision")
+        all_cards = vertical_agent_cards(snapshot.config)
+        cards = _lane_candidates(all_cards, state.lane_decision.lane)
+        if (
+            not cards
+            and state.lane_decision.lane == RuntimeLane.ISOLATED_GENERAL
+        ):
+            async for event in self._stream_unconfigured_general_boundary(
+                session_id, trace_id, snapshot, state, ledger, started
+            ):
+                yield event
+            return
         if not cards:
             raise RuntimeError("published RuntimeRelease has no enabled vertical agent")
+
+        visible_history = _visible_chat_history(
+            session_id,
+            current_trace_id=trace_id,
+            rounds=5,
+        )
 
         router_started = time.time()
         from agents.router import classify_intent
@@ -1709,9 +2114,10 @@ class RuntimeCoordinator:
             message,
             vertical_agents=cards,
             user_id=user_id,
-            session_id=session_id,
+            session_id=f"{session_id}::router::{trace_id}",
             published_instructions=str(router_config.get("instructions") or ""),
             model=_build_model_from_snapshot(snapshot.config, router_model_id),
+            visible_history=visible_history,
         )
         candidates = [str(item["agent_id"]) for item in cards]
         selected = str(
@@ -1720,27 +2126,43 @@ class RuntimeCoordinator:
             or "customer_service"
         )
         if selected not in candidates:
-            selected = "customer_service" if "customer_service" in candidates else candidates[0]
+            selected = str((_lane_fallback_agent(cards, state.lane_decision.lane) or cards[0])["agent_id"])
+        if (
+            state.lane_decision.lane == RuntimeLane.PROPERTY_GOVERNED
+            and state.lane_decision.business_intent
+            in {"lost_and_found", "property_scope_clarification", "property_service"}
+            and "customer_service" in candidates
+        ):
+            selected = "customer_service"
         selected_card = next(
             item for item in cards if str(item.get("agent_id")) == selected
         )
-        property_query = _is_property_business_query(message)
-        fallback = None
-        if _agent_domain_scope(selected_card) == "property" and not property_query:
-            fallback = _isolated_general_fallback(cards)
-            if fallback:
-                selected = str(fallback["agent_id"])
-                selected_card = fallback
+        property_query = state.lane_decision.lane == RuntimeLane.PROPERTY_GOVERNED
         domain_scope = _agent_domain_scope(selected_card)
-        out_of_scope_without_agent = bool(
-            domain_scope == "property" and not property_query and not fallback
-        )
+        out_of_scope_without_agent = False
         route_reason = str(route_result.get("reason") or "Router selected published agent")
-        if fallback:
-            route_reason = (
-                f"{route_reason}; deterministic domain fallback selected configured "
-                "isolated_general Agent"
+        model_target = route_result.get("model_target_agent_id")
+        if model_target and str(model_target) not in candidates:
+            ledger.violation(
+                "lane_agent_scope_mismatch",
+                "Router proposed an Agent outside the selected Lane; within-Lane fallback applied.",
+                lane=state.lane_decision.lane.value,
+                proposed_agent_id=str(model_target),
+                allowed_agent_ids=candidates,
+                selected_agent_id=selected,
             )
+            record_trace_event(
+                trace_id,
+                "lane_agent_scope_mismatch",
+                "blocked",
+                output_summary=f"blocked {model_target}; selected {selected}",
+                metadata={
+                    "lane": state.lane_decision.lane.value,
+                    "proposed_agent_id": str(model_target),
+                    "allowed_agent_ids": candidates,
+                },
+            )
+            route_reason += "; blocked cross-Lane Agent and applied within-Lane fallback"
         route = RouteDecision(
             candidates=candidates,
             selected_agent_id=selected,
@@ -1764,6 +2186,8 @@ class RuntimeCoordinator:
                 "current_agent": state.selected_agent.get("name"),
                 "current_agent_id": selected,
                 "domain_scope": domain_scope,
+                "lane": state.lane_decision.lane.value,
+                "business_intent": state.lane_decision.business_intent,
                 "trace_id": trace_id,
             },
         )
@@ -2155,6 +2579,59 @@ class RuntimeCoordinator:
                 policy_reason=handoff_reason_code,
             ),
         }
+        state.capability_decision = CapabilityDecision(
+            selected_agent_id=selected,
+            skill={
+                "status": "selected" if build.activated_skills else "skipped",
+                "reason_code": "matched_intent" if build.activated_skills else "no_match",
+                "details": {
+                    "skill_ids": [item.skill_id for item in build.activated_skills]
+                },
+            },
+            rag={
+                "status": (
+                    "selected"
+                    if allowed_doc_ids and not structured_realtime_query
+                    else "skipped"
+                ),
+                "reason_code": (
+                    "knowledge_evidence_required"
+                    if allowed_doc_ids and not structured_realtime_query
+                    else (
+                        "structured_realtime_query"
+                        if structured_realtime_query
+                        else "no_bound_knowledge"
+                    )
+                ),
+                "details": {
+                    "retrieval_status": retrieval_status,
+                    "evidence_count": len(evidence.items),
+                },
+            },
+            tool={
+                "status": "selected" if read_tool_plans else "skipped",
+                "reason_code": (
+                    "exact_workorder_lookup"
+                    if structured_realtime_query
+                    else ("matched_intent" if read_tool_plans else "not_required")
+                ),
+                "details": {
+                    "tools": [
+                        f"{plan.server_name}/{plan.tool_name}"
+                        for plan in read_tool_plans
+                    ]
+                },
+            },
+            write={"status": "not_required", "reason_code": "consultation_path"},
+            handoff={
+                "status": "available",
+                "reason_code": (
+                    "negated_by_user"
+                    if handoff_reason_code == "negated_by_user"
+                    else "owner_can_request"
+                ),
+            },
+        )
         ledger.append(
             "evaluation_results",
             {
@@ -2224,9 +2701,13 @@ class RuntimeCoordinator:
                 {"trace_id": trace_id, "stage": "model.invoke", "status": "running"},
             )
         agent_started = time.time()
-        contextual_message = (
-            "[运行边界] 本轮是只读技术栈咨询路径，不得创建工单、草稿或任何待确认 Action。\n"
-            + message
+        contextual_message = _render_visible_history_context(
+            visible_history,
+            message,
+            boundary=(
+                "本轮是只读咨询路径。只回答本轮用户问题；不得输出 Router、LaneDecision、"
+                "CapabilityDecision 或其他控制 JSON；不得创建工单、草稿或待确认 Action。"
+            ),
         )
         full_content = ""
         provisional_buffer = ""
@@ -2242,7 +2723,7 @@ class RuntimeCoordinator:
             build.agent.arun(
                 contextual_message,
                 user_id=user_id,
-                session_id=session_id,
+                session_id=f"{session_id}::vertical::{selected}::{trace_id}",
                 stream=True,
                 stream_events=True,
             )
@@ -2263,22 +2744,8 @@ class RuntimeCoordinator:
                 content_delta = str(content)
                 full_content += content_delta
                 provisional_buffer += content_delta
-                # Some OpenAI-compatible Providers return account/auth errors
-                # as ordinary assistant text. Hold only a possible error prefix;
-                # normal model text still streams immediately.
-                if not direct_knowledge_required and not _provider_failure_reason(
-                    provisional_buffer
-                ) and not _provider_failure_prefix(provisional_buffer):
-                    yield _sse(
-                        "delta",
-                        {
-                            "content": provisional_buffer,
-                            "provisional": True,
-                            "current_agent": state.selected_agent.get("name"),
-                            "current_agent_id": selected,
-                        },
-                    )
-                    provisional_buffer = ""
+                # Buffer until the complete answer passes control-payload and
+                # evidence validation. Internal JSON must never leak as a delta.
             for call in _extract_tool_calls(chunk):
                 if call not in tool_calls:
                     tool_calls.append(call)
@@ -2334,6 +2801,26 @@ class RuntimeCoordinator:
             ]
 
         provider_failure_reason = _provider_failure_reason(full_content)
+        if _is_internal_control_payload(full_content):
+            ledger.violation(
+                "internal_control_payload_leak",
+                "A business Agent returned control-plane JSON at the user-answer boundary.",
+                selected_agent_id=selected,
+                lane=state.lane_decision.lane.value,
+            )
+            record_trace_event(
+                trace_id,
+                "internal_control_payload_leak",
+                "blocked",
+                output_summary="control-plane JSON blocked before user delivery",
+                metadata={
+                    "selected_agent_id": selected,
+                    "lane": state.lane_decision.lane.value,
+                },
+            )
+            raise InternalControlPayloadLeakError(
+                "business Agent returned an internal control payload"
+            )
         if (
             provisional_buffer
             and not direct_knowledge_required
@@ -2644,6 +3131,8 @@ class RuntimeCoordinator:
                 "citation_violations": citation_violations,
                 "model_invoked": model_invoked,
                 "domain_scope": domain_scope,
+                "lane_decision": state.lane_decision.model_dump(mode="json"),
+                "capability_decision": state.capability_decision.model_dump(mode="json"),
             },
         )
 
@@ -2806,6 +3295,8 @@ class RuntimeCoordinator:
                 "tool_calls": tool_calls,
                 "mcp_calls": mcp_payload,
                 "decision_summary": decision_summary,
+                "lane_decision": state.lane_decision.model_dump(mode="json"),
+                "capability_decision": state.capability_decision.model_dump(mode="json"),
                 "cost_entries": [
                     item.model_dump(mode="json") for item in state.cost_entries
                 ],

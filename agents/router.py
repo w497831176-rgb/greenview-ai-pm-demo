@@ -96,9 +96,9 @@ def create_router_agent(
             published_instructions=published_instructions,
         ),
         add_datetime_to_context=True,
-        add_history_to_context=True,
-        read_chat_history=True,
-        num_history_runs=3,
+        add_history_to_context=False,
+        read_chat_history=False,
+        num_history_runs=0,
         markdown=False,
     )
 
@@ -302,6 +302,7 @@ async def classify_intent(
     session_id: str = "",
     published_instructions: Optional[str] = None,
     model: Any = None,
+    visible_history: Optional[List[Dict[str, str]]] = None,
 ) -> Dict[str, Any]:
     """Use the router agent to classify the user message intent.
 
@@ -337,13 +338,25 @@ async def classify_intent(
             + (f'；绑定 RAG={"、".join(knowledge_docs)}' if knowledge_docs else "")
         )
     valid_lines = "\n".join(valid_entries) or "- maintenance（维修 Agent）\n- billing（费用 Agent）\n- complaint（投诉 Agent）\n- customer_service（客服 Agent）"
+    history_lines = []
+    for item in visible_history or []:
+        role = "用户" if item.get("role") == "user" else "助手"
+        history_lines.append(f"{role}：{item.get('content', '')}")
+    history_block = (
+        "最近成功可见对话（只作语义上下文，不包含运行控制数据）：\n"
+        + "\n".join(history_lines)
+        + "\n\n"
+        if history_lines
+        else ""
+    )
     prompt = (
         "请判断以下业主问题的意图，并从当前启用的垂直 Agent 中选择一个目标。只输出 JSON，不要添加其他解释。\n"
         "选择规则：优先选择描述与用户问题关键词最匹配的垂直 Agent；"
         "如果某个 Agent 的描述明确包含用户问题的主题词，则必须选择该 Agent。\n\n"
-        f"用户问题：{message}\n\n"
-        "可选目标：\n" + valid_lines + "\n\n"
-        '输出格式：{"target_agent_id": "<agent_id>", "reason": "<简要理由>"}'
+        + history_block
+        + f"本轮用户问题：{message}\n\n"
+        + "可选目标：\n" + valid_lines + "\n\n"
+        + '输出格式：{"target_agent_id": "<agent_id>", "reason": "<简要理由>"}'
     )
     route_mode = "model_success"
     raw_response = ""
@@ -383,9 +396,11 @@ async def classify_intent(
             }
 
         json_match = re.search(r"\{.*\}", response, re.DOTALL)
+        model_target = None
         if json_match:
             parsed = json.loads(json_match.group(0))
             target = parsed.get("target_agent_id", parsed.get("intent", "customer_service"))
+            model_target = target
             reason = parsed.get("reason", "")
         else:
             target, reason, fallback_scores = _capability_fallback(message, vertical_agents)
@@ -411,6 +426,7 @@ async def classify_intent(
 
         return {
             "target_agent_id": target,
+            "model_target_agent_id": model_target,
             "reason": reason,
             "raw": raw_response,
             "route_mode": route_mode,
@@ -432,6 +448,7 @@ async def classify_intent(
         target, reason, fallback_scores = _capability_fallback(message, vertical_agents)
         return {
             "target_agent_id": target,
+            "model_target_agent_id": None,
             "reason": reason,
             "raw": raw_response,
             "route_mode": "capability_fallback",
