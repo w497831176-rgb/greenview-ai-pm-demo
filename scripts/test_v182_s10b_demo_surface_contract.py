@@ -67,10 +67,12 @@ def main() -> None:
     for phrase in ("保存会修改Draft", "不调用模型", "不自动发布", "必须发布RuntimeRelease后才影响新会话"):
         check(f"RAG consequence explained: {phrase}", phrase in knowledge)
 
-    # Runtime history keeps comparison visible; mutating or technical operations are folded.
+    # Runtime keeps the unique current release visible and folds history governance.
     runtime = between(html, "const renderHistoryRow", "async function openAdvancedAcceptance")
     advanced_version = runtime.index("高级版本操作")
-    check("Runtime diff remains the default action", runtime.index("runtime-history-diff") < advanced_version)
+    check("Runtime current release is the default", "当前生效版本" in html and "唯一当前生效" in html)
+    check("Runtime history and diff are folded", 'id="runtime-history-panel"' in html and "历史版本与 Diff" in html)
+    check("Runtime diff remains first inside history", runtime.index("runtime-history-diff") < advanced_version)
     check("Runtime snapshot is folded", runtime.index("runtime-history-config") > advanced_version)
     check("Runtime rollback is folded", runtime.index("runtime-rollback-btn") > advanced_version)
     for phrase in ("修改当前运行版本指针", "不部署Git代码", "仅影响后续新会话", "旧会话保持原Snapshot"):
@@ -78,9 +80,11 @@ def main() -> None:
     acceptance = between(html, '<details class="rounded-2xl border border-dashed', "requireElement('#runtime-preview-btn'")
     check("Runtime advanced acceptance is folded", "<details" in acceptance and 'id="runtime-advanced-btn"' in acceptance)
 
-    # Model-consuming Badcase actions stay advanced and require an explicit confirmation.
-    badcase_surface = between(html, "查看处理草稿与操作入口", "查看技术证据")
-    check("Badcase operations stay in folded advanced area", "高级操作" in badcase_surface)
+    # Badcase defaults to the four-step business flow; evidence remains folded.
+    badcase_surface = between(html, "四步人工质量闭环", "高级证据：草稿、Trace、Release、历次复测与审计")
+    check("Badcase four-step flow is visible", all(value in badcase_surface for value in ("发现问题", "AI 根因建议", "人工确认修复方案", "单例复测与人工关闭")))
+    check("Badcase operations are human-controlled", "当前下一步 · 人工控制" in badcase_surface)
+    check("Badcase evidence stays folded", "<details" in html and "原始技术证据" in html)
     for phrase in (
         "可能调用模型并产生费用", "调用Pro并产生费用",
         "通常调用Flash并产生费用", "AI分析建议，不等于人工确认根因",

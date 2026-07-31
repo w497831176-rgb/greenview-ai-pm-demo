@@ -1,9 +1,10 @@
 """Capture provider-returned model identity and raw DeepSeek usage evidence.
 
-Agno 2.6.21 keeps the provider request id, but its generic OpenAI-compatible
-adapter does not retain ``response.model`` or DeepSeek's cache-hit/cache-miss
-usage fields.  This module adds only those missing evidence fields; it never
-infers one token class from another.
+Agno 2.6.21 keeps the provider request id on ordinary content chunks, but its
+generic OpenAI-compatible adapter does not retain the id on a final usage-only
+stream chunk.  It also omits ``response.model`` and DeepSeek's cache-hit/cache-
+miss usage fields.  This module adds only those missing evidence fields; it
+never infers one token class from another.
 """
 
 from __future__ import annotations
@@ -77,6 +78,9 @@ def raw_provider_usage(usage: Any) -> Dict[str, Optional[int]]:
 def capture_provider_response(model_response: Any, provider_response: Any) -> Any:
     """Attach raw response identity and usage to Agno's provider_data."""
     provider_data = dict(getattr(model_response, "provider_data", None) or {})
+    response_id = _value(provider_response, "id")
+    if response_id:
+        provider_data["id"] = str(response_id)
     response_model = _value(provider_response, "model")
     if response_model:
         provider_data["response_model"] = str(response_model)
