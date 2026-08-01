@@ -7,6 +7,7 @@ import json
 import re
 import time
 import uuid
+from contextlib import nullcontext
 from types import SimpleNamespace
 from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 
@@ -37,7 +38,7 @@ from app.runtime.contracts import (
     ToolInvocation,
     content_hash,
 )
-from app.runtime.cost_ledger import build_cost_entry, cost_entry_usage_payload
+from app.runtime.cost_ledger import build_cost_entry
 from app.runtime.evidence_ledger import EvidenceLedger
 from app.runtime.mcp_executor import (
     build_model_native_read_tools,
@@ -45,10 +46,8 @@ from app.runtime.mcp_executor import (
 )
 from app.runtime.snapshot_resolver import resolve_snapshot
 from app.runtime.tool_planner import plan_tools, unique_write_plan
-from app.runtime.provider_evidence import (
-    provider_evidence_from_run,
-    provider_requests_from_model,
-)
+from app.runtime.provider_accounting import merge_non_null, provider_accounting_scope
+from app.runtime.provider_evidence import provider_evidence_from_run
 from app.settings import MODEL_ID, USE_THINKING, build_model
 from app.work_order_workflow import (
     _is_draft_follow_up,
@@ -71,8 +70,6 @@ from db.property_db import (
     list_action_approvals,
     now_cn,
     record_mcp_call_audit,
-    record_model_call,
-    record_model_call_idempotent,
     record_trace_event,
     request_handoff,
     resume_handoff_after_owner_message,
@@ -627,24 +624,6 @@ def _thinking_for_snapshot(snapshot_config: Dict[str, Any], model_id: str) -> bo
     return bool(params.get("use_thinking", USE_THINKING))
 
 
-def _usage_for_observability(
-    cost: Any,
-    provider_request_id: Optional[str] = None,
-    provider_request_sequence: Optional[int] = None,
-    provider_request_key: Optional[str] = None,
-    provider_request_identity_source: Optional[str] = None,
-    evidence_source: Optional[str] = None,
-) -> Dict[str, Any]:
-    return cost_entry_usage_payload(
-        cost,
-        provider_request_id=provider_request_id,
-        provider_request_sequence=provider_request_sequence,
-        provider_request_key=provider_request_key,
-        provider_request_identity_source=provider_request_identity_source,
-        evidence_source=evidence_source,
-    )
-
-
 def _results_from_snapshot(
     query: str,
     live_results: List[Dict[str, Any]],
@@ -1164,20 +1143,31 @@ class RuntimeCoordinator:
                 rounds=5,
             )
             router_started = time.time()
-            result = await classify_lane_decision(
-                message,
-                vertical_agents=cards,
-                user_id=user_id,
-                session_id=f"{session_id}::semantic_router::{trace_id}",
-                model=_build_model_from_snapshot(snapshot.config, router_model_id),
-                visible_history=visible_history,
-            )
+            router_thinking = _thinking_for_snapshot(snapshot.config, router_model_id)
+            with provider_accounting_scope(
+                trace_id=trace_id,
+                session_id=session_id,
+                stage="router",
+                model_selection_reason="semantic LaneDecision from Published Snapshot",
+                price_snapshot=_price_for_snapshot(snapshot.config, router_model_id),
+                model_policy_version=str(
+                    (snapshot.config.get("model_policy") or {}).get("version") or "v1.8"
+                ),
+            ):
+                result = await classify_lane_decision(
+                    message,
+                    vertical_agents=cards,
+                    user_id=user_id,
+                    session_id=f"{session_id}::semantic_router::{trace_id}",
+                    model=_build_model_from_snapshot(snapshot.config, router_model_id),
+                    visible_history=visible_history,
+                )
             evidence = result.get("provider_evidence") or {}
             usage = evidence.get("usage") or result.get("metrics") or {}
             response_model = evidence.get("provider_response_model")
             provider_status = str(result.get("provider_status") or "failed")
             billing_model = response_model or router_model_id
-            thinking = _thinking_for_snapshot(snapshot.config, router_model_id)
+            thinking = router_thinking
             cost = build_cost_entry(
                 stage="router",
                 provider=_model_provider(snapshot.config, router_model_id),
@@ -1207,31 +1197,6 @@ class RuntimeCoordinator:
                     "usage_source": cost.usage_source.value,
                     "status": provider_status,
                 }
-            )
-            record_model_call(
-                trace_id=trace_id,
-                stage="router",
-                model_id=router_model_id,
-                model_selection_reason="semantic LaneDecision from Published Snapshot",
-                status=provider_status,
-                error_summary=result.get("validation_error"),
-                latency_ms=int((time.time() - router_started) * 1000),
-                input_tokens=cost.input_tokens,
-                output_tokens=cost.output_tokens,
-                reasoning_tokens=cost.reasoning_tokens,
-                cached_tokens=cost.cached_input_tokens,
-                total_tokens=cost.total_tokens,
-                usage_source=cost.usage_source.value,
-                price_snapshot=(
-                    cost.price_snapshot.model_dump(mode="json")
-                    if cost.price_snapshot
-                    else None
-                ),
-                estimated_cost_cny=cost.amount,
-                usage_normalized=_usage_for_observability(
-                    cost,
-                    provider_request_id=evidence.get("provider_request_id"),
-                ),
             )
             if result.get("decision") is None:
                 if provider_status != "success":
@@ -1286,22 +1251,33 @@ class RuntimeCoordinator:
                 "candidate_count": len(cards),
             }
         started = time.time()
-        selection = await select_lane_agent(
-            message,
-            lane=state.lane_decision.lane,
-            vertical_agents=cards,
-            user_id=user_id,
-            session_id=f"{session_id}::agent_selector::{trace_id}",
-            model=_build_model_from_snapshot(snapshot.config, selector_model_id),
-            visible_history=visible_history,
-        )
+        selector_thinking = _thinking_for_snapshot(snapshot.config, selector_model_id)
+        with provider_accounting_scope(
+            trace_id=trace_id,
+            session_id=session_id,
+            stage="agent_selector",
+            model_selection_reason="same-domain Agent selection after fixed Lane",
+            price_snapshot=_price_for_snapshot(snapshot.config, selector_model_id),
+            model_policy_version=str(
+                (snapshot.config.get("model_policy") or {}).get("version") or "v1.8"
+            ),
+        ):
+            selection = await select_lane_agent(
+                message,
+                lane=state.lane_decision.lane,
+                vertical_agents=cards,
+                user_id=user_id,
+                session_id=f"{session_id}::agent_selector::{trace_id}",
+                model=_build_model_from_snapshot(snapshot.config, selector_model_id),
+                visible_history=visible_history,
+            )
         provider_status = str(selection.get("provider_status") or "not_applicable")
         if provider_status != "not_applicable":
             evidence = selection.get("provider_evidence") or {}
             usage = evidence.get("usage") or selection.get("metrics") or {}
             response_model = evidence.get("provider_response_model")
             billing_model = response_model or selector_model_id
-            thinking = _thinking_for_snapshot(snapshot.config, selector_model_id)
+            thinking = selector_thinking
             cost = build_cost_entry(
                 stage="agent_selector",
                 provider=_model_provider(snapshot.config, selector_model_id),
@@ -1331,31 +1307,6 @@ class RuntimeCoordinator:
                     "usage_source": cost.usage_source.value,
                     "status": provider_status,
                 }
-            )
-            record_model_call(
-                trace_id=trace_id,
-                stage="agent_selector",
-                model_id=selector_model_id,
-                model_selection_reason="same-domain Agent selection after fixed Lane",
-                status=provider_status,
-                error_summary=selection.get("validation_error"),
-                latency_ms=int((time.time() - started) * 1000),
-                input_tokens=cost.input_tokens,
-                output_tokens=cost.output_tokens,
-                reasoning_tokens=cost.reasoning_tokens,
-                cached_tokens=cost.cached_input_tokens,
-                total_tokens=cost.total_tokens,
-                usage_source=cost.usage_source.value,
-                price_snapshot=(
-                    cost.price_snapshot.model_dump(mode="json")
-                    if cost.price_snapshot
-                    else None
-                ),
-                estimated_cost_cny=cost.amount,
-                usage_normalized=_usage_for_observability(
-                    cost,
-                    provider_request_id=evidence.get("provider_request_id"),
-                ),
             )
         selected = selection.get("selected_agent_id")
         record_trace_event(
@@ -2967,86 +2918,75 @@ class RuntimeCoordinator:
             "usage": {},
         }
         last_progress_at = time.time()
-        response_stream = (
-            build.agent.arun(
-                contextual_message,
-                user_id=user_id,
-                session_id=f"{session_id}::vertical::{selected}::{trace_id}",
-                stream=True,
-                stream_events=True,
+        model_id = str(
+            state.selected_agent.get("model_id")
+            or ((snapshot.config.get("model_policy") or {}).get("default") or {}).get(
+                "model_id"
+            )
+            or MODEL_ID
+        )
+        accounting_context = (
+            provider_accounting_scope(
+                trace_id=trace_id,
+                session_id=session_id,
+                stage="vertical_agent",
+                model_selection_reason=f"agent model from snapshot:{selected}",
+                price_snapshot=_price_for_snapshot(snapshot.config, model_id),
+                model_policy_version=str(
+                    (snapshot.config.get("model_policy") or {}).get("version") or "v1.8"
+                ),
             )
             if model_invoked
-            else _static_response_stream(
-                OUT_OF_SCOPE_RESPONSE
-                if out_of_scope_without_agent
-                else KNOWLEDGE_INSUFFICIENT_RESPONSE
-            )
+            else nullcontext(None)
         )
-        async for chunk in response_stream:
-            content = getattr(chunk, "content", None) or getattr(chunk, "delta", None)
-            event_name = str(getattr(chunk, "event", "") or "").lower()
-            # RunCompleted carries the full answer again together with the
-            # final metrics.  Capture its metrics but do not append its content
-            # a second time.
-            if content and "completed" not in event_name:
-                content_delta = str(content)
-                full_content += content_delta
-                provisional_buffer += content_delta
-                # Buffer until the complete answer passes control-payload and
-                # evidence validation. Internal JSON must never leak as a delta.
-            for call in _extract_tool_calls(chunk):
-                if call not in tool_calls:
-                    tool_calls.append(call)
-            metrics = _metrics_dict(chunk)
-            if metrics:
-                final_metrics.update(metrics)
-            chunk_evidence = provider_evidence_from_run(chunk)
-            if chunk_evidence.get("provider_response_model"):
-                final_provider_evidence["provider_response_model"] = chunk_evidence[
-                    "provider_response_model"
-                ]
-            if chunk_evidence.get("provider_request_id"):
-                final_provider_evidence["provider_request_id"] = chunk_evidence[
-                    "provider_request_id"
-                ]
-            if chunk_evidence.get("usage"):
-                final_provider_evidence["usage"].update(chunk_evidence["usage"])
-            if time.time() - last_progress_at >= 12:
-                yield _sse(
-                    "progress",
-                    {
-                        "trace_id": trace_id,
-                        "stage": "model.invoke",
-                        "status": "running",
-                    },
+        with accounting_context as provider_scope:
+            response_stream = (
+                build.agent.arun(
+                    contextual_message,
+                    user_id=user_id,
+                    session_id=f"{session_id}::vertical::{selected}::{trace_id}",
+                    stream=True,
+                    stream_events=True,
                 )
-                last_progress_at = time.time()
+                if model_invoked
+                else _static_response_stream(
+                    OUT_OF_SCOPE_RESPONSE
+                    if out_of_scope_without_agent
+                    else KNOWLEDGE_INSUFFICIENT_RESPONSE
+                )
+            )
+            async for chunk in response_stream:
+                content = getattr(chunk, "content", None) or getattr(chunk, "delta", None)
+                event_name = str(getattr(chunk, "event", "") or "").lower()
+                # RunCompleted carries the full answer again together with the
+                # final metrics.  Capture its metrics but do not append its content
+                # a second time.
+                if content and "completed" not in event_name:
+                    content_delta = str(content)
+                    full_content += content_delta
+                    provisional_buffer += content_delta
+                    # Buffer until the complete answer passes control-payload and
+                    # evidence validation. Internal JSON must never leak as a delta.
+                for call in _extract_tool_calls(chunk):
+                    if call not in tool_calls:
+                        tool_calls.append(call)
+                metrics = _metrics_dict(chunk)
+                if metrics:
+                    final_metrics.update(metrics)
+                chunk_evidence = provider_evidence_from_run(chunk)
+                merge_non_null(final_provider_evidence, chunk_evidence)
+                if time.time() - last_progress_at >= 12:
+                    yield _sse(
+                        "progress",
+                        {
+                            "trace_id": trace_id,
+                            "stage": "model.invoke",
+                            "status": "running",
+                        },
+                    )
+                    last_progress_at = time.time()
 
-        provider_requests = (
-            provider_requests_from_model(build.agent.model, consume=True)
-            if model_invoked
-            else []
-        )
-        if model_invoked and not provider_requests:
-            fallback_usage = final_provider_evidence.get("usage") or final_metrics
-            provider_requests = [
-                {
-                    **final_provider_evidence,
-                    "usage": dict(fallback_usage or {}),
-                    "provider_request_sequence": 1,
-                    "provider_request_key": (
-                        f"request_id:{final_provider_evidence['provider_request_id']}"
-                        if final_provider_evidence.get("provider_request_id")
-                        else "run_sequence:1"
-                    ),
-                    "provider_request_identity_source": (
-                        "provider_request_id"
-                        if final_provider_evidence.get("provider_request_id")
-                        else "run_sequence"
-                    ),
-                    "status": "success",
-                }
-            ]
+        provider_requests = list(provider_scope.attempts) if provider_scope else []
 
         provider_failure_reason = _provider_failure_reason(full_content)
         if _is_internal_control_payload(full_content):
@@ -3173,13 +3113,6 @@ class RuntimeCoordinator:
             citations,
         )
 
-        model_id = str(
-            state.selected_agent.get("model_id")
-            or (
-                (snapshot.config.get("model_policy") or {}).get("default") or {}
-            ).get("model_id")
-            or MODEL_ID
-        )
         vertical_cost_entries = []
         vertical_usage_sources: List[str] = []
         vertical_usage_source = "not_applicable"
@@ -3190,14 +3123,6 @@ class RuntimeCoordinator:
                     request_evidence.get("provider_request_sequence") or index
                 )
                 request_id = request_evidence.get("provider_request_id")
-                request_key = request_evidence.get("provider_request_key") or (
-                    f"request_id:{request_id}"
-                    if request_id
-                    else f"run_sequence:{sequence}"
-                )
-                identity_source = request_evidence.get(
-                    "provider_request_identity_source"
-                ) or ("provider_request_id" if request_id else "run_sequence")
                 vertical_usage = dict(request_evidence.get("usage") or {})
                 vertical_response_model = request_evidence.get(
                     "provider_response_model"
@@ -3239,36 +3164,6 @@ class RuntimeCoordinator:
                         "usage_source": vertical_usage_source,
                         "status": request_evidence.get("status") or "success",
                     }
-                )
-                record_model_call_idempotent(
-                    trace_id=trace_id,
-                    stage="vertical_agent",
-                    model_id=model_id,
-                    model_selection_reason=(
-                        f"agent model from snapshot:{selected}; "
-                        f"Provider request {sequence}/{len(provider_requests)}"
-                    ),
-                    latency_ms=None,
-                    input_tokens=vertical_cost.input_tokens,
-                    output_tokens=vertical_cost.output_tokens,
-                    reasoning_tokens=vertical_cost.reasoning_tokens,
-                    cached_tokens=vertical_cost.cached_input_tokens,
-                    total_tokens=vertical_cost.total_tokens,
-                    usage_source=vertical_usage_source,
-                    price_snapshot=(
-                        vertical_cost.price_snapshot.model_dump(mode="json")
-                        if vertical_cost.price_snapshot
-                        else None
-                    ),
-                    estimated_cost_cny=vertical_cost.amount,
-                    usage_normalized=_usage_for_observability(
-                        vertical_cost,
-                        provider_request_id=request_id,
-                        provider_request_sequence=sequence,
-                        provider_request_key=request_key,
-                        provider_request_identity_source=identity_source,
-                        evidence_source="provider_response",
-                    ),
                 )
 
         state.status = RunStatus.COMPLETED

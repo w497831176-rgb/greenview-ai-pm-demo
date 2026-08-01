@@ -50,8 +50,9 @@ from app.runtime.darwin_evidence import (
     persist_darwin_operation,
     start_darwin_operation,
 )
+from app.runtime.provider_accounting import merge_non_null, provider_accounting_scope
 from app.runtime.provider_evidence import provider_evidence_from_run
-from app.settings import MODEL, MODEL_ID, build_model
+from app.settings import MODEL_ID, build_model
 from app.skill_runtime import canonical_metadata, next_patch_version
 from app.utils.cost_utils import build_price_snapshot, compute_cost_cny
 import skill_storage
@@ -91,7 +92,7 @@ from db.property_db import (
     list_skill_prompt_drafts as db_list_skill_prompt_drafts,
     list_skills,
     now_cn,
-    record_model_call,
+    get_provider_attempts_for_trace,
     set_agent_skills,
     update_badcase as db_update_badcase,
     update_capability_gap_draft as db_update_capability_gap_draft,
@@ -350,12 +351,14 @@ def _extract_usage(usage_obj: Any) -> Dict[str, Any]:
 
 def _merge_provider_evidence(usage: Dict[str, Any], value: Any) -> None:
     evidence = provider_evidence_from_run(value)
-    if evidence.get("usage"):
-        usage.update(evidence["usage"])
-    if evidence.get("provider_response_model"):
-        usage["provider_response_model"] = evidence["provider_response_model"]
-    if evidence.get("provider_request_id"):
-        usage["provider_request_id"] = evidence["provider_request_id"]
+    merge_non_null(usage, evidence.get("usage") or {})
+    merge_non_null(
+        usage,
+        {
+            "provider_response_model": evidence.get("provider_response_model"),
+            "provider_request_id": evidence.get("provider_request_id"),
+        },
+    )
 
 
 async def _collect_response(generator) -> Tuple[str, Dict[str, Any]]:
@@ -390,17 +393,38 @@ async def _collect_response(generator) -> Tuple[str, Dict[str, Any]]:
         raise
 
 
-async def _llm_generate(prompt: str, model: Optional[Any] = None, model_id: Optional[str] = None) -> Tuple[str, Dict[str, Any]]:
-    """Generate text using the default, a provided model, or a model_id."""
+async def _llm_generate(
+    prompt: str,
+    model: Optional[Any] = None,
+    model_id: Optional[str] = None,
+    *,
+    trace_id: Optional[str] = None,
+    session_id: Optional[str] = None,
+    stage: str = "badcase_ai",
+    model_selection_reason: str = "Badcase AI operation",
+    explicit_retry: bool = False,
+) -> Tuple[str, Dict[str, Any]]:
+    """Generate text inside the central per-Provider-request ledger boundary."""
     from agno.agent import Agent
 
-    selected_model = model
-    if model_id:
-        selected_model = build_model(model_id)
-    agent = Agent(model=selected_model or MODEL, markdown=False)
-    content, usage = await _collect_response(agent.arun(prompt, stream=False))
-    active_model = selected_model or MODEL
+    selected_model = model or build_model(model_id or MODEL_ID)
+    resolved_model_id = str(model_id or getattr(selected_model, "id", None) or MODEL_ID)
+    operation_trace_id = trace_id or f"badcase-ai-{uuid.uuid4().hex[:16]}"
+    with provider_accounting_scope(
+        trace_id=operation_trace_id,
+        session_id=session_id,
+        stage=stage,
+        model_selection_reason=model_selection_reason,
+        price_snapshot=get_enabled_price_for_model(resolved_model_id),
+        model_policy_version="badcase_operation",
+        explicit_retry=explicit_retry,
+    ) as accounting:
+        agent = Agent(model=selected_model, markdown=False)
+        content, usage = await _collect_response(agent.arun(prompt, stream=False))
+    active_model = selected_model
     usage["thinking_enabled"] = getattr(active_model, "use_thinking", None)
+    usage["provider_attempts"] = list(accounting.attempts)
+    usage["trace_id"] = operation_trace_id
     return content, usage
 
 
@@ -662,21 +686,6 @@ async def classify_badcase(case_id: int, request: ClassifyRequest = ClassifyRequ
     if request.auto:
         budget = _check_budget("badcase_classify")
         if budget.get("alert_level") == "blocked":
-            try:
-                record_model_call(
-                    trace_id=classify_trace_id,
-                    stage="badcase_classify",
-                    model_id=model_id,
-                    status="blocked",
-                    latency_ms=0,
-                    usage_source="unavailable",
-                    model_selection_reason="Badcase classification blocked by daily budget",
-                    error_summary=budget.get("reason") or _BUDGET_BLOCKED_DETAIL,
-                    estimated_cost_cny=None,
-                    price_snapshot=None,
-                )
-            except Exception:
-                pass
             raise HTTPException(status_code=403, detail=_BUDGET_BLOCKED_DETAIL)
 
     if request.auto:
@@ -706,12 +715,19 @@ async def classify_badcase(case_id: int, request: ClassifyRequest = ClassifyRequ
             "authority_safety、human_collaboration、ux、external_dependency、unknown。"
         )
         try:
-            raw, usage = await _llm_generate(prompt, model_id=model_id)
+            raw, usage = await _llm_generate(
+                prompt,
+                model_id=model_id,
+                trace_id=classify_trace_id,
+                session_id=case.get("session_id") or f"badcase:{case_id}",
+                stage="badcase_classify",
+                model_selection_reason="Badcase classification uses Flash",
+            )
             parsed = _extract_json(raw) or {}
         except Exception as e:
             logger.exception("AI classification failed")
             status = "failed"
-            error_summary = str(e)[:300]
+            error_summary = f"{type(e).__name__}: provider operation failed"
 
         category = parsed.get("suggested_category", parsed.get("category", "other"))
         reason = parsed.get("root_cause_hypothesis", parsed.get("reason", "自动分类失败，归入 other"))
@@ -734,37 +750,6 @@ async def classify_badcase(case_id: int, request: ClassifyRequest = ClassifyRequ
         root_cause_domain = request.root_cause_domain or "unknown"
         if root_cause_domain not in ROOT_CAUSE_DOMAINS:
             raise HTTPException(status_code=400, detail=f"invalid root_cause_domain: {root_cause_domain}")
-
-    if request.auto:
-        latency_ms = int((time.time() - start) * 1000)
-        cost, normalized_usage = _cost_evidence_for_call(
-            "badcase_classify", model_id, usage, status
-        )
-        try:
-            record_model_call(
-                trace_id=classify_trace_id,
-                stage="badcase_classify",
-                model_id=model_id,
-                status=status,
-                latency_ms=latency_ms,
-                input_tokens=cost.input_tokens,
-                output_tokens=cost.output_tokens,
-                reasoning_tokens=cost.reasoning_tokens,
-                cached_tokens=cost.input_cache_hit_tokens,
-                total_tokens=cost.total_tokens,
-                usage_source=cost.usage_source.value,
-                model_selection_reason="Badcase classification uses Flash",
-                error_summary=error_summary,
-                price_snapshot=(
-                    cost.price_snapshot.model_dump(mode="json")
-                    if cost.price_snapshot
-                    else None
-                ),
-                estimated_cost_cny=cost.amount,
-                usage_normalized=normalized_usage,
-            )
-        except Exception:
-            pass
 
     new_status = "classified"
     updated = db_update_badcase(
@@ -814,6 +799,7 @@ async def extract_knowledge(case_id: int, request: ExtractKnowledgeRequest = Ext
         )
 
     title = request.title or case["title"]
+    provider_trace_id: Optional[str] = None
     if request.auto or not request.content:
         prompt = (
             "请根据以下 Badcase 信息，总结成一段可直接写入知识库的知识条目。"
@@ -823,7 +809,14 @@ async def extract_knowledge(case_id: int, request: ExtractKnowledgeRequest = Ext
             f"证据：{case.get('evidence', '')}\n\n"
             "直接输出知识条目内容，不要添加解释。"
         )
-        content, _ = await _llm_generate(prompt)
+        provider_trace_id = f"badcase-knowledge-{case_id}-{uuid.uuid4().hex[:10]}"
+        content, extract_usage = await _llm_generate(
+            prompt,
+            trace_id=provider_trace_id,
+            session_id=case.get("session_id") or f"badcase:{case_id}",
+            stage="badcase_extract_knowledge",
+            model_selection_reason="AI suggestion for a manually reviewed knowledge draft",
+        )
     else:
         content = request.content
 
@@ -838,10 +831,26 @@ async def extract_knowledge(case_id: int, request: ExtractKnowledgeRequest = Ext
     # Move to fixing state if currently classified.
     if case["status"] == "classified":
         updated = db_update_badcase(case_id, status="fixing", fix_plan="extracted to knowledge draft")
-        _record_action(case_id, "extract-knowledge", {"draft_id": draft["id"]}, case["status"], "fixing")
+        _record_action(
+            case_id,
+            "extract-knowledge",
+            {
+                "draft_id": draft["id"],
+                "provider_trace_id": provider_trace_id,
+                "provider_local_attempt_id": (
+                    extract_usage.get("local_attempt_id") if provider_trace_id else None
+                ),
+            },
+            case["status"],
+            "fixing",
+        )
         case = updated or case
 
-    return {"badcase": _enrich_badcase(case), "knowledge_draft": draft}
+    return {
+        "badcase": _enrich_badcase(case),
+        "knowledge_draft": draft,
+        "provider_trace_id": provider_trace_id,
+    }
 
 
 @router.post("/{case_id}/publish-draft/{draft_id}")
@@ -1460,22 +1469,10 @@ async def darwin_fix(case_id: int, request: DarwinFixRequest = DarwinFixRequest(
     budget = _check_budget("darwin")
     if budget.get("alert_level") == "blocked":
         blocked_reason = budget.get("reason") or _BUDGET_BLOCKED_DETAIL
-        model_call = record_model_call(
-            trace_id=darwin_trace_id,
-            stage="darwin",
-            model_id=model_id,
-            status="blocked",
-            latency_ms=0,
-            usage_source="unavailable",
-            model_selection_reason="Darwin deep analysis blocked by daily budget",
-            error_summary=blocked_reason,
-            estimated_cost_cny=None,
-            price_snapshot=None,
-        )
         persist_darwin_operation(
             trace_id=darwin_trace_id,
             badcase_id=case_id,
-            model_call=model_call,
+            model_call=None,
             operation_status="failed",
             started_at=operation_started_at,
             completed_at=now_cn(),
@@ -1486,39 +1483,20 @@ async def darwin_fix(case_id: int, request: DarwinFixRequest = DarwinFixRequest(
         raise HTTPException(status_code=403, detail=_BUDGET_BLOCKED_DETAIL)
 
     try:
-        analysis_text, usage = await _llm_generate(prompt, model_id=model_id)
+        analysis_text, usage = await _llm_generate(
+            prompt,
+            model_id=model_id,
+            trace_id=darwin_trace_id,
+            session_id=f"badcase-darwin:{case_id}:{darwin_trace_id}",
+            stage="darwin",
+            model_selection_reason="Darwin deep analysis uses Pro",
+        )
     except Exception as e:
-        import traceback
-        traceback.print_exc()
         analysis_text = ""
         status = "failed"
-        error_summary = str(e)[:300]
-    latency_ms = int((time.time() - start) * 1000)
-    cost, normalized_usage = _cost_evidence_for_call(
-        "darwin", model_id, usage, status
-    )
-    model_call = record_model_call(
-        trace_id=darwin_trace_id,
-        stage="darwin",
-        model_id=model_id,
-        status=status,
-        latency_ms=latency_ms,
-        input_tokens=cost.input_tokens,
-        output_tokens=cost.output_tokens,
-        reasoning_tokens=cost.reasoning_tokens,
-        cached_tokens=cost.input_cache_hit_tokens,
-        total_tokens=cost.total_tokens,
-        usage_source=cost.usage_source.value,
-        model_selection_reason="Darwin deep analysis uses Pro",
-        error_summary=error_summary,
-        price_snapshot=(
-            cost.price_snapshot.model_dump(mode="json")
-            if cost.price_snapshot
-            else None
-        ),
-        estimated_cost_cny=cost.amount,
-        usage_normalized=normalized_usage,
-    )
+        error_summary = f"{type(e).__name__}: provider operation failed"
+    provider_attempts = get_provider_attempts_for_trace(darwin_trace_id)
+    model_call = provider_attempts[-1] if provider_attempts else None
 
     if status != "success":
         persist_darwin_operation(
@@ -1565,7 +1543,14 @@ async def darwin_fix(case_id: int, request: DarwinFixRequest = DarwinFixRequest(
     # Enrich with runtime metadata.
     analysis_obj["model"] = model_id
     analysis_obj["trace_id"] = darwin_trace_id
-    analysis_obj["token_cost_estimate"] = cost.amount
+    direct_cost = model_call.get("estimated_cost_cny") if model_call else None
+    cost_source = model_call.get("cost_source") if model_call else None
+    # Keep the historical response key for UI compatibility, but make the
+    # actual accounting semantics explicit alongside it.
+    analysis_obj["token_cost_estimate"] = direct_cost
+    analysis_obj["calculated_direct_cost"] = direct_cost
+    analysis_obj["cost_source"] = cost_source
+    analysis_obj["cost_disclaimer"] = "platform_price_snapshot_not_provider_final_bill"
 
     # Keep a backward-compatible root_cause alias for downstream consumers.
     analysis_obj.setdefault("root_cause", analysis_obj["root_cause_hypothesis"])
@@ -1676,9 +1661,12 @@ async def darwin_fix(case_id: int, request: DarwinFixRequest = DarwinFixRequest(
         "model_id": model_id,
         "darwin_skill_found": bool(darwin),
         "darwin_trace_id": darwin_trace_id,
-        "usage_source": cost.usage_source.value,
-        "total_tokens": cost.total_tokens,
-        "estimated_cost_cny": cost.amount,
+        "usage_source": model_call.get("usage_source") if model_call else "unavailable",
+        "total_tokens": model_call.get("total_tokens") if model_call else None,
+        "estimated_cost_cny": model_call.get("estimated_cost_cny") if model_call else None,
+        "calculated_direct_cost": model_call.get("estimated_cost_cny") if model_call else None,
+        "cost_source": model_call.get("cost_source") if model_call else None,
+        "cost_disclaimer": "platform_price_snapshot_not_provider_final_bill",
     }
 
 
@@ -1716,7 +1704,16 @@ async def switch_model_retry(case_id: int, request: SwitchModelRetryRequest = Sw
         "当问题超出物业维修、收费或客服范围时，主动提出转人工。\n\n"
         f"业主问题：{user_message}"
     )
-    retry_text, _ = await _llm_generate(prompt, model=alt_model)
+    retry_text, _ = await _llm_generate(
+        prompt,
+        model=alt_model,
+        model_id=model_id,
+        trace_id=f"badcase-retry-{case_id}-{uuid.uuid4().hex[:10]}",
+        session_id=case.get("session_id") or f"badcase:{case_id}",
+        stage="badcase_switch_model_retry",
+        model_selection_reason="operator-triggered Badcase model retry",
+        explicit_retry=True,
+    )
 
     before = case["status"]
     new_status = "fixing" if before in ("pending", "classified") else before
@@ -2068,11 +2065,14 @@ async def retest_badcase(case_id: int, request: SwitchModelRetryRequest = Switch
         _record_action(
             case_id,
             "retest",
-            {"retest_session_id": retest_session_id, "error": str(e)[:300]},
+            {
+                "retest_session_id": retest_session_id,
+                "error": f"{type(e).__name__}: retest runtime failed",
+            },
             case["status"],
             case["status"],
         )
-        raise HTTPException(status_code=502, detail=f"retest failed: {e}")
+        raise HTTPException(status_code=502, detail="retest failed; see retained Trace evidence")
 
     answer = result.get("answer", "")
     done = result.get("done", {})
@@ -2097,6 +2097,9 @@ async def retest_badcase(case_id: int, request: SwitchModelRetryRequest = Switch
         pass
 
     retest_context = {
+        "record_kind": "logical_aggregate",
+        "include_in_provider_aggregate": False,
+        "provider_evidence_source": "referenced_underlying_trace_attempts",
         "session_id": retest_session_id,
         "route_intent": done.get("route_intent"),
         "current_agent": done.get("current_agent"),
@@ -2114,26 +2117,6 @@ async def retest_badcase(case_id: int, request: SwitchModelRetryRequest = Switch
         "price_snapshot": retest_price,
         "auto_badcase_id": done.get("auto_badcase_id"),
     }
-
-    # Record a retest-stage model call for cost observability.
-    try:
-        record_model_call(
-            trace_id=retest_trace_id,
-            stage="retest",
-            model_id=model_id,
-            model_selection_reason="real retest through chat runtime",
-            input_tokens=usage.get("input_tokens"),
-            output_tokens=usage.get("output_tokens"),
-            reasoning_tokens=usage.get("reasoning_tokens"),
-            cached_tokens=usage.get("cached_tokens"),
-            total_tokens=usage.get("total_tokens"),
-            usage_source=done.get("usage_source", "unavailable"),
-            status="success",
-            estimated_cost_cny=retest_cost,
-            price_snapshot=retest_price,
-        )
-    except Exception:
-        pass
 
     before = case["status"]
     # Retest does not change the status. In fixing it is a pre-apply diagnosis;
@@ -2193,7 +2176,13 @@ async def check_tools_badcase(case_id: int):
         f"当前已启用 MCP 工具：\n{chr(10).join(tool_descriptions)}\n\n"
         "请直接输出分析结论与建议，不要添加解释。"
     )
-    analysis, _ = await _llm_generate(prompt)
+    analysis, _ = await _llm_generate(
+        prompt,
+        trace_id=f"badcase-tools-{case_id}-{uuid.uuid4().hex[:10]}",
+        session_id=case.get("session_id") or f"badcase:{case_id}",
+        stage="badcase_check_tools",
+        model_selection_reason="AI suggestion for operator-reviewed tool diagnosis",
+    )
 
     before = case["status"]
     new_status = "fixing" if before in ("pending", "classified") else before

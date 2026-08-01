@@ -12,11 +12,7 @@ from pathlib import Path
 import db.property_db as property_db
 from app.observability import _aggregate_model_calls, _trace_cost_explanation
 from app.runtime.cost_ledger import build_cost_entry, cost_entry_usage_payload
-from app.runtime.provider_evidence import (
-    provider_request_journal,
-    provider_requests_from_model,
-    remember_provider_request,
-)
+from app.runtime.provider_evidence import remember_provider_request
 
 
 PRICE = {
@@ -66,6 +62,15 @@ def model_call(trace_id: str, stage: str, evidence: dict) -> dict:
         ],
         evidence_source="provider_response",
     )
+    normalized.update(
+        {
+            "record_kind": "provider_attempt",
+            "include_in_provider_aggregate": True,
+            "provider_request_sent": True,
+            "token_source": "provider_actual",
+            "cost_source": "platform_price_snapshot",
+        }
+    )
     return {
         "trace_id": trace_id,
         "stage": stage,
@@ -80,25 +85,14 @@ def model_call(trace_id: str, stage: str, evidence: dict) -> dict:
         "price_snapshot": cost.price_snapshot.model_dump(mode="json"),
         "estimated_cost_cny": cost.amount,
         "usage_normalized": normalized,
+        "record_kind": "provider_attempt",
+        "usage_status": "provider_actual",
+        "cost_source": "platform_price_snapshot",
+        "provider_request_id": evidence.get("provider_request_id"),
     }
 
 
 def assert_journal_and_aggregation() -> None:
-    class AgnoStyleModel:
-        pass
-
-    model = AgnoStyleModel()
-    assert provider_request_journal(model) == []
-    remember_provider_request(
-        provider_request_journal(model),
-        request("adapter-request", 1, 2, 3),
-    )
-    assert len(provider_requests_from_model(model)) == 1
-    assert provider_requests_from_model(model, consume=True)[0][
-        "provider_request_id"
-    ] == "adapter-request"
-    assert provider_requests_from_model(model) == []
-
     journal: list[dict] = []
     remember_provider_request(journal, request("router-1", 384, 1845, 191))
     remember_provider_request(journal, request("vertical-1", 0, 2203, 85))
@@ -153,7 +147,10 @@ def assert_idempotent_storage() -> None:
                 reasoning_tokens INTEGER, cached_tokens INTEGER, total_tokens INTEGER,
                 usage_source TEXT, model_selection_reason TEXT, error_summary TEXT,
                 price_snapshot TEXT, estimated_cost_cny REAL,
-                context_breakdown TEXT, usage_normalized TEXT, created_at TEXT
+                context_breakdown TEXT, usage_normalized TEXT,
+                local_attempt_id TEXT, provider_request_id TEXT,
+                record_kind TEXT, usage_status TEXT, cost_source TEXT,
+                finished_at TEXT, created_at TEXT
             );
             """
         )

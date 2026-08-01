@@ -17,8 +17,13 @@ from db.property_db import get_default_model_config, get_model_config_by_model_i
 from app.runtime.provider_evidence import (
     capture_provider_response,
     provider_evidence_from_run,
-    provider_request_journal,
-    remember_provider_request,
+)
+from app.runtime.provider_accounting import (
+    begin_provider_attempt,
+    capture_active_provider_evidence,
+    finalize_provider_attempt,
+    mark_provider_attempt_dispatched,
+    reset_active_provider_attempt,
 )
 
 # ---------------------------------------------------------------------------
@@ -36,13 +41,10 @@ USE_THINKING = True
 
 
 class EvidenceDeepSeek(DeepSeek):
-    """DeepSeek adapter that preserves fields dropped by Agno 2.6.21."""
+    """DeepSeek adapter with one durable row per outbound SDK invocation."""
 
     def _capture_request_evidence(self, parsed):
-        remember_provider_request(
-            provider_request_journal(self),
-            provider_evidence_from_run(parsed),
-        )
+        capture_active_provider_evidence(provider_evidence_from_run(parsed))
         return parsed
 
     def _parse_provider_response(self, response, response_format=None):
@@ -54,6 +56,116 @@ class EvidenceDeepSeek(DeepSeek):
         parsed = super()._parse_provider_response_delta(response_delta)
         parsed = capture_provider_response(parsed, response_delta)
         return self._capture_request_evidence(parsed)
+
+    @staticmethod
+    def _run_response(args, kwargs):
+        if kwargs.get("run_response") is not None:
+            return kwargs.get("run_response")
+        return args[5] if len(args) > 5 else None
+
+    def invoke(self, *args, **kwargs):
+        attempt, token = begin_provider_attempt(
+            requested_model=self.id,
+            thinking_enabled=getattr(self, "use_thinking", None),
+            stream=False,
+            run_response=self._run_response(args, kwargs),
+        )
+        try:
+            mark_provider_attempt_dispatched(attempt)
+            result = super().invoke(*args, **kwargs)
+        except BaseException as exc:
+            try:
+                finalize_provider_attempt(
+                    attempt,
+                    normal_completion=False,
+                    exception=exc,
+                    phase="non_stream_provider_call",
+                )
+            finally:
+                reset_active_provider_attempt(token)
+            raise
+        try:
+            finalize_provider_attempt(attempt, normal_completion=True)
+            return result
+        finally:
+            reset_active_provider_attempt(token)
+
+    async def ainvoke(self, *args, **kwargs):
+        attempt, token = begin_provider_attempt(
+            requested_model=self.id,
+            thinking_enabled=getattr(self, "use_thinking", None),
+            stream=False,
+            run_response=self._run_response(args, kwargs),
+        )
+        try:
+            mark_provider_attempt_dispatched(attempt)
+            result = await super().ainvoke(*args, **kwargs)
+        except BaseException as exc:
+            try:
+                finalize_provider_attempt(
+                    attempt,
+                    normal_completion=False,
+                    exception=exc,
+                    phase="non_stream_provider_call",
+                )
+            finally:
+                reset_active_provider_attempt(token)
+            raise
+        try:
+            finalize_provider_attempt(attempt, normal_completion=True)
+            return result
+        finally:
+            reset_active_provider_attempt(token)
+
+    def invoke_stream(self, *args, **kwargs):
+        attempt, token = begin_provider_attempt(
+            requested_model=self.id,
+            thinking_enabled=getattr(self, "use_thinking", None),
+            stream=True,
+            run_response=self._run_response(args, kwargs),
+        )
+        try:
+            mark_provider_attempt_dispatched(attempt)
+            for chunk in super().invoke_stream(*args, **kwargs):
+                yield chunk
+            attempt.sdk_stream_exhausted = True
+        except BaseException as exc:
+            finalize_provider_attempt(
+                attempt,
+                normal_completion=False,
+                exception=exc,
+                phase="stream_provider_call",
+            )
+            raise
+        else:
+            finalize_provider_attempt(attempt, normal_completion=True)
+        finally:
+            reset_active_provider_attempt(token)
+
+    async def ainvoke_stream(self, *args, **kwargs):
+        attempt, token = begin_provider_attempt(
+            requested_model=self.id,
+            thinking_enabled=getattr(self, "use_thinking", None),
+            stream=True,
+            run_response=self._run_response(args, kwargs),
+        )
+        try:
+            mark_provider_attempt_dispatched(attempt)
+            async for chunk in super().ainvoke_stream(*args, **kwargs):
+                yield chunk
+            attempt.sdk_stream_exhausted = True
+        except BaseException as exc:
+            finalize_provider_attempt(
+                attempt,
+                normal_completion=False,
+                exception=exc,
+                phase="stream_provider_call",
+            )
+            raise
+        else:
+            finalize_provider_attempt(attempt, normal_completion=True)
+        finally:
+            reset_active_provider_attempt(token)
 
 
 def _deepseek_api_key() -> str:
@@ -111,6 +223,11 @@ def build_model(model_id: Optional[str] = None, **overrides) -> DeepSeek:
         base_url=base_url,
         use_thinking=use_thinking,
         timeout=120,
+        retries=0,
+        # The OpenAI-compatible SDK otherwise retries twice below our
+        # accounting boundary. Explicit application retries re-enter this
+        # gateway and therefore receive independent Provider attempt rows.
+        max_retries=0,
     )
 
 

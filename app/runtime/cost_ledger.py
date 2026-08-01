@@ -18,7 +18,7 @@ def _integer_or_none(value: Any) -> Optional[int]:
     if value is None:
         return None
     try:
-        return max(0, int(value))
+        return int(value)
     except (TypeError, ValueError):
         return None
 
@@ -64,7 +64,10 @@ def build_cost_entry(
     reasoning_tokens = _integer_or_none(usage.get("reasoning_tokens"))
     total_tokens = _integer_or_none(usage.get("total_tokens"))
     split_complete = all(
-        value is not None for value in (cache_hit, cache_miss, output_tokens)
+        value is not None for value in (cache_hit, cache_miss, output_tokens, total_tokens)
+    ) and all(
+        int(value) >= 0
+        for value in (cache_hit, cache_miss, output_tokens, total_tokens)
     )
 
     price: Optional[PriceSnapshot] = None
@@ -185,7 +188,25 @@ def cost_entry_usage_payload(
 ) -> Dict[str, Any]:
     """Serialize new evidence into the existing model_calls JSON column."""
     actual = cost.usage_source == UsageSource.PROVIDER_ACTUAL
+    calculated_split_total = (
+        int(cost.input_cache_hit_tokens)
+        + int(cost.input_cache_miss_tokens)
+        + int(cost.output_tokens)
+        if actual
+        and cost.input_cache_hit_tokens is not None
+        and cost.input_cache_miss_tokens is not None
+        and cost.output_tokens is not None
+        else None
+    )
+    usage_inconsistent = bool(
+        actual
+        and cost.total_tokens is not None
+        and calculated_split_total is not None
+        and int(cost.total_tokens) != calculated_split_total
+    )
     return {
+        "record_kind": "legacy_business_evidence",
+        "include_in_provider_aggregate": False,
         "requested_model": cost.requested_model,
         "provider_response_model": cost.provider_response_model,
         "provider_request_id": provider_request_id,
@@ -203,6 +224,13 @@ def cost_entry_usage_payload(
         "reasoning_tokens": cost.reasoning_tokens,
         "total_tokens": cost.total_tokens,
         "usage_source": cost.usage_source.value,
+        "usage_status": cost.usage_source.value,
+        "token_source": cost.usage_source.value,
         "usage_split_unavailable": not actual,
+        "provider_usage_inconsistent": usage_inconsistent,
+        "calculated_split_total_tokens": calculated_split_total,
+        "calculated_direct_cost": cost.amount,
+        "cost_source": "platform_price_snapshot" if cost.amount is not None else None,
+        "cost_disclaimer": "platform_price_snapshot_not_provider_final_bill",
         "cost_contract": cost.model_dump(mode="json"),
     }

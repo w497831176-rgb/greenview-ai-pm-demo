@@ -1959,6 +1959,13 @@ def _migrate_v1_3_observability(cursor):
             price_snapshot TEXT,
             estimated_cost_cny REAL,
             context_breakdown TEXT,
+            usage_normalized TEXT,
+            local_attempt_id TEXT,
+            provider_request_id TEXT,
+            record_kind TEXT,
+            usage_status TEXT,
+            cost_source TEXT,
+            finished_at TEXT,
             created_at TEXT
         )
         """
@@ -1977,6 +1984,36 @@ def _migrate_v1_3_observability(cursor):
         cursor.execute("ALTER TABLE model_calls ADD COLUMN usage_normalized TEXT")
     except sqlite3.OperationalError:
         pass
+
+    # Provider request accounting is additive and deliberately leaves every
+    # historical ModelCall untouched.  Legacy rows therefore keep NULL in
+    # these columns and cannot silently masquerade as a new Provider attempt.
+    for col, dtype in [
+        ("local_attempt_id", "TEXT"),
+        ("provider_request_id", "TEXT"),
+        ("record_kind", "TEXT"),
+        ("usage_status", "TEXT"),
+        ("cost_source", "TEXT"),
+        ("finished_at", "TEXT"),
+    ]:
+        try:
+            cursor.execute(f"ALTER TABLE model_calls ADD COLUMN {col} {dtype}")
+        except sqlite3.OperationalError:
+            pass
+    cursor.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_model_calls_local_attempt_unique
+        ON model_calls(local_attempt_id)
+        WHERE local_attempt_id IS NOT NULL AND trim(local_attempt_id) <> ''
+        """
+    )
+    cursor.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_model_calls_provider_request_unique
+        ON model_calls(provider_request_id)
+        WHERE provider_request_id IS NOT NULL AND trim(provider_request_id) <> ''
+        """
+    )
 
     # V1.4.3: add invocation_mode to mcp_call_audits for policy_preinvoke traceability.
     try:
@@ -5083,6 +5120,12 @@ def record_model_call(
     context_breakdown: Optional[Dict[str, Any]] = None,
     usage_normalized: Optional[Dict[str, Any]] = None,
     created_at: Optional[str] = None,
+    local_attempt_id: Optional[str] = None,
+    provider_request_id: Optional[str] = None,
+    record_kind: Optional[str] = "legacy",
+    usage_status: Optional[str] = None,
+    cost_source: Optional[str] = None,
+    finished_at: Optional[str] = None,
 ) -> Dict[str, Any]:
     now = created_at or now_cn()
     conn = _get_conn()
@@ -5092,8 +5135,10 @@ def record_model_call(
         INSERT INTO model_calls (
             trace_id, stage, model_id, status, latency_ms, input_tokens, output_tokens,
             reasoning_tokens, cached_tokens, total_tokens, usage_source, model_selection_reason,
-            error_summary, price_snapshot, estimated_cost_cny, context_breakdown, usage_normalized, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            error_summary, price_snapshot, estimated_cost_cny, context_breakdown, usage_normalized,
+            local_attempt_id, provider_request_id, record_kind, usage_status, cost_source,
+            finished_at, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             trace_id,
@@ -5113,6 +5158,12 @@ def record_model_call(
             estimated_cost_cny,
             json.dumps(context_breakdown, ensure_ascii=False) if context_breakdown else None,
             json.dumps(usage_normalized, ensure_ascii=False) if usage_normalized else None,
+            local_attempt_id,
+            provider_request_id,
+            record_kind,
+            usage_status,
+            cost_source,
+            finished_at,
             now,
         ),
     )
@@ -5120,6 +5171,481 @@ def record_model_call(
     conn.commit()
     conn.close()
     return get_model_call(call_id) or {"id": call_id}
+
+
+def _decode_model_call_row(row: sqlite3.Row) -> Dict[str, Any]:
+    result = dict(row)
+    for json_col in ("price_snapshot", "context_breakdown", "usage_normalized"):
+        if result.get(json_col):
+            try:
+                result[json_col] = json.loads(result[json_col])
+            except Exception:
+                pass
+    return result
+
+
+def _usage_object(raw: Any) -> Dict[str, Any]:
+    if isinstance(raw, dict):
+        return dict(raw)
+    if isinstance(raw, str) and raw:
+        try:
+            value = json.loads(raw)
+            return dict(value) if isinstance(value, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
+def create_provider_attempt(
+    local_attempt_id: str,
+    trace_id: str,
+    stage: str,
+    model_id: Optional[str] = None,
+    session_id: Optional[str] = None,
+    model_selection_reason: Optional[str] = None,
+    thinking_enabled: Optional[bool] = None,
+    stream: bool = False,
+    price_snapshot: Optional[Dict[str, Any]] = None,
+    model_policy_version: Optional[str] = None,
+    explicit_retry: bool = False,
+    retry_of_local_attempt_id: Optional[str] = None,
+    started_at: Optional[str] = None,
+    requested_model: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Durably reserve one outbound Provider attempt before SDK dispatch.
+
+    Sequence allocation and insertion share one ``BEGIN IMMEDIATE`` transaction,
+    so concurrent attempts for the same trace/stage cannot receive the same
+    sequence.  No paid request should be made when this function raises.
+    """
+    local_id = str(local_attempt_id or "").strip()
+    trace = str(trace_id or "").strip()
+    stage_name = str(stage or "").strip()
+    requested = str(model_id or requested_model or "").strip()
+    if not local_id or not trace or not stage_name or not requested:
+        raise ValueError(
+            "local_attempt_id, trace_id, stage and model_id are required"
+        )
+    start = started_at or now_cn()
+    conn = _get_conn()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("BEGIN IMMEDIATE")
+        cursor.execute(
+            """
+            SELECT usage_normalized
+            FROM model_calls
+            WHERE trace_id = ? AND stage = ? AND record_kind = 'provider_attempt'
+            ORDER BY id ASC
+            """,
+            (trace, stage_name),
+        )
+        max_sequence = 0
+        for existing in cursor.fetchall():
+            sequence = _usage_object(existing["usage_normalized"]).get(
+                "attempt_sequence"
+            )
+            try:
+                max_sequence = max(max_sequence, int(sequence))
+            except (TypeError, ValueError):
+                continue
+        attempt_sequence = max_sequence + 1
+        normalized = {
+            "record_kind": "provider_attempt",
+            "include_in_provider_aggregate": False,
+            "local_attempt_id": local_id,
+            "trace_id": trace,
+            "session_id": str(session_id) if session_id else None,
+            "stage": stage_name,
+            "attempt_sequence": attempt_sequence,
+            "requested_model": requested,
+            "provider_response_model": None,
+            "provider_request_id": None,
+            "thinking_enabled": thinking_enabled,
+            "stream": bool(stream),
+            "started_at": start,
+            "finished_at": None,
+            "provider_request_sent": False,
+            "provider_response_seen": False,
+            "received_done": None,
+            "done_observation_status": "not_exposed_by_sdk" if stream else "not_applicable",
+            "sdk_stream_exhausted": False,
+            "completion_evidence": None,
+            "received_usage": False,
+            "persistence_status": "persisted",
+            "explicit_retry": bool(explicit_retry),
+            "retry_of_local_attempt_id": retry_of_local_attempt_id,
+            "model_policy_version": model_policy_version,
+            "usage_status": "pending_pre_dispatch",
+            "usage_unavailable_reason": None,
+            "token_source": "unavailable",
+            "price_snapshot": price_snapshot,
+            "calculated_direct_cost": None,
+            "cost_source": None,
+        }
+        cursor.execute(
+            """
+            INSERT INTO model_calls (
+                trace_id, stage, model_id, status, usage_source,
+                model_selection_reason, price_snapshot, usage_normalized,
+                local_attempt_id, provider_request_id, record_kind,
+                usage_status, cost_source, finished_at, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                trace,
+                stage_name,
+                requested,
+                "pending",
+                "unavailable",
+                model_selection_reason,
+                json.dumps(price_snapshot, ensure_ascii=False)
+                if price_snapshot is not None
+                else None,
+                json.dumps(normalized, ensure_ascii=False),
+                local_id,
+                None,
+                "provider_attempt",
+                "pending_pre_dispatch",
+                None,
+                None,
+                start,
+            ),
+        )
+        call_id = cursor.lastrowid
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return get_model_call(call_id) or {"id": call_id, "usage_normalized": normalized}
+
+
+def mark_provider_attempt_dispatched(
+    local_attempt_id: str,
+    *,
+    dispatched_at: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Persist the dispatch boundary; any failure must block the paid call."""
+    local_id = str(local_attempt_id or "").strip()
+    if not local_id:
+        raise ValueError("local_attempt_id is required")
+    dispatched = dispatched_at or now_cn()
+    conn = _get_conn()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("BEGIN IMMEDIATE")
+        cursor.execute(
+            "SELECT * FROM model_calls WHERE local_attempt_id = ?",
+            (local_id,),
+        )
+        row = cursor.fetchone()
+        if not row or row["record_kind"] != "provider_attempt":
+            raise LookupError(f"Provider attempt not found: {local_id}")
+        normalized = _usage_object(row["usage_normalized"])
+        normalized.update(
+            {
+                "record_kind": "provider_attempt",
+                "include_in_provider_aggregate": True,
+                "local_attempt_id": local_id,
+                "provider_request_sent": True,
+                "dispatch_recorded_at": dispatched,
+                "usage_status": "orphaned_pending",
+                "usage_unavailable_reason": "provider_attempt_dispatched_not_finalized",
+                "persistence_status": "persisted",
+            }
+        )
+        cursor.execute(
+            """
+            UPDATE model_calls
+            SET status = ?, usage_source = ?, usage_status = ?,
+                usage_normalized = ?
+            WHERE local_attempt_id = ? AND record_kind = 'provider_attempt'
+            """,
+            (
+                "in_progress",
+                "unavailable",
+                "orphaned_pending",
+                json.dumps(normalized, ensure_ascii=False),
+                local_id,
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise RuntimeError(f"Provider attempt dispatch update failed: {local_id}")
+        conn.commit()
+        result = _decode_model_call_row(row)
+        result.update(
+            {
+                "status": "in_progress",
+                "usage_source": "unavailable",
+                "usage_status": "orphaned_pending",
+                "usage_normalized": normalized,
+            }
+        )
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return result
+
+
+def finalize_provider_attempt(
+    local_attempt_id: str,
+    *,
+    provider_request_id: Optional[str] = None,
+    provider_actual_model: Optional[str] = None,
+    status: str = "success",
+    latency_ms: Optional[int] = None,
+    usage_status: str = "provider_actual",
+    usage_source: str = "provider_actual",
+    input_tokens: Optional[int] = None,
+    output_tokens: Optional[int] = None,
+    reasoning_tokens: Optional[int] = None,
+    cached_tokens: Optional[int] = None,
+    total_tokens: Optional[int] = None,
+    price_snapshot: Optional[Dict[str, Any]] = None,
+    calculated_direct_cost: Optional[float] = None,
+    estimated_cost_cny: Optional[float] = None,
+    cost_source: Optional[str] = None,
+    error_summary: Optional[str] = None,
+    usage_normalized: Optional[Dict[str, Any]] = None,
+    finished_at: Optional[str] = None,
+    model_selection_reason: Optional[str] = None,
+    context_breakdown: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Finalize exactly one Provider attempt by its durable local identity."""
+    local_id = str(local_attempt_id or "").strip()
+    if not local_id:
+        raise ValueError("local_attempt_id is required")
+    provider_id = str(provider_request_id).strip() if provider_request_id else None
+    finished = finished_at or now_cn()
+    direct_cost = (
+        calculated_direct_cost
+        if calculated_direct_cost is not None
+        else estimated_cost_cny
+    )
+    conn = _get_conn()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("BEGIN IMMEDIATE")
+        cursor.execute(
+            "SELECT * FROM model_calls WHERE local_attempt_id = ?",
+            (local_id,),
+        )
+        row = cursor.fetchone()
+        if not row or row["record_kind"] != "provider_attempt":
+            raise LookupError(f"Provider attempt not found: {local_id}")
+        normalized = _usage_object(row["usage_normalized"])
+        if usage_normalized is not None:
+            normalized.update(dict(usage_normalized))
+        normalized.update(
+            {
+                "record_kind": "provider_attempt",
+                "local_attempt_id": local_id,
+                "trace_id": row["trace_id"],
+                "stage": row["stage"],
+                "provider_request_id": provider_id,
+                "provider_response_model": provider_actual_model,
+                "finished_at": finished,
+                "usage_status": usage_status,
+                "cost_source": cost_source,
+                "calculated_direct_cost": direct_cost,
+                "persistence_status": "persisted",
+            }
+        )
+        if "include_in_provider_aggregate" not in normalized:
+            normalized["include_in_provider_aggregate"] = bool(
+                normalized.get("provider_request_sent")
+            )
+        serialized_price = (
+            json.dumps(price_snapshot, ensure_ascii=False)
+            if price_snapshot is not None
+            else row["price_snapshot"]
+        )
+        serialized_context = (
+            json.dumps(context_breakdown, ensure_ascii=False)
+            if context_breakdown is not None
+            else row["context_breakdown"]
+        )
+        cursor.execute(
+            """
+            UPDATE model_calls
+            SET status = ?, latency_ms = ?, input_tokens = ?, output_tokens = ?,
+                reasoning_tokens = ?, cached_tokens = ?, total_tokens = ?,
+                usage_source = ?, model_selection_reason = ?, error_summary = ?,
+                price_snapshot = ?, estimated_cost_cny = ?, context_breakdown = ?,
+                usage_normalized = ?, provider_request_id = ?,
+                record_kind = 'provider_attempt', usage_status = ?, cost_source = ?,
+                finished_at = ?
+            WHERE local_attempt_id = ? AND record_kind = 'provider_attempt'
+            """,
+            (
+                status,
+                latency_ms,
+                input_tokens,
+                output_tokens,
+                reasoning_tokens,
+                cached_tokens,
+                total_tokens,
+                usage_source,
+                model_selection_reason
+                if model_selection_reason is not None
+                else row["model_selection_reason"],
+                error_summary,
+                serialized_price,
+                direct_cost,
+                serialized_context,
+                json.dumps(normalized, ensure_ascii=False),
+                provider_id,
+                usage_status,
+                cost_source,
+                finished,
+                local_id,
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise RuntimeError(f"Provider attempt finalization failed: {local_id}")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    result = get_provider_attempt_by_local_id(local_id)
+    if result is None:
+        raise RuntimeError(f"Provider attempt finalization verification failed: {local_id}")
+    return result
+
+
+def mark_provider_attempt_persistence_failure(
+    local_attempt_id: str,
+    *,
+    usage_normalized: Optional[Dict[str, Any]] = None,
+    finished_at: Optional[str] = None,
+    error_summary: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Best-effort fallback when final Provider evidence could not be stored."""
+    local_id = str(local_attempt_id or "").strip()
+    if not local_id:
+        return None
+    finished = finished_at or now_cn()
+    conn: Optional[sqlite3.Connection] = None
+    try:
+        conn = _get_conn()
+        cursor = conn.cursor()
+        cursor.execute("BEGIN IMMEDIATE")
+        cursor.execute(
+            "SELECT * FROM model_calls WHERE local_attempt_id = ?",
+            (local_id,),
+        )
+        row = cursor.fetchone()
+        if not row or row["record_kind"] != "provider_attempt":
+            conn.rollback()
+            return None
+        normalized = _usage_object(row["usage_normalized"])
+        if usage_normalized is not None:
+            normalized.update(dict(usage_normalized))
+        reason = (
+            error_summary
+            or normalized.get("usage_unavailable_reason")
+            or "provider_evidence_finalize_persistence_failed"
+        )
+        normalized.update(
+            {
+                "record_kind": "provider_attempt",
+                "local_attempt_id": local_id,
+                "trace_id": row["trace_id"],
+                "stage": row["stage"],
+                "finished_at": finished,
+                "usage_status": "unavailable_persistence_failure",
+                "usage_unavailable_reason": reason,
+                "token_source": "unavailable",
+                "calculated_direct_cost": None,
+                "cost_source": None,
+                "persistence_status": "failed",
+            }
+        )
+        cursor.execute(
+            """
+            UPDATE model_calls
+            SET status = 'failed', usage_source = 'unavailable',
+                error_summary = ?, estimated_cost_cny = NULL,
+                usage_normalized = ?, record_kind = 'provider_attempt',
+                usage_status = 'unavailable_persistence_failure',
+                cost_source = NULL, finished_at = ?
+            WHERE local_attempt_id = ? AND record_kind = 'provider_attempt'
+            """,
+            (
+                reason,
+                json.dumps(normalized, ensure_ascii=False),
+                finished,
+                local_id,
+            ),
+        )
+        if cursor.rowcount != 1:
+            conn.rollback()
+            return None
+        conn.commit()
+        return get_provider_attempt_by_local_id(local_id)
+    except Exception:
+        if conn is not None:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        return None
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def get_provider_attempt_by_local_id(
+    local_attempt_id: str,
+) -> Optional[Dict[str, Any]]:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT * FROM model_calls
+        WHERE local_attempt_id = ? AND record_kind = 'provider_attempt'
+        """,
+        (local_attempt_id,),
+    )
+    row = cursor.fetchone()
+    conn.close()
+    return _decode_model_call_row(row) if row else None
+
+
+def is_provider_attempt_record(record: Any) -> bool:
+    """Return True only for the new durable Provider-attempt record kind."""
+    if record is None:
+        return False
+    try:
+        value = dict(record).get("record_kind")
+    except Exception:
+        return False
+    return value == "provider_attempt"
+
+
+def get_provider_attempts_for_trace(trace_id: str) -> List[Dict[str, Any]]:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT * FROM model_calls
+        WHERE trace_id = ? AND record_kind = 'provider_attempt'
+        ORDER BY id ASC
+        """,
+        (trace_id,),
+    )
+    rows = cursor.fetchall()
+    conn.close()
+    return [_decode_model_call_row(row) for row in rows]
 
 
 def record_model_call_idempotent(**model_call: Any) -> Dict[str, Any]:

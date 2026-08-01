@@ -177,12 +177,15 @@ def main() -> None:
     assert pro.thinking_enabled is True
     assert pro.provider_response_model == "deepseek-v4-pro"
 
-    # 11. Darwin response metadata reads the unified CostEntry contract.
+    # 11. Darwin response metadata reads the central Provider-attempt row and
+    # preserves the legacy key without hiding the platform snapshot source.
     darwin_source = Path("app/badcases.py").read_text(encoding="utf-8")
-    assert 'analysis_obj["token_cost_estimate"] = cost.amount' in darwin_source
-    assert '"usage_source": cost.usage_source.value' in darwin_source
-    assert '"total_tokens": cost.total_tokens' in darwin_source
-    assert '"estimated_cost_cny": cost.amount' in darwin_source
+    assert 'analysis_obj["token_cost_estimate"] = direct_cost' in darwin_source
+    assert 'analysis_obj["cost_source"] = cost_source' in darwin_source
+    assert '"usage_source": model_call.get("usage_source")' in darwin_source
+    assert '"total_tokens": model_call.get("total_tokens")' in darwin_source
+    assert '"cost_source": model_call.get("cost_source")' in darwin_source
+    assert "platform_price_snapshot_not_provider_final_bill" in darwin_source
 
     print("PASS: V1.8.2-S5 deterministic provider cost contract (11 checks)")
 

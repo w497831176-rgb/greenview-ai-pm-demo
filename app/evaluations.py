@@ -14,7 +14,12 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
-from app.observability import _check_budget
+from app.observability import (
+    _check_budget,
+    _split_model_records,
+    _token_source,
+    _token_value,
+)
 from db.property_db import (
     add_badcase_action,
     create_badcase,
@@ -346,7 +351,7 @@ def evaluate_runtime_evidence(case: Dict[str, Any], answer: str, done: Dict[str,
             "pass" if successful else "fail",
         ))
 
-    model_calls = done.get("model_calls") or []
+    model_calls, _ = _split_model_records(done.get("model_calls") or [])
     if assertions.get("forbid_normal_business_answer"):
         actual = {
             "handoff": bool(done.get("handoff")),
@@ -451,13 +456,38 @@ async def _run_real_chat(message: str, session_id: str) -> Tuple[str, Dict[str, 
 
 
 def _direct_model_cost(trace_id: str) -> Optional[float]:
-    calls = get_model_calls_for_trace(trace_id)
+    calls, _ = _split_model_records(get_model_calls_for_trace(trace_id))
     if not calls:
-        return 0.0
-    costs = [item.get("estimated_cost_cny") for item in calls]
-    if any(value is None for value in costs):
         return None
-    return round(sum(float(value or 0.0) for value in costs), 8)
+    costs: List[float] = []
+    for item in calls:
+        usage = item.get("usage_normalized") or {}
+        if isinstance(usage, str):
+            try:
+                usage = json.loads(usage)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                usage = {}
+        cost_source = item.get("cost_source") or (
+            usage.get("cost_source") if isinstance(usage, dict) else None
+        )
+        value = item.get("estimated_cost_cny")
+        if cost_source != "platform_price_snapshot" or value is None:
+            return None
+        costs.append(float(value))
+    return round(sum(costs), 8)
+
+
+def _direct_model_tokens(calls: List[Dict[str, Any]]) -> Optional[int]:
+    provider_calls, _ = _split_model_records(calls)
+    if not provider_calls:
+        return None
+    values: List[int] = []
+    for item in provider_calls:
+        value = _token_value(item, "total_tokens")
+        if _token_source(item) != "provider_actual" or value is None:
+            return None
+        values.append(int(value))
+    return sum(values)
 
 
 def _enrich_runtime_evidence(
@@ -465,7 +495,8 @@ def _enrich_runtime_evidence(
 ) -> Dict[str, Any]:
     enriched = dict(done or {})
     trace = get_chat_trace(trace_id) if trace_id else None
-    model_calls = get_model_calls_for_trace(trace_id) if trace_id else []
+    raw_model_calls = get_model_calls_for_trace(trace_id) if trace_id else []
+    model_calls, logical_model_records = _split_model_records(raw_model_calls)
     ledger_row = get_evidence_ledger(trace_id) if trace_id else None
     trace_events = list_trace_events(trace_id) if trace_id else []
     if not enriched.get("decision_summary"):
@@ -479,6 +510,7 @@ def _enrich_runtime_evidence(
         enriched["current_agent"] = enriched.get("current_agent") or trace.get("agent_name")
         enriched["route_intent"] = enriched.get("route_intent") or trace.get("intent")
     enriched["model_calls"] = model_calls
+    enriched["logical_model_records"] = logical_model_records
     enriched["evidence_ledger"] = (ledger_row or {}).get("ledger") or {}
     enriched["trace_events"] = trace_events
     enriched["side_effects"] = get_session_runtime_side_effects(session_id)
@@ -500,6 +532,7 @@ def _evaluation_evidence(done: Dict[str, Any]) -> Dict[str, Any]:
         "handoff_reason": done.get("handoff_reason"),
         "decision_summary": done.get("decision_summary") or {},
         "model_calls": done.get("model_calls") or [],
+        "logical_model_records": done.get("logical_model_records") or [],
         "side_effects": done.get("side_effects") or {},
         "evidence_ledger": done.get("evidence_ledger") or {},
         "trace_events": done.get("trace_events") or [],
@@ -736,7 +769,7 @@ async def run_case(case_id: int, request: EvaluationRunRequest = EvaluationRunRe
             answer=exc.answer,
             evidence={**evidence, "runtime_error": str(exc)[:500]},
             rule_results=checks,
-            total_tokens=evidence.get("token_count"),
+            total_tokens=_direct_model_tokens(done.get("model_calls") or []),
             estimated_cost_cny=(
                 _direct_model_cost(done.get("trace_id"))
                 if done.get("trace_id") else None
@@ -781,11 +814,7 @@ async def run_case(case_id: int, request: EvaluationRunRequest = EvaluationRunRe
     done = _enrich_runtime_evidence(done, trace_id, session_id)
     checks, run_status = evaluate_runtime_evidence(case, answer, done)
     evidence = _evaluation_evidence(done)
-    model_tokens = [item.get("total_tokens") for item in (done.get("model_calls") or [])]
-    total_tokens = (
-        sum(int(value or 0) for value in model_tokens)
-        if model_tokens else (evidence.get("token_count") or 0)
-    )
+    total_tokens = _direct_model_tokens(done.get("model_calls") or [])
     cost = _direct_model_cost(trace_id) if trace_id else None
     run = create_evaluation_run(
         evaluation_case_id=case_id,

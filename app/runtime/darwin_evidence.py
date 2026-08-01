@@ -132,9 +132,13 @@ def _model_and_cost_evidence(
         "input_cache_hit_tokens": usage.get("input_cache_hit_tokens"),
         "input_cache_miss_tokens": usage.get("input_cache_miss_tokens"),
         "output_tokens": usage.get("output_tokens"),
+        "reasoning_tokens": usage.get("reasoning_tokens"),
+        "total_tokens": usage.get("total_tokens"),
     }
     model_evidence = {
         "model_call_id": model_call.get("id"),
+        "record_kind": model_call.get("record_kind"),
+        "local_attempt_id": model_call.get("local_attempt_id"),
         "trace_id": model_call.get("trace_id"),
         "stage": model_call.get("stage"),
         "status": model_call.get("status"),
@@ -144,11 +148,14 @@ def _model_and_cost_evidence(
         "provider_request_id": usage.get("provider_request_id"),
         "thinking_enabled": usage.get("thinking_enabled"),
         "usage_source": model_call.get("usage_source"),
+        "usage_status": model_call.get("usage_status") or usage.get("usage_status"),
         "provider_usage": provider_usage,
         "latency_ms": model_call.get("latency_ms"),
         "total_tokens": model_call.get("total_tokens"),
         "price_snapshot": _json_object(model_call.get("price_snapshot")),
         "amount": model_call.get("estimated_cost_cny"),
+        "cost_source": model_call.get("cost_source") or usage.get("cost_source"),
+        "cost_disclaimer": "platform_price_snapshot_not_provider_final_bill",
         "created_at": model_call.get("created_at"),
     }
 
@@ -157,6 +164,12 @@ def _model_and_cost_evidence(
         cost_evidence = dict(stored_contract)
         cost_evidence["model_call_id"] = model_call.get("id")
         cost_evidence["trace_id"] = model_call.get("trace_id")
+        cost_evidence["cost_source"] = model_call.get("cost_source") or usage.get(
+            "cost_source"
+        )
+        cost_evidence["cost_disclaimer"] = (
+            "platform_price_snapshot_not_provider_final_bill"
+        )
     else:
         # Historical rows without a stored CostEntry keep their real fields;
         # missing fields remain unavailable instead of being reconstructed.
@@ -172,6 +185,8 @@ def _model_and_cost_evidence(
             "price_snapshot": _json_object(model_call.get("price_snapshot")),
             "formula": None,
             "amount": model_call.get("estimated_cost_cny"),
+            "cost_source": model_call.get("cost_source") or usage.get("cost_source"),
+            "cost_disclaimer": "platform_price_snapshot_not_provider_final_bill",
             "availability_note": (
                 "Stored CostEntry is unavailable; missing fields were not reconstructed."
             ),
@@ -287,7 +302,7 @@ def persist_darwin_operation(
     *,
     trace_id: str,
     badcase_id: int,
-    model_call: Dict[str, Any],
+    model_call: Optional[Dict[str, Any]],
     operation_status: str,
     started_at: str,
     completed_at: str,
@@ -299,13 +314,18 @@ def persist_darwin_operation(
     """Idempotently persist final Darwin evidence for one trace."""
     if operation_status not in {"complete", "failed"}:
         raise ValueError("Darwin operation status must be complete or failed")
-    if model_call.get("trace_id") != trace_id or model_call.get("stage") != "darwin":
-        raise ValueError("model_call does not belong to the Darwin trace")
-    child_status = model_call.get("status")
-    if operation_status == "complete" and child_status != "success":
-        raise ValueError("a complete Darwin operation requires a successful model_call")
-    if operation_status == "failed" and child_status == "success" and not error_summary:
-        raise ValueError("failed Darwin operation requires an explicit failure reason")
+    if model_call is None:
+        if operation_status == "complete":
+            raise ValueError("a complete Darwin operation requires a Provider attempt")
+        child_status = None
+    else:
+        if model_call.get("trace_id") != trace_id or model_call.get("stage") != "darwin":
+            raise ValueError("model_call does not belong to the Darwin trace")
+        child_status = model_call.get("status")
+        if operation_status == "complete" and child_status != "success":
+            raise ValueError("a complete Darwin operation requires a successful model_call")
+        if operation_status == "failed" and child_status == "success" and not error_summary:
+            raise ValueError("failed Darwin operation requires an explicit failure reason")
 
     session_id = _operation_session_id(trace_id, badcase_id)
     if not get_chat_trace(trace_id):
@@ -317,7 +337,17 @@ def persist_darwin_operation(
 
     links = _draft_links(drafts, badcase_id)
     counts = _side_effect_counts(trace_id, session_id)
-    model_evidence, cost_evidence = _model_and_cost_evidence(model_call)
+    if model_call is not None:
+        model_evidence, cost_evidence = _model_and_cost_evidence(model_call)
+        model_evidence_rows = [model_evidence]
+        cost_evidence_rows = [cost_evidence]
+        model_call_ids = [model_call.get("id")]
+    else:
+        # Budget/policy blocking is a logical operation outcome, not a fake
+        # Provider request with zero tokens.
+        model_evidence_rows = []
+        cost_evidence_rows = []
+        model_call_ids = []
     metadata = _operation_metadata(
         trace_id=trace_id,
         badcase_id=badcase_id,
@@ -334,14 +364,14 @@ def persist_darwin_operation(
         trace_id=trace_id,
         session_id=session_id,
         config_snapshot=metadata,
-        model_calls=[model_evidence],
-        cost_entries=[cost_evidence],
+        model_calls=model_evidence_rows,
+        cost_entries=cost_evidence_rows,
         badcase_links=[
             {
                 "badcase_id": int(badcase_id),
                 "operation_type": OPERATION_TYPE,
                 "status": operation_status,
-                "model_call_ids": [model_call.get("id")],
+                "model_call_ids": model_call_ids,
                 "drafts": links,
                 "status_transition": {
                     "from": status_before,

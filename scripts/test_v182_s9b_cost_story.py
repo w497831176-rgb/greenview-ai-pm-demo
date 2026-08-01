@@ -25,6 +25,8 @@ def actual_call(
     output: int,
     amount: float,
 ) -> dict:
+    local_attempt_id = f"fixture-{trace_id}-{stage}"
+    provider_request_id = f"req-{trace_id}-{stage}"
     return {
         "trace_id": trace_id,
         "stage": stage,
@@ -33,17 +35,30 @@ def actual_call(
         "provider_response_model": model,
         "thinking_enabled": True,
         "usage_source": "provider_actual",
+        "usage_status": "provider_actual",
+        "record_kind": "provider_attempt",
+        "local_attempt_id": local_attempt_id,
+        "provider_request_id": provider_request_id,
+        "cost_source": "platform_price_snapshot",
         "usage_normalized": {
+            "record_kind": "provider_attempt",
+            "include_in_provider_aggregate": True,
+            "provider_request_sent": True,
+            "local_attempt_id": local_attempt_id,
+            "provider_request_id": provider_request_id,
             "requested_model": model,
             "provider_response_model": model,
             "thinking_enabled": True,
             "usage_source": "provider_actual",
+            "usage_status": "provider_actual",
+            "cost_source": "platform_price_snapshot",
             "input_cache_hit_tokens": hit,
             "input_cache_miss_tokens": miss,
             "output_tokens": output,
         },
         "total_tokens": hit + miss + output,
         "estimated_cost_cny": amount,
+        "calculated_direct_cost": amount,
         "status": "success",
         "price_snapshot": {"model_id": model, "currency": "CNY"},
         "cost_formula": "hit*cached_price + miss*input_price + output*output_price",
@@ -91,30 +106,50 @@ def main() -> None:
     )
     estimated = {
         **actual_call("estimated-trace", "router", "deepseek-v4-flash", 0, 0, 0, 0),
+        "record_kind": "legacy",
         "usage_source": "estimated",
-        "usage_normalized": {"usage_source": "estimated"},
+        "usage_status": "estimated",
+        "cost_source": None,
+        "usage_normalized": {
+            "record_kind": "legacy",
+            "include_in_provider_aggregate": False,
+            "provider_request_sent": None,
+            "usage_source": "estimated",
+            "usage_status": "estimated",
+        },
         "total_tokens": 80,
         "estimated_cost_cny": 0.0001,
+        "calculated_direct_cost": None,
         "provider_response_model": None,
     }
     unavailable = {
         **actual_call("failed-trace", "router", "deepseek-v4-flash", 0, 0, 0, 0),
-        "usage_source": "provider_reported_total_only",
-        "usage_normalized": {"usage_source": "provider_reported_total_only"},
+        "usage_source": "unavailable",
+        "usage_status": "unavailable_provider_error",
+        "cost_source": None,
+        "usage_normalized": {
+            **actual_call("failed-trace", "router", "deepseek-v4-flash", 0, 0, 0, 0)["usage_normalized"],
+            "usage_source": "unavailable",
+            "usage_status": "unavailable_provider_error",
+            "usage_unavailable_reason": "provider_http_error",
+            "cost_source": None,
+        },
         "total_tokens": 99,
         "estimated_cost_cny": None,
+        "calculated_direct_cost": None,
         "provider_response_model": None,
         "status": "failed",
     }
 
     # 2. provider_actual, estimated, and unavailable are strict separate buckets.
     aggregate = _aggregate_model_calls(flash_calls + [estimated, unavailable])
-    assert aggregate["calls"] == 4
+    assert aggregate["calls"] == 3
     assert aggregate["provider_actual_calls"] == 2
     assert aggregate["provider_actual_cost_cny"] == 0.00301020
-    assert aggregate["estimated_calls"] == 1
-    assert aggregate["estimated_cost_cny"] == 0.0001
+    assert aggregate["estimated_calls"] == 0
+    assert aggregate["estimated_cost_cny"] == 0
     assert aggregate["unavailable_calls"] == 1
+    assert aggregate["excluded_record_count"] == 1
     assert aggregate["input_cache_hit_tokens"] == 2560
     assert aggregate["input_cache_miss_tokens"] == 2249
     assert aggregate["output_tokens"] == 355
@@ -137,7 +172,8 @@ def main() -> None:
     # 5. Flash story adds stages exactly and proposes one evidence-based action.
     flash_story = _trace_cost_explanation(flash_calls)
     assert flash_story["summary"] == (
-        "本轮调用2次Flash，共5,164 Token，Provider真实成本¥0.00301020。"
+        "本轮产生2次Provider请求（2次Flash）；已取得Provider实际Usage合计5,164 Token；"
+        "平台价格快照直接成本¥0.00301020（非DeepSeek最终账单）。"
     )
     assert sum(item["amount_cny"] for item in flash_story["chain"]) == 0.00301020
     assert [item["stage_name"] for item in flash_story["chain"]] == [
@@ -149,7 +185,8 @@ def main() -> None:
     # 6. Darwin remains Pro even with Thinking enabled and uses output advice.
     pro_story = _trace_cost_explanation([pro_call])
     assert pro_story["summary"] == (
-        "本轮调用1次Pro，共4,670 Token，Provider真实成本¥0.01188720。"
+        "本轮产生1次Provider请求（1次Pro）；已取得Provider实际Usage合计4,670 Token；"
+        "平台价格快照直接成本¥0.01188720（非DeepSeek最终账单）。"
     )
     assert pro_story["chain"][0]["provider_response_model"] == "deepseek-v4-pro"
     assert pro_story["chain"][0]["thinking_enabled"] is True
@@ -161,7 +198,7 @@ def main() -> None:
     assert no_model_story["total_tokens"] is None
     assert no_model_story["cost_scope"]["status"] == "not_applicable"
     failed_story = _trace_cost_explanation([unavailable])
-    assert "1次金额不可计算" in failed_story["summary"]
+    assert "1次Provider实际Usage不可得" in failed_story["summary"]
     assert "¥0" not in failed_story["summary"]
     assert failed_story["recommendation"]["code"] == "evidence_insufficient"
 
@@ -170,7 +207,7 @@ def main() -> None:
     platform_menu = source[source.index("platform: [") : source.index("const ICONS")]
     cost_section = source[source.index("async function renderCostGovernancePage") : source.index("async function renderCostStrategyPage")]
     render_page = cost_section[cost_section.rindex("function renderPage()") : cost_section.index("function bindEvents()")]
-    assert platform_menu.count("label: '调用与成本治理'") == 1
+    assert platform_menu.count("label: 'Trace 与成本'") == 1
     assert "label: '成本优化策略'" not in platform_menu
     assert "/api/model-configs/ab-test" not in cost_section
     assert "traceParams.set('limit', String(state.pagination.limit))" in cost_section
@@ -201,14 +238,14 @@ def main() -> None:
         "每页20条",
         "高级筛选",
         "我们的成本治理原则",
-        "查看详情",
+        "查看逐请求对账证据",
         "1. 本次发生了什么",
         "2. 为什么这样选择",
-        "3. 花费怎么来的",
+        "3. 平台直接成本怎么来的",
         "4. 下一步建议",
-        "查看Token与计算明细",
-        "本轮使用确定性规则完成，没有调用模型，因此Token与模型费用不适用。",
-        "本轮发生了模型调用，但Provider用量证据不完整，因此无法计算金额；系统没有按0元处理。",
+        "高级证据：逐请求对账、逻辑聚合与历史记录",
+        "本轮没有纳入汇总的Provider请求，因此Provider Token与平台价格快照直接成本不适用",
+        "系统没有按0或估算冒充actual",
     ))
     assert "$('#cg-run-cost01').addEventListener" not in cost_section
     assert "$('#cg-run-cost02').addEventListener" not in cost_section

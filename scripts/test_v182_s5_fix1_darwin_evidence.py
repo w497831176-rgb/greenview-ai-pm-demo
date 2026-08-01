@@ -30,6 +30,14 @@ def main() -> None:
         init_db()
         import app.badcases as badcases
         from app.runtime.darwin_evidence import persist_darwin_operation
+        from app.runtime.provider_accounting import (
+            begin_provider_attempt,
+            capture_active_provider_evidence,
+            finalize_provider_attempt,
+            mark_provider_attempt_dispatched,
+            provider_accounting_scope,
+            reset_active_provider_attempt,
+        )
 
         badcases._check_budget = lambda _strategy: {"alert_level": "none"}
         badcases._find_darwin_skill = lambda: None
@@ -76,9 +84,47 @@ def main() -> None:
             "total_tokens": 4670,
         }
 
-        async def provider_success(_prompt, model_id):
+        async def provider_success(_prompt, model_id=None, **kwargs):
             assert model_id == "deepseek-v4-pro"
-            return json.dumps(analysis, ensure_ascii=False), dict(usage)
+            trace_id = kwargs["trace_id"]
+            with provider_accounting_scope(
+                trace_id=trace_id,
+                session_id=kwargs.get("session_id"),
+                stage=kwargs.get("stage") or "darwin",
+                model_selection_reason="deterministic Darwin fixture",
+                price_snapshot=badcases.get_enabled_price_for_model(model_id),
+            ) as scope:
+                attempt, token = begin_provider_attempt(
+                    requested_model=model_id,
+                    thinking_enabled=True,
+                    stream=False,
+                )
+                try:
+                    mark_provider_attempt_dispatched(attempt)
+                    capture_active_provider_evidence(
+                        {
+                            "provider_response_model": provider_model,
+                            "provider_request_id": usage["provider_request_id"],
+                            "usage": {
+                                "input_cache_hit_tokens": usage["input_cache_hit_tokens"],
+                                "input_cache_miss_tokens": usage["input_cache_miss_tokens"],
+                                "input_tokens": 2712,
+                                "output_tokens": usage["output_tokens"],
+                                "total_tokens": usage["total_tokens"],
+                            },
+                        }
+                    )
+                    normalized = finalize_provider_attempt(
+                        attempt,
+                        normal_completion=True,
+                    )
+                finally:
+                    reset_active_provider_attempt(token)
+            returned_usage = dict(usage)
+            returned_usage["provider_attempts"] = list(scope.attempts)
+            returned_usage["trace_id"] = trace_id
+            assert normalized["usage_status"] == "provider_actual"
+            return json.dumps(analysis, ensure_ascii=False), returned_usage
 
         badcases._llm_generate = provider_success
         case = create_badcase(
@@ -121,8 +167,11 @@ def main() -> None:
             "input_cache_hit_tokens": 2688,
             "input_cache_miss_tokens": 24,
             "output_tokens": 1958,
+            "reasoning_tokens": None,
+            "total_tokens": 4670,
         }
         assert ledger["cost_entries"][0]["amount"] == 0.0118872
+        assert ledger["cost_entries"][0]["cost_source"] == "platform_price_snapshot"
         checks.append("7 exact Usage and cost consistent")
 
         draft_link = ledger["badcase_links"][0]["drafts"][0]
@@ -157,8 +206,33 @@ def main() -> None:
         assert row["count"] == 1
         checks.append("10 Evidence persistence idempotent")
 
-        async def provider_failure(_prompt, model_id):
-            raise RuntimeError("simulated provider failure")
+        class FixtureProviderError(RuntimeError):
+            status_code = 503
+
+        async def provider_failure(_prompt, model_id=None, **kwargs):
+            trace_id = kwargs["trace_id"]
+            error = FixtureProviderError("simulated provider failure")
+            with provider_accounting_scope(
+                trace_id=trace_id,
+                session_id=kwargs.get("session_id"),
+                stage=kwargs.get("stage") or "darwin",
+                price_snapshot=badcases.get_enabled_price_for_model(model_id),
+            ):
+                attempt, token = begin_provider_attempt(
+                    requested_model=model_id,
+                    thinking_enabled=True,
+                    stream=False,
+                )
+                try:
+                    mark_provider_attempt_dispatched(attempt)
+                    finalize_provider_attempt(
+                        attempt,
+                        normal_completion=False,
+                        exception=error,
+                    )
+                finally:
+                    reset_active_provider_attempt(token)
+            raise error
 
         badcases._llm_generate = provider_failure
         failed_case = create_badcase(

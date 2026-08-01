@@ -9,7 +9,6 @@ never infers one token class from another.
 
 from __future__ import annotations
 
-from copy import deepcopy
 from typing import Any, Dict, List, Optional
 
 
@@ -33,7 +32,10 @@ def _integer_or_none(value: Any) -> Optional[int]:
     if value is None:
         return None
     try:
-        return max(0, int(value))
+        # Preserve the Provider value exactly. Validation and inconsistency
+        # flags belong to the accounting layer; evidence capture must not
+        # silently turn an invalid negative value into zero.
+        return int(value)
     except (TypeError, ValueError):
         return None
 
@@ -89,7 +91,13 @@ def capture_provider_response(model_response: Any, provider_response: Any) -> An
     if usage_object is not None:
         usage = raw_provider_usage(usage_object)
         if any(value is not None for value in usage.values()):
-            provider_data["usage"] = usage
+            existing_usage = provider_data.get("usage")
+            if not isinstance(existing_usage, dict):
+                existing_usage = {}
+            for key, value in usage.items():
+                if value is not None:
+                    existing_usage[key] = value
+            provider_data["usage"] = existing_usage
 
     model_response.provider_data = provider_data
     return model_response
@@ -118,11 +126,11 @@ def remember_provider_request(
     journal: List[Dict[str, Any]],
     evidence: Dict[str, Any],
 ) -> None:
-    """Merge one parsed Provider response into a per-model request journal.
+    """Pure merge helper retained for deterministic/backfill fixtures only.
 
     Streaming adapters may expose the same Provider request over many deltas.
-    A real request id is therefore the primary identity.  Providers without an
-    id are appended only when Usage arrives and receive a stable run ordinal.
+    Runtime accounting does not store this list on a model instance; it uses
+    the request-scoped durable attempt in ``provider_accounting``.
     """
     request_id = evidence.get("provider_request_id")
     response_model = evidence.get("provider_response_model")
@@ -162,30 +170,6 @@ def remember_provider_request(
     if response_model:
         existing["provider_response_model"] = str(response_model)
     if usage:
-        existing["usage"].update(usage)
-
-
-def provider_request_journal(model: Any) -> List[Dict[str, Any]]:
-    """Return an instance-local journal without assuming a Pydantic model.
-
-    Agno 2.6.21 model classes are not guaranteed to initialize Pydantic
-    ``PrivateAttr`` descriptors. Keeping this ordinary instance attribute
-    works for both its dataclass-style models and test doubles.
-    """
-    namespace = getattr(model, "__dict__", {})
-    journal = namespace.get("_provider_request_journal")
-    if not isinstance(journal, list):
-        journal = []
-        object.__setattr__(model, "_provider_request_journal", journal)
-    return journal
-
-
-def provider_requests_from_model(model: Any, *, consume: bool = False) -> List[Dict[str, Any]]:
-    """Return every captured Provider request for one model instance."""
-    journal = getattr(model, "__dict__", {}).get("_provider_request_journal")
-    if not isinstance(journal, list):
-        return []
-    result = deepcopy(journal)
-    if consume:
-        journal.clear()
-    return result
+        for key, value in usage.items():
+            if value is not None:
+                existing["usage"][key] = value

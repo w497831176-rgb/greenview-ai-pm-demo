@@ -198,13 +198,15 @@ def main() -> None:
     check("list requests paginated API", "page_size" in list_block and "data.items" in list_block)
     check("list does not preload per-row details", "apiGet(`/api/badcases/${id}`)" not in list_block)
     check("detail is requested only after opening detail", "apiGet(`/api/badcases/${id}`)" in detail_block)
-    headings = ["1. 问题概览", "2. 根因结论", "3. 解决方案与人工决策", "4. 验证与发布", "5. 生命周期时间线"]
-    check("detail contains product hierarchy", all(label in detail_block for label in headings))
-    check("detail hierarchy order is correct", [detail_block.index(label) for label in headings] == sorted(detail_block.index(label) for label in headings))
+    main_headings = ["1 · 发现问题", "2 · AI 根因建议", "3 · 人工确认修复方案", "4 · 单例复测与人工关闭"]
+    check("detail contains four-step business hierarchy", all(label in detail_block for label in main_headings))
+    check("four-step business hierarchy order is correct", [detail_block.index(label) for label in main_headings] == sorted(detail_block.index(label) for label in main_headings))
+    advanced_headings = ["1. 问题概览", "2. 分析记录", "3. 解决方案与人工决策", "4. 验证与发布", "5. 生命周期时间线"]
+    check("advanced evidence keeps full history hierarchy", all(label in detail_block for label in advanced_headings))
     check("before and after are readable", "修改前" in detail_block and "修改后" in detail_block)
-    check("technical evidence is collapsed by default", '<details class="bg-white' in detail_block and "技术证据（默认收起）" in detail_block)
+    check("technical evidence is collapsed by default", '<details class="bg-white' in detail_block and "高级证据：草稿、Trace、Release、历次复测与审计" in detail_block and "原始技术证据" in detail_block)
     check("long text supports expand and collapse", "展开全文" in detail_block and "<details" in detail_block)
-    check("missing analysis and retest have honest empty states", "尚未运行 Darwin" in detail_block and "尚未复测" in detail_block)
+    check("missing analysis and retest have honest empty states", "尚未请求 AI 建议" in detail_block and "尚未复测" in detail_block)
     check("pending records do not fabricate analysis", "尚未形成修复计划" in detail_block and "尚无专家建议" in detail_block)
 
     # 41-43. Current-vs-history summary and response-size discipline.

@@ -17,15 +17,14 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 from app.observability import _check_budget
+from app.runtime.provider_accounting import provider_accounting_scope
 from app.settings import build_model
-from app.utils.cost_utils import build_price_snapshot, compute_cost_cny
 from db.property_db import (
     create_model_config as db_create_model_config,
     delete_model_config as db_delete_model_config,
     get_enabled_price_for_model,
     get_model_config as db_get_model_config,
     list_model_configs as db_list_model_configs,
-    record_model_call,
     set_default_model_config as db_set_default_model_config,
     update_model_config as db_update_model_config,
 )
@@ -184,61 +183,32 @@ async def ab_test_models(request: AbTestRequest):
     # A/B test uses Pro; enforce the daily budget before spending budget.
     budget = _check_budget("ab_test")
     if budget.get("alert_level") == "blocked":
-        try:
-            record_model_call(
-                trace_id=trace_id,
-                stage="ab_test",
-                model_id="deepseek-v4-pro",
-                status="blocked",
-                latency_ms=0,
-                usage_source="unavailable",
-                model_selection_reason="A/B test blocked by daily budget",
-                error_summary=budget.get("reason") or _BUDGET_BLOCKED_DETAIL,
-                estimated_cost_cny=None,
-                price_snapshot=None,
-            )
-        except Exception:
-            pass
         raise HTTPException(status_code=403, detail=_BUDGET_BLOCKED_DETAIL)
-
-    def _get_price_snapshot(model_id: str) -> Optional[Dict[str, Any]]:
-        price = get_enabled_price_for_model(model_id)
-        return build_price_snapshot(price)
-
-    def _calculate_cost(model_id: str, usage: Dict[str, Optional[int]]) -> tuple:
-        snapshot = _get_price_snapshot(model_id)
-        cost, _status = compute_cost_cny(snapshot, usage)
-        return cost, snapshot
 
     async def _collect_response(generator) -> tuple:
         response = ""
         usage = {}
-        try:
-            if isinstance(generator, str):
-                return generator, usage
-            if hasattr(generator, "__aiter__"):
-                async for chunk in generator:
-                    if hasattr(chunk, "content") and chunk.content:
-                        response += str(chunk.content)
-                    elif hasattr(chunk, "delta") and chunk.delta:
-                        response += str(chunk.delta)
-                    elif isinstance(chunk, str):
-                        response += chunk
-                    if hasattr(chunk, "usage") and chunk.usage:
-                        usage = _extract_usage(chunk.usage)
-                return response.strip(), usage
-            result = await generator
-            if hasattr(result, "content"):
-                if hasattr(result, "usage") and result.usage:
-                    usage = _extract_usage(result.usage)
-                return str(result.content).strip(), usage
-            if isinstance(result, str):
-                return result.strip(), usage
-            return "", usage
-        except Exception:
-            import traceback
-            traceback.print_exc()
-            return "", usage
+        if isinstance(generator, str):
+            return generator, usage
+        if hasattr(generator, "__aiter__"):
+            async for chunk in generator:
+                if hasattr(chunk, "content") and chunk.content:
+                    response += str(chunk.content)
+                elif hasattr(chunk, "delta") and chunk.delta:
+                    response += str(chunk.delta)
+                elif isinstance(chunk, str):
+                    response += chunk
+                if hasattr(chunk, "usage") and chunk.usage:
+                    usage = _extract_usage(chunk.usage)
+            return response.strip(), usage
+        result = await generator
+        if hasattr(result, "content"):
+            if hasattr(result, "usage") and result.usage:
+                usage = _extract_usage(result.usage)
+            return str(result.content).strip(), usage
+        if isinstance(result, str):
+            return result.strip(), usage
+        return "", usage
 
     def _extract_usage(usage_obj: Any) -> Dict[str, Optional[int]]:
         if isinstance(usage_obj, dict):
@@ -263,41 +233,29 @@ async def ab_test_models(request: AbTestRequest):
         error_summary = None
         response_text = ""
         usage = {}
+        accounting = None
         try:
             model = build_model(model_id)
             from agno.agent import Agent
 
-            agent = Agent(model=model, markdown=False)
-            response_text, usage = await _collect_response(agent.arun(prompt, stream=False))
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            status = "failed"
-            error_summary = str(e)[:300]
-        latency_ms = int((time.time() - start) * 1000)
-        total_tokens = usage.get("total_tokens") or (usage.get("input_tokens") or 0) + (usage.get("output_tokens") or 0)
-        usage_source = "provider_reported" if usage.get("total_tokens") else "estimated_tokenization" if total_tokens else "unavailable"
-        cost_cny, snapshot = _calculate_cost(model_id, usage)
-        try:
-            record_model_call(
+            with provider_accounting_scope(
                 trace_id=trace_id,
+                session_id=f"ab-test:{trace_id}",
                 stage=stage,
-                model_id=model_id,
-                status=status,
-                latency_ms=latency_ms,
-                input_tokens=usage.get("input_tokens"),
-                output_tokens=usage.get("output_tokens"),
-                reasoning_tokens=usage.get("reasoning_tokens"),
-                cached_tokens=usage.get("cached_tokens"),
-                total_tokens=total_tokens,
-                usage_source=usage_source,
                 model_selection_reason="A/B test fixed model",
-                error_summary=error_summary,
-                price_snapshot=snapshot,
-                estimated_cost_cny=cost_cny,
-            )
-        except Exception:
-            pass
+                price_snapshot=get_enabled_price_for_model(model_id),
+                model_policy_version="ab_test",
+            ) as accounting:
+                agent = Agent(model=model, markdown=False)
+                response_text, usage = await _collect_response(agent.arun(prompt, stream=False))
+        except Exception as e:
+            status = "failed"
+            error_summary = f"{type(e).__name__}: provider operation failed"
+        latency_ms = int((time.time() - start) * 1000)
+        attempt = accounting.attempts[-1] if accounting and accounting.attempts else {}
+        total_tokens = attempt.get("total_tokens")
+        usage_source = attempt.get("token_source") or "unavailable"
+        cost_cny = attempt.get("calculated_direct_cost")
         return {
             "model_id": model_id,
             "response": response_text,

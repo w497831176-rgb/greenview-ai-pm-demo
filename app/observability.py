@@ -7,7 +7,7 @@ model pricing table, and budget thresholds.
 """
 import json
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
@@ -198,10 +198,138 @@ def _usage_payload(call: Dict[str, Any]) -> Dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
+def _first_present(mapping: Dict[str, Any], *keys: str) -> Any:
+    """Return the first explicitly present value, preserving False and zero."""
+    for key in keys:
+        if key in mapping:
+            return mapping.get(key)
+    return None
+
+
+def _optional_bool(value: Any) -> Optional[bool]:
+    if isinstance(value, bool):
+        return value
+    if value in (1, "1", "true", "True", "yes", "on"):
+        return True
+    if value in (0, "0", "false", "False", "no", "off"):
+        return False
+    return None
+
+
+def _provider_aggregate_decision(call: Dict[str, Any]) -> Dict[str, Any]:
+    """Return the single source of truth for Provider aggregate membership.
+
+    The per-request accounting contract starts with records that explicitly opt
+    in as ``provider_attempt``.  Historical rows remain visible in trace detail,
+    but are never silently upgraded into the new reconciliation ledger.
+    """
+    usage = _usage_payload(call)
+    stage = str(call.get("stage") or usage.get("stage") or "").strip().lower()
+    status = str(call.get("status") or usage.get("status") or "").strip().lower()
+    record_kind = str(
+        call.get("record_kind")
+        or usage.get("record_kind")
+        or usage.get("record_type")
+        or ""
+    ).strip().lower()
+    usage_status = str(
+        call.get("usage_status")
+        or usage.get("usage_status")
+        or ""
+    ).strip().lower()
+    include_value = _first_present(
+        usage,
+        "include_in_provider_aggregate",
+        # Read-only compatibility for early development rows; new writers use
+        # the singular ``include_`` spelling above.
+        "included_in_provider_aggregate",
+    )
+    include_flag = _optional_bool(include_value)
+    request_sent = _optional_bool(
+        _first_present(usage, "provider_request_sent", "request_sent")
+    )
+
+    reason = "included_provider_attempt"
+    included = True
+    if stage == "retest":
+        included, reason = False, "logical_retest_aggregate"
+    elif status == "blocked":
+        included, reason = False, "blocked_before_provider"
+    elif record_kind in {
+        "logical",
+        "logical_aggregate",
+        "business_aggregate",
+        "not_applicable",
+        "legacy",
+    }:
+        included, reason = False, f"record_kind_{record_kind}"
+    elif usage_status == "not_applicable":
+        included, reason = False, "usage_not_applicable"
+    elif not record_kind:
+        included, reason = False, "legacy_record_not_upgraded"
+    elif record_kind != "provider_attempt":
+        included, reason = False, "record_kind_not_provider_attempt"
+    elif include_flag is not True:
+        included, reason = False, "provider_aggregate_flag_not_true"
+    elif request_sent is not True:
+        included, reason = False, "provider_request_sent_not_confirmed"
+
+    return {
+        "included": included,
+        "reason": reason,
+        "record_kind": record_kind or "legacy",
+        "include_in_provider_aggregate": include_flag,
+        "request_sent": request_sent,
+        "legacy": not bool(record_kind),
+    }
+
+
+def _is_provider_aggregate_record(call: Dict[str, Any]) -> bool:
+    return bool(_provider_aggregate_decision(call)["included"])
+
+
+def _split_model_records(
+    calls: List[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    provider_attempts: List[Dict[str, Any]] = []
+    logical_or_legacy: List[Dict[str, Any]] = []
+    for call in calls:
+        target = provider_attempts if _is_provider_aggregate_record(call) else logical_or_legacy
+        target.append(call)
+    return provider_attempts, logical_or_legacy
+
+
+def _token_value(call: Dict[str, Any], *keys: str) -> Any:
+    usage = _usage_payload(call)
+    value = _first_present(usage, *keys)
+    if value is not None:
+        return value
+    return _first_present(call, *keys)
+
+
+def _token_source(call: Dict[str, Any]) -> str:
+    usage = _usage_payload(call)
+    status = str(
+        call.get("usage_status") or usage.get("usage_status") or ""
+    ).strip().lower()
+    source = str(
+        usage.get("token_source")
+        or call.get("usage_source")
+        or usage.get("usage_source")
+        or ""
+    ).strip().lower()
+    if status == "provider_actual" or source == "provider_actual":
+        return "provider_actual"
+    if source == "estimated" or status == "estimated":
+        return "estimated"
+    return "unavailable"
+
+
 def _provider_model(call: Dict[str, Any]) -> str:
     usage = _usage_payload(call)
     return (
-        usage.get("provider_response_model")
+        usage.get("provider_actual_model")
+        or usage.get("provider_response_model")
         or call.get("provider_response_model")
         or usage.get("requested_model")
         or call.get("model_id")
@@ -210,21 +338,18 @@ def _provider_model(call: Dict[str, Any]) -> str:
 
 
 def _cost_bucket(call: Dict[str, Any]) -> str:
-    """Classify one real model_call without upgrading a legacy source."""
-    source = call.get("usage_source") or _usage_payload(call).get("usage_source")
-    amount = call.get("estimated_cost_cny")
-    if source == "provider_actual" and amount is not None:
-        return "provider_actual"
-    if source == "estimated":
-        return "estimated"
-    return "unavailable"
+    """Classify token evidence; cost may still be unavailable for actual usage."""
+    return _token_source(call)
 
 
 def _empty_cost_group() -> Dict[str, Any]:
     return {
         "calls": 0,
         "total_tokens": 0,
+        "token_known_calls": 0,
+        "token_unavailable_calls": 0,
         "provider_actual_calls": 0,
+        "provider_actual_priced_calls": 0,
         "provider_actual_cost_cny": 0.0,
         "estimated_calls": 0,
         "estimated_cost_cny": 0.0,
@@ -239,25 +364,35 @@ def _empty_cost_group() -> Dict[str, Any]:
 
 def _add_call_to_group(group: Dict[str, Any], call: Dict[str, Any]) -> None:
     group["calls"] += 1
-    group["total_tokens"] += int(call.get("total_tokens") or 0)
     bucket = _cost_bucket(call)
     amount = call.get("estimated_cost_cny")
     if bucket == "provider_actual":
         group["provider_actual_calls"] += 1
-        group["provider_actual_cost_cny"] += float(amount)
+        total_tokens = _token_value(call, "total_tokens")
+        if total_tokens is None:
+            group["token_unavailable_calls"] += 1
+        else:
+            group["token_known_calls"] += 1
+            group["total_tokens"] += int(total_tokens)
+        if amount is None:
+            group["unavailable_calls"] += 1
+        else:
+            group["provider_actual_priced_calls"] += 1
+            group["provider_actual_cost_cny"] += float(amount)
     elif bucket == "estimated":
         group["estimated_calls"] += 1
+        group["token_unavailable_calls"] += 1
         if amount is None:
             group["estimated_amount_unavailable_calls"] += 1
         else:
             group["estimated_cost_cny"] += float(amount)
     else:
+        group["token_unavailable_calls"] += 1
         group["unavailable_calls"] += 1
 
-    usage = _usage_payload(call)
-    hit = usage.get("input_cache_hit_tokens")
-    miss = usage.get("input_cache_miss_tokens")
-    output = usage.get("output_tokens")
+    hit = _token_value(call, "cache_hit_input_tokens", "input_cache_hit_tokens")
+    miss = _token_value(call, "cache_miss_input_tokens", "input_cache_miss_tokens")
+    output = _token_value(call, "output_tokens")
     if bucket == "provider_actual" and None not in (hit, miss, output):
         group["known_usage_calls"] += 1
         group["input_cache_hit_tokens"] += int(hit)
@@ -267,11 +402,18 @@ def _add_call_to_group(group: Dict[str, Any], call: Dict[str, Any]) -> None:
 
 def _finalize_cost_group(group: Dict[str, Any]) -> Dict[str, Any]:
     result = dict(group)
+    if result["token_known_calls"] == 0:
+        result["total_tokens"] = None
     result["provider_actual_cost_cny"] = round(
         float(result["provider_actual_cost_cny"]), 8
     )
     result["estimated_cost_cny"] = round(float(result["estimated_cost_cny"]), 8)
+    result["platform_price_snapshot_direct_cost_cny"] = result[
+        "provider_actual_cost_cny"
+    ]
+    result["cost_source"] = "platform_price_snapshot"
     result["cost_complete"] = result["unavailable_calls"] == 0
+    result["token_complete"] = result["token_unavailable_calls"] == 0
     return result
 
 
@@ -280,7 +422,8 @@ def _aggregate_model_calls(calls: List[Dict[str, Any]]) -> Dict[str, Any]:
     by_model: Dict[str, Dict[str, Any]] = {}
     by_stage: Dict[str, Dict[str, Any]] = {}
     failed_calls = 0
-    for raw in calls:
+    provider_calls, excluded_calls = _split_model_records(calls)
+    for raw in provider_calls:
         call = dict(raw)
         _add_call_to_group(total, call)
         model_id = _provider_model(call)
@@ -292,6 +435,7 @@ def _aggregate_model_calls(calls: List[Dict[str, Any]]) -> Dict[str, Any]:
             failed_calls += 1
     result = _finalize_cost_group(total)
     result["failed_calls"] = failed_calls
+    result["excluded_record_count"] = len(excluded_calls)
     result["by_model"] = {
         key: _finalize_cost_group(value) for key, value in by_model.items()
     }
@@ -323,7 +467,8 @@ def _top_provider_actual_traces(
     calls: List[Dict[str, Any]], limit: int = 5
 ) -> List[Dict[str, Any]]:
     grouped: Dict[str, Dict[str, Any]] = {}
-    for call in calls:
+    provider_calls, _ = _split_model_records(calls)
+    for call in provider_calls:
         trace_id = call.get("trace_id")
         if not trace_id:
             continue
@@ -334,18 +479,25 @@ def _top_provider_actual_traces(
                 "all_calls": 0,
                 "provider_actual_calls": 0,
                 "total_tokens": 0,
+                "token_unavailable_calls": 0,
                 "provider_actual_cost_cny": 0.0,
                 "models": set(),
                 "stages": set(),
             },
         )
         item["all_calls"] += 1
-        if _cost_bucket(call) != "provider_actual":
+        if _cost_bucket(call) != "provider_actual" or call.get(
+            "estimated_cost_cny"
+        ) is None:
             continue
         item["provider_actual_calls"] += 1
-        item["total_tokens"] += int(call.get("total_tokens") or 0)
+        total_tokens = _token_value(call, "total_tokens")
+        if total_tokens is None:
+            item["token_unavailable_calls"] += 1
+        else:
+            item["total_tokens"] += int(total_tokens)
         item["provider_actual_cost_cny"] += float(
-            call.get("estimated_cost_cny") or 0.0
+            call.get("estimated_cost_cny")
         )
         item["models"].add(_provider_model(call))
         item["stages"].add(call.get("stage") or "unknown")
@@ -364,6 +516,14 @@ def _top_provider_actual_traces(
                 **item,
                 "provider_actual_cost_cny": round(
                     item["provider_actual_cost_cny"], 8
+                ),
+                "platform_price_snapshot_direct_cost_cny": round(
+                    item["provider_actual_cost_cny"], 8
+                ),
+                "total_tokens": (
+                    item["total_tokens"]
+                    if item["provider_actual_calls"] > item["token_unavailable_calls"]
+                    else None
                 ),
                 "models": sorted(item["models"]),
                 "stages": sorted(item["stages"]),
@@ -391,19 +551,18 @@ def _check_budget(strategy: Optional[str] = None) -> Dict[str, Any]:
     today_cost = 0.0
     month_cost = 0.0
     try:
-        conn = _get_conn()
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT COALESCE(SUM(estimated_cost_cny), 0) as cost FROM model_calls WHERE created_at >= ? AND created_at <= ?",
-            (bounds["today"]["start"], bounds["today"]["end"]),
+        today = _query_period_summary(
+            bounds["today"]["start"], bounds["today"]["end"]
         )
-        today_cost = float(cursor.fetchone()["cost"])
-        cursor.execute(
-            "SELECT COALESCE(SUM(estimated_cost_cny), 0) as cost FROM model_calls WHERE created_at >= ? AND created_at <= ?",
-            (bounds["this_month"]["start"], bounds["this_month"]["end"]),
+        month = _query_period_summary(
+            bounds["this_month"]["start"], bounds["this_month"]["end"]
         )
-        month_cost = float(cursor.fetchone()["cost"])
-        conn.close()
+        today_cost = float(today["provider_actual_cost_cny"]) + float(
+            today["estimated_cost_cny"]
+        )
+        month_cost = float(month["provider_actual_cost_cny"]) + float(
+            month["estimated_cost_cny"]
+        )
     except Exception:
         today_cost = 0.0
         month_cost = 0.0
@@ -444,6 +603,7 @@ def _check_budget(strategy: Optional[str] = None) -> Dict[str, Any]:
         "trigger_dimension": trigger_dimension,
         "today_cost": round(today_cost, 8),
         "month_cost": round(month_cost, 8),
+        "cost_source": "platform_price_snapshot",
         "daily_threshold_cny": daily_threshold,
         "monthly_threshold_cny": monthly_threshold,
         "per_call_threshold_cny": thresholds.get("per_call_threshold_cny"),
@@ -541,9 +701,17 @@ async def overview(
     return {
         "scope": scope,
         "calls": data["calls"],
+        "provider_request_count": data["calls"],
+        "excluded_record_count": data["excluded_record_count"],
         "total_tokens": data["total_tokens"],
+        "known_token_calls": data["token_known_calls"],
+        "unknown_token_calls": data["token_unavailable_calls"],
         "provider_actual_calls": data["provider_actual_calls"],
+        "provider_actual_priced_calls": data["provider_actual_priced_calls"],
         "provider_actual_cost_cny": data["provider_actual_cost_cny"],
+        "platform_price_snapshot_direct_cost_cny": data[
+            "provider_actual_cost_cny"
+        ],
         "estimated_calls": data["estimated_calls"],
         "estimated_cost_cny": data["estimated_cost_cny"],
         "estimated_amount_unavailable_calls": data[
@@ -559,7 +727,12 @@ async def overview(
         "failed_calls": data["failed_calls"],
         "alerts": alerts,
         "currency": "CNY",
-        "cost_note": "Provider真实成本仅汇总 provider_actual；本地估算单列且不是供应商账单；金额不可计算的模型调用不按0元处理。",
+        "cost_source": "platform_price_snapshot",
+        "cost_note": (
+            "Provider actual 仅表示该请求的实际Token证据；人民币金额由平台冻结"
+            "价格快照换算，不是DeepSeek最终账单。历史估算单列且不进入Provider actual"
+            "对账；金额不可得不按0元处理。"
+        ),
         "today": periods["today"],
         "last_7_days": periods["last_7_days"],
         "this_month": periods["this_month"],
@@ -708,34 +881,53 @@ def _list_trace_page(
     if page_trace_ids:
         placeholders = ",".join("?" for _ in page_trace_ids)
         cursor.execute(
-            f"""
-            SELECT
-                trace_id,
-                GROUP_CONCAT(DISTINCT model_id) AS model_ids,
-                COALESCE(SUM(total_tokens), 0) AS total_tokens,
-                SUM(estimated_cost_cny) AS estimated_cost_cny,
-                COALESCE(SUM(CASE WHEN usage_source = 'provider_actual' THEN estimated_cost_cny ELSE 0 END), 0) AS provider_actual_cost_cny,
-                COALESCE(SUM(CASE WHEN usage_source = 'estimated' THEN estimated_cost_cny ELSE 0 END), 0) AS local_estimated_cost_cny,
-                SUM(CASE WHEN usage_source = 'provider_actual' THEN 1 ELSE 0 END) AS provider_actual_calls,
-                SUM(CASE WHEN usage_source = 'provider_actual' AND estimated_cost_cny IS NOT NULL THEN 1 ELSE 0 END) AS provider_actual_priced_calls,
-                SUM(CASE WHEN usage_source = 'estimated' THEN 1 ELSE 0 END) AS estimated_calls,
-                SUM(CASE WHEN usage_source = 'estimated' AND estimated_cost_cny IS NOT NULL THEN 1 ELSE 0 END) AS estimated_priced_calls,
-                SUM(CASE WHEN COALESCE(usage_source, 'unavailable') NOT IN ('provider_actual', 'estimated') OR estimated_cost_cny IS NULL THEN 1 ELSE 0 END) AS unknown_cost_calls,
-                COUNT(*) AS call_count
-            FROM model_calls
-            WHERE trace_id IN ({placeholders})
-            GROUP BY trace_id
-            """,
+            f"SELECT * FROM model_calls WHERE trace_id IN ({placeholders})",
             page_trace_ids,
         )
-        agg_rows = {row["trace_id"]: dict(row) for row in cursor.fetchall()}
+        calls_by_trace: Dict[str, List[Dict[str, Any]]] = {}
+        for raw_row in cursor.fetchall():
+            raw_call = dict(raw_row)
+            calls_by_trace.setdefault(raw_call["trace_id"], []).append(raw_call)
+        for item_trace_id, item_calls in calls_by_trace.items():
+            provider_calls, logical_calls = _split_model_records(item_calls)
+            summary = _aggregate_model_calls(item_calls)
+            provider_actual_priced_calls = int(
+                summary.get("provider_actual_priced_calls") or 0
+            )
+            estimated_priced_calls = int(summary.get("estimated_calls") or 0) - int(
+                summary.get("estimated_amount_unavailable_calls") or 0
+            )
+            known_cost = None
+            if provider_actual_priced_calls or estimated_priced_calls:
+                known_cost = round(
+                    float(summary["provider_actual_cost_cny"])
+                    + float(summary["estimated_cost_cny"]),
+                    8,
+                )
+            agg_rows[item_trace_id] = {
+                **summary,
+                "model_ids": sorted({_provider_model(call) for call in provider_calls}),
+                "call_count": len(provider_calls),
+                "logical_record_count": len(logical_calls),
+                "estimated_cost_cny": known_cost,
+                "local_estimated_cost_cny": (
+                    summary["estimated_cost_cny"] if estimated_priced_calls else None
+                ),
+                "provider_actual_cost_cny": (
+                    summary["provider_actual_cost_cny"]
+                    if provider_actual_priced_calls
+                    else None
+                ),
+                "estimated_priced_calls": estimated_priced_calls,
+                "unknown_cost_calls": int(summary.get("unavailable_calls") or 0),
+            }
     conn.close()
 
     results = []
     for row in trace_rows:
         trace = dict(row)
         agg = agg_rows.get(trace["trace_id"], {})
-        model_ids = [item for item in str(agg.get("model_ids") or "").split(",") if item]
+        model_ids = list(agg.get("model_ids") or [])
         call_count = int(agg.get("call_count") or 0)
         provider_actual_calls = int(agg.get("provider_actual_calls") or 0)
         provider_actual_priced_calls = int(
@@ -755,16 +947,23 @@ def _list_trace_page(
         trace.update({
             "models": model_ids,
             "model_summary": model_summary,
-            "total_tokens": int(agg.get("total_tokens") or 0) if call_count else None,
+            "total_tokens": agg.get("total_tokens") if call_count else None,
             "estimated_cost_cny": agg.get("estimated_cost_cny"),
-            "provider_actual_cost_cny": round(float(agg.get("provider_actual_cost_cny") or 0), 8),
-            "local_estimated_cost_cny": round(float(agg.get("local_estimated_cost_cny") or 0), 8),
+            "provider_actual_cost_cny": agg.get("provider_actual_cost_cny"),
+            "platform_price_snapshot_direct_cost_cny": agg.get(
+                "provider_actual_cost_cny"
+            ),
+            "local_estimated_cost_cny": agg.get("local_estimated_cost_cny"),
             "provider_actual_calls": provider_actual_calls,
             "provider_actual_priced_calls": provider_actual_priced_calls,
             "estimated_calls": estimated_calls,
             "estimated_priced_calls": estimated_priced_calls,
             "unavailable_calls": unknown_cost_calls,
             "model_call_count": call_count,
+            "provider_request_count": call_count,
+            "logical_model_record_count": int(
+                agg.get("logical_record_count") or 0
+            ),
             "cost_status": (
                 "not_applicable" if call_count == 0
                 else "partial_unavailable" if unknown_cost_calls
@@ -832,34 +1031,55 @@ async def traces(
 
 
 def _build_cost_formula(call: Dict[str, Any]) -> str:
-    """Build a human-readable cost formula from the recorded price snapshot."""
-    normalized = call.get("usage_normalized") or {}
+    """Build a price-snapshot formula without calling it a Provider bill."""
+    normalized = _usage_payload(call)
+    decision = _provider_aggregate_decision(call)
+    if not decision["included"]:
+        return f"{decision['reason']}：不计入Provider请求、Token或成本汇总"
     contract = normalized.get("cost_contract") or {}
     if contract.get("formula"):
         return contract["formula"]
     if contract.get("availability_note"):
         return contract["availability_note"]
 
+    usage_status = str(
+        call.get("usage_status") or normalized.get("usage_status") or ""
+    ).strip()
+    unavailable_reason = (
+        normalized.get("usage_unavailable_reason")
+        or (usage_status if usage_status and usage_status != "provider_actual" else None)
+    )
+    if _token_source(call) != "provider_actual":
+        return (
+            f"{unavailable_reason or 'cause_unconfirmed'}：Provider实际Usage不可得；"
+            "平台不显示0，也不估算成Provider actual"
+        )
+
     snapshot = call.get("price_snapshot") or {}
     if not snapshot:
-        return "单价已配置，但 Provider 未返回本次 usage，无法估算本次成本"
-
-    usage_source = call.get("usage_source")
-    if usage_source == "unavailable":
-        return "单价已配置，但 Provider 未返回本次 usage，无法估算本次成本"
+        return "price_snapshot_unavailable：未形成平台价格快照直接成本；不按0元处理"
 
     terms = []
     input_p = snapshot.get("input_price_per_1m")
     cached_p = snapshot.get("cached_input_price_per_1m")
     output_p = snapshot.get("output_price_per_1m")
 
-    # V1.4.3: normalized usage fields are preferred over legacy raw fields.
     if normalized.get("usage_split_unavailable"):
-        return "usage_split_unavailable：Provider 未拆分缓存/未缓存输入，成本 --"
+        return "usage_split_unavailable：三类Provider Usage不完整，平台直接成本不可得"
 
-    uncached = normalized.get("uncached_input_tokens")
-    cached = normalized.get("cached_input_tokens")
-    output = normalized.get("output_tokens")
+    uncached = _first_present(
+        normalized,
+        "cache_miss_input_tokens",
+        "input_cache_miss_tokens",
+        "uncached_input_tokens",
+    )
+    cached = _first_present(
+        normalized,
+        "cache_hit_input_tokens",
+        "input_cache_hit_tokens",
+        "cached_input_tokens",
+    )
+    output = _first_present(normalized, "output_tokens")
 
     if uncached is not None and input_p is not None:
         terms.append(f"uncached_input_tokens({uncached}) * {input_p} / 1_000_000")
@@ -869,53 +1089,185 @@ def _build_cost_formula(call: Dict[str, Any]) -> str:
         terms.append(f"output_tokens({output}) * {output_p} / 1_000_000")
 
     if not terms:
-        return "价格快照中无有效单价，无法估算成本"
+        return "price_snapshot_incomplete：平台价格快照直接成本不可得；不按0元处理"
     return " + ".join(terms)
 
 
 def _enrich_model_call(call: Dict[str, Any], session_id: Optional[str]) -> Dict[str, Any]:
-    """Add display name, session linkage, badcase linkage, and cost formula."""
-    import json
-
+    """Expose one record with an evidence-backed reconciliation decision."""
     enriched = dict(call)
     model_id = enriched.get("model_id")
     enriched["model_name"] = _model_display_name(model_id)
     enriched["session_id"] = session_id
+    usage_norm = _usage_payload(enriched)
+    enriched["usage_normalized"] = usage_norm
+    decision = _provider_aggregate_decision(enriched)
 
-    # Parse normalized usage JSON if stored as string.
-    usage_norm = enriched.get("usage_normalized")
-    if isinstance(usage_norm, str):
-        try:
-            usage_norm = json.loads(usage_norm)
-        except Exception:
-            usage_norm = None
-    enriched["usage_normalized"] = usage_norm or {}
     enriched["requested_model"] = (
-        enriched["usage_normalized"].get("requested_model") or model_id
+        usage_norm.get("requested_model") or model_id
     )
-    # Never fall back to requested_model: null means the Provider/SDK did not
-    # return or retain the actual response model for this historical call.
-    enriched["provider_response_model"] = enriched["usage_normalized"].get(
+    provider_actual_model = usage_norm.get("provider_actual_model") or usage_norm.get(
         "provider_response_model"
     )
-    enriched["thinking_enabled"] = enriched["usage_normalized"].get(
-        "thinking_enabled"
+    enriched["provider_actual_model"] = provider_actual_model
+    enriched["provider_response_model"] = provider_actual_model
+    enriched["thinking_enabled"] = _first_present(
+        usage_norm, "thinking", "thinking_enabled"
     )
-    enriched["provider_request_id"] = enriched["usage_normalized"].get(
+    enriched["stream"] = _optional_bool(
+        _first_present(usage_norm, "stream", "streaming")
+    )
+    enriched["local_attempt_id"] = enriched.get("local_attempt_id") or usage_norm.get(
+        "local_attempt_id"
+    )
+    enriched["provider_request_id"] = enriched.get(
         "provider_request_id"
+    ) or usage_norm.get("provider_request_id")
+    attempt_sequence = _first_present(
+        usage_norm, "attempt_sequence", "provider_request_sequence"
     )
-    enriched["provider_request_sequence"] = enriched["usage_normalized"].get(
-        "provider_request_sequence"
+    enriched["attempt_sequence"] = attempt_sequence
+    enriched["provider_request_sequence"] = attempt_sequence
+    enriched["record_kind"] = enriched.get("record_kind") or decision["record_kind"]
+    enriched["usage_status"] = enriched.get("usage_status") or usage_norm.get(
+        "usage_status"
+    ) or _token_source(enriched)
+    enriched["usage_unavailable_reason"] = usage_norm.get(
+        "usage_unavailable_reason"
     )
+    enriched["token_source"] = usage_norm.get("token_source") or _token_source(
+        enriched
+    )
+    enriched["cost_source"] = enriched.get("cost_source") or usage_norm.get(
+        "cost_source"
+    )
+    enriched["include_in_provider_aggregate"] = decision[
+        "include_in_provider_aggregate"
+    ]
+    enriched["included_in_provider_summary"] = decision["included"]
+    enriched["aggregate_exclusion_reason"] = None if decision[
+        "included"
+    ] else decision["reason"]
+
+    hit = _token_value(
+        enriched, "cache_hit_input_tokens", "input_cache_hit_tokens"
+    )
+    miss = _token_value(
+        enriched, "cache_miss_input_tokens", "input_cache_miss_tokens"
+    )
+    output = _token_value(enriched, "output_tokens")
+    reasoning = _token_value(enriched, "reasoning_tokens")
+    total = _token_value(enriched, "total_tokens")
     enriched["provider_usage"] = {
-        "input_cache_hit_tokens": enriched["usage_normalized"].get(
-            "input_cache_hit_tokens"
-        ),
-        "input_cache_miss_tokens": enriched["usage_normalized"].get(
-            "input_cache_miss_tokens"
-        ),
-        "output_tokens": enriched["usage_normalized"].get("output_tokens"),
+        "cache_hit_input_tokens": hit,
+        "cache_miss_input_tokens": miss,
+        "input_cache_hit_tokens": hit,
+        "input_cache_miss_tokens": miss,
+        "output_tokens": output,
+        "reasoning_tokens": reasoning,
+        "total_tokens": total,
     }
+    enriched["reasoning_tokens"] = reasoning
+    enriched["total_tokens"] = total
+    enriched["provider_usage_raw"] = usage_norm.get("provider_usage_raw")
+    enriched["provider_usage_inconsistent"] = bool(
+        usage_norm.get("provider_usage_inconsistent")
+    )
+
+    request_sent = decision["request_sent"]
+    done_received = _optional_bool(
+        _first_present(usage_norm, "done_received", "received_done")
+    )
+    stream_completed = _optional_bool(
+        _first_present(
+            usage_norm,
+            "sdk_stream_exhausted",
+            "stream_completed",
+            "sdk_exhausted",
+        )
+    )
+    usage_received = _optional_bool(
+        _first_present(usage_norm, "received_usage", "usage_received")
+    )
+    if usage_received is None and enriched["usage_status"] == "provider_actual":
+        usage_received = True
+    persistence_value = _first_present(
+        usage_norm, "persistence_succeeded", "persisted", "persistence_status"
+    )
+    persistence_succeeded = _optional_bool(persistence_value)
+    if persistence_succeeded is None and isinstance(persistence_value, str):
+        normalized_persistence = persistence_value.strip().lower()
+        if normalized_persistence in {"success", "succeeded", "persisted", "complete"}:
+            persistence_succeeded = True
+        elif normalized_persistence in {"failed", "failure", "error"}:
+            persistence_succeeded = False
+    retry_of = usage_norm.get("retry_of_local_attempt_id")
+    retry_detected = _optional_bool(usage_norm.get("retry_detected"))
+    explicit_retry = _optional_bool(usage_norm.get("explicit_retry"))
+    if retry_detected is not None:
+        retry = retry_detected
+    elif explicit_retry is not None:
+        retry = explicit_retry
+    elif retry_of:
+        retry = True
+    elif str(attempt_sequence or "").isdigit():
+        retry = int(attempt_sequence) > 1
+    else:
+        retry = None
+    reconciliation_reason = decision["reason"]
+    if decision["included"]:
+        reconciliation_reason = (
+            "provider_actual"
+            if enriched["usage_status"] == "provider_actual"
+            else enriched["usage_unavailable_reason"]
+            or enriched["usage_status"]
+            or "cause_unconfirmed"
+        )
+    non_sensitive_error = usage_norm.get("non_sensitive_error_evidence")
+    if non_sensitive_error is None:
+        non_sensitive_error = usage_norm.get("error_evidence")
+    if isinstance(non_sensitive_error, str):
+        non_sensitive_error = non_sensitive_error[:1000]
+    reconciliation_evidence = {
+        "http_status": usage_norm.get("http_status"),
+        "provider_response_seen": usage_norm.get("provider_response_seen"),
+        "stream_completed": stream_completed,
+        "done_received": done_received,
+        "completion_evidence": usage_norm.get("completion_evidence"),
+        "non_sensitive_error": non_sensitive_error,
+        "provider_usage_inconsistent": enriched["provider_usage_inconsistent"],
+    }
+    enriched["reconciliation"] = {
+        "trace_id": enriched.get("trace_id"),
+        "stage": enriched.get("stage"),
+        "local_attempt_id": enriched.get("local_attempt_id"),
+        "attempt_sequence": attempt_sequence,
+        "provider_request_sent": request_sent,
+        "provider_request_id": enriched.get("provider_request_id"),
+        "done_received": done_received,
+        "sdk_stream_exhausted": stream_completed,
+        "usage_received": usage_received,
+        "persisted": persistence_succeeded,
+        "persistence_status": persistence_value,
+        "record_persisted": bool(enriched.get("id")),
+        "retry": retry,
+        "retry_of_local_attempt_id": retry_of,
+        "included_in_provider_summary": decision["included"],
+        "reason": reconciliation_reason,
+        "evidence": reconciliation_evidence,
+    }
+    enriched["started_at"] = usage_norm.get("started_at") or enriched.get(
+        "created_at"
+    )
+    enriched["finished_at"] = enriched.get("finished_at") or usage_norm.get(
+        "finished_at"
+    )
+    calculated_cost = _first_present(
+        usage_norm, "calculated_direct_cost", "calculated_direct_cost_cny"
+    )
+    if calculated_cost is None and enriched.get("cost_source") == "platform_price_snapshot":
+        calculated_cost = enriched.get("estimated_cost_cny")
+    enriched["calculated_direct_cost"] = calculated_cost
 
     snapshot = enriched.get("price_snapshot") or {}
     for key in (
@@ -929,7 +1281,14 @@ def _enrich_model_call(call: Dict[str, Any], session_id: Optional[str]) -> Dict[
         enriched[key] = snapshot.get(key)
 
     stage = enriched.get("stage") or ""
-    if stage in ("darwin", "badcase_classify", "retest"):
+    if stage in {
+        "darwin",
+        "badcase_classify",
+        "badcase_extract_knowledge",
+        "badcase_switch_model_retry",
+        "badcase_check_tools",
+        "retest",
+    }:
         enriched["badcase_id"] = get_badcase_id_by_trace_id(enriched.get("trace_id"))
     else:
         enriched["badcase_id"] = None
@@ -939,34 +1298,76 @@ def _enrich_model_call(call: Dict[str, Any], session_id: Optional[str]) -> Dict[
 
 
 def _cost_summary(calls: List[Dict[str, Any]]) -> Dict[str, Any]:
+    provider_calls, excluded_calls = _split_model_records(calls)
     by_model: Dict[str, Dict[str, Any]] = {}
     known_cost_cny = 0.0
     unknown_cost_calls = 0
-    for call in calls:
+    known_cost_calls = 0
+    known_token_calls = 0
+    unknown_token_calls = 0
+    total_tokens = 0
+    for call in provider_calls:
         model_id = (
-            call.get("provider_response_model")
+            call.get("provider_actual_model")
+            or call.get("provider_response_model")
             or call.get("requested_model")
             or call.get("model_id")
             or "unknown"
         )
         item = by_model.setdefault(
             model_id,
-            {"model_id": model_id, "calls": 0, "tokens": 0, "cost_cny": 0.0, "unknown_cost_calls": 0},
+            {
+                "model_id": model_id,
+                "calls": 0,
+                "tokens": 0,
+                "known_token_calls": 0,
+                "unknown_token_calls": 0,
+                "cost_cny": 0.0,
+                "known_cost_calls": 0,
+                "unknown_cost_calls": 0,
+            },
         )
         item["calls"] += 1
-        item["tokens"] += int(call.get("total_tokens") or 0)
-        amount = call.get("estimated_cost_cny")
+        token_value = _token_value(call, "total_tokens")
+        if _token_source(call) == "provider_actual" and token_value is not None:
+            known_token_calls += 1
+            item["known_token_calls"] += 1
+            total_tokens += int(token_value)
+            item["tokens"] += int(token_value)
+        else:
+            unknown_token_calls += 1
+            item["unknown_token_calls"] += 1
+        amount = call.get("calculated_direct_cost")
+        if amount is None and call.get("cost_source") == "platform_price_snapshot":
+            amount = call.get("estimated_cost_cny")
         if amount is None:
             unknown_cost_calls += 1
             item["unknown_cost_calls"] += 1
         else:
+            known_cost_calls += 1
+            item["known_cost_calls"] += 1
             known_cost_cny += float(amount)
             item["cost_cny"] += float(amount)
+    for item in by_model.values():
+        if item["known_token_calls"] == 0:
+            item["tokens"] = None
+        if item["known_cost_calls"] == 0:
+            item["cost_cny"] = None
     return {
-        "calls": len(calls),
-        "known_cost_cny": round(known_cost_cny, 8),
+        "calls": len(provider_calls),
+        "provider_request_count": len(provider_calls),
+        "excluded_record_count": len(excluded_calls),
+        "total_tokens": total_tokens if known_token_calls else None,
+        "known_token_calls": known_token_calls,
+        "unknown_token_calls": unknown_token_calls,
+        "known_cost_cny": round(known_cost_cny, 8) if known_cost_calls else None,
+        "platform_price_snapshot_direct_cost_cny": (
+            round(known_cost_cny, 8) if known_cost_calls else None
+        ),
+        "cost_source": "platform_price_snapshot",
+        "known_cost_calls": known_cost_calls,
         "unknown_cost_calls": unknown_cost_calls,
-        "complete": unknown_cost_calls == 0,
+        "complete": unknown_cost_calls == 0 and unknown_token_calls == 0,
         "by_model": list(by_model.values()),
     }
 
@@ -977,12 +1378,13 @@ def _stage_display_name(stage: Optional[str]) -> str:
         "vertical_agent": "垂直Agent",
         "badcase_classify": "Badcase分类",
         "darwin": "Darwin/AI专家",
-        "retest": "Badcase复测",
+        "retest": "Badcase复测（逻辑聚合）",
     }.get(stage or "") or (stage or "模型调用")
 
 
 def _trace_cost_explanation(calls: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Build one interview-friendly cost story from persisted model calls."""
+    """Build a request-level story from included Provider attempts only."""
+    provider_calls, _ = _split_model_records(calls)
     chain = []
     model_counts: Dict[str, int] = {}
     provider_actual_cost = 0.0
@@ -991,30 +1393,52 @@ def _trace_cost_explanation(calls: List[Dict[str, Any]]) -> Dict[str, Any]:
     estimated_calls = 0
     unavailable_calls = 0
     total_tokens = 0
+    known_token_calls = 0
+    unknown_token_calls = 0
+    known_cost_calls = 0
 
-    for raw in calls:
+    for raw in provider_calls:
         call = dict(raw)
         usage = _usage_payload(call)
         bucket = _cost_bucket(call)
-        response_model = usage.get("provider_response_model") or call.get(
-            "provider_response_model"
+        response_model = (
+            call.get("provider_actual_model")
+            or usage.get("provider_actual_model")
+            or usage.get("provider_response_model")
+            or call.get("provider_response_model")
         )
         requested_model = usage.get("requested_model") or call.get(
             "requested_model"
         ) or call.get("model_id")
         display_model = response_model or requested_model or "unknown"
         model_counts[display_model] = model_counts.get(display_model, 0) + 1
-        amount = call.get("estimated_cost_cny")
+        amount = call.get("calculated_direct_cost")
+        if amount is None and call.get("cost_source") == "platform_price_snapshot":
+            amount = call.get("estimated_cost_cny")
         if bucket == "provider_actual":
             provider_actual_calls += 1
-            provider_actual_cost += float(amount)
+            if amount is not None:
+                known_cost_calls += 1
+                provider_actual_cost += float(amount)
         elif bucket == "estimated":
             estimated_calls += 1
             if amount is not None:
                 estimated_cost += float(amount)
         else:
             unavailable_calls += 1
-        total_tokens += int(call.get("total_tokens") or 0)
+        attempt_total = _token_value(call, "total_tokens")
+        if bucket == "provider_actual" and attempt_total is not None:
+            known_token_calls += 1
+            total_tokens += int(attempt_total)
+        else:
+            unknown_token_calls += 1
+        hit = _token_value(
+            call, "cache_hit_input_tokens", "input_cache_hit_tokens"
+        )
+        miss = _token_value(
+            call, "cache_miss_input_tokens", "input_cache_miss_tokens"
+        )
+        output = _token_value(call, "output_tokens")
         chain.append(
             {
                 "stage": call.get("stage"),
@@ -1025,21 +1449,32 @@ def _trace_cost_explanation(calls: List[Dict[str, Any]]) -> Dict[str, Any]:
                 "thinking_enabled": usage.get(
                     "thinking_enabled", call.get("thinking_enabled")
                 ),
-                "usage_source": call.get("usage_source")
-                or usage.get("usage_source")
-                or "unavailable",
-                "input_cache_hit_tokens": usage.get("input_cache_hit_tokens"),
-                "input_cache_miss_tokens": usage.get("input_cache_miss_tokens"),
-                "output_tokens": usage.get("output_tokens"),
-                "total_tokens": call.get("total_tokens"),
-                "amount_cny": amount if bucket != "unavailable" else None,
+                "usage_source": _token_source(call),
+                "usage_status": call.get("usage_status")
+                or usage.get("usage_status")
+                or _token_source(call),
+                "usage_unavailable_reason": call.get("usage_unavailable_reason")
+                or usage.get("usage_unavailable_reason"),
+                "input_cache_hit_tokens": hit,
+                "input_cache_miss_tokens": miss,
+                "output_tokens": output,
+                "reasoning_tokens": _token_value(call, "reasoning_tokens"),
+                "total_tokens": attempt_total,
+                "amount_cny": amount,
+                "calculated_direct_cost": amount,
+                "cost_source": call.get("cost_source")
+                or usage.get("cost_source"),
                 "price_snapshot": call.get("price_snapshot") or {},
                 "formula": call.get("cost_formula"),
                 "bucket": bucket,
-                "provider_request_id": usage.get("provider_request_id"),
-                "provider_request_sequence": usage.get(
-                    "provider_request_sequence"
-                ),
+                "local_attempt_id": call.get("local_attempt_id")
+                or usage.get("local_attempt_id"),
+                "provider_request_id": call.get("provider_request_id")
+                or usage.get("provider_request_id"),
+                "provider_request_sequence": call.get("attempt_sequence")
+                or usage.get("attempt_sequence")
+                or usage.get("provider_request_sequence"),
+                "reconciliation": call.get("reconciliation") or {},
             }
         )
 
@@ -1051,36 +1486,48 @@ def _trace_cost_explanation(calls: List[Dict[str, Any]]) -> Dict[str, Any]:
             for model_id, count in sorted(model_counts.items())
         ]
         call_text = "、".join(model_parts)
-        if provider_actual_calls == len(chain):
-            summary = (
-                f"本轮调用{call_text}，共{total_tokens:,} Token，"
-                f"Provider真实成本¥{provider_actual_cost:.8f}。"
+        parts = [f"本轮产生{len(chain)}次Provider请求（{call_text}）"]
+        if known_token_calls:
+            parts.append(f"已取得Provider实际Usage合计{total_tokens:,} Token")
+        if unknown_token_calls:
+            parts.append(f"{unknown_token_calls}次实际Token不可得")
+        if known_cost_calls:
+            parts.append(
+                f"平台价格快照直接成本¥{provider_actual_cost:.8f}"
+                "（非DeepSeek最终账单）"
             )
-        else:
-            parts = [f"本轮调用{call_text}，共{total_tokens:,} Token"]
-            if provider_actual_calls:
-                parts.append(f"Provider真实成本¥{provider_actual_cost:.8f}")
-            if estimated_calls:
-                parts.append(
-                    f"本地估算成本¥{estimated_cost:.8f}（非供应商账单）"
-                    if estimated_cost
-                    else f"{estimated_calls}次本地估算未形成可计金额"
-                )
-            if unavailable_calls:
-                parts.append(f"{unavailable_calls}次金额不可计算")
-            summary = "；".join(parts) + "。"
+        if provider_actual_calls - known_cost_calls:
+            parts.append(f"{provider_actual_calls - known_cost_calls}次直接成本不可得")
+        if estimated_calls:
+            parts.append(
+                f"历史估算¥{estimated_cost:.8f}（排除Provider actual对账）"
+                if estimated_cost
+                else f"{estimated_calls}次历史估算未形成可计金额"
+            )
+        if unavailable_calls:
+            parts.append(f"{unavailable_calls}次Provider实际Usage不可得")
+        summary = "；".join(parts) + "。"
 
     recommendation = _single_trace_recommendation(chain)
     return {
         "summary": summary,
         "model_call_count": len(chain),
         "provider_request_count": len(chain),
-        "total_tokens": total_tokens if chain else None,
+        "total_tokens": total_tokens if known_token_calls else None,
+        "known_token_calls": known_token_calls,
+        "unknown_token_calls": unknown_token_calls,
         "chain": chain,
         "cost_scope": {
             "status": "not_applicable" if not chain else "model_calls_present",
             "provider_actual_calls": provider_actual_calls,
-            "provider_actual_cost_cny": round(provider_actual_cost, 8),
+            "provider_actual_cost_cny": (
+                round(provider_actual_cost, 8) if known_cost_calls else None
+            ),
+            "platform_price_snapshot_direct_cost_cny": (
+                round(provider_actual_cost, 8) if known_cost_calls else None
+            ),
+            "cost_source": "platform_price_snapshot",
+            "known_cost_calls": known_cost_calls,
             "estimated_calls": estimated_calls,
             "estimated_cost_cny": round(estimated_cost, 8),
             "unavailable_calls": unavailable_calls,
@@ -1252,16 +1699,23 @@ async def trace_detail(trace_id: str):
     messages = list_chat_messages(session_id or "")
     trace_messages = [m for m in messages if m.get("trace_id") == trace_id]
 
-    model_calls = [_enrich_model_call(c, session_id) for c in raw_calls]
-    session_model_calls: List[Dict[str, Any]] = []
+    provider_raw_calls, logical_raw_calls = _split_model_records(raw_calls)
+    model_calls = [_enrich_model_call(c, session_id) for c in provider_raw_calls]
+    logical_model_records = [
+        _enrich_model_call(c, session_id) for c in logical_raw_calls
+    ]
+    session_raw_calls: List[Dict[str, Any]] = []
     if session_id:
         for session_trace in list_chat_traces(session_id=session_id, limit=100):
-            session_model_calls.extend(
-                _enrich_model_call(c, session_id)
-                for c in get_model_calls_for_trace(session_trace["trace_id"])
+            session_raw_calls.extend(
+                get_model_calls_for_trace(session_trace["trace_id"])
             )
     else:
-        session_model_calls = list(model_calls)
+        session_raw_calls = list(raw_calls)
+    session_provider_raw_calls, _ = _split_model_records(session_raw_calls)
+    session_model_calls = [
+        _enrich_model_call(c, session_id) for c in session_provider_raw_calls
+    ]
     trace_events = list_trace_events(trace_id)
     evaluation_run = get_evaluation_run_by_trace_id(trace_id)
 
@@ -1282,9 +1736,76 @@ async def trace_detail(trace_id: str):
             "note": "本地上下文估算，不等于 Provider 原始账单",
         }
 
+    reconciliation_rows = [call.get("reconciliation") or {} for call in model_calls]
+    request_ids = {
+        row.get("provider_request_id")
+        for row in reconciliation_rows
+        if row.get("provider_request_id")
+    }
+    non_actual_rows = [
+        call
+        for call in model_calls
+        if str(call.get("usage_status") or "") != "provider_actual"
+    ]
+    reconciliation_summary = {
+        "provider_attempt_count": len(model_calls),
+        "provider_request_sent_count": sum(
+            1 for row in reconciliation_rows if row.get("provider_request_sent") is True
+        ),
+        "provider_request_id_count": sum(
+            1 for row in reconciliation_rows if row.get("provider_request_id")
+        ),
+        "unique_provider_request_id_count": len(request_ids),
+        "done_received_count": sum(
+            1 for row in reconciliation_rows if row.get("done_received") is True
+        ),
+        "sdk_stream_exhausted_count": sum(
+            1 for row in reconciliation_rows if row.get("sdk_stream_exhausted") is True
+        ),
+        "usage_received_count": sum(
+            1 for row in reconciliation_rows if row.get("usage_received") is True
+        ),
+        "persisted_count": sum(
+            1
+            for row in reconciliation_rows
+            if row.get("persisted") is True
+        ),
+        "persistence_failure_count": sum(
+            1 for row in reconciliation_rows if row.get("persisted") is False
+        ),
+        "record_row_count": sum(
+            1 for row in reconciliation_rows if row.get("record_persisted") is True
+        ),
+        "retry_count": sum(
+            1 for row in reconciliation_rows if row.get("retry") is True
+        ),
+        "included_in_provider_summary_count": sum(
+            1
+            for row in reconciliation_rows
+            if row.get("included_in_provider_summary") is True
+        ),
+        "non_actual_count": len(non_actual_rows),
+        "non_actual_reasons": [
+            {
+                "local_attempt_id": call.get("local_attempt_id"),
+                "stage": call.get("stage"),
+                "usage_status": call.get("usage_status"),
+                "reason": call.get("usage_unavailable_reason")
+                or (call.get("reconciliation") or {}).get("reason")
+                or "cause_unconfirmed",
+                "evidence": (call.get("reconciliation") or {}).get("evidence") or {},
+            }
+            for call in non_actual_rows
+        ],
+    }
+
     return {
         "trace": trace,
         "model_calls": model_calls,
+        "provider_model_calls": model_calls,
+        "logical_model_records": logical_model_records,
+        "provider_reconciliation": reconciliation_rows,
+        "reconciliation_summary": reconciliation_summary,
         "mcp_calls": mcp_calls,
         "trace_events": trace_events,
         "evaluation_run": evaluation_run,
@@ -1311,69 +1832,81 @@ async def distribution(
 
     Each group item includes a list of trace IDs so the aggregate is traceable.
     """
-    column_map = {
-        "model": ("model_id", "model_calls"),
-        "agent": ("agent_name", "chat_traces"),
-        "intent": ("intent", "chat_traces"),
-        "session": ("session_id", "chat_traces"),
-        "trace": ("trace_id", "model_calls"),
-        "stage": ("stage", "model_calls"),
-    }
-    column, table = column_map.get(group_by, ("model_id", "model_calls"))
-
-    conn = _get_conn()
-    cursor = conn.cursor()
-    date_filter = ""
-    params = []
-    if start and end:
-        date_filter = "WHERE created_at >= ? AND created_at <= ?"
-        params = [start, end]
-    elif start:
-        date_filter = "WHERE created_at >= ?"
-        params = [start]
-    elif end:
-        date_filter = "WHERE created_at <= ?"
-        params = [end]
-
-    if table == "model_calls":
+    raw_calls = _fetch_model_calls(start, _normalize_end(end))
+    provider_calls, excluded_calls = _split_model_records(raw_calls)
+    trace_metadata: Dict[str, Dict[str, Any]] = {}
+    trace_ids = sorted({str(call.get("trace_id")) for call in provider_calls if call.get("trace_id")})
+    if trace_ids and group_by in {"agent", "intent", "session"}:
+        conn = _get_conn()
+        cursor = conn.cursor()
+        placeholders = ",".join("?" for _ in trace_ids)
         cursor.execute(
-            f"""
-            SELECT {column},
-                   COUNT(*) as calls,
-                   SUM(total_tokens) as tokens,
-                   SUM(estimated_cost_cny) as cost,
-                   GROUP_CONCAT(DISTINCT trace_id) as trace_ids
-            FROM model_calls
-            {date_filter}
-            GROUP BY {column}
-            """,
-            params,
+            f"SELECT trace_id, agent_name, intent, session_id FROM chat_traces WHERE trace_id IN ({placeholders})",
+            trace_ids,
         )
-    else:
-        cursor.execute(
-            f"""
-            SELECT t.{column},
-                   COUNT(m.id) as calls,
-                   SUM(m.total_tokens) as tokens,
-                   SUM(m.estimated_cost_cny) as cost,
-                   GROUP_CONCAT(DISTINCT m.trace_id) as trace_ids
-            FROM chat_traces t
-            JOIN model_calls m ON t.trace_id = m.trace_id
-            {date_filter.replace('WHERE', 'WHERE t.') if date_filter else ''}
-            GROUP BY t.{column}
-            """,
-            params,
-        )
-    rows = cursor.fetchall()
-    conn.close()
+        trace_metadata = {row["trace_id"]: dict(row) for row in cursor.fetchall()}
+        conn.close()
+
+    grouped: Dict[str, List[Dict[str, Any]]] = {}
+    for call in provider_calls:
+        trace_id = str(call.get("trace_id") or "")
+        if group_by == "model":
+            key = _provider_model(call)
+        elif group_by == "stage":
+            key = str(call.get("stage") or "unknown")
+        elif group_by == "trace":
+            key = trace_id or "unknown"
+        else:
+            metadata = trace_metadata.get(trace_id) or {}
+            metadata_key = {
+                "agent": "agent_name",
+                "intent": "intent",
+                "session": "session_id",
+            }[group_by]
+            key = str(metadata.get(metadata_key) or "unknown")
+        grouped.setdefault(key, []).append(call)
 
     items = []
-    for r in rows:
-        item = dict(r)
-        trace_ids = item.get("trace_ids")
-        item["trace_ids"] = trace_ids.split(",") if trace_ids else []
-        items.append(item)
-    return {"group_by": group_by, "items": items}
+    for key, group_calls in grouped.items():
+        summary = _aggregate_model_calls(group_calls)
+        actual_priced = int(summary.get("provider_actual_priced_calls") or 0)
+        estimated_priced = int(summary.get("estimated_calls") or 0) - int(
+            summary.get("estimated_amount_unavailable_calls") or 0
+        )
+        known_cost = None
+        if actual_priced or estimated_priced:
+            known_cost = round(
+                float(summary["provider_actual_cost_cny"])
+                + float(summary["estimated_cost_cny"]),
+                8,
+            )
+        items.append(
+            {
+                group_by: key,
+                "calls": summary["calls"],
+                "provider_request_count": summary["calls"],
+                "tokens": summary["total_tokens"],
+                "known_token_calls": summary["token_known_calls"],
+                "unknown_token_calls": summary["token_unavailable_calls"],
+                "cost": known_cost,
+                "platform_price_snapshot_direct_cost_cny": (
+                    summary["provider_actual_cost_cny"] if actual_priced else None
+                ),
+                "estimated_cost_cny": (
+                    summary["estimated_cost_cny"] if estimated_priced else None
+                ),
+                "unknown_cost_calls": summary["unavailable_calls"],
+                "cost_source": "platform_price_snapshot",
+                "trace_ids": sorted(
+                    {str(call.get("trace_id")) for call in group_calls if call.get("trace_id")}
+                ),
+            }
+        )
+    return {
+        "group_by": group_by,
+        "items": items,
+        "excluded_record_count": len(excluded_calls),
+    }
 
 
 @router.get("/trends")
@@ -1382,38 +1915,58 @@ async def trends(
     start: Optional[str] = Query(None),
     end: Optional[str] = Query(None),
 ):
-    """Return calls/tokens/cost over time."""
-    fmt = "%Y-%m-%d %H:00" if group_by == "hour" else "%Y-%m-%d"
-    conn = _get_conn()
-    cursor = conn.cursor()
-    date_filter = ""
-    params = []
-    if start and end:
-        date_filter = "WHERE created_at >= ? AND created_at <= ?"
-        params = [start, end]
-    elif start:
-        date_filter = "WHERE created_at >= ?"
-        params = [start]
-    elif end:
-        date_filter = "WHERE created_at <= ?"
-        params = [end]
+    """Return included Provider attempts over time; logical rows never enter."""
+    raw_calls = _fetch_model_calls(start, _normalize_end(end))
+    provider_calls, excluded_calls = _split_model_records(raw_calls)
+    grouped: Dict[str, List[Dict[str, Any]]] = {}
+    for call in provider_calls:
+        created_at = str(call.get("created_at") or "")
+        if not created_at:
+            period = "unknown"
+        elif group_by == "hour":
+            period = f"{created_at[:13]}:00"
+        else:
+            period = created_at[:10]
+        grouped.setdefault(period, []).append(call)
 
-    cursor.execute(
-        f"""
-        SELECT strftime('{fmt}', created_at) as period,
-               COUNT(*) as calls,
-               SUM(total_tokens) as tokens,
-               SUM(estimated_cost_cny) as cost
-        FROM model_calls
-        {date_filter}
-        GROUP BY period
-        ORDER BY period ASC
-        """,
-        params,
-    )
-    rows = cursor.fetchall()
-    conn.close()
-    return {"group_by": group_by, "items": [dict(r) for r in rows]}
+    items = []
+    for period in sorted(grouped):
+        summary = _aggregate_model_calls(grouped[period])
+        actual_priced = int(summary.get("provider_actual_priced_calls") or 0)
+        estimated_priced = int(summary.get("estimated_calls") or 0) - int(
+            summary.get("estimated_amount_unavailable_calls") or 0
+        )
+        known_cost = None
+        if actual_priced or estimated_priced:
+            known_cost = round(
+                float(summary["provider_actual_cost_cny"])
+                + float(summary["estimated_cost_cny"]),
+                8,
+            )
+        items.append(
+            {
+                "period": period,
+                "calls": summary["calls"],
+                "provider_request_count": summary["calls"],
+                "tokens": summary["total_tokens"],
+                "known_token_calls": summary["token_known_calls"],
+                "unknown_token_calls": summary["token_unavailable_calls"],
+                "cost": known_cost,
+                "platform_price_snapshot_direct_cost_cny": (
+                    summary["provider_actual_cost_cny"] if actual_priced else None
+                ),
+                "estimated_cost_cny": (
+                    summary["estimated_cost_cny"] if estimated_priced else None
+                ),
+                "unknown_cost_calls": summary["unavailable_calls"],
+                "cost_source": "platform_price_snapshot",
+            }
+        )
+    return {
+        "group_by": group_by,
+        "items": items,
+        "excluded_record_count": len(excluded_calls),
+    }
 
 
 # -----------------------------------------------------------------------------

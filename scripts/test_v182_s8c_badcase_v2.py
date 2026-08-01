@@ -140,6 +140,10 @@ check("31 Skill loader is filtered from ordinary tools", "!isSkillLoader(call)" 
 check("32 Skill evidence has business wording", "业务规则依据：" in html and "已加载业务规则：" in html)
 check("33 technical trace wording is honest", "技术追踪 ·" in html and "Trace · 未知" not in html)
 check("34 current/history tabs exist", "badcase-current-tab" in html and "badcase-history-tab" in html)
-check("35 technical evidence is collapsed", "<summary class=\"font-semibold text-slate-900 cursor-pointer\">查看技术证据</summary>" in html)
+check(
+    "35 technical evidence is collapsed",
+    "高级证据：草稿、Trace、Release、历次复测与审计" in html
+    and "原始技术证据" in html,
+)
 
 print(f"PASS: {len(checks)} deterministic S8-C checks")

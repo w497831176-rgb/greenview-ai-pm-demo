@@ -24,6 +24,18 @@ def main() -> None:
     db.init_db()
     evaluation_api._check_budget = lambda _operation: {"alert_level": "ok"}
 
+    def provider_attempt(stage: str, sequence: int) -> dict:
+        request_id = f"fixture-s6-{stage}-{sequence}"
+        core = {
+            "stage": stage,
+            "record_kind": "provider_attempt",
+            "include_in_provider_aggregate": True,
+            "provider_request_sent": True,
+            "provider_request_id": request_id,
+            "usage_status": "provider_actual",
+        }
+        return {**core, "usage_normalized": dict(core)}
+
     def assistant_message(session_id: str, trace_id: str, answer: str = "测试回答") -> dict:
         db.ensure_chat_session(session_id)
         db.save_chat_message(session_id, "user", "原始业主问题")
@@ -93,11 +105,29 @@ def main() -> None:
             trace_id=trace_id, stage="router", model_id="deepseek-v4-flash",
             status="success", total_tokens=10, usage_source="provider_actual",
             estimated_cost_cny=0.00001,
+            local_attempt_id=f"fixture-local-{trace_id}-router",
+            provider_request_id=f"fixture-request-{trace_id}-router",
+            record_kind="provider_attempt", usage_status="provider_actual",
+            cost_source="platform_price_snapshot",
+            usage_normalized={
+                **provider_attempt("router", 1),
+                "local_attempt_id": f"fixture-local-{trace_id}-router",
+                "provider_request_id": f"fixture-request-{trace_id}-router",
+            },
         )
         db.record_model_call(
             trace_id=trace_id, stage="vertical_agent", model_id="deepseek-v4-flash",
             status="success", total_tokens=20, usage_source="provider_actual",
             estimated_cost_cny=0.00002,
+            local_attempt_id=f"fixture-local-{trace_id}-agent",
+            provider_request_id=f"fixture-request-{trace_id}-agent",
+            record_kind="provider_attempt", usage_status="provider_actual",
+            cost_source="platform_price_snapshot",
+            usage_normalized={
+                **provider_attempt("vertical_agent", 2),
+                "local_attempt_id": f"fixture-local-{trace_id}-agent",
+                "provider_request_id": f"fixture-request-{trace_id}-agent",
+            },
         )
         db.save_evidence_ledger(
             trace_id, session_id,
@@ -185,7 +215,8 @@ def main() -> None:
             "5分钟内响应，30分钟内到场。",
             {
                 "current_agent_id": "maintenance", "citations": [{"doc_title": "物业维修服务承诺", "content_snapshot": "5分钟响应，30分钟到场"}],
-                "handoff": False, "side_effects": base_side_effects, "model_calls": [{}, {}],
+                "handoff": False, "side_effects": base_side_effects,
+                "model_calls": [provider_attempt("router", 1), provider_attempt("vertical_agent", 2)],
                 "decision_summary": {"rag": {"status": "selected", "evidence_decision": "accepted"}, "tool": {"status": "skipped"}, "handoff": {"status": "skipped"}},
             },
         ),
@@ -202,7 +233,7 @@ def main() -> None:
             "当前知识依据不足，无法提供小区搬家服务细节。",
             {
                 "current_agent_id": "customer_service", "handoff": False,
-                "side_effects": base_side_effects, "model_calls": [{}],
+                "side_effects": base_side_effects, "model_calls": [provider_attempt("router", 1)],
                 "decision_summary": {"rag": {"status": "selected", "evidence_decision": "rejected_insufficient"}},
             },
         ),
@@ -225,7 +256,8 @@ def main() -> None:
             {
                 "current_agent_id": "maintenance", "handoff": False,
                 "mcp_calls": [{"server_name": "workorder-server", "tool_name": "get_my_work_order_by_id", "invocation_status": "success", "business_status": "success"}],
-                "side_effects": base_side_effects, "model_calls": [{}, {}],
+                "side_effects": base_side_effects,
+                "model_calls": [provider_attempt("router", 1), provider_attempt("vertical_agent", 2)],
                 "decision_summary": {
                     "skill": {"status": "skipped", "reason": "structured_realtime_query"},
                     "rag": {"status": "skipped", "reason": "structured_realtime_query"},
