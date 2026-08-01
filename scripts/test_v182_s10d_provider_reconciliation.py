@@ -677,6 +677,159 @@ def test_gateway_retry_and_preflight_contracts() -> None:
     check("preflight persistence failure sends no Provider request", paid_dispatches == [])
 
 
+def test_sdk_entry_does_not_claim_outbound_request() -> None:
+    trace_id = "s10d-sdk-entry-unconfirmed"
+    with provider_accounting_scope(
+        trace_id=trace_id,
+        stage="router",
+        price_snapshot=PRICE_SNAPSHOT,
+    ):
+        attempt, token = begin_provider_attempt(
+            requested_model=MODEL_ID,
+            thinking_enabled=True,
+            stream=False,
+        )
+        try:
+            mark_provider_attempt_dispatched(attempt)
+            pending = property_db.get_provider_attempts_for_trace(trace_id)[0]
+            pending_usage = pending["usage_normalized"]
+            check("SDK entry intent is retained", pending_usage["sdk_dispatch_started"] is True)
+            check("SDK entry alone does not claim request sent", pending_usage["provider_request_sent"] is None)
+            check("unconfirmed SDK entry is excluded from Provider aggregate", pending_usage["include_in_provider_aggregate"] is False)
+            normalized = finalize_provider_attempt(
+                attempt,
+                normal_completion=False,
+                exception=ValueError("fixture local serialization failure"),
+                phase="non_stream_provider_call",
+            )
+        finally:
+            reset_active_provider_attempt(token)
+    check("local SDK failure keeps outbound fact unknown", normalized["provider_request_sent"] is None)
+    check("local SDK failure uses cause_unconfirmed", normalized["usage_status"] == "cause_unconfirmed")
+    check("unknown outbound attempt stays out of Provider count", normalized["include_in_provider_aggregate"] is False)
+
+
+def test_provider_http_error_confirms_outbound_request() -> None:
+    class FixtureProviderHTTPError(RuntimeError):
+        status_code = 503
+
+    with provider_accounting_scope(
+        trace_id="s10d-provider-http-error",
+        stage="router",
+        price_snapshot=PRICE_SNAPSHOT,
+    ):
+        attempt, token = begin_provider_attempt(
+            requested_model=MODEL_ID,
+            thinking_enabled=True,
+            stream=False,
+        )
+        try:
+            mark_provider_attempt_dispatched(attempt)
+            normalized = finalize_provider_attempt(
+                attempt,
+                normal_completion=False,
+                exception=FixtureProviderHTTPError("fixture provider error"),
+                phase="non_stream_provider_call",
+            )
+        finally:
+            reset_active_provider_attempt(token)
+    check("Provider HTTP status confirms outbound request", normalized["provider_request_sent"] is True)
+    check("Provider HTTP error enters request count without fake usage", normalized["include_in_provider_aggregate"] is True and normalized["usage_status"] == "unavailable_provider_error")
+    check("Provider HTTP status is retained as structural evidence", normalized["http_status"] == 503 and normalized["provider_request_sent_evidence"] == "provider_http_status")
+
+
+def test_cancel_origin_requires_confirmed_evidence() -> None:
+    with provider_accounting_scope(
+        trace_id="s10d-cancel-unconfirmed",
+        stage="vertical_agent",
+        price_snapshot=PRICE_SNAPSHOT,
+    ):
+        attempt, token = begin_provider_attempt(
+            requested_model=MODEL_ID,
+            thinking_enabled=True,
+            stream=True,
+        )
+        try:
+            mark_provider_attempt_dispatched(attempt)
+            _capture_raw(request_id="req-s10d-cancel-unconfirmed", usage=None)
+            unconfirmed = finalize_provider_attempt(
+                attempt,
+                normal_completion=False,
+                exception=asyncio.CancelledError(),
+                phase="stream_provider_call",
+            )
+        finally:
+            reset_active_provider_attempt(token)
+    check("unattributed cancellation is not guessed as client", unconfirmed["usage_status"] == "cause_unconfirmed")
+    check("unattributed cancellation names exact evidence gap", unconfirmed["usage_unavailable_reason"] == "cancellation_observed_origin_unconfirmed")
+
+    with provider_accounting_scope(
+        trace_id="s10d-cancel-client-confirmed",
+        stage="vertical_agent",
+        price_snapshot=PRICE_SNAPSHOT,
+        client_cancel_confirmed=True,
+        client_cancel_evidence_code="asgi_client_disconnect",
+    ):
+        attempt, token = begin_provider_attempt(
+            requested_model=MODEL_ID,
+            thinking_enabled=True,
+            stream=True,
+        )
+        try:
+            mark_provider_attempt_dispatched(attempt)
+            _capture_raw(request_id="req-s10d-cancel-confirmed", usage=None)
+            confirmed = finalize_provider_attempt(
+                attempt,
+                normal_completion=False,
+                exception=GeneratorExit(),
+                phase="stream_provider_call",
+            )
+        finally:
+            reset_active_provider_attempt(token)
+    check("confirmed client cancellation has exact status", confirmed["usage_status"] == "unavailable_client_cancelled")
+    check("confirmed client cancellation retains evidence code", confirmed["usage_unavailable_reason"] == "asgi_client_disconnect")
+
+
+def test_golden_cost_missing_is_not_zero() -> None:
+    case = property_db.create_evaluation_case(
+        case_key="S10D-MISSING-COST",
+        title="Missing cost must stay unavailable",
+        user_message="deterministic fixture",
+        status="active",
+        version_label="V1.8.2-S10-D",
+    )
+    property_db.create_evaluation_run(
+        evaluation_case_id=case["id"],
+        status="passed",
+        trace_id="s10d-golden-missing-cost",
+        total_tokens=None,
+        estimated_cost_cny=None,
+    )
+    summary = property_db.evaluation_summary()
+    check("Golden summary exposes unknown cost runs", summary["unknown_cost_runs"] >= 1)
+    check("Golden complete cost is unavailable not zero", summary["model_direct_cost_cny"] is None and summary["cost_complete"] is False)
+    check("Golden cost per pass is unavailable when evidence is incomplete", summary["cost_per_passed_run_cny"] is None)
+
+
+def test_trace_main_count_uses_confirmed_provider_requests() -> None:
+    frontend_source = _source("frontend/index.html")
+    observability_source = _source("app/observability.py")
+    check(
+        "Trace main count uses confirmed Provider requests",
+        "const providerRequestCount = Number(reconciliationSummary.included_in_provider_summary_count"
+        in frontend_source,
+    )
+    check(
+        "Trace retains SDK attempt count as separate diagnostic evidence",
+        '"provider_attempt_count": len(model_calls)' in observability_source,
+    )
+    check(
+        "Trace main Provider count never falls back to all SDK attempts",
+        "providerRequestCount = Number((data.reconciliation_summary || {}).provider_attempt_count"
+        not in frontend_source,
+    )
+
+
 def test_error_evidence_is_non_sensitive() -> None:
     class FixtureHTTPError(RuntimeError):
         status_code = 503
@@ -738,6 +891,11 @@ def main() -> None:
             test_reasoning_is_output_subset,
             test_legacy_missing_usage_is_not_backfilled,
             test_gateway_retry_and_preflight_contracts,
+            test_sdk_entry_does_not_claim_outbound_request,
+            test_provider_http_error_confirms_outbound_request,
+            test_cancel_origin_requires_confirmed_evidence,
+            test_golden_cost_missing_is_not_zero,
+            test_trace_main_count_uses_confirmed_provider_requests,
             test_error_evidence_is_non_sensitive,
             test_provider_request_id_unique_schema,
         )

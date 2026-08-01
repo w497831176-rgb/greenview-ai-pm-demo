@@ -889,7 +889,22 @@ def _list_trace_page(
             raw_call = dict(raw_row)
             calls_by_trace.setdefault(raw_call["trace_id"], []).append(raw_call)
         for item_trace_id, item_calls in calls_by_trace.items():
-            provider_calls, logical_calls = _split_model_records(item_calls)
+            provider_calls, _ = _split_model_records(item_calls)
+            provider_attempt_records = [
+                call
+                for call in item_calls
+                if _provider_aggregate_decision(call)["record_kind"] == "provider_attempt"
+            ]
+            logical_calls = [
+                call
+                for call in item_calls
+                if _provider_aggregate_decision(call)["record_kind"] != "provider_attempt"
+            ]
+            unconfirmed_provider_attempts = [
+                call
+                for call in provider_attempt_records
+                if not _is_provider_aggregate_record(call)
+            ]
             summary = _aggregate_model_calls(item_calls)
             provider_actual_priced_calls = int(
                 summary.get("provider_actual_priced_calls") or 0
@@ -909,6 +924,9 @@ def _list_trace_page(
                 "model_ids": sorted({_provider_model(call) for call in provider_calls}),
                 "call_count": len(provider_calls),
                 "logical_record_count": len(logical_calls),
+                "unconfirmed_provider_attempt_count": len(
+                    unconfirmed_provider_attempts
+                ),
                 "estimated_cost_cny": known_cost,
                 "local_estimated_cost_cny": (
                     summary["estimated_cost_cny"] if estimated_priced_calls else None
@@ -1230,6 +1248,7 @@ def _enrich_model_call(call: Dict[str, Any], session_id: Optional[str]) -> Dict[
         non_sensitive_error = non_sensitive_error[:1000]
     reconciliation_evidence = {
         "http_status": usage_norm.get("http_status"),
+        "sdk_dispatch_started": usage_norm.get("sdk_dispatch_started"),
         "provider_response_seen": usage_norm.get("provider_response_seen"),
         "stream_completed": stream_completed,
         "done_received": done_received,
@@ -1699,7 +1718,19 @@ async def trace_detail(trace_id: str):
     messages = list_chat_messages(session_id or "")
     trace_messages = [m for m in messages if m.get("trace_id") == trace_id]
 
-    provider_raw_calls, logical_raw_calls = _split_model_records(raw_calls)
+    # Trace detail must retain every physical Provider attempt, including SDK
+    # entries whose outbound status remains unconfirmed. Aggregate membership
+    # is decided separately and never turns an unknown into a Provider count.
+    provider_raw_calls = [
+        call
+        for call in raw_calls
+        if _provider_aggregate_decision(call)["record_kind"] == "provider_attempt"
+    ]
+    logical_raw_calls = [
+        call
+        for call in raw_calls
+        if _provider_aggregate_decision(call)["record_kind"] != "provider_attempt"
+    ]
     model_calls = [_enrich_model_call(c, session_id) for c in provider_raw_calls]
     logical_model_records = [
         _enrich_model_call(c, session_id) for c in logical_raw_calls
@@ -1712,7 +1743,11 @@ async def trace_detail(trace_id: str):
             )
     else:
         session_raw_calls = list(raw_calls)
-    session_provider_raw_calls, _ = _split_model_records(session_raw_calls)
+    session_provider_raw_calls = [
+        call
+        for call in session_raw_calls
+        if _provider_aggregate_decision(call)["record_kind"] == "provider_attempt"
+    ]
     session_model_calls = [
         _enrich_model_call(c, session_id) for c in session_provider_raw_calls
     ]

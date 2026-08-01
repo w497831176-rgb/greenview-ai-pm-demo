@@ -113,6 +113,8 @@ class ProviderAccountingScope:
     model_policy_version: Optional[str] = None
     explicit_retry: bool = False
     retry_of_local_attempt_id: Optional[str] = None
+    client_cancel_confirmed: bool = False
+    client_cancel_evidence_code: Optional[str] = None
     generated_identity: bool = False
     attempts: List[Dict[str, Any]] = field(default_factory=list)
 
@@ -183,6 +185,8 @@ def provider_accounting_scope(
     model_policy_version: Optional[str] = None,
     explicit_retry: bool = False,
     retry_of_local_attempt_id: Optional[str] = None,
+    client_cancel_confirmed: bool = False,
+    client_cancel_evidence_code: Optional[str] = None,
 ) -> Iterator[ProviderAccountingScope]:
     """Bind business metadata to all Provider attempts in this execution path."""
 
@@ -195,6 +199,12 @@ def provider_accounting_scope(
         model_policy_version=model_policy_version,
         explicit_retry=bool(explicit_retry),
         retry_of_local_attempt_id=retry_of_local_attempt_id,
+        client_cancel_confirmed=bool(client_cancel_confirmed),
+        client_cancel_evidence_code=(
+            str(client_cancel_evidence_code)
+            if client_cancel_confirmed and client_cancel_evidence_code
+            else None
+        ),
     )
     token = _ACTIVE_SCOPE.set(scope)
     try:
@@ -288,7 +298,12 @@ def begin_provider_attempt(
 
 
 def mark_provider_attempt_dispatched(attempt: ProviderAttempt) -> None:
-    """Durably mark SDK dispatch before control enters the paid SDK method."""
+    """Durably mark that control is about to enter the SDK.
+
+    This is deliberately *not* proof that an HTTP request left the process.
+    Provider dispatch is confirmed only from response/request-id evidence or a
+    real Provider HTTP status during finalization.
+    """
 
     try:
         from db.property_db import mark_provider_attempt_dispatched as persist_dispatch
@@ -364,9 +379,29 @@ def _usage_facts(attempt: ProviderAttempt) -> Dict[str, Any]:
     }
 
 
+def _confirmed_provider_request_sent(
+    attempt: ProviderAttempt,
+    exception: Optional[BaseException],
+) -> Optional[bool]:
+    """Return True only when this layer has affirmative outbound evidence."""
+
+    if attempt.provider_request_id or attempt.response_seen:
+        return True
+    status_code = _safe_status_code(exception) if exception is not None else None
+    if status_code is not None and 400 <= status_code <= 599:
+        return True
+    return None
+
+
 def _classify_failure(attempt: ProviderAttempt, exc: BaseException, *, phase: str) -> tuple[str, str]:
     if isinstance(exc, (asyncio.CancelledError, GeneratorExit)):
-        return "unavailable_client_cancelled", "client_cancelled_during_provider_consumption"
+        if attempt.scope.client_cancel_confirmed:
+            return (
+                "unavailable_client_cancelled",
+                attempt.scope.client_cancel_evidence_code
+                or "client_disconnect_confirmed",
+            )
+        return "cause_unconfirmed", "cancellation_observed_origin_unconfirmed"
     status_code = _safe_status_code(exc)
     if status_code is not None and 400 <= status_code <= 599:
         return "unavailable_provider_error", "provider_http_error"
@@ -446,6 +481,17 @@ def finalize_provider_attempt(
     finished_at = _now_iso()
     usage_facts = _usage_facts(attempt)
     usage_received = any(value is not None for value in attempt.usage.values())
+    provider_request_sent = _confirmed_provider_request_sent(attempt, exception)
+    http_status = _safe_status_code(exception) if exception is not None else None
+    provider_request_sent_evidence = (
+        "provider_request_id"
+        if attempt.provider_request_id
+        else "provider_response_seen"
+        if attempt.response_seen
+        else "provider_http_status"
+        if http_status is not None and 400 <= http_status <= 599
+        else None
+    )
     unavailable_reason: Optional[str] = None
     error_evidence: Optional[Dict[str, Any]] = None
     if exception is not None:
@@ -489,7 +535,7 @@ def finalize_provider_attempt(
 
     normalized: Dict[str, Any] = {
         "record_kind": "provider_attempt",
-        "include_in_provider_aggregate": bool(attempt.dispatched),
+        "include_in_provider_aggregate": provider_request_sent is True,
         "local_attempt_id": attempt.local_attempt_id,
         "trace_id": attempt.scope.trace_id,
         "session_id": attempt.scope.session_id,
@@ -515,7 +561,10 @@ def finalize_provider_attempt(
         "stream": attempt.stream,
         "started_at": attempt.started_at,
         "finished_at": finished_at,
-        "provider_request_sent": bool(attempt.dispatched),
+        "sdk_dispatch_started": bool(attempt.dispatched),
+        "provider_request_sent": provider_request_sent,
+        "provider_request_sent_evidence": provider_request_sent_evidence,
+        "http_status": http_status,
         "provider_response_seen": bool(attempt.response_seen),
         # Agno/OpenAI SDK consumes the wire-level [DONE] sentinel internally.
         # Do not claim that this layer observed it; iterator exhaustion is the
@@ -537,6 +586,8 @@ def finalize_provider_attempt(
             attempt.scope.explicit_retry or attempt.scope.retry_of_local_attempt_id
         ),
         "retry_of_local_attempt_id": attempt.scope.retry_of_local_attempt_id,
+        "client_cancel_confirmed": attempt.scope.client_cancel_confirmed,
+        "client_cancel_evidence_code": attempt.scope.client_cancel_evidence_code,
         "usage_status": usage_status,
         "usage_unavailable_reason": unavailable_reason,
         "input_cache_hit_tokens": attempt.usage.get("input_cache_hit_tokens"),

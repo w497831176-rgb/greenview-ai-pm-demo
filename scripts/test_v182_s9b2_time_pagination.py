@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import sqlite3
 import tempfile
+import json
 from datetime import datetime
 from pathlib import Path
 
@@ -71,6 +72,7 @@ def create_fixture(path: Path) -> None:
             total_tokens INTEGER,
             estimated_cost_cny REAL,
             usage_source TEXT,
+            usage_normalized TEXT,
             stage TEXT,
             status TEXT,
             created_at TEXT
@@ -98,14 +100,22 @@ def create_fixture(path: Path) -> None:
         conn.execute(
             """INSERT INTO model_calls
                (trace_id, model_id, total_tokens, estimated_cost_cny,
-                usage_source, stage, status, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                usage_source, usage_normalized, stage, status, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 trace_id,
                 "deepseek-v4-flash",
                 100 + index,
                 0.001,
                 "provider_actual",
+                json.dumps(
+                    {
+                        "record_kind": "provider_attempt",
+                        "include_in_provider_aggregate": True,
+                        "provider_request_sent": True,
+                        "usage_status": "provider_actual",
+                    }
+                ),
                 "vertical_agent",
                 "success",
                 created_at,
@@ -148,8 +158,8 @@ def create_fixture(path: Path) -> None:
     conn.executemany(
         """INSERT INTO model_calls
            (trace_id, model_id, total_tokens, estimated_cost_cny,
-            usage_source, stage, status, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            usage_source, usage_normalized, stage, status, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         [
             (
                 "duplicate-trace",
@@ -157,6 +167,14 @@ def create_fixture(path: Path) -> None:
                 5164,
                 0.0030102,
                 "provider_actual",
+                json.dumps(
+                    {
+                        "record_kind": "provider_attempt",
+                        "include_in_provider_aggregate": True,
+                        "provider_request_sent": True,
+                        "usage_status": "provider_actual",
+                    }
+                ),
                 "router",
                 "success",
                 "2026-07-28 12:00:00",
@@ -167,6 +185,15 @@ def create_fixture(path: Path) -> None:
                 99,
                 None,
                 "unavailable",
+                json.dumps(
+                    {
+                        "record_kind": "provider_attempt",
+                        "include_in_provider_aggregate": True,
+                        "provider_request_sent": True,
+                        "usage_status": "unavailable_done_without_usage",
+                        "usage_unavailable_reason": "stream_done_without_usage_chunk",
+                    }
+                ),
                 "router",
                 "failed",
                 "2026-07-28 11:58:00",
@@ -177,6 +204,14 @@ def create_fixture(path: Path) -> None:
                 4670,
                 0.0118872,
                 "provider_actual",
+                json.dumps(
+                    {
+                        "record_kind": "provider_attempt",
+                        "include_in_provider_aggregate": True,
+                        "provider_request_sent": True,
+                        "usage_status": "provider_actual",
+                    }
+                ),
                 "darwin",
                 "success",
                 "2026-07-28 11:57:00",

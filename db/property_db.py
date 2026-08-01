@@ -3559,7 +3559,14 @@ def evaluation_summary() -> Dict[str, Any]:
     passed = sum(1 for item in golden_rows if item.get("status") == "passed")
     failed = sum(1 for item in golden_rows if item.get("status") in {"failed", "error"})
     manual = sum(1 for item in golden_rows if item.get("status") == "needs_manual_review")
-    total_cost = sum(float(item.get("estimated_cost_cny") or 0.0) for item in golden_rows)
+    known_cost_rows = [
+        item for item in golden_rows if item.get("estimated_cost_cny") is not None
+    ]
+    unknown_cost_runs = len(golden_rows) - len(known_cost_rows)
+    known_total_cost = sum(
+        float(item["estimated_cost_cny"]) for item in known_cost_rows
+    )
+    cost_complete = bool(golden_rows) and unknown_cost_runs == 0
     active_golden_ids = {int(item["id"]) for item in golden_cases}
     latest_by_case: Dict[int, Dict[str, Any]] = {}
     for item in sorted(golden_rows, key=lambda row: (str(row.get("created_at") or ""), int(row.get("id") or 0)), reverse=True):
@@ -3589,9 +3596,21 @@ def evaluation_summary() -> Dict[str, Any]:
         "runs_failed": failed,
         "runs_needing_manual_review": manual,
         "deterministic_pass_rate": round((passed / total) * 100, 2) if total else None,
-        "model_direct_cost_cny": round(total_cost, 8),
-        "cost_per_passed_run_cny": round(total_cost / passed, 8) if passed else None,
-        "note": "仅统计已显式运行的黄金评估；受控失败探针不计入黄金集通过率。成本来自关联 Trace 的模型调用记录，不代表供应商账单。",
+        "model_direct_cost_cny": (
+            round(known_total_cost, 8) if cost_complete else None
+        ),
+        "known_model_direct_cost_cny": (
+            round(known_total_cost, 8) if known_cost_rows else None
+        ),
+        "known_cost_runs": len(known_cost_rows),
+        "unknown_cost_runs": unknown_cost_runs,
+        "cost_complete": cost_complete,
+        "cost_per_passed_run_cny": (
+            round(known_total_cost / passed, 8)
+            if cost_complete and passed
+            else None
+        ),
+        "note": "仅统计已显式运行的黄金评估；受控失败探针不计入黄金集通过率。任一运行缺少 Provider actual 成本时，完整成本与单次通过成本保持不可得，不以 0 补齐；已知小计仅供审计。平台价格快照金额不代表供应商账单。",
     }
 
 
@@ -5265,7 +5284,8 @@ def create_provider_attempt(
             "stream": bool(stream),
             "started_at": start,
             "finished_at": None,
-            "provider_request_sent": False,
+            "sdk_dispatch_started": False,
+            "provider_request_sent": None,
             "provider_response_seen": False,
             "received_done": None,
             "done_observation_status": "not_exposed_by_sdk" if stream else "not_applicable",
@@ -5327,7 +5347,7 @@ def mark_provider_attempt_dispatched(
     *,
     dispatched_at: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Persist the dispatch boundary; any failure must block the paid call."""
+    """Persist SDK entry intent; this is not proof of an outbound HTTP request."""
     local_id = str(local_attempt_id or "").strip()
     if not local_id:
         raise ValueError("local_attempt_id is required")
@@ -5347,12 +5367,13 @@ def mark_provider_attempt_dispatched(
         normalized.update(
             {
                 "record_kind": "provider_attempt",
-                "include_in_provider_aggregate": True,
+                "include_in_provider_aggregate": False,
                 "local_attempt_id": local_id,
-                "provider_request_sent": True,
+                "sdk_dispatch_started": True,
+                "provider_request_sent": None,
                 "dispatch_recorded_at": dispatched,
                 "usage_status": "orphaned_pending",
-                "usage_unavailable_reason": "provider_attempt_dispatched_not_finalized",
+                "usage_unavailable_reason": "sdk_dispatch_started_not_finalized_cause_unconfirmed",
                 "persistence_status": "persisted",
             }
         )
