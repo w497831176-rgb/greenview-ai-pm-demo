@@ -102,7 +102,9 @@ def create_schema(conn: sqlite3.Connection) -> None:
             created_at TEXT,
             record_kind TEXT DEFAULT 'provider_attempt',
             usage_status TEXT,
-            finished_at TEXT
+            finished_at TEXT,
+            price_snapshot TEXT DEFAULT '{"fixture_price": true}',
+            cost_source TEXT DEFAULT 'platform_price_snapshot'
         );
         CREATE TABLE evaluation_runs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -463,7 +465,12 @@ def assert_mixed_time_cross_day_and_model_only() -> None:
                 "reasoning_known_calls": 5,
                 "reasoning_unavailable_calls": 0,
                 "reasoning_is_output_subset": True,
+                "reasoning_comparable_calls": 5,
+                "reasoning_unknown_calls": 0,
+                "reasoning_violation_calls": 0,
             }
+            assert overview["statistics_status"] == "consistent"
+            assert overview["data_quality_status"] == "normal"
 
             daily_trends = asyncio.run(
                 observability.trends(group_by="day", start=None, end=None)
@@ -575,6 +582,10 @@ def assert_pagination() -> None:
             assert first["trace_group_count"] == 26
             assert first["provider_request_count"] == 25
             assert first["scope_consistent"] is True
+            assert first["statistics_status"] in {
+                "consistent",
+                "reconciliation_attention",
+            }
 
             all_items = first["traces"] + second["traces"]
             trace_ids = [item["trace_id"] for item in all_items]
@@ -635,6 +646,11 @@ def assert_frontend() -> None:
         "属于输出子集，不重复计入总量",
         "统计口径异常",
         "state.overview.scope_consistent !== false",
+        "state.overview.statistics_status === 'consistent'",
+        "state.overview.data_quality_status === 'normal'",
+        "traces.data_quality_status === 'normal'",
+        "无法完整核实",
+        "异常attempt",
         "Number(state.overview.trace_group_count ?? 0) === state.traceSummary.traceGroupCount",
         "Trace与成本加载失败",
         "接口失败没有被转换成0次、¥0或“不适用”",

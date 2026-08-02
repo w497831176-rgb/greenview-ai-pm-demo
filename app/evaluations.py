@@ -15,7 +15,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 from app.observability import (
-    _check_budget,
+    _background_budget_gate,
     _split_model_records,
     _token_source,
     _token_value,
@@ -745,9 +745,12 @@ async def run_case(case_id: int, request: EvaluationRunRequest = EvaluationRunRe
 
     # Evaluation is an explicit background-quality operation, unlike ordinary
     # owner chat.  Respect a hard budget stop before spending a new model call.
-    budget = _check_budget("evaluation_run")
-    if budget.get("alert_level") == "blocked":
-        raise HTTPException(status_code=403, detail=budget.get("reason") or "预算已达上限，评估运行已阻止")
+    budget_gate = _background_budget_gate("evaluation_run")
+    if not budget_gate.get("allowed"):
+        raise HTTPException(
+            status_code=int(budget_gate["http_status"]),
+            detail=budget_gate["detail"],
+        )
 
     session_id = f"evaluation-{case['case_key'][:32]}-{uuid.uuid4().hex[:8]}"
     try:

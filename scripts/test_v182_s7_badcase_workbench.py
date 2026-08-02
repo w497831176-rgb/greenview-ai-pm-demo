@@ -158,7 +158,11 @@ def main() -> None:
     check("config apply clears stale retest", not apply_result["badcase"].get("retest_trace_id"))
 
     # 26-30. Run only the linked case through a mocked runtime, then close.
-    evaluation_api._check_budget = lambda _operation: {"alert_level": "ok"}
+    evaluation_api._background_budget_gate = lambda _operation: {
+        "budget_status": "available",
+        "alert_level": "none",
+        "allowed": True,
+    }
 
     async def mocked_chat(message: str, session_id: str):
         trace_id = f"s7-retest-{uuid.uuid4().hex[:8]}"

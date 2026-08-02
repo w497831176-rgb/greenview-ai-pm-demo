@@ -16,7 +16,7 @@ from typing import Any, Dict, Optional
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
-from app.observability import _check_budget
+from app.observability import _background_budget_gate
 from app.runtime.provider_accounting import provider_accounting_scope
 from app.settings import build_model
 from db.property_db import (
@@ -181,9 +181,12 @@ async def ab_test_models(request: AbTestRequest):
     trace_id = uuid.uuid4().hex[:16]
 
     # A/B test uses Pro; enforce the daily budget before spending budget.
-    budget = _check_budget("ab_test")
-    if budget.get("alert_level") == "blocked":
-        raise HTTPException(status_code=403, detail=_BUDGET_BLOCKED_DETAIL)
+    budget_gate = _background_budget_gate("ab_test")
+    if not budget_gate.get("allowed"):
+        raise HTTPException(
+            status_code=int(budget_gate["http_status"]),
+            detail=budget_gate["detail"],
+        )
 
     async def _collect_response(generator) -> tuple:
         response = ""

@@ -22,7 +22,11 @@ def main() -> None:
     from db import property_db as db
 
     db.init_db()
-    evaluation_api._check_budget = lambda _operation: {"alert_level": "ok"}
+    evaluation_api._background_budget_gate = lambda _operation: {
+        "budget_status": "available",
+        "alert_level": "none",
+        "allowed": True,
+    }
 
     def provider_attempt(stage: str, sequence: int) -> dict:
         request_id = f"fixture-s6-{stage}-{sequence}"

@@ -356,10 +356,10 @@ def _provider_aggregate_decision(call: Dict[str, Any]) -> Dict[str, Any]:
         included, reason = False, "legacy_record_not_upgraded"
     elif record_kind != "provider_attempt":
         included, reason = False, "record_kind_not_provider_attempt"
-    elif include_flag is not True:
-        included, reason = False, "provider_aggregate_flag_not_true"
     elif request_sent is not True:
         included, reason = False, "provider_request_sent_not_confirmed"
+    elif include_flag is not True:
+        included, reason = False, "provider_aggregate_flag_not_true"
 
     return {
         "included": included,
@@ -403,12 +403,30 @@ def _sqlite_provider_aggregate(
     return 1 if _is_provider_aggregate_record(call) else 0
 
 
+def _sqlite_provider_attempt(record_kind: Any, usage_normalized: Any) -> int:
+    call = {
+        "record_kind": record_kind,
+        "usage_normalized": usage_normalized,
+    }
+    return (
+        1
+        if _provider_aggregate_decision(call)["record_kind"] == "provider_attempt"
+        else 0
+    )
+
+
 def _register_reporting_sql(conn: Any) -> None:
     _register_time_sql(conn)
     conn.create_function(
         "yiai_provider_aggregate",
         5,
         _sqlite_provider_aggregate,
+        deterministic=True,
+    )
+    conn.create_function(
+        "yiai_provider_attempt",
+        2,
+        _sqlite_provider_attempt,
         deterministic=True,
     )
 
@@ -418,6 +436,214 @@ def _provider_sql_predicate(alias: str) -> str:
         f"yiai_provider_aggregate({alias}.record_kind, {alias}.stage, "
         f"{alias}.status, {alias}.usage_status, {alias}.usage_normalized) = 1"
     )
+
+
+def _provider_attempt_sql_predicate(alias: str) -> str:
+    return (
+        f"yiai_provider_attempt({alias}.record_kind, "
+        f"{alias}.usage_normalized) = 1"
+    )
+
+
+def _compact_identifier(value: Any, *, fallback: str = "unassigned") -> str:
+    text = str(value or "").strip()
+    if not text:
+        return fallback
+    if len(text) <= 20:
+        return text
+    return f"{text[:10]}...{text[-6:]}"
+
+
+def _optional_int(value: Any) -> Optional[int]:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _provider_usage_inconsistency(call: Dict[str, Any]) -> Tuple[bool, List[str]]:
+    usage = _usage_payload(call)
+    reasons = usage.get("provider_usage_inconsistent_reasons") or []
+    if isinstance(reasons, str):
+        reasons = [reasons]
+    reasons = [str(item) for item in reasons if str(item or "").strip()]
+    derived: List[str] = []
+    hit = _optional_int(
+        _token_value(call, "cache_hit_input_tokens", "input_cache_hit_tokens")
+    )
+    miss = _optional_int(
+        _token_value(call, "cache_miss_input_tokens", "input_cache_miss_tokens")
+    )
+    output = _optional_int(_token_value(call, "output_tokens"))
+    reasoning = _optional_int(_token_value(call, "reasoning_tokens"))
+    total = _optional_int(_token_value(call, "total_tokens"))
+    provider_input = _optional_int(
+        _token_value(call, "input_tokens", "prompt_tokens")
+    )
+    known_values = [value for value in (hit, miss, output, reasoning, total) if value is not None]
+    if any(value < 0 for value in known_values):
+        derived.append("negative_provider_usage_value")
+    if None not in (hit, miss, output, total) and total != hit + miss + output:
+        derived.append("provider_total_not_equal_three_class_sum")
+    if None not in (provider_input, hit, miss) and provider_input != hit + miss:
+        derived.append("provider_input_not_equal_cache_split")
+    if None not in (reasoning, output) and reasoning > output:
+        derived.append("reasoning_exceeds_output")
+    reasons = list(dict.fromkeys([*reasons, *derived]))
+    inconsistent = bool(
+        usage.get("provider_usage_inconsistent")
+        or str(usage.get("reconciliation_status") or "").strip().lower()
+        == "provider_usage_inconsistent"
+        or reasons
+    )
+    return inconsistent, reasons
+
+
+def _data_quality_summary(calls: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Explain reporting exclusions without upgrading them into Provider calls."""
+    counts = {
+        "invalid_timestamp_count": 0,
+        "provider_send_unconfirmed_count": 0,
+        "orphaned_pending_count": 0,
+        "provider_usage_inconsistent_count": 0,
+        "provider_actual_price_missing_count": 0,
+        "unavailable_usage_count": 0,
+        "unresolved_reconciliation_count": 0,
+    }
+    samples: List[Dict[str, Any]] = []
+    reasoning_comparable_calls = 0
+    reasoning_unknown_calls = 0
+    reasoning_violation_calls = 0
+    anomaly_attempt_count = 0
+
+    for raw in calls:
+        call = dict(raw)
+        decision = _provider_aggregate_decision(call)
+        if decision["record_kind"] != "provider_attempt":
+            continue
+        usage = _usage_payload(call)
+        usage_status = str(
+            call.get("usage_status") or usage.get("usage_status") or ""
+        ).strip().lower()
+        issues: List[str] = []
+
+        if _reporting_epoch(call.get("created_at")) is None:
+            counts["invalid_timestamp_count"] += 1
+            issues.append("invalid_timestamp")
+
+        if decision.get("request_sent") is not True:
+            counts["provider_send_unconfirmed_count"] += 1
+            issues.append("provider_send_unconfirmed")
+        if usage_status in {"orphaned_pending", "cause_unconfirmed", "pending"}:
+            counts["orphaned_pending_count"] += 1
+            issues.append("orphaned_pending")
+
+        inconsistent, inconsistency_reasons = _provider_usage_inconsistency(call)
+        if inconsistent:
+            counts["provider_usage_inconsistent_count"] += 1
+            issues.append("provider_usage_inconsistent")
+
+        token_source = _token_source(call)
+        core_tokens = (
+            _token_value(call, "cache_hit_input_tokens", "input_cache_hit_tokens"),
+            _token_value(call, "cache_miss_input_tokens", "input_cache_miss_tokens"),
+            _token_value(call, "output_tokens"),
+        )
+        if (
+            token_source == "provider_actual"
+            and None not in core_tokens
+            and _provider_direct_cost(call) is None
+        ):
+            counts["provider_actual_price_missing_count"] += 1
+            issues.append("provider_actual_price_missing")
+
+        if decision.get("request_sent") is True and usage_status != "provider_actual":
+            counts["unavailable_usage_count"] += 1
+            issues.append("provider_usage_unavailable")
+
+        if decision.get("included") and token_source == "provider_actual":
+            output = _token_value(call, "output_tokens")
+            reasoning = _token_value(call, "reasoning_tokens")
+            if output is None or reasoning is None:
+                reasoning_unknown_calls += 1
+            else:
+                reasoning_comparable_calls += 1
+                if int(reasoning) < 0 or int(reasoning) > int(output):
+                    reasoning_violation_calls += 1
+
+        unresolved_codes = {
+            "provider_send_unconfirmed",
+            "orphaned_pending",
+            "provider_usage_inconsistent",
+            "provider_actual_price_missing",
+            "provider_usage_unavailable",
+        }
+        if any(code in unresolved_codes for code in issues):
+            counts["unresolved_reconciliation_count"] += 1
+
+        if issues:
+            anomaly_attempt_count += 1
+        if issues and len(samples) < 20:
+            timestamp_assignable = "invalid_timestamp" not in issues
+            included_in_provider_summary = bool(decision.get("included")) and timestamp_assignable
+            if not timestamp_assignable:
+                exclusion_reason = "invalid_timestamp_range_unassignable"
+            elif included_in_provider_summary:
+                exclusion_reason = None
+            else:
+                exclusion_reason = decision.get("reason")
+            samples.append(
+                {
+                    "trace_id_summary": _compact_identifier(
+                        call.get("trace_id"), fallback="trace-unassigned"
+                    ),
+                    "local_attempt_id_summary": _compact_identifier(
+                        usage.get("local_attempt_id")
+                        or call.get("local_attempt_id"),
+                        fallback=f"row-{call.get('id', 'unknown')}",
+                    ),
+                    "stage": call.get("stage") or usage.get("stage") or "unknown",
+                    "created_at_status": (
+                        "invalid" if "invalid_timestamp" in issues else "valid"
+                    ),
+                    "usage_status": usage_status or "cause_unconfirmed",
+                    "provider_request_sent": decision.get("request_sent"),
+                    "included_in_provider_summary": included_in_provider_summary,
+                    "exclusion_reason": exclusion_reason,
+                    "issue_codes": issues,
+                    "provider_usage_inconsistent_reasons": inconsistency_reasons,
+                }
+            )
+
+    if reasoning_violation_calls:
+        reasoning_is_output_subset: Optional[bool] = False
+    elif reasoning_comparable_calls and not reasoning_unknown_calls:
+        reasoning_is_output_subset = True
+    else:
+        reasoning_is_output_subset = None
+
+    if counts["invalid_timestamp_count"] or counts[
+        "provider_usage_inconsistent_count"
+    ]:
+        status = "data_quality_error"
+    elif counts["unresolved_reconciliation_count"]:
+        status = "reconciliation_attention"
+    else:
+        status = "normal"
+
+    return {
+        "data_quality_status": status,
+        **counts,
+        "anomaly_attempt_count": anomaly_attempt_count,
+        "anomaly_samples_truncated": anomaly_attempt_count > len(samples),
+        "anomaly_attempts": samples,
+        "reasoning_comparable_calls": reasoning_comparable_calls,
+        "reasoning_unknown_calls": reasoning_unknown_calls,
+        "reasoning_violation_calls": reasoning_violation_calls,
+        "reasoning_is_output_subset": reasoning_is_output_subset,
+    }
 
 
 def _token_value(call: Dict[str, Any], *keys: str) -> Any:
@@ -463,6 +689,34 @@ def _cost_bucket(call: Dict[str, Any]) -> str:
     return _token_source(call)
 
 
+def _price_snapshot_payload(call: Dict[str, Any]) -> Dict[str, Any]:
+    usage = _usage_payload(call)
+    value = usage.get("price_snapshot") or call.get("price_snapshot") or {}
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            value = {}
+    return value if isinstance(value, dict) else {}
+
+
+def _provider_direct_cost(call: Dict[str, Any]) -> Optional[float]:
+    """Return only cost backed by a frozen platform price snapshot."""
+    usage = _usage_payload(call)
+    cost_source = str(
+        usage.get("cost_source") or call.get("cost_source") or ""
+    ).strip().lower()
+    if cost_source != "platform_price_snapshot" or not _price_snapshot_payload(call):
+        return None
+    amount = _first_present(usage, "calculated_direct_cost")
+    if amount is None:
+        amount = call.get("estimated_cost_cny")
+    try:
+        return None if amount is None else float(amount)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
 def _empty_cost_group() -> Dict[str, Any]:
     return {
         "calls": 0,
@@ -483,13 +737,19 @@ def _empty_cost_group() -> Dict[str, Any]:
         "reasoning_tokens": 0,
         "reasoning_known_calls": 0,
         "reasoning_unavailable_calls": 0,
+        "reasoning_comparable_calls": 0,
+        "reasoning_violation_calls": 0,
     }
 
 
 def _add_call_to_group(group: Dict[str, Any], call: Dict[str, Any]) -> None:
     group["calls"] += 1
     bucket = _cost_bucket(call)
-    amount = call.get("estimated_cost_cny")
+    amount = (
+        _provider_direct_cost(call)
+        if bucket == "provider_actual"
+        else call.get("estimated_cost_cny")
+    )
     if bucket == "provider_actual":
         group["provider_actual_calls"] += 1
         total_tokens = _token_value(call, "total_tokens")
@@ -528,6 +788,9 @@ def _add_call_to_group(group: Dict[str, Any], call: Dict[str, Any]) -> None:
         else:
             group["reasoning_known_calls"] += 1
             group["reasoning_tokens"] += int(reasoning)
+            group["reasoning_comparable_calls"] += 1
+            if int(reasoning) < 0 or int(reasoning) > int(output):
+                group["reasoning_violation_calls"] += 1
 
 
 def _finalize_cost_group(group: Dict[str, Any]) -> Dict[str, Any]:
@@ -536,13 +799,27 @@ def _finalize_cost_group(group: Dict[str, Any]) -> Dict[str, Any]:
         result["total_tokens"] = None
     if result["reasoning_known_calls"] == 0:
         result["reasoning_tokens"] = None
+    if result["reasoning_violation_calls"]:
+        result["reasoning_is_output_subset"] = False
+    elif (
+        result["reasoning_comparable_calls"]
+        and not result["reasoning_unavailable_calls"]
+    ):
+        result["reasoning_is_output_subset"] = True
+    else:
+        result["reasoning_is_output_subset"] = None
     result["provider_actual_cost_cny"] = round(
         float(result["provider_actual_cost_cny"]), 8
     )
     result["estimated_cost_cny"] = round(float(result["estimated_cost_cny"]), 8)
-    result["platform_price_snapshot_direct_cost_cny"] = result[
-        "provider_actual_cost_cny"
-    ]
+    result["platform_price_snapshot_direct_cost_cny"] = (
+        result["provider_actual_cost_cny"]
+        if (
+            not result["provider_actual_calls"]
+            or result["provider_actual_priced_calls"]
+        )
+        else None
+    )
     result["cost_source"] = "platform_price_snapshot"
     result["cost_complete"] = result["unavailable_calls"] == 0
     result["token_complete"] = result["token_unavailable_calls"] == 0
@@ -605,6 +882,62 @@ def _fetch_model_calls(
     return rows
 
 
+def _fetch_reporting_model_calls(
+    start: Optional[str],
+    end: Optional[str],
+    *,
+    model_id: Optional[str] = None,
+    stage: Optional[str] = None,
+    trace_id: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Return scoped records plus Provider attempts whose time is unassignable.
+
+    Invalid or NULL timestamps cannot honestly be assigned to a reporting day.
+    They remain globally visible to every scoped reconciliation query and are
+    never included in the normal Provider request aggregate.
+    """
+    range_conditions, params = _time_range_predicates("created_at", start, end)
+    conditions: List[str] = []
+    if range_conditions:
+        valid_range = " AND ".join(range_conditions)
+        conditions.append(
+            f"(({valid_range}) OR "
+            f"({_provider_attempt_sql_predicate('model_calls')} "
+            "AND yiai_time_epoch(created_at) IS NULL))"
+        )
+    if model_id:
+        conditions.append("model_id = ?")
+        params.append(model_id)
+    if stage:
+        conditions.append("stage = ?")
+        params.append(stage)
+    if trace_id:
+        conditions.append("trace_id = ?")
+        params.append(trace_id)
+    where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+    conn = _get_conn()
+    _register_reporting_sql(conn)
+    cursor = conn.cursor()
+    cursor.execute(f"SELECT * FROM model_calls {where}", params)
+    rows = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+    return rows
+
+
+def _statistics_status(
+    *,
+    scope_consistent: bool,
+    data_quality_status: str,
+) -> str:
+    if not scope_consistent:
+        return "scope_mismatch"
+    if data_quality_status == "data_quality_error":
+        return "data_quality_error"
+    if data_quality_status == "reconciliation_attention":
+        return "reconciliation_attention"
+    return "consistent"
+
+
 def _top_provider_actual_traces(
     calls: List[Dict[str, Any]], limit: int = 5
 ) -> List[Dict[str, Any]]:
@@ -628,9 +961,8 @@ def _top_provider_actual_traces(
             },
         )
         item["all_calls"] += 1
-        if _cost_bucket(call) != "provider_actual" or call.get(
-            "estimated_cost_cny"
-        ) is None:
+        direct_cost = _provider_direct_cost(call)
+        if _cost_bucket(call) != "provider_actual" or direct_cost is None:
             continue
         item["provider_actual_calls"] += 1
         total_tokens = _token_value(call, "total_tokens")
@@ -638,9 +970,7 @@ def _top_provider_actual_traces(
             item["token_unavailable_calls"] += 1
         else:
             item["total_tokens"] += int(total_tokens)
-        item["provider_actual_cost_cny"] += float(
-            call.get("estimated_cost_cny")
-        )
+        item["provider_actual_cost_cny"] += direct_cost
         item["models"].add(_provider_model(call))
         item["stages"].add(call.get("stage") or "unknown")
 
@@ -679,35 +1009,97 @@ def _query_period_summary(start: str, end: str) -> Dict[str, Any]:
 
 
 def _check_budget(strategy: Optional[str] = None) -> Dict[str, Any]:
-    """Return daily and monthly budget usage and the highest alert level.
-
-    - blocked: any configured threshold has reached or exceeded 100%.
-    - warning: any configured threshold has reached or exceeded 80%.
-    - none: no threshold is configured or all usages are below 80%.
-    """
-    thresholds = get_budget_thresholds()
-    daily_threshold = thresholds.get("daily_threshold_cny")
-    monthly_threshold = thresholds.get("monthly_threshold_cny")
-
-    bounds = _period_bounds()
-    today_cost = 0.0
-    month_cost = 0.0
+    """Fail closed for optional paid background work when cost is unknowable."""
+    thresholds: Dict[str, Any] = {}
     try:
+        thresholds = get_budget_thresholds()
+        daily_threshold = thresholds.get("daily_threshold_cny")
+        monthly_threshold = thresholds.get("monthly_threshold_cny")
+        bounds = _period_bounds()
         today = _query_period_summary(
             bounds["today"]["start"], bounds["today"]["end"]
         )
         month = _query_period_summary(
             bounds["this_month"]["start"], bounds["this_month"]["end"]
         )
+        today_quality = _data_quality_summary(
+            _fetch_reporting_model_calls(
+                bounds["today"]["start"], bounds["today"]["end"]
+            )
+        )
+        month_quality = _data_quality_summary(
+            _fetch_reporting_model_calls(
+                bounds["this_month"]["start"], bounds["this_month"]["end"]
+            )
+        )
+        if (
+            today.get("cost_complete") is not True
+            or month.get("cost_complete") is not True
+            or today_quality["data_quality_status"] != "normal"
+            or month_quality["data_quality_status"] != "normal"
+        ):
+            reason_code = (
+                "budget_data_quality_error"
+                if "data_quality_error"
+                in {
+                    today_quality["data_quality_status"],
+                    month_quality["data_quality_status"],
+                }
+                else "budget_reconciliation_attention"
+                if "reconciliation_attention"
+                in {
+                    today_quality["data_quality_status"],
+                    month_quality["data_quality_status"],
+                }
+                else "budget_cost_incomplete"
+            )
+            return {
+                "budget_status": "unavailable",
+                "daily_usage_percent": None,
+                "monthly_usage_percent": None,
+                "alert_level": "unavailable",
+                "reason": "预算账本当前无法核实，本次额外付费后台操作未执行",
+                "reason_code": reason_code,
+                "error_type": None,
+                "trigger_dimension": None,
+                "today_cost": None,
+                "month_cost": None,
+                "cost_source": "platform_price_snapshot",
+                "daily_threshold_cny": daily_threshold,
+                "monthly_threshold_cny": monthly_threshold,
+                "per_call_threshold_cny": thresholds.get("per_call_threshold_cny"),
+                "strategy": strategy,
+                "data_quality_status": (
+                    "data_quality_error"
+                    if reason_code == "budget_data_quality_error"
+                    else "reconciliation_attention"
+                ),
+            }
         today_cost = float(today["provider_actual_cost_cny"]) + float(
             today["estimated_cost_cny"]
         )
         month_cost = float(month["provider_actual_cost_cny"]) + float(
             month["estimated_cost_cny"]
         )
-    except Exception:
-        today_cost = 0.0
-        month_cost = 0.0
+    except Exception as exc:
+        return {
+            "budget_status": "unavailable",
+            "daily_usage_percent": None,
+            "monthly_usage_percent": None,
+            "alert_level": "unavailable",
+            "reason": "预算账本当前无法核实，本次额外付费后台操作未执行",
+            "reason_code": "budget_query_failed",
+            "error_type": type(exc).__name__,
+            "trigger_dimension": None,
+            "today_cost": None,
+            "month_cost": None,
+            "cost_source": "platform_price_snapshot",
+            "daily_threshold_cny": thresholds.get("daily_threshold_cny"),
+            "monthly_threshold_cny": thresholds.get("monthly_threshold_cny"),
+            "per_call_threshold_cny": thresholds.get("per_call_threshold_cny"),
+            "strategy": strategy,
+            "data_quality_status": "unavailable",
+        }
 
     daily_usage_percent = None
     monthly_usage_percent = None
@@ -738,10 +1130,13 @@ def _check_budget(strategy: Optional[str] = None) -> Dict[str, Any]:
             trigger_dimension = "monthly"
 
     return {
+        "budget_status": "available",
         "daily_usage_percent": daily_usage_percent,
         "monthly_usage_percent": monthly_usage_percent,
         "alert_level": alert_level,
         "reason": reason,
+        "reason_code": None,
+        "error_type": None,
         "trigger_dimension": trigger_dimension,
         "today_cost": round(today_cost, 8),
         "month_cost": round(month_cost, 8),
@@ -750,7 +1145,34 @@ def _check_budget(strategy: Optional[str] = None) -> Dict[str, Any]:
         "monthly_threshold_cny": monthly_threshold,
         "per_call_threshold_cny": thresholds.get("per_call_threshold_cny"),
         "strategy": strategy,
+        "data_quality_status": "normal",
     }
+
+
+def _background_budget_gate(strategy: str) -> Dict[str, Any]:
+    """One fail-closed gate for optional paid background capabilities."""
+    budget = _check_budget(strategy)
+    if budget.get("budget_status") != "available":
+        return {
+            **budget,
+            "allowed": False,
+            "http_status": 503,
+            "detail": {
+                "code": "budget_status_unavailable",
+                "message": "预算账本当前无法核实，本次额外付费后台操作未执行",
+                "budget_status": "unavailable",
+                "reason_code": budget.get("reason_code") or "cause_unconfirmed",
+                "error_type": budget.get("error_type"),
+            },
+        }
+    if budget.get("alert_level") == "blocked":
+        return {
+            **budget,
+            "allowed": False,
+            "http_status": 403,
+            "detail": budget.get("reason") or "预算已达上限，本次额外付费后台操作未执行",
+        }
+    return {**budget, "allowed": True, "http_status": None, "detail": None}
 
 
 # -----------------------------------------------------------------------------
@@ -782,7 +1204,15 @@ async def overview(
         stage=stage,
         trace_id=trace_id,
     )
+    reporting_calls = _fetch_reporting_model_calls(
+        scope.get("start"),
+        scope.get("end"),
+        model_id=model_id,
+        stage=stage,
+        trace_id=trace_id,
+    )
     data = _aggregate_model_calls(selected_calls)
+    data_quality = _data_quality_summary(reporting_calls)
     trace_scope = _list_trace_page(
         trace_id=trace_id,
         model_id=model_id,
@@ -797,6 +1227,8 @@ async def overview(
         int(trace_scope["provider_request_count"]) == int(data["calls"])
         and str(trace_scope.get("start") or "") == str(scope.get("start") or "")
         and str(trace_scope.get("end") or "") == str(scope.get("end") or "")
+        and int(trace_scope.get("anomaly_attempt_count") or 0)
+        == int(data_quality["anomaly_attempt_count"])
     )
     scope["filters"] = {
         "model_id": model_id,
@@ -806,10 +1238,11 @@ async def overview(
     history_total = _aggregate_model_calls(_fetch_model_calls(None, None))
     thresholds = get_budget_thresholds()
     known_cost = data["provider_actual_cost_cny"] + data["estimated_cost_cny"]
-    priced_calls = data["provider_actual_calls"] + (
+    priced_calls = data["provider_actual_priced_calls"] + (
         data["estimated_calls"] - data["estimated_amount_unavailable_calls"]
     )
-    per_call_cost = known_cost / priced_calls if priced_calls else 0.0
+    per_call_cost = known_cost / priced_calls if priced_calls else None
+    per_call_cost_complete = bool(data.get("cost_complete"))
 
     periods = {}
     daily_threshold = thresholds.get("daily_threshold_cny")
@@ -851,7 +1284,12 @@ async def overview(
             "threshold": thresholds["monthly_threshold_cny"],
             "actual": round(month_cost, 6),
         })
-    if thresholds.get("per_call_threshold_cny") and per_call_cost > thresholds["per_call_threshold_cny"]:
+    if (
+        per_call_cost_complete
+        and per_call_cost is not None
+        and thresholds.get("per_call_threshold_cny")
+        and per_call_cost > thresholds["per_call_threshold_cny"]
+    ):
         alerts.append({
             "type": "per_call",
             "threshold": thresholds["per_call_threshold_cny"],
@@ -875,7 +1313,27 @@ async def overview(
         "provider_request_count": data["calls"],
         "trace_group_count": trace_group_count,
         "scope_consistent": scope_consistent,
-        "statistics_status": "consistent" if scope_consistent else "scope_mismatch",
+        "statistics_status": _statistics_status(
+            scope_consistent=scope_consistent,
+            data_quality_status=data_quality["data_quality_status"],
+        ),
+        "data_quality_status": data_quality["data_quality_status"],
+        "data_quality": data_quality,
+        "invalid_timestamp_count": data_quality["invalid_timestamp_count"],
+        "provider_send_unconfirmed_count": data_quality[
+            "provider_send_unconfirmed_count"
+        ],
+        "orphaned_pending_count": data_quality["orphaned_pending_count"],
+        "provider_usage_inconsistent_count": data_quality[
+            "provider_usage_inconsistent_count"
+        ],
+        "provider_actual_price_missing_count": data_quality[
+            "provider_actual_price_missing_count"
+        ],
+        "unavailable_usage_count": data_quality["unavailable_usage_count"],
+        "unresolved_reconciliation_count": data_quality[
+            "unresolved_reconciliation_count"
+        ],
         "count_semantics": {
             "trace_group_count": "unique_trace_groups",
             "provider_request_count": "included_outbound_provider_attempts",
@@ -888,8 +1346,11 @@ async def overview(
         "provider_actual_priced_calls": data["provider_actual_priced_calls"],
         "provider_actual_cost_cny": data["provider_actual_cost_cny"],
         "platform_price_snapshot_direct_cost_cny": data[
-            "provider_actual_cost_cny"
+            "platform_price_snapshot_direct_cost_cny"
         ],
+        "known_priced_request_count": priced_calls,
+        "per_call_cost_cny": round(per_call_cost, 8) if per_call_cost is not None else None,
+        "per_call_cost_complete": per_call_cost_complete,
         "estimated_calls": data["estimated_calls"],
         "estimated_cost_cny": data["estimated_cost_cny"],
         "estimated_amount_unavailable_calls": data[
@@ -904,7 +1365,16 @@ async def overview(
             "reasoning_tokens": data["reasoning_tokens"],
             "reasoning_known_calls": data["reasoning_known_calls"],
             "reasoning_unavailable_calls": data["reasoning_unavailable_calls"],
-            "reasoning_is_output_subset": True,
+            "reasoning_is_output_subset": data_quality[
+                "reasoning_is_output_subset"
+            ],
+            "reasoning_comparable_calls": data_quality[
+                "reasoning_comparable_calls"
+            ],
+            "reasoning_unknown_calls": data_quality["reasoning_unknown_calls"],
+            "reasoning_violation_calls": data_quality[
+                "reasoning_violation_calls"
+            ],
         },
         "failed_calls": data["failed_calls"],
         "alerts": alerts,
@@ -963,6 +1433,23 @@ def _normalize_end(end: Optional[str]) -> Optional[str]:
         return text
     except ValueError:
         return text
+
+
+def _validated_reporting_range(
+    start: Optional[str], end: Optional[str]
+) -> Tuple[Optional[str], Optional[str]]:
+    normalized_end = _normalize_end(end)
+    start_epoch = (
+        _required_reporting_epoch(start, "开始时间") if start else None
+    )
+    end_epoch = (
+        _required_reporting_epoch(normalized_end, "结束时间")
+        if normalized_end
+        else None
+    )
+    if start_epoch is not None and end_epoch is not None and start_epoch > end_epoch:
+        raise ValueError("开始时间不能晚于结束时间")
+    return start, normalized_end
 
 
 _RUN_TYPE_LABELS = {
@@ -1035,8 +1522,7 @@ def _list_trace_page(
         effective_start = scope["start"]
         effective_end = scope["end"]
     else:
-        effective_start = start
-        effective_end = _normalize_end(end)
+        effective_start, effective_end = _validated_reporting_range(start, end)
         scope = {
             "range_key": "custom" if start or end else None,
             "start": effective_start,
@@ -1044,10 +1530,14 @@ def _list_trace_page(
             "timezone": "Asia/Shanghai (UTC+8)",
         }
 
-    model_range_conditions, model_range_params = _time_range_predicates(
+    valid_model_range_conditions, model_range_params = _time_range_predicates(
         "m.created_at", effective_start, effective_end
     )
-    model_range_conditions.insert(0, _provider_sql_predicate("m"))
+    valid_model_range = " AND ".join(valid_model_range_conditions) or "1=1"
+    model_range_conditions = [
+        _provider_attempt_sql_predicate("m"),
+        f"(({valid_model_range}) OR yiai_time_epoch(m.created_at) IS NULL)",
+    ]
     if model_id:
         model_range_conditions.append("m.model_id = ?")
         model_range_params.append(model_id)
@@ -1090,7 +1580,12 @@ def _list_trace_page(
         ), model_groups AS (
             SELECT
                 trace_id,
-                COUNT(*) AS provider_request_count,
+                SUM(CASE
+                    WHEN created_epoch IS NOT NULL
+                     AND {_provider_sql_predicate('range_model_calls')}
+                    THEN 1 ELSE 0 END
+                ) AS provider_request_count,
+                COUNT(*) AS provider_attempt_count,
                 MAX(created_epoch) AS provider_last_epoch
             FROM range_model_calls
             WHERE trace_id IS NOT NULL
@@ -1114,7 +1609,8 @@ def _list_trace_page(
                 t.agent_name, t.status, t.created_at, t.updated_at,
                 COALESCE(t.run_type, 'chat') AS run_type,
                 COALESCE(mg.provider_last_epoch, yiai_time_epoch(t.created_at)) AS sort_epoch,
-                COALESCE(mg.provider_request_count, 0) AS provider_request_count
+                COALESCE(mg.provider_request_count, 0) AS provider_request_count,
+                COALESCE(mg.provider_attempt_count, 0) AS provider_attempt_count
             FROM chat_traces t
             LEFT JOIN model_groups mg ON mg.trace_id = t.trace_id
             WHERE {chat_candidate_where}
@@ -1136,7 +1632,8 @@ def _list_trace_page(
                     ELSE 'model_only'
                 END AS run_type,
                 m.created_epoch AS sort_epoch,
-                mg.provider_request_count
+                mg.provider_request_count,
+                mg.provider_attempt_count
             FROM model_only_ranked m
             JOIN model_groups mg ON mg.trace_id = m.trace_id
             WHERE m.range_rank = 1
@@ -1169,6 +1666,17 @@ def _list_trace_page(
     cursor.execute(
         f"""
         {all_traces_sql}
+        SELECT a.trace_id FROM all_traces a
+        WHERE {where_sql}
+        """,
+        query_params,
+    )
+    matching_trace_ids = {
+        str(row["trace_id"]) for row in cursor.fetchall() if row["trace_id"]
+    }
+    cursor.execute(
+        f"""
+        {all_traces_sql}
         SELECT * FROM all_traces a
         WHERE {where_sql}
         ORDER BY a.sort_epoch DESC, a.trace_id DESC
@@ -1181,6 +1689,7 @@ def _list_trace_page(
 
     page_trace_ids = [row["trace_id"] for row in trace_rows]
     calls_by_trace: Dict[str, List[Dict[str, Any]]] = {}
+    reporting_calls_by_trace: Dict[str, List[Dict[str, Any]]] = {}
     if page_trace_ids:
         page_ids = set(page_trace_ids)
         range_calls = _fetch_model_calls(
@@ -1193,13 +1702,25 @@ def _list_trace_page(
             item_trace_id = raw_call.get("trace_id")
             if item_trace_id in page_ids:
                 calls_by_trace.setdefault(item_trace_id, []).append(raw_call)
+        reporting_range_calls = _fetch_reporting_model_calls(
+            effective_start,
+            effective_end,
+            model_id=model_id,
+            stage=stage,
+        )
+        for raw_call in reporting_range_calls:
+            item_trace_id = raw_call.get("trace_id")
+            if item_trace_id in page_ids:
+                reporting_calls_by_trace.setdefault(item_trace_id, []).append(raw_call)
 
     agg_rows: Dict[str, Dict[str, Any]] = {}
-    for item_trace_id, item_calls in calls_by_trace.items():
+    for item_trace_id in page_trace_ids:
+        item_calls = calls_by_trace.get(item_trace_id, [])
+        reporting_item_calls = reporting_calls_by_trace.get(item_trace_id, [])
         provider_calls, _ = _split_model_records(item_calls)
         provider_attempt_records = [
             call
-            for call in item_calls
+            for call in reporting_item_calls
             if _provider_aggregate_decision(call)["record_kind"] == "provider_attempt"
         ]
         logical_calls = [
@@ -1210,9 +1731,13 @@ def _list_trace_page(
         unconfirmed_provider_attempts = [
             call
             for call in provider_attempt_records
-            if not _is_provider_aggregate_record(call)
+            if (
+                not _is_provider_aggregate_record(call)
+                or _reporting_epoch(call.get("created_at")) is None
+            )
         ]
         summary = _aggregate_model_calls(item_calls)
+        item_data_quality = _data_quality_summary(reporting_item_calls)
         provider_actual_priced_calls = int(
             summary.get("provider_actual_priced_calls") or 0
         )
@@ -1229,10 +1754,15 @@ def _list_trace_page(
         agg_rows[item_trace_id] = {
             **summary,
             "provider_calls": provider_calls,
-            "model_ids": sorted({_provider_model(call) for call in provider_calls}),
+            "provider_attempt_records": provider_attempt_records,
+            "model_ids": sorted(
+                {_provider_model(call) for call in provider_attempt_records}
+            ),
             "call_count": len(provider_calls),
+            "provider_attempt_count": len(provider_attempt_records),
             "logical_record_count": len(logical_calls),
             "unconfirmed_provider_attempt_count": len(unconfirmed_provider_attempts),
+            "data_quality": item_data_quality,
             "estimated_cost_cny": known_cost,
             "local_estimated_cost_cny": (
                 summary["estimated_cost_cny"] if estimated_priced_calls else None
@@ -1252,6 +1782,8 @@ def _list_trace_page(
         agg = agg_rows.get(trace["trace_id"], {})
         model_ids = list(agg.get("model_ids") or [])
         call_count = int(agg.get("call_count") or 0)
+        provider_attempt_count = int(agg.get("provider_attempt_count") or 0)
+        item_data_quality = agg.get("data_quality") or _data_quality_summary([])
         provider_actual_calls = int(agg.get("provider_actual_calls") or 0)
         provider_actual_priced_calls = int(
             agg.get("provider_actual_priced_calls") or 0
@@ -1300,34 +1832,98 @@ def _list_trace_page(
             "unavailable_calls": unknown_cost_calls,
             "model_call_count": call_count,
             "provider_request_count": call_count,
+            "provider_attempt_count": provider_attempt_count,
+            "unconfirmed_provider_attempt_count": int(
+                agg.get("unconfirmed_provider_attempt_count") or 0
+            ),
+            "data_quality_status": item_data_quality["data_quality_status"],
+            "anomaly_attempt_count": item_data_quality["anomaly_attempt_count"],
+            "anomaly_attempts": item_data_quality["anomaly_attempts"],
+            "unresolved_reconciliation_count": item_data_quality[
+                "unresolved_reconciliation_count"
+            ],
+            "invalid_timestamp_count": item_data_quality[
+                "invalid_timestamp_count"
+            ],
+            "reasoning_is_output_subset": item_data_quality[
+                "reasoning_is_output_subset"
+            ],
             "logical_model_record_count": int(
                 agg.get("logical_record_count") or 0
             ),
             "cost_status": (
-                "not_applicable" if call_count == 0
+                "not_applicable" if provider_attempt_count == 0
+                else item_data_quality["data_quality_status"]
+                if call_count == 0
                 else "partial_unavailable" if unknown_cost_calls
                 else "provider_actual" if provider_actual_calls and not estimated_calls
                 else "estimated" if estimated_calls and not provider_actual_calls
                 else "mixed"
             ),
             "price_missing": unknown_cost_calls > 0,
-            "no_model_calls": call_count == 0,
-            **_trace_operation_metadata(trace, list(agg.get("provider_calls") or [])),
+            "no_model_calls": provider_attempt_count == 0,
+            **_trace_operation_metadata(
+                trace, list(agg.get("provider_attempt_records") or [])
+            ),
         })
         results.append(trace)
 
     pages = max(1, (total + limit - 1) // limit)
     page = (offset // limit) + 1
-    metadata_scope_consistent = not any([session_id, intent, agent])
+    scoped_normal_calls = _fetch_model_calls(
+        effective_start,
+        effective_end,
+        model_id=model_id,
+        stage=stage,
+        trace_id=trace_id,
+    )
+    scoped_reporting_calls = _fetch_reporting_model_calls(
+        effective_start,
+        effective_end,
+        model_id=model_id,
+        stage=stage,
+        trace_id=trace_id,
+    )
+    if any([session_id, intent, agent]):
+        scoped_normal_calls = [
+            call
+            for call in scoped_normal_calls
+            if str(call.get("trace_id") or "") in matching_trace_ids
+        ]
+        scoped_reporting_calls = [
+            call
+            for call in scoped_reporting_calls
+            if str(call.get("trace_id") or "") in matching_trace_ids
+        ]
+    scoped_expected_provider_count = int(
+        _aggregate_model_calls(scoped_normal_calls)["calls"]
+    )
+    trace_data_quality = _data_quality_summary(scoped_reporting_calls)
+    scope_consistent = (
+        scoped_provider_request_count == scoped_expected_provider_count
+    )
     return {
         "traces": results,
         "total": total,
         "trace_group_count": total,
         "provider_request_count": scoped_provider_request_count,
-        "scope_consistent": metadata_scope_consistent,
-        "statistics_status": (
-            "consistent" if metadata_scope_consistent else "filtered_trace_scope"
+        "scope_consistent": scope_consistent,
+        "statistics_status": _statistics_status(
+            scope_consistent=scope_consistent,
+            data_quality_status=trace_data_quality["data_quality_status"],
         ),
+        "data_quality_status": trace_data_quality["data_quality_status"],
+        "data_quality": trace_data_quality,
+        "anomaly_attempt_count": trace_data_quality["anomaly_attempt_count"],
+        "invalid_timestamp_count": trace_data_quality["invalid_timestamp_count"],
+        "unresolved_reconciliation_count": trace_data_quality[
+            "unresolved_reconciliation_count"
+        ],
+        "unassigned_timestamp_attempts": [
+            item
+            for item in trace_data_quality["anomaly_attempts"]
+            if "invalid_timestamp" in item.get("issue_codes", [])
+        ],
         "count_semantics": {
             "trace_group_count": "unique_trace_groups",
             "provider_request_count": "included_outbound_provider_attempts",
@@ -2205,7 +2801,7 @@ async def trace_detail(trace_id: str):
 
 @router.get("/distribution")
 async def distribution(
-    group_by: str = Query("model", regex="^(model|agent|intent|session|trace|stage)$"),
+    group_by: str = Query("model", pattern="^(model|agent|intent|session|trace|stage)$"),
     start: Optional[str] = Query(None),
     end: Optional[str] = Query(None),
 ):
@@ -2213,7 +2809,11 @@ async def distribution(
 
     Each group item includes a list of trace IDs so the aggregate is traceable.
     """
-    raw_calls = _fetch_model_calls(start, _normalize_end(end))
+    try:
+        effective_start, effective_end = _validated_reporting_range(start, end)
+        raw_calls = _fetch_model_calls(effective_start, effective_end)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     provider_calls, excluded_calls = _split_model_records(raw_calls)
     trace_metadata: Dict[str, Dict[str, Any]] = {}
     trace_ids = sorted({str(call.get("trace_id")) for call in provider_calls if call.get("trace_id")})
@@ -2292,12 +2892,16 @@ async def distribution(
 
 @router.get("/trends")
 async def trends(
-    group_by: str = Query("hour", regex="^(hour|day)$"),
+    group_by: str = Query("hour", pattern="^(hour|day)$"),
     start: Optional[str] = Query(None),
     end: Optional[str] = Query(None),
 ):
     """Return included Provider attempts over time; logical rows never enter."""
-    raw_calls = _fetch_model_calls(start, _normalize_end(end))
+    try:
+        effective_start, effective_end = _validated_reporting_range(start, end)
+        raw_calls = _fetch_model_calls(effective_start, effective_end)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     provider_calls, excluded_calls = _split_model_records(raw_calls)
     grouped: Dict[str, List[Dict[str, Any]]] = {}
     for call in provider_calls:

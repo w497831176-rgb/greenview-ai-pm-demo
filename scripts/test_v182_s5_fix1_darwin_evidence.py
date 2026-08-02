@@ -39,7 +39,11 @@ def main() -> None:
             reset_active_provider_attempt,
         )
 
-        badcases._check_budget = lambda _strategy: {"alert_level": "none"}
+        badcases._background_budget_gate = lambda _strategy: {
+            "budget_status": "available",
+            "alert_level": "none",
+            "allowed": True,
+        }
         badcases._find_darwin_skill = lambda: None
 
         provider_model = "deepseek-v4-pro-provider"

@@ -3946,6 +3946,7 @@
         resolvedScope: null,
         pagination: { page: 1, pages: 1, total: 0, limit: 20, hasPrevious: false, hasNext: false },
         traceSummary: { traceGroupCount: 0, providerRequestCount: 0 },
+        traceDataQuality: {},
         statisticsConsistent: null,
         overview: null,
         traces: [],
@@ -4040,12 +4041,17 @@
           traceGroupCount: Number(traces.trace_group_count ?? traces.total ?? 0),
           providerRequestCount: Number(traces.provider_request_count ?? 0),
         };
+        state.traceDataQuality = traces.data_quality || {};
         const overviewRequests = Number(state.overview.provider_request_count ?? state.overview.calls ?? 0);
         const sameRange = String(traces.start || '') === String(scope.start || '')
           && String(traces.end || '') === String(scope.end || '');
         state.statisticsConsistent = Boolean(
           state.overview.scope_consistent !== false
           && traces.scope_consistent !== false
+          && state.overview.statistics_status === 'consistent'
+          && traces.statistics_status === 'consistent'
+          && state.overview.data_quality_status === 'normal'
+          && traces.data_quality_status === 'normal'
           && Number(state.overview.trace_group_count ?? 0) === state.traceSummary.traceGroupCount
           && sameRange
           && overviewRequests === state.traceSummary.providerRequestCount
@@ -4079,6 +4085,7 @@
         const calls = Number(o.provider_request_count ?? o.calls ?? 0);
         const traceGroupCount = Number(state.traceSummary.traceGroupCount ?? o.trace_group_count ?? 0);
         const knownUsage = o.known_usage || {};
+        const dataQuality = o.data_quality || {};
         const tokens = o.total_tokens;
         const knownTokenCalls = Number(o.known_token_calls ?? o.known_usage_calls ?? 0);
         const unknownTokenCalls = Number(o.unknown_token_calls ?? 0);
@@ -4095,11 +4102,15 @@
           : unknownModelCalls > 0
             ? '模型身份待确认'
             : (flashCalls === calls ? '全部使用Flash' : (proCalls === calls ? '全部使用Pro' : '使用Flash与Pro'));
-        const evidenceSummary = estimatedCalls === 0 && unavailableCalls === 0 && unknownTokenCalls === 0
+        const evidenceSummary = o.data_quality_status === 'normal' && estimatedCalls === 0 && unavailableCalls === 0 && unknownTokenCalls === 0
           ? '当前纳入汇总的请求均有完整Provider实际Usage与平台价格快照。'
-          : `其中历史估算 ${estimatedCalls} 次（排除Provider actual对账），实际Usage不可得 ${unknownTokenCalls} 次，直接成本不可得 ${unavailableCalls} 次。`;
-        const attention = state.statisticsConsistent === false
-          ? { label: '统计口径异常', tone: 'text-red-700 bg-red-50 border-red-200' }
+          : `其中历史估算 ${estimatedCalls} 次（排除Provider actual对账），实际Usage不可得 ${unknownTokenCalls} 次，直接成本不可得 ${unavailableCalls} 次；数据质量异常attempt ${Number(dataQuality.anomaly_attempt_count || 0)} 条。`;
+        const attention = o.statistics_status === 'data_quality_error'
+          ? { label: '数据质量错误', tone: 'text-red-700 bg-red-50 border-red-200' }
+          : o.statistics_status === 'reconciliation_attention'
+            ? { label: '对账待处理', tone: 'text-amber-800 bg-amber-50 border-amber-200' }
+          : state.statisticsConsistent === false
+            ? { label: '统计口径异常', tone: 'text-red-700 bg-red-50 border-red-200' }
           : unexpectedPro > 0
           ? { label: '存在非预期Pro调用', tone: 'text-red-700 bg-red-50 border-red-200' }
           : unavailableCalls > 0
@@ -4115,12 +4126,24 @@
           : (calls ? `不可得（${unknownTokenCalls || calls}次，不显示0）` : '不适用');
         const reasoningKnownCalls = Number(knownUsage.reasoning_known_calls || 0);
         const reasoningUnavailableCalls = Number(knownUsage.reasoning_unavailable_calls || 0);
+        const reasoningRelationship = knownUsage.reasoning_is_output_subset === true
+          ? '属于输出子集，不重复计入总量'
+          : knownUsage.reasoning_is_output_subset === false
+            ? '发现Reasoning大于Output或负值，Usage内部不一致'
+            : '证据不足，无法核实是否为输出子集';
         const usageBreakdown = knownTokenCalls
-          ? `缓存命中输入 ${Number(knownUsage.input_cache_hit_tokens || 0).toLocaleString()} · 缓存未命中输入 ${Number(knownUsage.input_cache_miss_tokens || 0).toLocaleString()} · 输出 ${Number(knownUsage.output_tokens || 0).toLocaleString()} · Reasoning ${reasoningKnownCalls ? Number(knownUsage.reasoning_tokens || 0).toLocaleString() : '不可得'}${reasoningUnavailableCalls ? `（另${reasoningUnavailableCalls}次不可得）` : ''}（属于输出子集，不重复计入总量）`
+          ? `缓存命中输入 ${Number(knownUsage.input_cache_hit_tokens || 0).toLocaleString()} · 缓存未命中输入 ${Number(knownUsage.input_cache_miss_tokens || 0).toLocaleString()} · 输出 ${Number(knownUsage.output_tokens || 0).toLocaleString()} · Reasoning ${reasoningKnownCalls ? Number(knownUsage.reasoning_tokens || 0).toLocaleString() : '不可得'}${reasoningUnavailableCalls ? `（另${reasoningUnavailableCalls}次不可得）` : ''}（${reasoningRelationship}）`
           : (calls ? 'Provider实际Usage拆分不可得，不显示0。' : '本范围没有Provider请求，Token不适用。');
         const directCost = Number(o.provider_actual_priced_calls || 0)
-          ? fmtCost(o.platform_price_snapshot_direct_cost_cny ?? o.provider_actual_cost_cny)
+          ? `${fmtCost(o.platform_price_snapshot_direct_cost_cny ?? o.provider_actual_cost_cny)}${o.per_call_cost_complete === false ? '（仅已知部分，完整成本不可核实）' : ''}`
           : (calls ? '不可得（不显示¥0）' : '不适用');
+        const qualityIssues = (dataQuality.anomaly_attempts || []).map(item => {
+          const codes = (item.issue_codes || []).join(' / ') || 'cause_unconfirmed';
+          return `<li class="mt-1"><span class="font-mono">${escapeHtml(item.trace_id_summary || 'trace-unassigned')}</span> · ${escapeHtml(item.stage || 'unknown')} · ${escapeHtml(codes)} · 去向：${item.included_in_provider_summary ? '正常Provider汇总' : `排除（${escapeHtml(item.exclusion_reason || 'cause_unconfirmed')}）`}</li>`;
+        }).join('');
+        const qualityPanel = o.data_quality_status === 'normal'
+          ? '<div class="mt-3 rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-xs text-emerald-700">数据质量正常：坏时间、未决发送、Usage矛盾、实际Token缺价格与Usage不可得均为0。</div>'
+          : `<div class="mt-3 rounded-lg border ${o.data_quality_status === 'data_quality_error' ? 'border-red-200 bg-red-50 text-red-700' : 'border-amber-200 bg-amber-50 text-amber-800'} px-3 py-2 text-xs"><div class="font-semibold">无法完整核实：${escapeHtml(o.data_quality_status || 'cause_unconfirmed')}</div><div class="mt-1">坏时间 ${Number(dataQuality.invalid_timestamp_count || 0)} · 发送未确认 ${Number(dataQuality.provider_send_unconfirmed_count || 0)} · Usage矛盾 ${Number(dataQuality.provider_usage_inconsistent_count || 0)} · 实际Token缺价格 ${Number(dataQuality.provider_actual_price_missing_count || 0)} · Usage不可得 ${Number(dataQuality.unavailable_usage_count || 0)}</div>${qualityIssues ? `<ul class="mt-2">${qualityIssues}</ul>` : ''}</div>`;
         const ranges = [
           ['today', '今天'], ['yesterday', '昨天'], ['last_7_days', '近7天'],
           ['this_month', '本月'], ['last_month', '上月'], ['custom', '自定义']
@@ -4136,6 +4159,7 @@
             <p class="mt-2 text-lg font-semibold text-slate-900">${sentenceLead}${traceGroupCount.toLocaleString()}条Trace分组，实际发起Provider请求${calls.toLocaleString()}次，${modelSummary}；Provider实际Usage合计${tokenSummary}；平台价格快照直接成本${directCost}（非DeepSeek最终账单）。${evidenceSummary}</p>
             <p class="mt-2 text-sm text-slate-600">三类Token与Reasoning：${usageBreakdown}</p>
             <p class="mt-2 text-xs text-slate-500">统计范围：${escapeHtml(scope.start || '-')} 至 ${escapeHtml(scope.end || '-')} · 时区 ${escapeHtml(scope.timezone || 'Asia/Shanghai')}</p>
+            ${qualityPanel}
             <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 mt-4">
               <div class="rounded-xl border border-emerald-200 bg-emerald-50 p-3"><div class="text-xs text-emerald-700">${cardPrefix}平台价格快照直接成本</div><div class="mt-1 text-xl font-semibold text-emerald-800">${directCost}</div><div class="mt-1 text-[10px] text-emerald-700">Provider实际Token换算，非DeepSeek最终账单</div></div>
               <div class="rounded-xl border border-slate-200 bg-slate-50 p-3"><div class="text-xs text-slate-500">${cardPrefix}Trace分组</div><div class="mt-1 text-xl font-semibold text-slate-900">${traceGroupCount.toLocaleString()}条Trace分组</div></div>
@@ -4250,7 +4274,7 @@
                     ${Number(i.estimated_calls || 0) ? `<div class="text-amber-700">历史估算 ${fmtCost(i.estimated_cost_cny)}（排除Provider actual对账）</div>` : ''}
                     ${Number(i.unavailable_calls || 0) ? `<div class="text-slate-500">${Number(i.unavailable_calls)}次不可计算</div>` : ''}
                     ${!Number(i.calls || 0) ? '<div class="text-slate-400">不适用</div>' : ''}
-                    ${Number(i.known_usage_calls || 0) ? `<div class="mt-1 text-[10px] text-slate-500">命中 ${Number(i.input_cache_hit_tokens || 0).toLocaleString()} · 未命中 ${Number(i.input_cache_miss_tokens || 0).toLocaleString()} · 输出 ${Number(i.output_tokens || 0).toLocaleString()} · 推理 ${Number(i.reasoning_known_calls || 0) ? `${Number(i.reasoning_tokens).toLocaleString()}${Number(i.reasoning_unavailable_calls || 0) ? `（另${Number(i.reasoning_unavailable_calls)}次不可得）` : ''}` : '不可得'}（输出子集）</div>` : ''}
+                    ${Number(i.known_usage_calls || 0) ? `<div class="mt-1 text-[10px] text-slate-500">命中 ${Number(i.input_cache_hit_tokens || 0).toLocaleString()} · 未命中 ${Number(i.input_cache_miss_tokens || 0).toLocaleString()} · 输出 ${Number(i.output_tokens || 0).toLocaleString()} · 推理 ${Number(i.reasoning_known_calls || 0) ? `${Number(i.reasoning_tokens).toLocaleString()}${Number(i.reasoning_unavailable_calls || 0) ? `（另${Number(i.reasoning_unavailable_calls)}次不可得）` : ''}` : '不可得'}（${i.reasoning_is_output_subset === true ? '输出子集' : i.reasoning_is_output_subset === false ? 'Usage矛盾' : '关系待核实'}）</div>` : ''}
                   </div>
                 </div>
               `).join('')}
@@ -4284,6 +4308,7 @@
         const items = state.traces || [];
         const pagination = state.pagination || {};
         const traceSummary = state.traceSummary || {};
+        const traceDataQuality = state.traceDataQuality || {};
         const range = state.traceRange || {};
         const rangeText = (range.start || range.end)
           ? `<span class="text-xs text-slate-500">${escapeHtml(range.start || '')} 至 ${escapeHtml(range.end || '')}</span>`
@@ -4299,6 +4324,7 @@
               ? '模型身份待确认'
               : (hasProModel && hasFlashModel ? 'Flash + Pro' : (hasProModel ? 'Pro' : (hasFlashModel ? 'Flash' : '模型身份待确认')));
           const callCount = Number(t.provider_request_count ?? t.model_call_count ?? 0);
+          const pendingAttemptCount = Number(t.unconfirmed_provider_attempt_count || 0);
           const operationBadge = t.operation_label
             ? `<span class="inline-flex mt-1 px-2 py-0.5 rounded-full text-[10px] ${t.is_background_task ? 'bg-violet-50 text-violet-700' : 'bg-slate-100 text-slate-600'}">${escapeHtml(t.operation_label)}</span>`
             : '';
@@ -4309,6 +4335,8 @@
           ].filter(Boolean).join('；');
           const costText = t.cost_status === 'not_applicable'
             ? '费用不适用'
+            : ['data_quality_error', 'reconciliation_attention'].includes(t.cost_status)
+              ? 'Provider attempt存在，但发送/时间/Usage或价格证据无法完整核实（不显示¥0）'
             : t.cost_status === 'partial_unavailable'
               ? partialCosts
               : t.cost_status === 'provider_actual'
@@ -4320,13 +4348,13 @@
             <div class="rounded-xl border border-slate-200 p-3 hover:border-brand-200">
               <div class="flex flex-col md:flex-row md:items-center gap-3">
                 <div class="min-w-0 flex-1">
-                  <div class="font-medium text-slate-900 line-clamp-1">${escapeHtml(t.user_message || t.intent || t.operation_label || '后台分析')}</div>${operationBadge}${Number(t.logical_model_record_count || 0) ? `<div class="mt-1 text-[10px] text-slate-500">另有 ${Number(t.logical_model_record_count)} 条逻辑/历史记录，不计Provider汇总</div>` : ''}
+                  <div class="font-medium text-slate-900 line-clamp-1">${escapeHtml(t.user_message || t.intent || t.operation_label || '后台分析')}</div>${operationBadge}${Number(t.logical_model_record_count || 0) ? `<div class="mt-1 text-[10px] text-slate-500">另有 ${Number(t.logical_model_record_count)} 条逻辑/历史记录，不计Provider汇总</div>` : ''}${Number(t.anomaly_attempt_count || 0) ? `<div class="mt-1 text-[10px] text-amber-700">${Number(t.anomaly_attempt_count)} 条异常attempt：${escapeHtml((t.anomaly_attempts || []).flatMap(item => item.issue_codes || []).join(' / ') || 'cause_unconfirmed')}；未纳入部分已明确标注排除原因。</div>` : ''}
                   <div class="mt-1 text-[11px] text-slate-400">${fmtTime(t.created_at)} · 辅助编号 ${escapeHtml(t.trace_id)}</div>
                 </div>
                 <div class="grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs md:w-[520px]">
                   <div><div class="text-slate-400">使用模型</div><div class="mt-0.5 font-medium text-slate-700">${modelLabel}</div></div>
-                  <div><div class="text-slate-400">Provider请求次数</div><div class="mt-0.5 font-medium text-slate-700">${t.no_model_calls ? '0次' : `${callCount}次`}</div></div>
-                  <div><div class="text-slate-400">总Token</div><div class="mt-0.5 font-medium text-slate-700">${t.no_model_calls ? '不适用' : fmtTokens(t.total_tokens)}</div>${t.no_model_calls ? '' : `<div class="mt-1 text-[10px] text-slate-400" title="Reasoning属于输出Token子集，不重复计入总量">命中 ${fmtTokens(t.input_cache_hit_tokens)} · 未命中 ${fmtTokens(t.input_cache_miss_tokens)} · 输出 ${fmtTokens(t.output_tokens)} · 推理 ${Number(t.reasoning_known_calls || 0) ? `${fmtTokens(t.reasoning_tokens)}${Number(t.reasoning_unavailable_calls || 0) ? `（另${Number(t.reasoning_unavailable_calls)}次不可得）` : ''}` : '不可得'}</div>`}</div>
+                  <div><div class="text-slate-400">Provider请求次数</div><div class="mt-0.5 font-medium text-slate-700">${t.no_model_calls ? '0次' : `${callCount}次${pendingAttemptCount ? `（另${pendingAttemptCount}条attempt未决）` : ''}`}</div></div>
+                  <div><div class="text-slate-400">总Token</div><div class="mt-0.5 font-medium text-slate-700">${t.no_model_calls ? '不适用' : fmtTokens(t.total_tokens)}</div>${t.no_model_calls ? '' : `<div class="mt-1 text-[10px] text-slate-400" title="${t.reasoning_is_output_subset === true ? 'Reasoning属于输出Token子集，不重复计入总量' : t.reasoning_is_output_subset === false ? 'Reasoning与Output关系违反Provider Usage约束' : 'Reasoning与Output关系证据不足'}">命中 ${fmtTokens(t.input_cache_hit_tokens)} · 未命中 ${fmtTokens(t.input_cache_miss_tokens)} · 输出 ${fmtTokens(t.output_tokens)} · 推理 ${Number(t.reasoning_known_calls || 0) ? `${fmtTokens(t.reasoning_tokens)}${Number(t.reasoning_unavailable_calls || 0) ? `（另${Number(t.reasoning_unavailable_calls)}次不可得）` : ''}` : '不可得'}</div>`}</div>
                   <div><div class="text-slate-400">平台快照直接成本</div><div class="mt-0.5 font-medium ${t.cost_status === 'provider_actual' ? 'text-emerald-700' : 'text-slate-700'}">${costText}</div></div>
                 </div>
                 <button type="button" data-trace="${escapeHtml(t.trace_id)}" class="cg-trace-detail shrink-0 px-3 py-2 bg-brand-50 text-brand-600 rounded-lg text-xs hover:bg-brand-100">查看逐请求对账证据</button>
@@ -4340,7 +4368,7 @@
               <div><h2 id="cg-records-title" class="font-semibold text-slate-900">调用记录</h2><p class="mt-1 text-xs text-slate-500">每页20条 · ${Number(traceSummary.traceGroupCount ?? pagination.total ?? 0).toLocaleString()}条Trace分组 · ${Number(traceSummary.providerRequestCount || 0).toLocaleString()}次Provider请求</p></div>
               <div class="text-right">${rangeText}<div class="mt-1 text-xs text-slate-400">第${Number(pagination.page || 1)}/${Number(pagination.pages || 1)}页</div></div>
             </div>
-            ${state.statisticsConsistent === false ? '<div class="mb-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm font-medium text-red-700">统计口径异常：顶部汇总与Trace列表的范围或Provider请求数不一致，请勿按“正常”解读。</div>' : ''}
+            ${state.statisticsConsistent === false ? `<div class="mb-3 rounded-lg border ${traceDataQuality.data_quality_status === 'reconciliation_attention' ? 'border-amber-200 bg-amber-50 text-amber-800' : 'border-red-200 bg-red-50 text-red-700'} px-3 py-2 text-sm font-medium">${traceDataQuality.data_quality_status === 'normal' ? '统计口径异常：顶部汇总与Trace列表的范围或Provider请求数不一致。' : `对账异常：坏时间 ${Number(traceDataQuality.invalid_timestamp_count || 0)}，未决对账 ${Number(traceDataQuality.unresolved_reconciliation_count || 0)}，异常attempt ${Number(traceDataQuality.anomaly_attempt_count || 0)}。`} 请勿按“正常”解读。</div>` : ''}
             <div class="space-y-2">${rows || '<p class="py-4 text-sm text-slate-400">当前范围暂无调用记录。</p>'}</div>
             <div class="mt-4 flex items-center justify-end gap-2">
               <button id="cg-prev-page" type="button" ${pagination.hasPrevious ? '' : 'disabled'} class="px-3 py-1.5 rounded-lg text-sm ${pagination.hasPrevious ? 'bg-slate-100 text-slate-700 hover:bg-slate-200' : 'bg-slate-50 text-slate-300 cursor-not-allowed'}">上一页</button>

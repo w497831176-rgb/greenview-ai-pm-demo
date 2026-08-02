@@ -44,7 +44,7 @@ from app.badcase_schema import (
     validate_status_transition,
     user_status_label,
 )
-from app.observability import _check_budget
+from app.observability import _background_budget_gate
 from app.runtime.cost_ledger import build_cost_entry, cost_entry_usage_payload
 from app.runtime.darwin_evidence import (
     persist_darwin_operation,
@@ -684,9 +684,12 @@ async def classify_badcase(case_id: int, request: ClassifyRequest = ClassifyRequ
     # AI classification is an extra evaluation step; enforce the daily budget
     # only when the caller asks for automatic (LLM-based) classification.
     if request.auto:
-        budget = _check_budget("badcase_classify")
-        if budget.get("alert_level") == "blocked":
-            raise HTTPException(status_code=403, detail=_BUDGET_BLOCKED_DETAIL)
+        budget_gate = _background_budget_gate("badcase_classify")
+        if not budget_gate.get("allowed"):
+            raise HTTPException(
+                status_code=int(budget_gate["http_status"]),
+                detail=budget_gate["detail"],
+            )
 
     if request.auto:
         prompt = (
@@ -1466,9 +1469,9 @@ async def darwin_fix(case_id: int, request: DarwinFixRequest = DarwinFixRequest(
     usage = {}
 
     # Darwin uses Pro and is an extra evaluation step; enforce the daily budget.
-    budget = _check_budget("darwin")
-    if budget.get("alert_level") == "blocked":
-        blocked_reason = budget.get("reason") or _BUDGET_BLOCKED_DETAIL
+    budget_gate = _background_budget_gate("darwin")
+    if not budget_gate.get("allowed"):
+        blocked_reason = budget_gate.get("reason") or _BUDGET_BLOCKED_DETAIL
         persist_darwin_operation(
             trace_id=darwin_trace_id,
             badcase_id=case_id,
@@ -1480,7 +1483,10 @@ async def darwin_fix(case_id: int, request: DarwinFixRequest = DarwinFixRequest(
             status_after=case["status"],
             error_summary=blocked_reason,
         )
-        raise HTTPException(status_code=403, detail=_BUDGET_BLOCKED_DETAIL)
+        raise HTTPException(
+            status_code=int(budget_gate["http_status"]),
+            detail=budget_gate["detail"],
+        )
 
     try:
         analysis_text, usage = await _llm_generate(
