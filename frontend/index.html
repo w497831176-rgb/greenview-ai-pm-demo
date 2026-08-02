@@ -3945,6 +3945,8 @@
         customEnd: '',
         resolvedScope: null,
         pagination: { page: 1, pages: 1, total: 0, limit: 20, hasPrevious: false, hasNext: false },
+        traceSummary: { traceGroupCount: 0, providerRequestCount: 0 },
+        statisticsConsistent: null,
         overview: null,
         traces: [],
         trends: [],
@@ -3969,8 +3971,8 @@
       function scopeParams() {
         const params = new URLSearchParams({ range_key: state.rangeKey });
         if (state.rangeKey === 'custom') {
-          params.set('start', `${state.customStart} 00:00:00`);
-          params.set('end', `${state.customEnd} 23:59:59`);
+          params.set('start', state.customStart);
+          params.set('end', state.customEnd);
         }
         return params;
       }
@@ -4000,11 +4002,14 @@
 
       async function loadAll({ refreshSummary = true } = {}) {
         const overviewParams = scopeParams();
+        if (state.filters.model) overviewParams.set('model_id', state.filters.model);
+        if (state.filters.stage) overviewParams.set('stage', state.filters.stage);
+        if (state.filters.search) overviewParams.set('trace_id', state.filters.search);
         if (refreshSummary || !state.overview || !state.resolvedScope) {
           const [overview, prices, budget] = await Promise.all([
-            apiGet(`/api/observability/overview?${overviewParams.toString()}`).catch(() => ({})),
-            apiGet('/api/observability/prices').catch(() => ({ prices: [] })),
-            apiGet('/api/observability/budget').catch(() => ({ budget: {} })),
+            apiGet(`/api/observability/overview?${overviewParams.toString()}`),
+            apiGet('/api/observability/prices'),
+            apiGet('/api/observability/budget'),
           ]);
           state.overview = overview;
           state.resolvedScope = overview.scope || null;
@@ -4020,7 +4025,7 @@
         if (state.filters.search) traceParams.set('trace_id', state.filters.search);
         traceParams.set('limit', String(state.pagination.limit));
         traceParams.set('offset', String((state.pagination.page - 1) * state.pagination.limit));
-        const traces = await apiGet(`/api/observability/traces?${traceParams.toString()}`).catch(() => ({ traces: [], total: 0, page: 1, pages: 1 }));
+        const traces = await apiGet(`/api/observability/traces?${traceParams.toString()}`);
         state.traces = traces.traces || [];
         state.traceRange = { start: traces.start || scope.start, end: traces.end || scope.end };
         state.pagination = {
@@ -4031,14 +4036,48 @@
           hasPrevious: Boolean(traces.has_previous),
           hasNext: Boolean(traces.has_next),
         };
+        state.traceSummary = {
+          traceGroupCount: Number(traces.trace_group_count ?? traces.total ?? 0),
+          providerRequestCount: Number(traces.provider_request_count ?? 0),
+        };
+        const overviewRequests = Number(state.overview.provider_request_count ?? state.overview.calls ?? 0);
+        const sameRange = String(traces.start || '') === String(scope.start || '')
+          && String(traces.end || '') === String(scope.end || '');
+        state.statisticsConsistent = Boolean(
+          state.overview.scope_consistent !== false
+          && traces.scope_consistent !== false
+          && Number(state.overview.trace_group_count ?? 0) === state.traceSummary.traceGroupCount
+          && sameRange
+          && overviewRequests === state.traceSummary.providerRequestCount
+        );
         state.trends = [];
         state.distribution = [];
+      }
+
+      async function reloadPage(options = {}) {
+        container.innerHTML = loadingState();
+        try {
+          await loadAll(options);
+          renderPage();
+        } catch (err) {
+          container.innerHTML = `
+            <div class="max-w-3xl mx-auto p-6">
+              <div class="rounded-2xl border border-red-200 bg-red-50 p-5">
+                <h2 class="font-semibold text-red-800">Trace与成本加载失败</h2>
+                <p class="mt-2 text-sm text-red-700">接口失败没有被转换成0次、¥0或“不适用”。请重试；若仍失败，请检查API健康状态。</p>
+                <p class="mt-2 text-xs text-red-600">${escapeHtml(err && err.message ? err.message : '未知接口错误')}</p>
+                <button id="cg-retry" type="button" class="mt-4 px-4 py-2 rounded-lg bg-red-700 text-white text-sm">重试</button>
+              </div>
+            </div>`;
+          $('#cg-retry').addEventListener('click', () => reloadPage(options));
+        }
       }
 
       function renderOverview() {
         const o = state.overview || {};
         const scope = o.scope || {};
         const calls = Number(o.provider_request_count ?? o.calls ?? 0);
+        const traceGroupCount = Number(state.traceSummary.traceGroupCount ?? o.trace_group_count ?? 0);
         const knownUsage = o.known_usage || {};
         const tokens = o.total_tokens;
         const knownTokenCalls = Number(o.known_token_calls ?? o.known_usage_calls ?? 0);
@@ -4059,7 +4098,9 @@
         const evidenceSummary = estimatedCalls === 0 && unavailableCalls === 0 && unknownTokenCalls === 0
           ? '当前纳入汇总的请求均有完整Provider实际Usage与平台价格快照。'
           : `其中历史估算 ${estimatedCalls} 次（排除Provider actual对账），实际Usage不可得 ${unknownTokenCalls} 次，直接成本不可得 ${unavailableCalls} 次。`;
-        const attention = unexpectedPro > 0
+        const attention = state.statisticsConsistent === false
+          ? { label: '统计口径异常', tone: 'text-red-700 bg-red-50 border-red-200' }
+          : unexpectedPro > 0
           ? { label: '存在非预期Pro调用', tone: 'text-red-700 bg-red-50 border-red-200' }
           : unavailableCalls > 0
             ? { label: '有金额无法计算', tone: 'text-slate-700 bg-slate-50 border-slate-200' }
@@ -4072,6 +4113,11 @@
         const tokenSummary = knownTokenCalls
           ? `${Number(tokens).toLocaleString()} Token${unknownTokenCalls ? `（另${unknownTokenCalls}次不可得）` : ''}`
           : (calls ? `不可得（${unknownTokenCalls || calls}次，不显示0）` : '不适用');
+        const reasoningKnownCalls = Number(knownUsage.reasoning_known_calls || 0);
+        const reasoningUnavailableCalls = Number(knownUsage.reasoning_unavailable_calls || 0);
+        const usageBreakdown = knownTokenCalls
+          ? `缓存命中输入 ${Number(knownUsage.input_cache_hit_tokens || 0).toLocaleString()} · 缓存未命中输入 ${Number(knownUsage.input_cache_miss_tokens || 0).toLocaleString()} · 输出 ${Number(knownUsage.output_tokens || 0).toLocaleString()} · Reasoning ${reasoningKnownCalls ? Number(knownUsage.reasoning_tokens || 0).toLocaleString() : '不可得'}${reasoningUnavailableCalls ? `（另${reasoningUnavailableCalls}次不可得）` : ''}（属于输出子集，不重复计入总量）`
+          : (calls ? 'Provider实际Usage拆分不可得，不显示0。' : '本范围没有Provider请求，Token不适用。');
         const directCost = Number(o.provider_actual_priced_calls || 0)
           ? fmtCost(o.platform_price_snapshot_direct_cost_cny ?? o.provider_actual_cost_cny)
           : (calls ? '不可得（不显示¥0）' : '不适用');
@@ -4087,11 +4133,13 @@
             </div>
             ${state.rangeKey === 'custom' ? `<div class="mt-3 flex flex-wrap items-end gap-2"><label class="text-xs text-slate-500">开始日期<input id="cg-custom-start" type="date" value="${escapeHtml(state.customStart)}" class="block mt-1 px-3 py-2 border border-slate-200 rounded-lg text-sm text-slate-700"></label><label class="text-xs text-slate-500">结束日期<input id="cg-custom-end" type="date" value="${escapeHtml(state.customEnd)}" class="block mt-1 px-3 py-2 border border-slate-200 rounded-lg text-sm text-slate-700"></label><button id="cg-custom-apply" type="button" class="px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white rounded-lg text-sm">查询</button></div>` : ''}
             <h2 id="cg-summary-title" class="mt-4 text-sm font-semibold text-brand-700">一句话结论</h2>
-            <p class="mt-2 text-lg font-semibold text-slate-900">${sentenceLead}发起Provider请求${calls.toLocaleString()}次，${modelSummary}；Provider实际Usage合计${tokenSummary}；平台价格快照直接成本${directCost}（非DeepSeek最终账单）。${evidenceSummary}</p>
+            <p class="mt-2 text-lg font-semibold text-slate-900">${sentenceLead}${traceGroupCount.toLocaleString()}条Trace分组，实际发起Provider请求${calls.toLocaleString()}次，${modelSummary}；Provider实际Usage合计${tokenSummary}；平台价格快照直接成本${directCost}（非DeepSeek最终账单）。${evidenceSummary}</p>
+            <p class="mt-2 text-sm text-slate-600">三类Token与Reasoning：${usageBreakdown}</p>
             <p class="mt-2 text-xs text-slate-500">统计范围：${escapeHtml(scope.start || '-')} 至 ${escapeHtml(scope.end || '-')} · 时区 ${escapeHtml(scope.timezone || 'Asia/Shanghai')}</p>
-            <div class="grid grid-cols-1 sm:grid-cols-3 gap-3 mt-4">
+            <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 mt-4">
               <div class="rounded-xl border border-emerald-200 bg-emerald-50 p-3"><div class="text-xs text-emerald-700">${cardPrefix}平台价格快照直接成本</div><div class="mt-1 text-xl font-semibold text-emerald-800">${directCost}</div><div class="mt-1 text-[10px] text-emerald-700">Provider实际Token换算，非DeepSeek最终账单</div></div>
-              <div class="rounded-xl border border-slate-200 bg-slate-50 p-3"><div class="text-xs text-slate-500">${cardPrefix}Provider请求</div><div class="mt-1 text-xl font-semibold text-slate-900">${calls.toLocaleString()}次</div></div>
+              <div class="rounded-xl border border-slate-200 bg-slate-50 p-3"><div class="text-xs text-slate-500">${cardPrefix}Trace分组</div><div class="mt-1 text-xl font-semibold text-slate-900">${traceGroupCount.toLocaleString()}条Trace分组</div></div>
+              <div class="rounded-xl border border-slate-200 bg-slate-50 p-3"><div class="text-xs text-slate-500">${cardPrefix}Provider请求</div><div class="mt-1 text-xl font-semibold text-slate-900">${calls.toLocaleString()}次Provider请求</div></div>
               <div class="rounded-xl border p-3 ${attention.tone}"><div class="text-xs">需要关注</div><div class="mt-1 text-lg font-semibold">${attention.label}</div></div>
             </div>
           </section>
@@ -4202,6 +4250,7 @@
                     ${Number(i.estimated_calls || 0) ? `<div class="text-amber-700">历史估算 ${fmtCost(i.estimated_cost_cny)}（排除Provider actual对账）</div>` : ''}
                     ${Number(i.unavailable_calls || 0) ? `<div class="text-slate-500">${Number(i.unavailable_calls)}次不可计算</div>` : ''}
                     ${!Number(i.calls || 0) ? '<div class="text-slate-400">不适用</div>' : ''}
+                    ${Number(i.known_usage_calls || 0) ? `<div class="mt-1 text-[10px] text-slate-500">命中 ${Number(i.input_cache_hit_tokens || 0).toLocaleString()} · 未命中 ${Number(i.input_cache_miss_tokens || 0).toLocaleString()} · 输出 ${Number(i.output_tokens || 0).toLocaleString()} · 推理 ${Number(i.reasoning_known_calls || 0) ? `${Number(i.reasoning_tokens).toLocaleString()}${Number(i.reasoning_unavailable_calls || 0) ? `（另${Number(i.reasoning_unavailable_calls)}次不可得）` : ''}` : '不可得'}（输出子集）</div>` : ''}
                   </div>
                 </div>
               `).join('')}
@@ -4234,6 +4283,7 @@
       function renderTraces() {
         const items = state.traces || [];
         const pagination = state.pagination || {};
+        const traceSummary = state.traceSummary || {};
         const range = state.traceRange || {};
         const rangeText = (range.start || range.end)
           ? `<span class="text-xs text-slate-500">${escapeHtml(range.start || '')} 至 ${escapeHtml(range.end || '')}</span>`
@@ -4249,6 +4299,9 @@
               ? '模型身份待确认'
               : (hasProModel && hasFlashModel ? 'Flash + Pro' : (hasProModel ? 'Pro' : (hasFlashModel ? 'Flash' : '模型身份待确认')));
           const callCount = Number(t.provider_request_count ?? t.model_call_count ?? 0);
+          const operationBadge = t.operation_label
+            ? `<span class="inline-flex mt-1 px-2 py-0.5 rounded-full text-[10px] ${t.is_background_task ? 'bg-violet-50 text-violet-700' : 'bg-slate-100 text-slate-600'}">${escapeHtml(t.operation_label)}</span>`
+            : '';
           const partialCosts = [
             Number(t.provider_actual_priced_calls || 0) ? `平台价格快照直接成本 ${fmtCost(t.platform_price_snapshot_direct_cost_cny ?? t.provider_actual_cost_cny)}` : '',
             Number(t.estimated_priced_calls || 0) ? `历史估算 ${fmtCost(t.local_estimated_cost_cny)}，排除Provider actual对账` : '',
@@ -4267,13 +4320,13 @@
             <div class="rounded-xl border border-slate-200 p-3 hover:border-brand-200">
               <div class="flex flex-col md:flex-row md:items-center gap-3">
                 <div class="min-w-0 flex-1">
-                  <div class="font-medium text-slate-900 line-clamp-1">${escapeHtml(t.user_message || t.intent || '后台分析')}</div>${Number(t.logical_model_record_count || 0) ? `<div class="mt-1 text-[10px] text-slate-500">另有 ${Number(t.logical_model_record_count)} 条逻辑/历史记录，不计Provider汇总</div>` : ''}
+                  <div class="font-medium text-slate-900 line-clamp-1">${escapeHtml(t.user_message || t.intent || t.operation_label || '后台分析')}</div>${operationBadge}${Number(t.logical_model_record_count || 0) ? `<div class="mt-1 text-[10px] text-slate-500">另有 ${Number(t.logical_model_record_count)} 条逻辑/历史记录，不计Provider汇总</div>` : ''}
                   <div class="mt-1 text-[11px] text-slate-400">${fmtTime(t.created_at)} · 辅助编号 ${escapeHtml(t.trace_id)}</div>
                 </div>
                 <div class="grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs md:w-[520px]">
                   <div><div class="text-slate-400">使用模型</div><div class="mt-0.5 font-medium text-slate-700">${modelLabel}</div></div>
                   <div><div class="text-slate-400">Provider请求次数</div><div class="mt-0.5 font-medium text-slate-700">${t.no_model_calls ? '0次' : `${callCount}次`}</div></div>
-                  <div><div class="text-slate-400">总Token</div><div class="mt-0.5 font-medium text-slate-700">${t.no_model_calls ? '不适用' : fmtTokens(t.total_tokens)}</div></div>
+                  <div><div class="text-slate-400">总Token</div><div class="mt-0.5 font-medium text-slate-700">${t.no_model_calls ? '不适用' : fmtTokens(t.total_tokens)}</div>${t.no_model_calls ? '' : `<div class="mt-1 text-[10px] text-slate-400" title="Reasoning属于输出Token子集，不重复计入总量">命中 ${fmtTokens(t.input_cache_hit_tokens)} · 未命中 ${fmtTokens(t.input_cache_miss_tokens)} · 输出 ${fmtTokens(t.output_tokens)} · 推理 ${Number(t.reasoning_known_calls || 0) ? `${fmtTokens(t.reasoning_tokens)}${Number(t.reasoning_unavailable_calls || 0) ? `（另${Number(t.reasoning_unavailable_calls)}次不可得）` : ''}` : '不可得'}</div>`}</div>
                   <div><div class="text-slate-400">平台快照直接成本</div><div class="mt-0.5 font-medium ${t.cost_status === 'provider_actual' ? 'text-emerald-700' : 'text-slate-700'}">${costText}</div></div>
                 </div>
                 <button type="button" data-trace="${escapeHtml(t.trace_id)}" class="cg-trace-detail shrink-0 px-3 py-2 bg-brand-50 text-brand-600 rounded-lg text-xs hover:bg-brand-100">查看逐请求对账证据</button>
@@ -4284,9 +4337,10 @@
         return `
           <section class="bg-white rounded-2xl shadow-soft border border-slate-200 p-4" aria-labelledby="cg-records-title">
             <div class="flex flex-wrap items-start justify-between gap-2 mb-3">
-              <div><h2 id="cg-records-title" class="font-semibold text-slate-900">调用记录</h2><p class="mt-1 text-xs text-slate-500">每页20条 · 共${Number(pagination.total || 0).toLocaleString()}条</p></div>
+              <div><h2 id="cg-records-title" class="font-semibold text-slate-900">调用记录</h2><p class="mt-1 text-xs text-slate-500">每页20条 · ${Number(traceSummary.traceGroupCount ?? pagination.total ?? 0).toLocaleString()}条Trace分组 · ${Number(traceSummary.providerRequestCount || 0).toLocaleString()}次Provider请求</p></div>
               <div class="text-right">${rangeText}<div class="mt-1 text-xs text-slate-400">第${Number(pagination.page || 1)}/${Number(pagination.pages || 1)}页</div></div>
             </div>
+            ${state.statisticsConsistent === false ? '<div class="mb-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm font-medium text-red-700">统计口径异常：顶部汇总与Trace列表的范围或Provider请求数不一致，请勿按“正常”解读。</div>' : ''}
             <div class="space-y-2">${rows || '<p class="py-4 text-sm text-slate-400">当前范围暂无调用记录。</p>'}</div>
             <div class="mt-4 flex items-center justify-end gap-2">
               <button id="cg-prev-page" type="button" ${pagination.hasPrevious ? '' : 'disabled'} class="px-3 py-1.5 rounded-lg text-sm ${pagination.hasPrevious ? 'bg-slate-100 text-slate-700 hover:bg-slate-200' : 'bg-slate-50 text-slate-300 cursor-not-allowed'}">上一页</button>
@@ -4611,9 +4665,8 @@
           state.filters.model = $('#cg-model').value;
           state.filters.stage = $('#cg-stage').value;
           state.pagination.page = 1;
-          container.innerHTML = loadingState();
-          await loadAll({ refreshSummary: false });
-          renderPage();
+          state.resolvedScope = null;
+          await reloadPage();
         });
         $$('.cg-range-btn').forEach(btn => btn.addEventListener('click', async () => {
           state.rangeKey = btn.dataset.range;
@@ -4623,9 +4676,7 @@
           }
           state.resolvedScope = null;
           state.pagination.page = 1;
-          container.innerHTML = loadingState();
-          await loadAll();
-          renderPage();
+          await reloadPage();
         }));
         const customApply = $('#cg-custom-apply');
         if (customApply) customApply.addEventListener('click', async () => {
@@ -4637,23 +4688,17 @@
           state.customEnd = customEnd;
           state.resolvedScope = null;
           state.pagination.page = 1;
-          container.innerHTML = loadingState();
-          await loadAll();
-          renderPage();
+          await reloadPage();
         });
         const previousPage = $('#cg-prev-page');
         if (previousPage && state.pagination.hasPrevious) previousPage.addEventListener('click', async () => {
           state.pagination.page -= 1;
-          container.innerHTML = loadingState();
-          await loadAll({ refreshSummary: false });
-          renderPage();
+          await reloadPage({ refreshSummary: false });
         });
         const nextPage = $('#cg-next-page');
         if (nextPage && state.pagination.hasNext) nextPage.addEventListener('click', async () => {
           state.pagination.page += 1;
-          container.innerHTML = loadingState();
-          await loadAll({ refreshSummary: false });
-          renderPage();
+          await reloadPage({ refreshSummary: false });
         });
         $$('.cg-trace-detail').forEach(btn => btn.addEventListener('click', () => showTraceDetail(btn.dataset.trace)));
         $('#cg-add-price').addEventListener('click', () => openPriceModal());
@@ -4669,8 +4714,7 @@
         });
       }
 
-      await loadAll();
-      renderPage();
+      await reloadPage();
     }
 
     async function renderCostStrategyPage(container) {

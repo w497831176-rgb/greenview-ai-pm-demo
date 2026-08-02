@@ -6,7 +6,7 @@ Endpoints for trace visibility, model-call auditing, MCP audit,
 model pricing table, and budget thresholds.
 """
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, HTTPException, Query
@@ -76,6 +76,73 @@ class BudgetUpdate(BaseModel):
 # -----------------------------------------------------------------------------
 
 
+REPORTING_TIMEZONE = timezone(timedelta(hours=8), name="Asia/Shanghai")
+
+
+def _parse_reporting_timepoint(value: Any) -> datetime:
+    """Parse one stored/reporting timestamp into an aware UTC timepoint.
+
+    Historical YIAI rows use naive ``YYYY-MM-DD HH:MM:SS`` Beijing time,
+    while Provider attempts use offset-aware ISO timestamps.  Converting both
+    to a real timepoint is required; lexical TEXT comparison is incorrect.
+    """
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        text = str(value or "").strip()
+        if not text:
+            raise ValueError("时间不能为空")
+        if len(text) == 10:
+            try:
+                parsed = datetime.strptime(text, "%Y-%m-%d")
+            except ValueError as exc:
+                raise ValueError(f"无效时间: {text}") from exc
+        else:
+            normalized = f"{text[:-1]}+00:00" if text.endswith(("Z", "z")) else text
+            try:
+                parsed = datetime.fromisoformat(normalized)
+            except ValueError as exc:
+                raise ValueError(f"无效时间: {text}") from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=REPORTING_TIMEZONE)
+    return parsed.astimezone(timezone.utc)
+
+
+def _reporting_epoch(value: Any) -> Optional[float]:
+    """SQLite-safe epoch converter; malformed stored values do not match."""
+    try:
+        return _parse_reporting_timepoint(value).timestamp()
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _required_reporting_epoch(value: Any, label: str) -> float:
+    epoch = _reporting_epoch(value)
+    if epoch is None:
+        raise ValueError(f"{label}无效")
+    return epoch
+
+
+def _time_range_predicates(
+    column: str,
+    start: Optional[str],
+    end: Optional[str],
+) -> Tuple[List[str], List[Any]]:
+    conditions: List[str] = []
+    params: List[Any] = []
+    if start:
+        conditions.append(f"yiai_time_epoch({column}) >= ?")
+        params.append(_required_reporting_epoch(start, "开始时间"))
+    if end:
+        conditions.append(f"yiai_time_epoch({column}) <= ?")
+        params.append(_required_reporting_epoch(end, "结束时间"))
+    return conditions, params
+
+
+def _register_time_sql(conn: Any) -> None:
+    conn.create_function("yiai_time_epoch", 1, _reporting_epoch, deterministic=True)
+
+
 def _model_display_name(model_id: Optional[str]) -> str:
     return {
         "deepseek-v4-flash": "Flash",
@@ -83,11 +150,29 @@ def _model_display_name(model_id: Optional[str]) -> str:
     }.get(model_id or "") or (model_id or "unknown")
 
 
+def _format_reporting_now(value: datetime) -> str:
+    """Keep the real current instant without inventing an end-of-second gap."""
+    return value.strftime("%Y-%m-%d %H:%M:%S.%f").rstrip("0").rstrip(".")
+
+
+def _reporting_period(value: Any, group_by: str) -> str:
+    """Bucket a stored timestamp by its real Asia/Shanghai timepoint."""
+    try:
+        local_time = _parse_reporting_timepoint(value).astimezone(
+            REPORTING_TIMEZONE
+        )
+    except (TypeError, ValueError, OverflowError):
+        return "unknown"
+    if group_by == "hour":
+        return local_time.strftime("%Y-%m-%d %H:00")
+    return local_time.strftime("%Y-%m-%d")
+
+
 def _period_bounds() -> Dict[str, Dict[str, Any]]:
     """Return canonical CN-time period bounds used by the overview."""
     dt = now_cn_dt()
     today_start = dt.strftime("%Y-%m-%d 00:00:00")
-    today_end = dt.strftime("%Y-%m-%d %H:%M:%S")
+    today_end = _format_reporting_now(dt)
     week_start = (dt - timedelta(days=6)).strftime("%Y-%m-%d 00:00:00")
     month_start = dt.replace(day=1).strftime("%Y-%m-%d 00:00:00")
     return {
@@ -111,7 +196,7 @@ def _overview_scope(
         return {
             "label": "今日",
             "start": current.strftime("%Y-%m-%d 00:00:00"),
-            "end": current.strftime("%Y-%m-%d %H:%M:%S"),
+            "end": _format_reporting_now(current),
             "timezone": "Asia/Shanghai (UTC+8)",
         }
     return {
@@ -131,7 +216,7 @@ def _reporting_scope(
     """Resolve one canonical Asia/Shanghai reporting range."""
     current = now or now_cn_dt()
     key = range_key or ("custom" if start or end else "today")
-    current_end = current.strftime("%Y-%m-%d %H:%M:%S")
+    current_end = _format_reporting_now(current)
 
     if key == "today":
         scope = {
@@ -144,7 +229,7 @@ def _reporting_scope(
         scope = {
             "label": "昨天",
             "start": day.strftime("%Y-%m-%d 00:00:00"),
-            "end": day.strftime("%Y-%m-%d 23:59:59"),
+            "end": day.strftime("%Y-%m-%d 23:59:59.999999"),
         }
     elif key == "last_7_days":
         scope = {
@@ -165,13 +250,15 @@ def _reporting_scope(
         scope = {
             "label": "上月",
             "start": previous_start.strftime("%Y-%m-%d 00:00:00"),
-            "end": previous_end.strftime("%Y-%m-%d 23:59:59"),
+            "end": previous_end.strftime("%Y-%m-%d 23:59:59.999999"),
         }
     elif key == "custom":
         if not start or not end:
             raise ValueError("自定义日期需要同时提供开始日期和结束日期")
         normalized_end = _normalize_end(end)
-        if str(start) > str(normalized_end):
+        if _required_reporting_epoch(start, "开始时间") > _required_reporting_epoch(
+            normalized_end, "结束时间"
+        ):
             raise ValueError("开始日期不能晚于结束日期")
         scope = {
             "label": f"{str(start)[:10]}至{str(normalized_end)[:10]}期间",
@@ -299,6 +386,40 @@ def _split_model_records(
     return provider_attempts, logical_or_legacy
 
 
+def _sqlite_provider_aggregate(
+    record_kind: Any,
+    stage: Any,
+    status: Any,
+    usage_status: Any,
+    usage_normalized: Any,
+) -> int:
+    call = {
+        "record_kind": record_kind,
+        "stage": stage,
+        "status": status,
+        "usage_status": usage_status,
+        "usage_normalized": usage_normalized,
+    }
+    return 1 if _is_provider_aggregate_record(call) else 0
+
+
+def _register_reporting_sql(conn: Any) -> None:
+    _register_time_sql(conn)
+    conn.create_function(
+        "yiai_provider_aggregate",
+        5,
+        _sqlite_provider_aggregate,
+        deterministic=True,
+    )
+
+
+def _provider_sql_predicate(alias: str) -> str:
+    return (
+        f"yiai_provider_aggregate({alias}.record_kind, {alias}.stage, "
+        f"{alias}.status, {alias}.usage_status, {alias}.usage_normalized) = 1"
+    )
+
+
 def _token_value(call: Dict[str, Any], *keys: str) -> Any:
     usage = _usage_payload(call)
     value = _first_present(usage, *keys)
@@ -359,6 +480,9 @@ def _empty_cost_group() -> Dict[str, Any]:
         "input_cache_hit_tokens": 0,
         "input_cache_miss_tokens": 0,
         "output_tokens": 0,
+        "reasoning_tokens": 0,
+        "reasoning_known_calls": 0,
+        "reasoning_unavailable_calls": 0,
     }
 
 
@@ -398,12 +522,20 @@ def _add_call_to_group(group: Dict[str, Any], call: Dict[str, Any]) -> None:
         group["input_cache_hit_tokens"] += int(hit)
         group["input_cache_miss_tokens"] += int(miss)
         group["output_tokens"] += int(output)
+        reasoning = _token_value(call, "reasoning_tokens")
+        if reasoning is None:
+            group["reasoning_unavailable_calls"] += 1
+        else:
+            group["reasoning_known_calls"] += 1
+            group["reasoning_tokens"] += int(reasoning)
 
 
 def _finalize_cost_group(group: Dict[str, Any]) -> Dict[str, Any]:
     result = dict(group)
     if result["token_known_calls"] == 0:
         result["total_tokens"] = None
+    if result["reasoning_known_calls"] == 0:
+        result["reasoning_tokens"] = None
     result["provider_actual_cost_cny"] = round(
         float(result["provider_actual_cost_cny"]), 8
     )
@@ -445,17 +577,27 @@ def _aggregate_model_calls(calls: List[Dict[str, Any]]) -> Dict[str, Any]:
     return result
 
 
-def _fetch_model_calls(start: Optional[str], end: Optional[str]) -> List[Dict[str, Any]]:
-    conditions = []
-    params: List[Any] = []
-    if start:
-        conditions.append("created_at >= ?")
-        params.append(start)
-    if end:
-        conditions.append("created_at <= ?")
-        params.append(end)
+def _fetch_model_calls(
+    start: Optional[str],
+    end: Optional[str],
+    *,
+    model_id: Optional[str] = None,
+    stage: Optional[str] = None,
+    trace_id: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    conditions, params = _time_range_predicates("created_at", start, end)
+    if model_id:
+        conditions.append("model_id = ?")
+        params.append(model_id)
+    if stage:
+        conditions.append("stage = ?")
+        params.append(stage)
+    if trace_id:
+        conditions.append("trace_id = ?")
+        params.append(trace_id)
     where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
     conn = _get_conn()
+    _register_reporting_sql(conn)
     cursor = conn.cursor()
     cursor.execute(f"SELECT * FROM model_calls {where}", params)
     rows = [dict(row) for row in cursor.fetchall()]
@@ -620,6 +762,9 @@ def _check_budget(strategy: Optional[str] = None) -> Dict[str, Any]:
 async def overview(
     start: Optional[str] = Query(None, description="Start date/time ISO"),
     end: Optional[str] = Query(None, description="End date/time ISO"),
+    model_id: Optional[str] = Query(None),
+    stage: Optional[str] = Query(None),
+    trace_id: Optional[str] = Query(None),
     range_key: Optional[str] = Query(
         None,
         pattern="^(today|yesterday|last_7_days|this_month|last_month|custom)$",
@@ -630,8 +775,34 @@ async def overview(
         scope = _reporting_scope(range_key, start, end)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    selected_calls = _fetch_model_calls(scope.get("start"), scope.get("end"))
+    selected_calls = _fetch_model_calls(
+        scope.get("start"),
+        scope.get("end"),
+        model_id=model_id,
+        stage=stage,
+        trace_id=trace_id,
+    )
     data = _aggregate_model_calls(selected_calls)
+    trace_scope = _list_trace_page(
+        trace_id=trace_id,
+        model_id=model_id,
+        stage=stage,
+        start=scope.get("start"),
+        end=scope.get("end"),
+        limit=1,
+        offset=0,
+    )
+    trace_group_count = int(trace_scope["trace_group_count"])
+    scope_consistent = (
+        int(trace_scope["provider_request_count"]) == int(data["calls"])
+        and str(trace_scope.get("start") or "") == str(scope.get("start") or "")
+        and str(trace_scope.get("end") or "") == str(scope.get("end") or "")
+    )
+    scope["filters"] = {
+        "model_id": model_id,
+        "stage": stage,
+        "trace_id": trace_id,
+    }
     history_total = _aggregate_model_calls(_fetch_model_calls(None, None))
     thresholds = get_budget_thresholds()
     known_cost = data["provider_actual_cost_cny"] + data["estimated_cost_cny"]
@@ -702,6 +873,13 @@ async def overview(
         "scope": scope,
         "calls": data["calls"],
         "provider_request_count": data["calls"],
+        "trace_group_count": trace_group_count,
+        "scope_consistent": scope_consistent,
+        "statistics_status": "consistent" if scope_consistent else "scope_mismatch",
+        "count_semantics": {
+            "trace_group_count": "unique_trace_groups",
+            "provider_request_count": "included_outbound_provider_attempts",
+        },
         "excluded_record_count": data["excluded_record_count"],
         "total_tokens": data["total_tokens"],
         "known_token_calls": data["token_known_calls"],
@@ -723,6 +901,10 @@ async def overview(
             "input_cache_hit_tokens": data["input_cache_hit_tokens"],
             "input_cache_miss_tokens": data["input_cache_miss_tokens"],
             "output_tokens": data["output_tokens"],
+            "reasoning_tokens": data["reasoning_tokens"],
+            "reasoning_known_calls": data["reasoning_known_calls"],
+            "reasoning_unavailable_calls": data["reasoning_unavailable_calls"],
+            "reasoning_is_output_subset": True,
         },
         "failed_calls": data["failed_calls"],
         "alerts": alerts,
@@ -751,18 +933,81 @@ async def overview(
 
 
 def _normalize_end(end: Optional[str]) -> Optional[str]:
-    """Expand a bare YYYY-MM-DD end date to the last second of that day."""
+    """Expand a day-level end boundary through the final microsecond.
+
+    The frontend historically sent ``23:59:59``.  Treating that as the end of
+    a reporting day must not drop rows that contain fractional seconds.
+    Offset-aware timestamps keep their offset and are compared as timepoints.
+    """
     if not end:
         return end
-    # If already has time component, leave as-is.
-    if len(end) > 10 or " " in end or "T" in end:
-        return end
+    text = str(end).strip()
+    if len(text) == 10:
+        try:
+            datetime.strptime(text, "%Y-%m-%d")
+            return f"{text} 23:59:59.999999"
+        except ValueError:
+            return text
     try:
-        from datetime import datetime
-        datetime.strptime(end, "%Y-%m-%d")
-        return f"{end} 23:59:59"
+        parsed = datetime.fromisoformat(
+            f"{text[:-1]}+00:00" if text.endswith(("Z", "z")) else text
+        )
+        if (
+            parsed.hour == 23
+            and parsed.minute == 59
+            and parsed.second == 59
+            and parsed.microsecond == 0
+        ):
+            parsed = parsed.replace(microsecond=999999)
+            return parsed.isoformat(sep="T" if "T" in text else " ")
+        return text
     except ValueError:
-        return end
+        return text
+
+
+_RUN_TYPE_LABELS = {
+    "chat": ("chat", "业主对话"),
+    "evaluation": ("evaluation", "Evaluation评估"),
+    "badcase_darwin": ("badcase_darwin", "Badcase · Darwin建议"),
+}
+
+_BACKGROUND_STAGE_LABELS = {
+    "darwin": ("badcase_darwin", "Badcase · Darwin建议"),
+    "badcase_classify": ("badcase_classify", "Badcase · AI分类"),
+    "badcase_extract_knowledge": (
+        "badcase_extract_knowledge",
+        "Badcase · 提取知识",
+    ),
+    "badcase_switch_model_retry": (
+        "badcase_switch_model_retry",
+        "Badcase · 切换模型重试",
+    ),
+    "badcase_check_tools": ("badcase_check_tools", "Badcase · 检查工具"),
+    "ab_test_a": ("model_ab_test", "模型A/B测试"),
+    "ab_test_b": ("model_ab_test", "模型A/B测试"),
+}
+
+
+def _trace_operation_metadata(
+    trace: Dict[str, Any], provider_calls: List[Dict[str, Any]]
+) -> Dict[str, Any]:
+    run_type = str(trace.get("run_type") or "").strip().lower()
+    if run_type and run_type not in {"model_only", "background"}:
+        operation_type, operation_label = _RUN_TYPE_LABELS.get(
+            run_type, (run_type, run_type)
+        )
+    else:
+        stages = [str(call.get("stage") or "").strip().lower() for call in provider_calls]
+        selected = next(
+            (_BACKGROUND_STAGE_LABELS[stage] for stage in stages if stage in _BACKGROUND_STAGE_LABELS),
+            ("background_model_call", "后台模型任务"),
+        )
+        operation_type, operation_label = selected
+    return {
+        "operation_type": operation_type,
+        "operation_label": operation_label,
+        "is_background_task": operation_type != "chat",
+    }
 
 
 def _list_trace_page(
@@ -779,7 +1024,12 @@ def _list_trace_page(
     limit: int = 20,
     offset: int = 0,
 ) -> Dict[str, Any]:
-    """Return one globally ordered, duplicate-free page of operation traces."""
+    """Return one range-correct page of chat and model-only Trace groups.
+
+    Overview and cards are both driven by the same range-limited Provider
+    attempt set.  A Trace crossing midnight stays one group, while its card
+    only aggregates attempts that occurred inside the selected range.
+    """
     if range_key:
         scope = _reporting_scope(range_key, start, end)
         effective_start = scope["start"]
@@ -794,152 +1044,207 @@ def _list_trace_page(
             "timezone": "Asia/Shanghai (UTC+8)",
         }
 
-    conditions = ["1=1"]
-    params: List[Any] = []
+    model_range_conditions, model_range_params = _time_range_predicates(
+        "m.created_at", effective_start, effective_end
+    )
+    model_range_conditions.insert(0, _provider_sql_predicate("m"))
+    if model_id:
+        model_range_conditions.append("m.model_id = ?")
+        model_range_params.append(model_id)
+    if stage:
+        model_range_conditions.append("m.stage = ?")
+        model_range_params.append(stage)
+    model_range_where = " AND ".join(model_range_conditions)
+
+    chat_range_conditions, chat_range_params = _time_range_predicates(
+        "t.created_at", effective_start, effective_end
+    )
+    chat_range_where = " AND ".join(chat_range_conditions) or "1=1"
+    chat_candidate_where = (
+        "mg.trace_id IS NOT NULL"
+        if model_id or stage
+        else f"mg.trace_id IS NOT NULL OR ({chat_range_where})"
+    )
+
+    outer_conditions = ["1=1"]
+    outer_params: List[Any] = []
     if trace_id:
-        conditions.append("a.trace_id = ?")
-        params.append(trace_id)
+        outer_conditions.append("a.trace_id = ?")
+        outer_params.append(trace_id)
     if session_id:
-        conditions.append("a.session_id = ?")
-        params.append(session_id)
+        outer_conditions.append("a.session_id = ?")
+        outer_params.append(session_id)
     if intent:
-        conditions.append("a.intent = ?")
-        params.append(intent)
+        outer_conditions.append("a.intent = ?")
+        outer_params.append(intent)
     if agent:
-        conditions.append("a.agent_name = ?")
-        params.append(agent)
-    if effective_start:
-        conditions.append("a.created_at >= ?")
-        params.append(effective_start)
-    if effective_end:
-        conditions.append("a.created_at <= ?")
-        params.append(effective_end)
-    if model_id or stage:
-        model_conditions = ["fm.trace_id = a.trace_id"]
-        if model_id:
-            model_conditions.append("fm.model_id = ?")
-            params.append(model_id)
-        if stage:
-            model_conditions.append("fm.stage = ?")
-            params.append(stage)
-        conditions.append(
-            f"EXISTS (SELECT 1 FROM model_calls fm WHERE {' AND '.join(model_conditions)})"
-        )
-    where_sql = " AND ".join(conditions)
-    all_traces_sql = """
-        WITH model_only AS (
+        outer_conditions.append("a.agent_name = ?")
+        outer_params.append(agent)
+    where_sql = " AND ".join(outer_conditions)
+
+    all_traces_sql = f"""
+        WITH range_model_calls AS (
+            SELECT m.*, yiai_time_epoch(m.created_at) AS created_epoch
+            FROM model_calls m
+            WHERE {model_range_where}
+        ), model_groups AS (
+            SELECT
+                trace_id,
+                COUNT(*) AS provider_request_count,
+                MAX(created_epoch) AS provider_last_epoch
+            FROM range_model_calls
+            WHERE trace_id IS NOT NULL
+            GROUP BY trace_id
+        ), model_only_ranked AS (
+            SELECT
+                m.*,
+                ROW_NUMBER() OVER (
+                    PARTITION BY m.trace_id
+                    ORDER BY m.created_epoch DESC, m.id DESC
+                ) AS range_rank
+            FROM range_model_calls m
+            WHERE m.trace_id IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM chat_traces existing
+                  WHERE existing.trace_id = m.trace_id
+              )
+        ), chat_candidates AS (
+            SELECT
+                t.trace_id, t.session_id, t.user_message, t.intent,
+                t.agent_name, t.status, t.created_at, t.updated_at,
+                COALESCE(t.run_type, 'chat') AS run_type,
+                COALESCE(mg.provider_last_epoch, yiai_time_epoch(t.created_at)) AS sort_epoch,
+                COALESCE(mg.provider_request_count, 0) AS provider_request_count
+            FROM chat_traces t
+            LEFT JOIN model_groups mg ON mg.trace_id = t.trace_id
+            WHERE {chat_candidate_where}
+        ), model_only AS (
             SELECT
                 m.trace_id,
                 NULL AS session_id,
                 NULL AS user_message,
                 NULL AS intent,
                 NULL AS agent_name,
-                MAX(m.status) AS status,
-                MAX(m.created_at) AS created_at,
-                MAX(m.created_at) AS updated_at
-            FROM model_calls m
-            WHERE m.trace_id IS NOT NULL
-              AND NOT EXISTS (
-                  SELECT 1 FROM chat_traces existing
-                  WHERE existing.trace_id = m.trace_id
-              )
-            GROUP BY m.trace_id
+                m.status,
+                m.created_at,
+                COALESCE(m.finished_at, m.created_at) AS updated_at,
+                CASE
+                    WHEN EXISTS (
+                        SELECT 1 FROM evaluation_runs evaluation
+                        WHERE evaluation.trace_id = m.trace_id
+                    ) THEN 'evaluation'
+                    ELSE 'model_only'
+                END AS run_type,
+                m.created_epoch AS sort_epoch,
+                mg.provider_request_count
+            FROM model_only_ranked m
+            JOIN model_groups mg ON mg.trace_id = m.trace_id
+            WHERE m.range_rank = 1
         ), all_traces AS (
-            SELECT
-                t.trace_id, t.session_id, t.user_message, t.intent,
-                t.agent_name, t.status, t.created_at, t.updated_at
-            FROM chat_traces t
+            SELECT * FROM chat_candidates
             UNION ALL
-            SELECT
-                trace_id, session_id, user_message, intent,
-                agent_name, status, created_at, updated_at
-            FROM model_only
+            SELECT * FROM model_only
         )
     """
+    cte_params = model_range_params + ([] if model_id or stage else chat_range_params)
+    query_params = cte_params + outer_params
 
     conn = _get_conn()
+    _register_reporting_sql(conn)
     cursor = conn.cursor()
     cursor.execute(
-        f"{all_traces_sql} SELECT COUNT(*) AS total FROM all_traces a WHERE {where_sql}",
-        params,
+        f"""
+        {all_traces_sql}
+        SELECT
+            COUNT(*) AS total,
+            COALESCE(SUM(a.provider_request_count), 0) AS provider_request_count
+        FROM all_traces a
+        WHERE {where_sql}
+        """,
+        query_params,
     )
-    total = int(cursor.fetchone()["total"] or 0)
+    totals = cursor.fetchone()
+    total = int(totals["total"] or 0)
+    scoped_provider_request_count = int(totals["provider_request_count"] or 0)
     cursor.execute(
         f"""
         {all_traces_sql}
         SELECT * FROM all_traces a
         WHERE {where_sql}
-        ORDER BY a.created_at DESC, a.trace_id DESC
+        ORDER BY a.sort_epoch DESC, a.trace_id DESC
         LIMIT ? OFFSET ?
         """,
-        params + [limit, offset],
+        query_params + [limit, offset],
     )
     trace_rows = cursor.fetchall()
+    conn.close()
 
     page_trace_ids = [row["trace_id"] for row in trace_rows]
-    agg_rows: Dict[str, Dict[str, Any]] = {}
+    calls_by_trace: Dict[str, List[Dict[str, Any]]] = {}
     if page_trace_ids:
-        placeholders = ",".join("?" for _ in page_trace_ids)
-        cursor.execute(
-            f"SELECT * FROM model_calls WHERE trace_id IN ({placeholders})",
-            page_trace_ids,
+        page_ids = set(page_trace_ids)
+        range_calls = _fetch_model_calls(
+            effective_start,
+            effective_end,
+            model_id=model_id,
+            stage=stage,
         )
-        calls_by_trace: Dict[str, List[Dict[str, Any]]] = {}
-        for raw_row in cursor.fetchall():
-            raw_call = dict(raw_row)
-            calls_by_trace.setdefault(raw_call["trace_id"], []).append(raw_call)
-        for item_trace_id, item_calls in calls_by_trace.items():
-            provider_calls, _ = _split_model_records(item_calls)
-            provider_attempt_records = [
-                call
-                for call in item_calls
-                if _provider_aggregate_decision(call)["record_kind"] == "provider_attempt"
-            ]
-            logical_calls = [
-                call
-                for call in item_calls
-                if _provider_aggregate_decision(call)["record_kind"] != "provider_attempt"
-            ]
-            unconfirmed_provider_attempts = [
-                call
-                for call in provider_attempt_records
-                if not _is_provider_aggregate_record(call)
-            ]
-            summary = _aggregate_model_calls(item_calls)
-            provider_actual_priced_calls = int(
-                summary.get("provider_actual_priced_calls") or 0
+        for raw_call in range_calls:
+            item_trace_id = raw_call.get("trace_id")
+            if item_trace_id in page_ids:
+                calls_by_trace.setdefault(item_trace_id, []).append(raw_call)
+
+    agg_rows: Dict[str, Dict[str, Any]] = {}
+    for item_trace_id, item_calls in calls_by_trace.items():
+        provider_calls, _ = _split_model_records(item_calls)
+        provider_attempt_records = [
+            call
+            for call in item_calls
+            if _provider_aggregate_decision(call)["record_kind"] == "provider_attempt"
+        ]
+        logical_calls = [
+            call
+            for call in item_calls
+            if _provider_aggregate_decision(call)["record_kind"] != "provider_attempt"
+        ]
+        unconfirmed_provider_attempts = [
+            call
+            for call in provider_attempt_records
+            if not _is_provider_aggregate_record(call)
+        ]
+        summary = _aggregate_model_calls(item_calls)
+        provider_actual_priced_calls = int(
+            summary.get("provider_actual_priced_calls") or 0
+        )
+        estimated_priced_calls = int(summary.get("estimated_calls") or 0) - int(
+            summary.get("estimated_amount_unavailable_calls") or 0
+        )
+        known_cost = None
+        if provider_actual_priced_calls or estimated_priced_calls:
+            known_cost = round(
+                float(summary["provider_actual_cost_cny"])
+                + float(summary["estimated_cost_cny"]),
+                8,
             )
-            estimated_priced_calls = int(summary.get("estimated_calls") or 0) - int(
-                summary.get("estimated_amount_unavailable_calls") or 0
-            )
-            known_cost = None
-            if provider_actual_priced_calls or estimated_priced_calls:
-                known_cost = round(
-                    float(summary["provider_actual_cost_cny"])
-                    + float(summary["estimated_cost_cny"]),
-                    8,
-                )
-            agg_rows[item_trace_id] = {
-                **summary,
-                "model_ids": sorted({_provider_model(call) for call in provider_calls}),
-                "call_count": len(provider_calls),
-                "logical_record_count": len(logical_calls),
-                "unconfirmed_provider_attempt_count": len(
-                    unconfirmed_provider_attempts
-                ),
-                "estimated_cost_cny": known_cost,
-                "local_estimated_cost_cny": (
-                    summary["estimated_cost_cny"] if estimated_priced_calls else None
-                ),
-                "provider_actual_cost_cny": (
-                    summary["provider_actual_cost_cny"]
-                    if provider_actual_priced_calls
-                    else None
-                ),
-                "estimated_priced_calls": estimated_priced_calls,
-                "unknown_cost_calls": int(summary.get("unavailable_calls") or 0),
-            }
-    conn.close()
+        agg_rows[item_trace_id] = {
+            **summary,
+            "provider_calls": provider_calls,
+            "model_ids": sorted({_provider_model(call) for call in provider_calls}),
+            "call_count": len(provider_calls),
+            "logical_record_count": len(logical_calls),
+            "unconfirmed_provider_attempt_count": len(unconfirmed_provider_attempts),
+            "estimated_cost_cny": known_cost,
+            "local_estimated_cost_cny": (
+                summary["estimated_cost_cny"] if estimated_priced_calls else None
+            ),
+            "provider_actual_cost_cny": (
+                summary["provider_actual_cost_cny"]
+                if provider_actual_priced_calls
+                else None
+            ),
+            "estimated_priced_calls": estimated_priced_calls,
+            "unknown_cost_calls": int(summary.get("unavailable_calls") or 0),
+        }
 
     results = []
     for row in trace_rows:
@@ -966,6 +1271,22 @@ def _list_trace_page(
             "models": model_ids,
             "model_summary": model_summary,
             "total_tokens": agg.get("total_tokens") if call_count else None,
+            "input_cache_hit_tokens": (
+                agg.get("input_cache_hit_tokens") if call_count else None
+            ),
+            "input_cache_miss_tokens": (
+                agg.get("input_cache_miss_tokens") if call_count else None
+            ),
+            "output_tokens": agg.get("output_tokens") if call_count else None,
+            "reasoning_tokens": (
+                agg.get("reasoning_tokens") if call_count else None
+            ),
+            "reasoning_known_calls": int(
+                agg.get("reasoning_known_calls") or 0
+            ),
+            "reasoning_unavailable_calls": int(
+                agg.get("reasoning_unavailable_calls") or 0
+            ),
             "estimated_cost_cny": agg.get("estimated_cost_cny"),
             "provider_actual_cost_cny": agg.get("provider_actual_cost_cny"),
             "platform_price_snapshot_direct_cost_cny": agg.get(
@@ -991,14 +1312,27 @@ def _list_trace_page(
             ),
             "price_missing": unknown_cost_calls > 0,
             "no_model_calls": call_count == 0,
+            **_trace_operation_metadata(trace, list(agg.get("provider_calls") or [])),
         })
         results.append(trace)
 
     pages = max(1, (total + limit - 1) // limit)
     page = (offset // limit) + 1
+    metadata_scope_consistent = not any([session_id, intent, agent])
     return {
         "traces": results,
         "total": total,
+        "trace_group_count": total,
+        "provider_request_count": scoped_provider_request_count,
+        "scope_consistent": metadata_scope_consistent,
+        "statistics_status": (
+            "consistent" if metadata_scope_consistent else "filtered_trace_scope"
+        ),
+        "count_semantics": {
+            "trace_group_count": "unique_trace_groups",
+            "provider_request_count": "included_outbound_provider_attempts",
+            "trace_card_provider_requests": "range_limited_attempts_only",
+        },
         "limit": limit,
         "offset": offset,
         "page": page,
@@ -1009,6 +1343,14 @@ def _list_trace_page(
         "end": effective_end,
         "range_key": scope.get("range_key"),
         "timezone": scope.get("timezone"),
+        "filters": {
+            "trace_id": trace_id,
+            "session_id": session_id,
+            "intent": intent,
+            "agent": agent,
+            "model_id": model_id,
+            "stage": stage,
+        },
     }
 
 
@@ -1677,9 +2019,13 @@ async def trace_detail(trace_id: str):
     trace = get_chat_trace(trace_id)
     if not trace:
         conn = _get_conn()
+        _register_reporting_sql(conn)
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT * FROM model_calls WHERE trace_id = ? ORDER BY created_at DESC LIMIT 1",
+            """SELECT * FROM model_calls
+               WHERE trace_id = ?
+               ORDER BY yiai_time_epoch(created_at) DESC, id DESC
+               LIMIT 1""",
             (trace_id,),
         )
         row = cursor.fetchone()
@@ -1955,13 +2301,7 @@ async def trends(
     provider_calls, excluded_calls = _split_model_records(raw_calls)
     grouped: Dict[str, List[Dict[str, Any]]] = {}
     for call in provider_calls:
-        created_at = str(call.get("created_at") or "")
-        if not created_at:
-            period = "unknown"
-        elif group_by == "hour":
-            period = f"{created_at[:13]}:00"
-        else:
-            period = created_at[:10]
+        period = _reporting_period(call.get("created_at"), group_by)
         grouped.setdefault(period, []).append(call)
 
     items = []
