@@ -2,8 +2,11 @@
 
 import asyncio
 from contextlib import asynccontextmanager
+from typing import Optional
 
+from fastapi import Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from agno.os import AgentOS
 
@@ -67,6 +70,55 @@ agent_os = AgentOS(
 )
 
 app = agent_os.get_app()
+
+
+def _disabled_agentos_direct_surface(method: str, path: str) -> Optional[str]:
+    """Identify unused direct AgentOS execution surfaces.
+
+    The product frontend and internal services use the audited ``/api``
+    capabilities.  Direct AgentOS model execution therefore stays disabled,
+    while read-only GET history routes remain available.
+    """
+    if str(method).upper() != "POST":
+        return None
+    segments = [segment for segment in str(path).split("/") if segment]
+    if segments == ["eval-runs"]:
+        return "agentos_builtin_eval"
+    if segments == ["optimize-memories"]:
+        return "agentos_memory_optimization"
+    if segments == ["agents", "runtime-agent", "runs"] or (
+        len(segments) == 5
+        and segments[:3] == ["agents", "runtime-agent", "runs"]
+        and segments[-1] in {"continue", "resume"}
+    ):
+        return "agentos_direct_agent_run"
+    if segments == ["workflows", "yiai-runtime", "runs"] or (
+        len(segments) == 5
+        and segments[:3] == ["workflows", "yiai-runtime", "runs"]
+        and segments[-1] in {"continue", "resume"}
+    ):
+        return "agentos_direct_workflow_run"
+    return None
+
+
+@app.middleware("http")
+async def _disabled_agentos_direct_surface_middleware(request: Request, call_next):
+    """Return a stable 410 before AgentOS can dispatch an unused model run."""
+    disabled_surface = _disabled_agentos_direct_surface(
+        request.method, request.url.path
+    )
+    if disabled_surface:
+        return JSONResponse(
+            status_code=410,
+            content={
+                "detail": {
+                    "code": "agentos_builtin_model_surface_disabled",
+                    "surface": disabled_surface,
+                    "message": "该框架模型入口未在本演示启用，请使用平台受审计的对应能力",
+                }
+            },
+        )
+    return await call_next(request)
 
 # ---------------------------------------------------------------------------
 # CORS

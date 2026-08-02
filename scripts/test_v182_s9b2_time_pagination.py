@@ -103,7 +103,7 @@ def create_schema(conn: sqlite3.Connection) -> None:
             record_kind TEXT DEFAULT 'provider_attempt',
             usage_status TEXT,
             finished_at TEXT,
-            price_snapshot TEXT DEFAULT '{"fixture_price": true}',
+            price_snapshot TEXT DEFAULT '{"input_price_per_1m": 1.0, "cached_input_price_per_1m": 0.1, "output_price_per_1m": 2.0}',
             cost_source TEXT DEFAULT 'platform_price_snapshot'
         );
         CREATE TABLE evaluation_runs (
@@ -280,6 +280,11 @@ def insert_provider_attempt(
         "record_kind": "provider_attempt",
         "include_in_provider_aggregate": True,
         "provider_request_sent": True,
+        "local_attempt_id": f"attempt:{trace_id}:{stage}:{created_at}",
+        "provider_request_id": f"request:{trace_id}:{stage}:{created_at}",
+        "provider_request_id_obtained": True,
+        "provider_actual_model": "deepseek-v4-flash",
+        "provider_response_model": "deepseek-v4-flash",
         "usage_status": "provider_actual",
         "token_source": "provider_actual",
         "input_cache_hit_tokens": 0,
@@ -582,10 +587,12 @@ def assert_pagination() -> None:
             assert first["trace_group_count"] == 26
             assert first["provider_request_count"] == 25
             assert first["scope_consistent"] is True
-            assert first["statistics_status"] in {
-                "consistent",
-                "reconciliation_attention",
-            }
+            # This legacy pagination fixture intentionally stores only Total
+            # for its provider_actual rows.  Under S10-F that evidence remains
+            # countable but is correctly classified as incomplete, never as a
+            # healthy/consistent Provider ledger.
+            assert first["statistics_status"] == "data_quality_error"
+            assert first["data_quality_status"] == "data_quality_error"
 
             all_items = first["traces"] + second["traces"]
             trace_ids = [item["trace_id"] for item in all_items]
@@ -596,13 +603,18 @@ def assert_pagination() -> None:
             )
 
             by_id = {item["trace_id"]: item for item in all_items}
-            assert by_id["duplicate-trace"]["cost_status"] == "provider_actual"
-            assert by_id["darwin-only"]["models"] == ["deepseek-v4-pro"]
+            assert by_id["duplicate-trace"]["cost_status"] == "data_quality_error"
+            assert by_id["darwin-only"]["models"] == [
+                "actual_model_unverified"
+            ]
             assert by_id["darwin-only"]["operation_type"] == "badcase_darwin"
             assert by_id["darwin-only"]["operation_label"] == "Badcase · Darwin建议"
             assert by_id["no-model"]["cost_status"] == "not_applicable"
             assert by_id["no-model"]["total_tokens"] is None
-            assert by_id["usage-missing"]["cost_status"] == "partial_unavailable"
+            assert (
+                by_id["usage-missing"]["cost_status"]
+                == "reconciliation_attention"
+            )
             assert by_id["usage-missing"]["model_call_count"] == 1
             assert by_id["usage-missing"]["provider_actual_priced_calls"] == 0
             assert by_id["usage-missing"]["unavailable_calls"] == 1

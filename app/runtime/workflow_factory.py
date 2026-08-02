@@ -9,8 +9,10 @@ from agno.factory import RequestContext
 from agno.workflow import OnReject, Workflow, WorkflowFactory
 from agno.workflow.step import Step
 from agno.workflow.types import StepInput, StepOutput
+from fastapi import HTTPException
 from pydantic import BaseModel
 
+from app.observability import _background_budget_gate
 from app.runtime.coordinator import RuntimeCoordinator
 from app.runtime.release_compiler import publish_compiled_release
 from app.runtime.snapshot_resolver import resolve_snapshot
@@ -19,10 +21,23 @@ from app.settings import agent_db
 
 class RuntimeWorkflowInput(BaseModel):
     path: str = "consultation"
-    message: str
+    # Agno rebuilds a WorkflowFactory for read-only run list/detail requests.
+    # Those GETs do not carry factory_input, so construction must accept an
+    # empty message and remain free of runtime/provider side effects.
+    message: str = ""
     consultation_message: Optional[str] = None
     action_message: Optional[str] = None
     created_by: str = "workflow-operator"
+
+
+def _enforce_agentos_workflow_budget() -> None:
+    """Re-check optional paid work at execution/resume time."""
+    budget_gate = _background_budget_gate("agentos_direct_workflow_run")
+    if not budget_gate.get("allowed"):
+        raise HTTPException(
+            status_code=int(budget_gate["http_status"]),
+            detail=budget_gate["detail"],
+        )
 
 
 async def _consume_coordinator(
@@ -54,10 +69,13 @@ def build_runtime_workflow(ctx: RequestContext) -> Workflow:
     config = RuntimeWorkflowInput.model_validate(raw)
     session_id = ctx.session_id or f"workflow-{ctx.user_id or 'anonymous'}"
     user_id = ctx.user_id or "workflow-user"
-    snapshot = resolve_snapshot(session_id)
 
     def resolve_step(step_input: StepInput) -> StepOutput:
         del step_input
+        # Snapshot resolution belongs to an executing Workflow run.  Keeping
+        # it out of factory construction makes Agno's GET run-history routes
+        # genuinely read-only and budget independent.
+        snapshot = resolve_snapshot(session_id)
         return StepOutput(
             step_name="resolve_snapshot",
             content={
@@ -70,6 +88,7 @@ def build_runtime_workflow(ctx: RequestContext) -> Workflow:
 
     async def execute_consultation(step_input: StepInput) -> StepOutput:
         del step_input
+        _enforce_agentos_workflow_budget()
         result = await _consume_coordinator(
             config.consultation_message or config.message, session_id, user_id
         )
@@ -81,6 +100,7 @@ def build_runtime_workflow(ctx: RequestContext) -> Workflow:
 
     async def collect_action(step_input: StepInput) -> StepOutput:
         del step_input
+        _enforce_agentos_workflow_budget()
         result = await _consume_coordinator(
             config.action_message or config.message, session_id, user_id
         )
@@ -92,6 +112,7 @@ def build_runtime_workflow(ctx: RequestContext) -> Workflow:
 
     async def commit_confirmed_action(step_input: StepInput) -> StepOutput:
         del step_input
+        _enforce_agentos_workflow_budget()
         result = await _consume_coordinator(
             "确认提交", session_id, user_id
         )

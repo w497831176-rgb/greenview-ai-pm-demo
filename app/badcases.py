@@ -104,6 +104,17 @@ from db.property_db import (
 router = APIRouter(tags=["badcases"])
 
 
+def _enforce_background_budget(strategy: str) -> Dict[str, Any]:
+    """Fail closed before an optional paid background model operation."""
+    budget_gate = _background_budget_gate(strategy)
+    if not budget_gate.get("allowed"):
+        raise HTTPException(
+            status_code=int(budget_gate["http_status"]),
+            detail=budget_gate["detail"],
+        )
+    return budget_gate
+
+
 class BadcaseCreate(BaseModel):
     title: str
     description: str = ""
@@ -684,12 +695,7 @@ async def classify_badcase(case_id: int, request: ClassifyRequest = ClassifyRequ
     # AI classification is an extra evaluation step; enforce the daily budget
     # only when the caller asks for automatic (LLM-based) classification.
     if request.auto:
-        budget_gate = _background_budget_gate("badcase_classify")
-        if not budget_gate.get("allowed"):
-            raise HTTPException(
-                status_code=int(budget_gate["http_status"]),
-                detail=budget_gate["detail"],
-            )
+        _enforce_background_budget("badcase_classify")
 
     if request.auto:
         prompt = (
@@ -803,7 +809,9 @@ async def extract_knowledge(case_id: int, request: ExtractKnowledgeRequest = Ext
 
     title = request.title or case["title"]
     provider_trace_id: Optional[str] = None
-    if request.auto or not request.content:
+    needs_model = request.auto or not str(request.content or "").strip()
+    if needs_model:
+        _enforce_background_budget("badcase_extract_knowledge")
         prompt = (
             "请根据以下 Badcase 信息，总结成一段可直接写入知识库的知识条目。"
             "回答应包含：问题现象、正确结论、给业主的标准话术。\n\n"
@@ -1701,6 +1709,8 @@ async def switch_model_retry(case_id: int, request: SwitchModelRetryRequest = Sw
     if not user_message:
         raise HTTPException(status_code=400, detail="user_message or source_message_id required")
 
+    _enforce_background_budget("badcase_switch_model_retry")
+
     # Prefer explicit model_id; otherwise retry with the runtime default Flash.
     model_id = request.model_id or "deepseek-v4-flash"
 
@@ -2062,6 +2072,8 @@ async def retest_badcase(case_id: int, request: SwitchModelRetryRequest = Switch
     if not user_message:
         raise HTTPException(status_code=400, detail="user_message or original_query required")
 
+    _enforce_background_budget("badcase_retest")
+
     retest_session_id = f"retest-{uuid.uuid4().hex[:12]}"
     try:
         result = await _consume_chat_stream(user_message, retest_session_id, user_id="retest")
@@ -2161,6 +2173,8 @@ async def check_tools_badcase(case_id: int):
     """Analyze whether the badcase is caused by missing or misconfigured tools."""
     case = _load_case(case_id)
     _require_case_status(case, "check-tools", {"pending", "classified"})
+
+    _enforce_background_budget("badcase_check_tools")
 
     from db.property_db import list_skills, list_mcp_servers
 
