@@ -28,12 +28,15 @@ from db.property_db import (
     evaluation_summary,
     get_badcase_by_evaluation_run,
     get_badcase,
+    get_action_proposal,
+    get_action_receipt_by_idempotency_key,
     get_chat_trace,
     get_evidence_ledger,
     get_evaluation_case,
     get_evaluation_run,
     get_model_calls_for_trace,
     get_session_runtime_side_effects,
+    get_work_order_draft,
     list_evaluation_cases,
     list_evaluation_runs,
     list_trace_events,
@@ -51,6 +54,7 @@ router = APIRouter(prefix="/api/evaluations", tags=["evaluations"])
 CASE_STATUSES = {"draft", "active", "archived"}
 RISK_LEVELS = {"L1", "L2", "L3", "L4"}
 SOURCES = {"badcase", "sop", "expert", "adversarial", "synthetic"}
+RUNTIME_TERMINAL_STATUSES = {"complete", "paused", "completed"}
 
 
 class EvaluationCaseCreate(BaseModel):
@@ -121,6 +125,19 @@ def _validate_case_payload(payload: Dict[str, Any]) -> None:
     key = payload.get("case_key")
     if key is not None and (not key.strip() or len(key) > 80):
         raise HTTPException(status_code=400, detail="case_key must be 1-80 characters")
+    rubric = payload.get("rubric")
+    if isinstance(rubric, dict):
+        assertions = rubric.get("deterministic_assertions")
+        if isinstance(assertions, dict) and "expected_runtime_status" in assertions:
+            expected_status = assertions.get("expected_runtime_status")
+            if (
+                not isinstance(expected_status, str)
+                or expected_status not in RUNTIME_TERMINAL_STATUSES
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"invalid expected_runtime_status: {expected_status}",
+                )
 
 
 def _text_list(value: Any) -> List[str]:
@@ -223,6 +240,18 @@ def _manual_rubric_required(case: Dict[str, Any]) -> bool:
     return bool(isinstance(rubric, dict) and rubric.get("operator_rubric"))
 
 
+def _expected_runtime_status(case: Dict[str, Any]) -> Any:
+    rubric = case.get("rubric") or {}
+    assertions = (
+        rubric.get("deterministic_assertions") or {}
+        if isinstance(rubric, dict)
+        else {}
+    )
+    if not isinstance(assertions, dict):
+        return "complete"
+    return assertions.get("expected_runtime_status", "complete")
+
+
 def evaluate_runtime_evidence(case: Dict[str, Any], answer: str, done: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], str]:
     """Run deterministic checks and leave qualitative judgement to humans.
 
@@ -236,6 +265,103 @@ def evaluate_runtime_evidence(case: Dict[str, Any], answer: str, done: Dict[str,
     tools = _normalize_tool_names(done)
     citations = _normalize_citation_titles(done)
     answer_lower = (answer or "").lower()
+
+    rubric = case.get("rubric") or {}
+    assertions = (
+        rubric.get("deterministic_assertions") or {}
+        if isinstance(rubric, dict)
+        else {}
+    )
+    expected_runtime_status = _expected_runtime_status(case)
+    actual_runtime_status = str(done.get("status") or "").strip()
+    checks.append(_rule(
+        "runtime_status",
+        "本轮结果",
+        expected_runtime_status,
+        actual_runtime_status,
+        "pass" if actual_runtime_status == expected_runtime_status else "fail",
+        note=(
+            "协议完整，但业务终态与用例预期不一致"
+            if actual_runtime_status != expected_runtime_status else ""
+        ),
+    ))
+
+    controlled_evidence = done.get("controlled_action_evidence") or {}
+    if actual_runtime_status == "paused":
+        proposal = controlled_evidence.get("proposal") or {}
+        draft = controlled_evidence.get("draft") or {}
+        proposal_waiting = bool(
+            proposal.get("session_matches")
+            and proposal.get("trace_matches")
+            and proposal.get("status") in {"pending_confirmation", "draft"}
+        )
+        draft_waiting = bool(draft.get("session_matches"))
+        gateway_waiting = bool(controlled_evidence.get("gateway_waiting"))
+        paused_evidence_ok = bool(
+            done.get("runtime_path") == "controlled_action"
+            and (proposal_waiting or draft_waiting or gateway_waiting)
+        )
+        checks.append(_rule(
+            "paused_controlled_action_evidence",
+            "等待业主确认依据",
+            {
+                "runtime_path": "controlled_action",
+                "proposal_draft_or_gateway_waiting": True,
+            },
+            {
+                "runtime_path": done.get("runtime_path"),
+                "proposal": proposal,
+                "draft": draft,
+                "gateway_waiting": gateway_waiting,
+                "gateway_waiting_detail": controlled_evidence.get(
+                    "gateway_waiting_detail"
+                ),
+            },
+            "pass" if paused_evidence_ok else "fail",
+            note=(
+                "paused 必须由受控写流程的 Proposal、草稿或等待确认阶段证据支持"
+                if not paused_evidence_ok else ""
+            ),
+        ))
+    elif actual_runtime_status == "completed":
+        proposal = controlled_evidence.get("proposal") or {}
+        receipt = controlled_evidence.get("receipt") or {}
+        receipt_success = bool(
+            receipt.get("proposal_matches")
+            and receipt.get("status") == "committed"
+            and str(receipt.get("resource_id") or "").strip()
+        )
+        completed_evidence_ok = bool(
+            done.get("runtime_path") == "controlled_action"
+            and proposal.get("session_matches")
+            and receipt_success
+            and controlled_evidence.get("gateway_committed")
+        )
+        checks.append(_rule(
+            "completed_receipt_evidence",
+            "受控写入成功 Receipt",
+            {
+                "runtime_path": "controlled_action",
+                "receipt_status": "committed",
+                "resource_id_present": True,
+            },
+            {
+                "runtime_path": done.get("runtime_path"),
+                "proposal": proposal,
+                "receipt": receipt,
+                "gateway_committed": controlled_evidence.get(
+                    "gateway_committed"
+                ),
+                "gateway_committed_detail": controlled_evidence.get(
+                    "gateway_committed_detail"
+                ),
+            },
+            "pass" if completed_evidence_ok else "fail",
+            note=(
+                "completed 必须由同一受控 Proposal 的 committed Receipt 和真实 resource_id 支持"
+                if not completed_evidence_ok else ""
+            ),
+        ))
 
     expected_agent = str(case.get("expected_agent_id") or "").strip()
     if expected_agent:
@@ -288,8 +414,7 @@ def evaluate_runtime_evidence(case: Dict[str, Any], answer: str, done: Dict[str,
     else:
         checks.append(_rule("handoff", "人机协同边界", "未配置", bool(done.get("handoff")), "not_configured"))
 
-    rubric = case.get("rubric") or {}
-    assertions = rubric.get("deterministic_assertions") or {}
+    assertions = assertions if isinstance(assertions, dict) else {}
     decision_summary = done.get("decision_summary") or {}
     expected_decisions = assertions.get("expected_decision_summary") or {}
     for component, expected_fields in expected_decisions.items():
@@ -438,6 +563,7 @@ async def _run_real_chat(message: str, session_id: str) -> Tuple[str, Dict[str, 
     evidence_trace_id: Optional[str] = None
     event_name = ""
     post_done_event_count = 0
+    done_payload_consumed = False
     stream_exception_type = ""
 
     def consume_chunk(chunk: str) -> None:
@@ -445,16 +571,21 @@ async def _run_real_chat(message: str, session_id: str) -> Tuple[str, Dict[str, 
         nonlocal done_payload_invalid, error_event_count
         nonlocal valid_error_payload_count, malformed_error_event_received
         nonlocal payload_error_detail, evidence_trace_id, event_name
-        nonlocal post_done_event_count
+        nonlocal post_done_event_count, done_payload_consumed
 
         for line in chunk.splitlines():
             if not line.strip():
                 event_name = ""
                 continue
+            if done_payload_consumed:
+                if line.startswith(":"):
+                    continue
+                if line.startswith("event:") and line[6:].strip() == "done":
+                    done_event_count += 1
+                post_done_event_count += 1
+                continue
             if line.startswith("event:"):
                 event_name = line[6:].strip()
-                if done_event_count:
-                    post_done_event_count += 1
                 if event_name == "error":
                     error_event_count += 1
                 elif event_name == "done":
@@ -499,6 +630,7 @@ async def _run_real_chat(message: str, session_id: str) -> Tuple[str, Dict[str, 
                     answer = str(terminal_answer)
             if event_name == "done":
                 done = payload
+                done_payload_consumed = True
             if payload.get("error"):
                 payload_error_detail = str(payload["error"])
 
@@ -547,7 +679,10 @@ async def _run_real_chat(message: str, session_id: str) -> Tuple[str, Dict[str, 
         reject("evaluation_event_after_done")
     if "status" not in done:
         reject("evaluation_done_status_missing")
-    if done.get("status") != "complete":
+    if (
+        not isinstance(done.get("status"), str)
+        or done.get("status") not in RUNTIME_TERMINAL_STATUSES
+    ):
         reject("evaluation_done_not_complete")
     if not answer.strip():
         reject("evaluation_answer_missing")
@@ -624,6 +759,118 @@ def _enrich_runtime_evidence(
     enriched["evidence_ledger"] = (ledger_row or {}).get("ledger") or {}
     enriched["trace_events"] = trace_events
     enriched["side_effects"] = get_session_runtime_side_effects(session_id)
+    if (
+        enriched.get("runtime_path") == "controlled_action"
+        or enriched.get("status") in {"paused", "completed"}
+        or enriched.get("proposal_id")
+    ):
+        proposal_id = str(enriched.get("proposal_id") or "").strip()
+        proposal = get_action_proposal(proposal_id) if proposal_id else None
+        draft = get_work_order_draft(session_id)
+        proposal_summary: Optional[Dict[str, Any]] = None
+        receipt_summary: Optional[Dict[str, Any]] = None
+        if proposal:
+            proposal_summary = {
+                "proposal_id": proposal.get("proposal_id"),
+                "status": proposal.get("status"),
+                "action_type": proposal.get("action_type"),
+                "session_matches": proposal.get("session_id") == session_id,
+                "trace_matches": bool(
+                    trace_id and proposal.get("trace_id") == trace_id
+                ),
+            }
+            idempotency_key = str(proposal.get("idempotency_key") or "").strip()
+            receipt = (
+                get_action_receipt_by_idempotency_key(idempotency_key)
+                if idempotency_key else None
+            )
+            if receipt:
+                receipt_summary = {
+                    "receipt_id": receipt.get("receipt_id"),
+                    "proposal_id": receipt.get("proposal_id"),
+                    "proposal_matches": (
+                        receipt.get("proposal_id") == proposal.get("proposal_id")
+                    ),
+                    "status": receipt.get("status"),
+                    "resource_type": receipt.get("resource_type"),
+                    "resource_id": receipt.get("resource_id"),
+                }
+        action_gateway_calls: List[Dict[str, Any]] = []
+        for call in (enriched.get("tool_calls") or []):
+            if not isinstance(call, dict):
+                continue
+            if str(call.get("tool_name") or call.get("name") or "") != "action_gateway":
+                continue
+            arguments = call.get("arguments") or {}
+            if isinstance(arguments, dict):
+                action_gateway_calls.append(arguments)
+
+        gateway_waiting_detail: Optional[Dict[str, Any]] = None
+        for event in trace_events:
+            if event.get("span_name") != "action_gateway":
+                continue
+            metadata = event.get("metadata") or {}
+            event_proposal_id = str(metadata.get("proposal_id") or "").strip()
+            if (
+                event.get("status") != "success"
+                or metadata.get("workflow_status") != "paused"
+                or not event_proposal_id
+            ):
+                continue
+            for arguments in action_gateway_calls:
+                call_proposal_id = str(arguments.get("proposal_id") or "").strip()
+                if (
+                    arguments.get("phase") == "awaiting_confirmation"
+                    and call_proposal_id == event_proposal_id
+                    and (not proposal_id or proposal_id == event_proposal_id)
+                ):
+                    gateway_waiting_detail = {
+                        "phase": "awaiting_confirmation",
+                        "proposal_id": event_proposal_id,
+                        "trace_event_status": event.get("status"),
+                    }
+                    break
+            if gateway_waiting_detail:
+                break
+
+        gateway_committed_detail: Optional[Dict[str, Any]] = None
+        if proposal_summary and receipt_summary:
+            for event in trace_events:
+                if event.get("span_name") != "action_gateway":
+                    continue
+                metadata = event.get("metadata") or {}
+                if (
+                    event.get("status") == "success"
+                    and metadata.get("workflow_status") == "completed"
+                    and metadata.get("proposal_id") == proposal_summary.get("proposal_id")
+                    and metadata.get("receipt_id") == receipt_summary.get("receipt_id")
+                    and metadata.get("resource_id") == receipt_summary.get("resource_id")
+                ):
+                    gateway_committed_detail = {
+                        "proposal_id": metadata.get("proposal_id"),
+                        "receipt_id": metadata.get("receipt_id"),
+                        "resource_id": metadata.get("resource_id"),
+                        "trace_event_status": event.get("status"),
+                    }
+                    break
+        enriched["controlled_action_evidence"] = {
+            "proposal": proposal_summary,
+            "draft": (
+                {
+                    "persisted": True,
+                    "session_id": draft.get("session_id"),
+                    "created_at": draft.get("created_at"),
+                    "updated_at": draft.get("updated_at"),
+                    "session_matches": draft.get("session_id") == session_id,
+                }
+                if draft else None
+            ),
+            "gateway_waiting": gateway_waiting_detail is not None,
+            "gateway_waiting_detail": gateway_waiting_detail,
+            "gateway_committed": gateway_committed_detail is not None,
+            "gateway_committed_detail": gateway_committed_detail,
+            "receipt": receipt_summary,
+        }
     return enriched
 
 
@@ -644,6 +891,11 @@ def _evaluation_evidence(done: Dict[str, Any]) -> Dict[str, Any]:
         "model_calls": done.get("model_calls") or [],
         "logical_model_records": done.get("logical_model_records") or [],
         "side_effects": done.get("side_effects") or {},
+        "runtime_status": done.get("status"),
+        "runtime_path": done.get("runtime_path"),
+        "proposal_id": done.get("proposal_id"),
+        "action_receipts": done.get("action_receipts") or [],
+        "controlled_action_evidence": done.get("controlled_action_evidence") or {},
         "evidence_ledger": done.get("evidence_ledger") or {},
         "trace_events": done.get("trace_events") or [],
         "token_count": done.get("round_token_count") or done.get("token_count"),
@@ -895,8 +1147,8 @@ async def run_case(case_id: int, request: EvaluationRunRequest = EvaluationRunRe
             exc.done, failure_trace_id, session_id
         )
         checks = [_rule(
-            "runtime_completion", "Provider/运行时成功完成", "complete",
-            done.get("status") or "failed", "fail", note=str(exc)[:500],
+            "runtime_status", "本轮结果", _expected_runtime_status(case),
+            done.get("status") or "unavailable", "fail", note=str(exc)[:500],
         )]
         evidence = _evaluation_evidence(done)
         run = create_evaluation_run(
@@ -926,8 +1178,8 @@ async def run_case(case_id: int, request: EvaluationRunRequest = EvaluationRunRe
         }
     except Exception as exc:
         checks = [_rule(
-            "runtime_completion", "Provider/运行时成功完成", "complete",
-            "failed", "fail", note=str(exc)[:500],
+            "runtime_status", "本轮结果", _expected_runtime_status(case),
+            "unavailable", "fail", note=str(exc)[:500],
         )]
         run = create_evaluation_run(
             evaluation_case_id=case_id,

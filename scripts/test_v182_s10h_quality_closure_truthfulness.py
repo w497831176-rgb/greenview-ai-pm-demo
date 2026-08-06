@@ -195,6 +195,7 @@ def _evaluation_stream_stub(
     trace_status: str = "complete",
     trace_session_override: str | None = None,
     raise_after: bool = False,
+    evidence_setup: Callable[[str, str], None] | None = None,
 ) -> Callable[..., AsyncIterator[str]]:
     """Replace only the SSE source below the real Evaluation runtime parser."""
 
@@ -217,6 +218,8 @@ def _evaluation_stream_stub(
                 message,
                 status=trace_status,
             )
+        if evidence_setup:
+            evidence_setup(session_id, trace_id or "")
         for chunk in chunks:
             yield chunk
         if raise_after:
@@ -431,7 +434,8 @@ def assert_evaluation_http_contract(client: TestClient) -> None:
             ("done-missing-status", {}),
             ("done-unknown-status", {"status": "unknown"}),
             ("done-failed-status", {"status": "failed"}),
-            ("done-paused-status", {"status": "paused"}),
+            ("done-running-status", {"status": "running"}),
+            ("done-created-status", {"status": "created"}),
         ):
             trace = f"s10h1-{label}"
             add_failure(
@@ -572,10 +576,34 @@ def assert_evaluation_http_contract(client: TestClient) -> None:
             trace_id=trace,
             expected_trace_id=trace,
         )
+        for label, trailing_field in (
+            (
+                "data-only-after-complete-done",
+                'data: {"status":"failed"}\n\n',
+            ),
+            ("id-after-complete-done", "id: late-event-id\n\n"),
+            ("retry-after-complete-done", "retry: 1000\n\n"),
+            ("unknown-field-after-complete-done", "x-runtime: late\n\n"),
+        ):
+            trace = f"s10h2-{label}"
+            add_failure(
+                label,
+                (
+                    _sse("delta", {"content": "answer"}),
+                    _sse(
+                        "done",
+                        {"status": "complete", "trace_id": trace},
+                    ),
+                    trailing_field,
+                ),
+                expected_reason="evaluation_event_after_done",
+                trace_id=trace,
+                expected_trace_id=trace,
+            )
 
         check(
-            "Evaluation strict-terminal matrix covers at least 22 failures",
-            len(failure_specs) >= 22,
+            "Evaluation strict-terminal matrix covers at least 27 failures",
+            len(failure_specs) >= 27,
         )
         for index, spec in enumerate(failure_specs, start=1):
             label = str(spec["label"])
@@ -670,6 +698,549 @@ def assert_evaluation_http_contract(client: TestClient) -> None:
         )
     finally:
         evaluation_api.create_evaluation_run = original_create_run
+
+
+def assert_evaluation_runtime_status_contract(client: TestClient) -> None:
+    """Exercise complete/paused/completed through the real parser and route."""
+
+    real_runtime = evaluation_api._run_real_chat
+    initial_provider_attempts = provider_attempt_count()
+    no_expectation = object()
+
+    def make_case(label: str, expected: object = no_expectation) -> Dict[str, Any]:
+        rubric: Dict[str, Any] = {}
+        if expected is not no_expectation:
+            rubric = {
+                "deterministic_assertions": {
+                    "expected_runtime_status": expected,
+                }
+            }
+        return db.create_evaluation_case(
+            case_key=f"S10H2-{label.upper()}",
+            title=f"S10-H.2 runtime status {label}",
+            user_message=f"deterministic runtime status question {label}",
+            rubric=rubric,
+            status="active",
+            version_label="V1.8.2-S10-H.2",
+        )
+
+    def controlled_setup(
+        proposal_id: str,
+        *,
+        committed: bool,
+        receipt_id: str | None = None,
+        resource_id: str | None = None,
+        gateway_phase: str | None = None,
+        proposal_trace_id: str | None = None,
+    ) -> Callable[[str, str], None]:
+        def setup(session_id: str, trace_id: str) -> None:
+            idempotency_key = f"idem-{proposal_id}"
+            source_trace_id = proposal_trace_id or trace_id
+            if source_trace_id != trace_id:
+                _persist_trace(
+                    source_trace_id,
+                    session_id,
+                    f"prior proposal fixture {proposal_id}",
+                    status="complete",
+                )
+            db.create_action_proposal(
+                proposal_id,
+                session_id,
+                "work_order.create",
+                "L2",
+                {"description": f"fixture {proposal_id}"},
+                idempotency_key,
+                trace_id=source_trace_id,
+                release_id="rr-test-s10h2",
+            )
+            if committed:
+                db.record_action_approval(
+                    proposal_id,
+                    "approved",
+                    "owner:s10h2",
+                    "deterministic fixture",
+                )
+                db.save_action_receipt(
+                    receipt_id or f"receipt-{proposal_id}",
+                    proposal_id,
+                    idempotency_key,
+                    "committed",
+                    result={"success": True},
+                    resource_type="work_order",
+                    resource_id=resource_id or f"WO-{proposal_id}",
+                )
+            if gateway_phase:
+                if gateway_phase not in {"awaiting_confirmation", "committed"}:
+                    raise AssertionError(f"unsupported gateway fixture phase: {gateway_phase}")
+                if (gateway_phase == "committed") != committed:
+                    raise AssertionError("gateway fixture phase must match Receipt state")
+                db.record_trace_event(
+                    trace_id,
+                    "action_gateway",
+                    "success",
+                    metadata={
+                        "proposal_id": proposal_id,
+                        "receipt_id": (
+                            receipt_id or f"receipt-{proposal_id}"
+                            if committed else None
+                        ),
+                        "resource_id": (
+                            resource_id or f"WO-{proposal_id}"
+                            if committed else None
+                        ),
+                        "workflow_status": (
+                            "completed"
+                            if gateway_phase == "committed"
+                            else "paused"
+                        ),
+                    },
+                )
+
+        return setup
+
+    def execute(
+        label: str,
+        case: Dict[str, Any],
+        chunks: Iterable[str],
+        trace_id: str,
+        *,
+        expected_run_status: str,
+        expected_runtime_status: str,
+        evidence_setup: Callable[[str, str], None] | None = None,
+        linked_failure: bool = False,
+    ) -> Dict[str, Any]:
+        linked_badcase = None
+        body: Dict[str, Any] = {}
+        if linked_failure:
+            linked_badcase = _new_retest_case(
+                f"runtime-status-{label}",
+                last_applied_at="2000-01-01 00:00",
+                linked_evaluation_case_id=int(case["id"]),
+            )
+            body["linked_badcase_id"] = int(linked_badcase["id"])
+        entries: list[Dict[str, str]] = []
+        before_provider = provider_attempt_count()
+        chat_api.stream_chat_response = _evaluation_stream_stub(
+            chunks,
+            entries=entries,
+            trace_id=trace_id,
+            evidence_setup=evidence_setup,
+        )
+        response = client.post(
+            f"/api/evaluations/cases/{case['id']}/run",
+            json=body,
+        )
+        check(f"{label}: Evaluation HTTP is controlled 200", response.status_code == 200)
+        payload = response.json()
+        runs = db.list_evaluation_runs(int(case["id"]))
+        check(
+            f"{label}: exactly one Run is persisted",
+            len(runs) == 1 and payload["run"]["id"] == runs[0]["id"],
+        )
+        check(
+            f"{label}: expected Run status is truthful",
+            runs[0]["status"] == expected_run_status
+            and sum(item["status"] == "passed" for item in runs)
+            == (1 if expected_run_status == "passed" else 0),
+        )
+        runtime_rules = [
+            item for item in (runs[0].get("rule_results") or [])
+            if item.get("key") == "runtime_status"
+        ]
+        check(
+            f"{label}: runtime_status rule is visible with raw actual",
+            len(runtime_rules) == 1
+            and runtime_rules[0].get("actual") == expected_runtime_status,
+        )
+        check(
+            f"{label}: real parser and lower SSE source are each used once",
+            evaluation_api._run_real_chat is real_runtime
+            and len(entries) == 1
+            and entries[0]["user_id"] == "evaluation",
+        )
+        check(
+            f"{label}: Provider attempt delta is zero",
+            provider_attempt_count() == before_provider,
+        )
+        if linked_badcase:
+            detail = client.get(f"/api/badcases/{linked_badcase['id']}")
+            check(f"{label}: linked Badcase remains readable", detail.status_code == 200)
+            badcase = detail.json()["badcase"]
+            check(
+                f"{label}: linked Badcase does not expose verify-pass",
+                (badcase.get("retest_context") or {}).get("run_status") == "failed"
+                and "verify-pass" not in badcase.get("allowed_actions", []),
+            )
+            verify = client.post(
+                f"/api/badcases/{linked_badcase['id']}/verify",
+                json={"passed": True, "note": f"must block {label}"},
+            )
+            check(f"{label}: verify-pass endpoint remains blocked", verify.status_code != 200)
+        return payload
+
+    completed_case = make_case("completed-pass", "completed")
+    completed_trace = "s10h2-completed-pass-trace"
+    completed_proposal = "proposal-s10h2-completed-pass"
+    completed_receipt = "receipt-s10h2-completed-pass"
+    completed_payload = execute(
+        "completed-with-committed-receipt",
+        completed_case,
+        (
+            _sse("delta", {"content": "controlled write completed"}),
+            _sse(
+                "done",
+                {
+                    "status": "completed",
+                    "trace_id": completed_trace,
+                    "runtime_path": "controlled_action",
+                    "proposal_id": completed_proposal,
+                    "action_receipts": [
+                        {
+                            "receipt_id": completed_receipt,
+                            "proposal_id": completed_proposal,
+                            "status": "committed",
+                            "resource_id": "WO-S10H2-COMPLETED",
+                        }
+                    ],
+                    "tool_calls": [
+                        {
+                            "tool_name": "action_gateway",
+                            "arguments": {
+                                "proposal_id": completed_proposal,
+                                "phase": "committed",
+                            },
+                        }
+                    ],
+                },
+            ),
+        ),
+        completed_trace,
+        expected_run_status="passed",
+        expected_runtime_status="completed",
+        evidence_setup=controlled_setup(
+            completed_proposal,
+            committed=True,
+            receipt_id=completed_receipt,
+            resource_id="WO-S10H2-COMPLETED",
+            gateway_phase="committed",
+            proposal_trace_id="s10h2-completed-prior-proposal-trace",
+        ),
+    )
+    completed_rules = completed_payload["rule_results"]
+    check(
+        "completed requires and exposes a committed persisted Receipt",
+        any(
+            item.get("key") == "completed_receipt_evidence"
+            and item.get("status") == "pass"
+            for item in completed_rules
+        )
+        and completed_payload["run"]["evidence"]["runtime_status"] == "completed"
+        and completed_payload["run"]["evidence"]["controlled_action_evidence"]["receipt"]["resource_id"]
+        == "WO-S10H2-COMPLETED"
+        and completed_payload["run"]["evidence"]["controlled_action_evidence"]["proposal"]["trace_matches"]
+        is False,
+    )
+
+    missing_receipt_case = make_case("completed-missing-receipt", "completed")
+    missing_receipt_trace = "s10h2-completed-missing-receipt-trace"
+    missing_receipt_proposal = "proposal-s10h2-completed-missing-receipt"
+    missing_receipt_payload = execute(
+        "completed-without-persisted-receipt",
+        missing_receipt_case,
+        (
+            _sse("delta", {"content": "claimed completed without receipt"}),
+            _sse(
+                "done",
+                {
+                    "status": "completed",
+                    "trace_id": missing_receipt_trace,
+                    "runtime_path": "controlled_action",
+                    "proposal_id": missing_receipt_proposal,
+                    "action_receipts": [
+                        {
+                            "receipt_id": "forged-payload-only",
+                            "status": "committed",
+                            "resource_id": "FORGED-RESOURCE",
+                        }
+                    ],
+                },
+            ),
+        ),
+        missing_receipt_trace,
+        expected_run_status="failed",
+        expected_runtime_status="completed",
+        evidence_setup=controlled_setup(
+            missing_receipt_proposal,
+            committed=False,
+        ),
+        linked_failure=True,
+    )
+    check(
+        "completed payload cannot forge a successful Receipt",
+        any(
+            item.get("key") == "completed_receipt_evidence"
+            and item.get("status") == "fail"
+            for item in missing_receipt_payload["rule_results"]
+        )
+        and missing_receipt_payload["run"]["evidence"]["controlled_action_evidence"]["receipt"] is None,
+    )
+
+    missing_commit_event_case = make_case(
+        "completed-missing-current-commit-event",
+        "completed",
+    )
+    missing_commit_event_trace = "s10h2-completed-missing-commit-event-trace"
+    missing_commit_event_proposal = "proposal-s10h2-completed-missing-commit-event"
+    missing_commit_event_payload = execute(
+        "completed-with-receipt-but-no-current-commit-event",
+        missing_commit_event_case,
+        (
+            _sse("delta", {"content": "claimed completion from an old receipt"}),
+            _sse(
+                "done",
+                {
+                    "status": "completed",
+                    "trace_id": missing_commit_event_trace,
+                    "runtime_path": "controlled_action",
+                    "proposal_id": missing_commit_event_proposal,
+                },
+            ),
+        ),
+        missing_commit_event_trace,
+        expected_run_status="failed",
+        expected_runtime_status="completed",
+        evidence_setup=controlled_setup(
+            missing_commit_event_proposal,
+            committed=True,
+            receipt_id="receipt-s10h2-missing-current-commit-event",
+            resource_id="WO-S10H2-OLD-RECEIPT",
+        ),
+        linked_failure=True,
+    )
+    missing_commit_evidence = missing_commit_event_payload["run"]["evidence"][
+        "controlled_action_evidence"
+    ]
+    check(
+        "completed cannot reuse a persisted Receipt without current Trace commit evidence",
+        missing_commit_evidence["receipt"]["status"] == "committed"
+        and missing_commit_evidence["gateway_committed"] is False
+        and any(
+            item.get("key") == "completed_receipt_evidence"
+            and item.get("status") == "fail"
+            for item in missing_commit_event_payload["rule_results"]
+        ),
+    )
+
+    paused_create = client.post(
+        "/api/evaluations/cases",
+        json={
+            "case_key": "S10H2-PAUSED-PASS",
+            "title": "S10-H.2 paused expected by operator",
+            "user_message": "create a controlled draft and wait",
+            "rubric": {
+                "deterministic_assertions": {
+                    "expected_runtime_status": "paused",
+                }
+            },
+            "status": "active",
+        },
+    )
+    check(
+        "manual-case API stores expected_runtime_status in existing rubric",
+        paused_create.status_code == 200
+        and paused_create.json()["case"]["rubric"]["deterministic_assertions"]["expected_runtime_status"]
+        == "paused",
+    )
+    paused_case = paused_create.json()["case"]
+    paused_trace = "s10h2-paused-pass-trace"
+    paused_proposal = "proposal-s10h2-paused-pass"
+    paused_payload = execute(
+        "paused-with-explicit-expectation-and-proposal",
+        paused_case,
+        (
+            _sse("delta", {"content": "waiting for owner confirmation"}),
+            _sse(
+                "done",
+                {
+                    "status": "paused",
+                    "trace_id": paused_trace,
+                    "runtime_path": "controlled_action",
+                    "proposal_id": paused_proposal,
+                    "action_receipts": [],
+                    "tool_calls": [
+                        {
+                            "tool_name": "action_gateway",
+                            "arguments": {
+                                "proposal_id": paused_proposal,
+                                "phase": "awaiting_confirmation",
+                            },
+                        }
+                    ],
+                },
+            ),
+        ),
+        paused_trace,
+        expected_run_status="passed",
+        expected_runtime_status="paused",
+        evidence_setup=controlled_setup(
+            paused_proposal,
+            committed=False,
+            gateway_phase="awaiting_confirmation",
+        ),
+    )
+    check(
+        "paused requires and exposes controlled waiting evidence",
+        any(
+            item.get("key") == "paused_controlled_action_evidence"
+            and item.get("status") == "pass"
+            for item in paused_payload["rule_results"]
+        )
+        and paused_payload["run"]["evidence"]["runtime_status"] == "paused",
+    )
+
+    for label, expected in (
+        ("paused-with-default-complete", no_expectation),
+        ("paused-while-completed-expected", "completed"),
+    ):
+        case = make_case(label, expected)
+        trace = f"s10h2-{label}-trace"
+        proposal = f"proposal-s10h2-{label}"
+        payload = execute(
+            label,
+            case,
+            (
+                _sse("delta", {"content": "waiting for owner confirmation"}),
+                _sse(
+                    "done",
+                    {
+                        "status": "paused",
+                        "trace_id": trace,
+                        "runtime_path": "controlled_action",
+                        "proposal_id": proposal,
+                        "tool_calls": [
+                            {
+                                "tool_name": "action_gateway",
+                                "arguments": {
+                                    "proposal_id": proposal,
+                                    "phase": "awaiting_confirmation",
+                                },
+                            }
+                        ],
+                    },
+                ),
+            ),
+            trace,
+            expected_run_status="failed",
+            expected_runtime_status="paused",
+            evidence_setup=controlled_setup(
+                proposal,
+                committed=False,
+                gateway_phase="awaiting_confirmation",
+            ),
+            linked_failure=True,
+        )
+        check(
+            f"{label}: runtime_status mismatch is the visible failure",
+            any(
+                item.get("key") == "runtime_status"
+                and item.get("status") == "fail"
+                for item in payload["rule_results"]
+            ),
+        )
+
+    awaiting_parameters_case = make_case(
+        "paused-awaiting-parameters-without-confirmation",
+        "paused",
+    )
+    awaiting_parameters_trace = "s10h2-paused-awaiting-parameters-trace"
+
+    def awaiting_parameters_setup(session_id: str, trace_id: str) -> None:
+        del session_id
+        db.record_trace_event(
+            trace_id,
+            "action_gateway",
+            "success",
+            metadata={
+                "workflow_status": "paused",
+                "proposal_id": None,
+            },
+        )
+
+    awaiting_parameters_payload = execute(
+        "paused-awaiting-parameters-is-not-confirmation",
+        awaiting_parameters_case,
+        (
+            _sse("delta", {"content": "please provide missing parameters"}),
+            _sse(
+                "done",
+                {
+                    "status": "paused",
+                    "trace_id": awaiting_parameters_trace,
+                    "runtime_path": "controlled_action",
+                    "tool_calls": [
+                        {
+                            "tool_name": "action_gateway",
+                            "arguments": {"phase": "awaiting_parameters"},
+                        }
+                    ],
+                },
+            ),
+        ),
+        awaiting_parameters_trace,
+        expected_run_status="failed",
+        expected_runtime_status="paused",
+        evidence_setup=awaiting_parameters_setup,
+        linked_failure=True,
+    )
+    check(
+        "paused awaiting_parameters without Proposal/Draft is not confirmation evidence",
+        any(
+            item.get("key") == "paused_controlled_action_evidence"
+            and item.get("status") == "fail"
+            for item in awaiting_parameters_payload["rule_results"]
+        ),
+    )
+
+    comment_case = make_case("complete-with-transport-comments")
+    comment_trace = "s10h2-complete-comments-trace"
+    execute(
+        "complete-with-only-post-done-comments",
+        comment_case,
+        (
+            _sse("delta", {"content": "normal complete answer"}),
+            _sse(
+                "done",
+                {"status": "complete", "trace_id": comment_trace},
+            ),
+            ": transport-flush\n\n",
+            "\n: keep-alive\n\n",
+        ),
+        comment_trace,
+        expected_run_status="passed",
+        expected_runtime_status="complete",
+    )
+
+    invalid_expected = client.post(
+        "/api/evaluations/cases",
+        json={
+            "case_key": "S10H2-INVALID-EXPECTED-STATUS",
+            "title": "invalid expected runtime status",
+            "user_message": "must be rejected without running",
+            "rubric": {
+                "deterministic_assertions": {
+                    "expected_runtime_status": "unknown",
+                }
+            },
+        },
+    )
+    check(
+        "invalid expected_runtime_status is rejected at case configuration",
+        invalid_expected.status_code == 400,
+    )
+    check(
+        "runtime-status contract suite has zero Provider attempt delta",
+        provider_attempt_count() == initial_provider_attempts,
+    )
 
 
 def assert_successful_badcase_retest(client: TestClient) -> None:
@@ -1253,6 +1824,38 @@ def assert_evaluation_linked_retest_compatibility(client: TestClient) -> None:
     )
 
 
+def assert_frontend_runtime_status_source_contract() -> None:
+    """Supplement behavior tests with a narrow, explicitly static UI contract."""
+
+    html = (ROOT / "frontend" / "index.html").read_text(encoding="utf-8")
+    check(
+        "frontend source contract has the expected-runtime-status select",
+        "evaluation-case-runtime-status" in html,
+    )
+    check(
+        "frontend source contract exposes the three business labels",
+        all(
+            label in html
+            for label in (
+                "正常完成回复（complete，默认）",
+                "等待业主确认（paused）",
+                "受控写入完成（completed）",
+            )
+        ),
+    )
+    check(
+        "frontend source contract stores status in the existing rubric",
+        "expected_runtime_status: $('#evaluation-case-runtime-status').value"
+        in html,
+    )
+    check(
+        "frontend source contract renders expected and actual runtime status",
+        "runtimeStatusRule" in html
+        and "ruleValueText(rule, 'expected')" in html
+        and "ruleValueText(rule, 'actual')" in html,
+    )
+
+
 def main() -> None:
     original_evaluation_gate = evaluation_api._background_budget_gate
     original_badcase_gate = badcase_api._background_budget_gate
@@ -1270,11 +1873,13 @@ def main() -> None:
             lambda _operation: dict(AVAILABLE_BUDGET)
         )
         assert_evaluation_http_contract(client)
+        assert_evaluation_runtime_status_contract(client)
         assert_successful_badcase_retest(client)
         assert_failed_badcase_retests(client)
         assert_retest_concurrent_apply_change(client)
         assert_retest_evidence_gate(client)
         assert_evaluation_linked_retest_compatibility(client)
+        assert_frontend_runtime_status_source_contract()
         check(
             "S10-H full suite has zero Provider attempt delta",
             provider_attempt_count() == initial_provider_attempts,

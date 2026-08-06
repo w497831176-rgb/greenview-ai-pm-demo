@@ -75,6 +75,7 @@ def test_rule_engine() -> None:
         "rubric": {},
     }
     done = {
+        "status": "complete",
         "current_agent_id": "maintenance",
         "activated_skills": ["维修工单处理"],
         "mcp_calls": [{"server_name": "weather-server", "tool_name": "get_current_weather"}],

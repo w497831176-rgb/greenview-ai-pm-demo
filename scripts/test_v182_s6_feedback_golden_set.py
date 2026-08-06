@@ -311,7 +311,11 @@ def main() -> None:
         ),
     ]
     for case, answer, done in five_contracts:
-        rules, status = evaluation_api.evaluate_runtime_evidence(case, answer, done)
+        rules, status = evaluation_api.evaluate_runtime_evidence(
+            case,
+            answer,
+            {**done, "status": "complete"},
+        )
         assert status == "passed", [item for item in rules if item["status"] == "fail"]
 
     # 12. Controlled-failure canary is visible but excluded from Golden stats.
