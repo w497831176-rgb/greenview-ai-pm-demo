@@ -18,6 +18,7 @@ from app.runtime.coordinator import (
     _results_from_snapshot,
     _static_response_stream,
 )
+from app.runtime.mcp_executor import _evaluate_read_tool_result
 
 
 def _grounded_answer_contract():
@@ -394,6 +395,13 @@ def test_calculation_input_does_not_weaken_policy_value_citations():
         items=[_evidence_item("每个种植舱每天需要3份标准营养液。")],
         query=query,
     )
+    _, result_summary, tool_evidence = _evaluate_read_tool_result(
+        {"structured_content": {"result": 84.0}},
+        {},
+        invocation_id="tool_calculation_84",
+        server_name="calculator",
+        tool_name="multiply",
+    )
     rendered, citations, violations = render_citations(
         "连续7天是用户给定的计算输入；每舱每天3份。"
         "[[evidence:ev_test]]\n\n计算：4 × 7 × 3 = 84份。",
@@ -402,10 +410,8 @@ def test_calculation_input_does_not_weaken_policy_value_citations():
             {
                 "invocation_status": "success",
                 "business_status": "success",
-                "result_summary": (
-                    "content='84.0' metadata={'structured_content': "
-                    "{'result': 84.0}}"
-                ),
+                "result_summary": result_summary,
+                "tool_evidence": tool_evidence.model_dump(mode="json"),
             }
         ],
     )

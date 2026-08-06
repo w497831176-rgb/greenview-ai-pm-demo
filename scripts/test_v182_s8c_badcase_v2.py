@@ -14,6 +14,7 @@ from app.badcase_schema import _enrich_badcase, user_status_label
 from app.runtime.badcase_capture import runtime_badcase_decision
 from app.runtime.citation_renderer import build_skill_evidence, render_citations
 from app.runtime.contracts import EvidenceItem, EvidenceSet, RunEvidenceLedger
+from app.runtime.mcp_executor import _evaluate_read_tool_result
 from db import property_db
 
 
@@ -87,9 +88,9 @@ check("10 normal not-found creates nothing", decide(ledger(tool_invocations=[emp
 check("11 cost-only issue is observation", decide(ledger(contract_violations=violation("cost_usage_unavailable")))["disposition"] == "system_observation")
 check("12 latency-only issue is observation", decide(ledger(contract_violations=violation("latency_observability")))["disposition"] == "system_observation")
 
-# Legal evidence: user, Skill, RAG, Tool and Receipt.
+# Legal property evidence: Skill, RAG, successful Tool and committed Receipt.
 rendered, citations, issues = render_citations("需要等待3天", EvidenceSet(query="需要等待3天"))
-check("13 user-provided value is legal evidence", not any(i.get("code") == "ungrounded_critical_value" for i in issues))
+check("13 user-provided value is not result evidence", any(i.get("code") == "ungrounded_critical_value" for i in issues))
 skill_source = {"skill_id": 17, "name": "宠物托管", "version": "1.0.1", "snapshot_id": "snap-26", "content_hash": "skill-hash", "content_snapshot": "提供24小时托管，收费100元/天，电话077512345678。"}
 answer = "可以24小时托管，收费100元/天，电话077512345678。"
 rendered, citations, issues = render_citations(answer, EvidenceSet(query="宠物托管多少钱？"), skill_sources=[skill_source])
@@ -99,10 +100,29 @@ check("15 Skill evidence identity is complete", bool(skill_items) and all(skill_
 check("16 Skill evidence keeps supporting excerpt", "100元" in skill_items[0]["supporting_excerpt"] and "24小时" in skill_items[0]["supporting_excerpt"] and "077512345678" in skill_items[0]["supporting_excerpt"])
 rendered, citations, issues = render_citations("收费100元【引用1】", evidence("收费100元。"))
 check("17 adopted RAG evidence grounds value", bool(citations) and not any(i.get("code") == "ungrounded_critical_value" for i in issues))
-tool_ok = {"invocation_status": "success", "business_status": "success", "result_summary": "{'result': 100}"}
+_, tool_summary, tool_evidence = _evaluate_read_tool_result(
+    {"status": "success", "data": {"fee_yuan": 100}},
+    {},
+    invocation_id="tool_fee_100",
+    server_name="fee-server",
+    tool_name="lookup_fee",
+)
+tool_ok = {
+    "invocation_status": "success",
+    "business_status": "success",
+    "result_summary": tool_summary,
+    "tool_evidence": tool_evidence.model_dump(mode="json"),
+}
 rendered, citations, issues = render_citations("查询结果是100元", EvidenceSet(), tool_invocations=[tool_ok])
 check("18 successful Tool result grounds value", not any(i.get("code") == "ungrounded_critical_value" for i in issues))
-receipt = {"status": "committed", "result": {"fee": "100元"}}
+receipt = {
+    "receipt_id": "receipt_100",
+    "proposal_id": "proposal_100",
+    "idempotency_key": "idem_100",
+    "status": "committed",
+    "resource_id": "resource_100",
+    "result": {"fee": "100元"},
+}
 rendered, citations, issues = render_citations("正式回执费用100元", EvidenceSet(), action_receipts=[receipt])
 check("19 committed Receipt grounds value", not any(i.get("code") == "ungrounded_critical_value" for i in issues))
 

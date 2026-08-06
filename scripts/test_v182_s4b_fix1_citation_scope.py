@@ -2,6 +2,7 @@
 
 from app.runtime.citation_renderer import render_citations
 from app.runtime.contracts import EvidenceItem, EvidenceSet, ToolEffect, ToolInvocation
+from app.runtime.mcp_executor import _evaluate_read_tool_result
 
 
 def _evidence(evidence_id: str, chunk_index: int, content: str) -> EvidenceItem:
@@ -51,7 +52,16 @@ def _mars_evidence() -> EvidenceSet:
 
 
 def _successful_multiply(a: float, b: float, result: float) -> ToolInvocation:
+    invocation_id = f"tool_multiply_{a}_{b}"
+    _, result_summary, tool_evidence = _evaluate_read_tool_result(
+        {"structured_content": {"result": result}},
+        {},
+        invocation_id=invocation_id,
+        server_name="mars-calculator-mcp",
+        tool_name="multiply",
+    )
     return ToolInvocation(
+        invocation_id=invocation_id,
         server_name="mars-calculator-mcp",
         tool_name="multiply",
         effect=ToolEffect.READ,
@@ -60,10 +70,8 @@ def _successful_multiply(a: float, b: float, result: float) -> ToolInvocation:
         transport_status="success",
         invocation_status="success",
         business_status="success",
-        result_summary=(
-            f"content='{result}' metadata={{'structured_content': "
-            f"{{'result': {result}}}}}"
-        ),
+        result_summary=result_summary,
+        tool_evidence=tool_evidence,
     )
 
 

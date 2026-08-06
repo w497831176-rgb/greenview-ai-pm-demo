@@ -803,11 +803,34 @@
 
     async function openTraceDrawer(traceId) {
       try {
-        const [data, runtimeEvidenceData] = await Promise.all([
+        const [data, runtimeEvidenceResult] = await Promise.all([
           apiGet(`/api/observability/traces/${traceId}`),
-          apiGet(`/api/runtime/traces/${traceId}/evidence`).catch(() => ({}))
+          apiGet(`/api/runtime/traces/${traceId}/evidence`)
+            .then(payload => ({ ok: true, payload }))
+            .catch(error => ({ ok: false, error }))
         ]);
+        const runtimeEvidenceData = runtimeEvidenceResult.ok ? runtimeEvidenceResult.payload : {};
         const runtimeEvidence = runtimeEvidenceData.ledger || {};
+        const evidenceProjection = runtimeEvidenceData.projection || {};
+        const evidenceProjectionAvailable = runtimeEvidenceResult.ok
+          && Array.isArray(evidenceProjection.retrieved_rag_candidates)
+          && Array.isArray(evidenceProjection.adopted_rag)
+          && Array.isArray(evidenceProjection.unused_rag);
+        const retrievedCitations = evidenceProjectionAvailable ? evidenceProjection.retrieved_rag_candidates : [];
+        const usedCitations = evidenceProjectionAvailable ? evidenceProjection.adopted_rag : [];
+        const candidateCitations = evidenceProjectionAvailable ? evidenceProjection.unused_rag : [];
+        const toolEvidenceLinks = evidenceProjectionAvailable && Array.isArray(evidenceProjection.tool_evidence_links)
+          ? evidenceProjection.tool_evidence_links
+          : [];
+        const withheldEvidence = evidenceProjectionAvailable && Array.isArray(evidenceProjection.withheld)
+          ? evidenceProjection.withheld
+          : [];
+        const projectedViolations = evidenceProjectionAvailable && Array.isArray(evidenceProjection.violation)
+          ? evidenceProjection.violation
+          : [];
+        const evidenceUnavailableHtml = evidenceProjectionAvailable
+          ? ''
+          : `<section class="rounded-xl border border-rose-200 bg-rose-50 p-4"><h4 class="font-semibold text-rose-900">运行证据暂时无法核实</h4><p class="mt-1 text-sm text-rose-800">Evidence Ledger 读取失败，本页不会把未知候选、采用证据或 Tool 依据显示为 0 或“无”。</p></section>`;
         const laneDecision = runtimeEvidence.lane_decision || {};
         const answerContract = runtimeEvidence.answer_contract || {};
         const capabilityDecision = runtimeEvidence.capability_decision || {};
@@ -862,10 +885,9 @@
         const mcpHtml = mcpCalls.length ? mcpCalls.map(call => `<div class="border border-slate-200 rounded-xl p-3 text-sm"><div class="font-medium text-slate-900">${escapeHtml(call.server_name || 'unknown')} · ${escapeHtml(call.tool_name || '-')}</div><div class="text-xs text-slate-500 mt-1">${call.invocation_mode === 'policy_preinvoke' ? '系统策略预调用' : 'Agent 自主调用'} · ${escapeHtml(mcpOutcomeLabel[call.status] || call.status || '未知')}</div><div class="text-xs text-slate-500 mt-1">参数：${escapeHtml(safeTraceJson(call.arguments || call.args || {}))}</div><div class="text-xs text-slate-600 mt-1">结果摘要：${escapeHtml(maskTraceText((call.result_summary || call.error_summary || '无').slice(0, 240)))}</div></div>`).join('') : (isControlledWorkOrderTrace
           ? '<p class="text-sm text-slate-500">本轮未调用MCP；正式写入由内部工单服务完成。</p>'
           : '<p class="text-sm text-slate-400">本轮未调用 MCP 工具。</p>');
-        const citations = assistantMsg.citations || [];
-        const usedCitations = citations.filter(c => c.used_in_answer === true);
-        const candidateCitations = citations.filter(c => c.used_in_answer !== true);
-        const citationList = items => items.length ? `<ol class="text-xs text-slate-600 list-decimal list-inside space-y-2">${items.map(c => {
+        const citationList = (items, unavailable = false) => unavailable
+          ? '<p class="text-sm text-rose-700">证据账本不可用，当前无法核实。</p>'
+          : items.length ? `<ol class="text-xs text-slate-600 list-decimal list-inside space-y-2">${items.map(c => {
           const rawExcerpt = String(c.content || c.content_snapshot || c.excerpt || '').trim();
           const excerpt = rawExcerpt ? `${rawExcerpt.slice(0, 160)}${rawExcerpt.length > 160 ? '…' : ''}` : '';
           return `<li><span>《${escapeHtml(c.doc_title || '未知文档')}》 · 分片 ${escapeHtml(String(c.chunk_index ?? '-'))}</span><div class="mt-1 ml-4 text-[11px] text-slate-500">${excerpt ? `证据摘录：${escapeHtml(excerpt)}` : '请从回答引用查看证据原文'}</div></li>`;
@@ -925,17 +947,30 @@
         const evaluationRun = data.evaluation_run;
         const evaluationHtml = evaluationRun ? `<div class="bg-violet-50 border border-violet-200 rounded-xl p-3 text-sm space-y-1"><div class="font-medium text-violet-900">Golden Set 评估运行 #${escapeHtml(String(evaluationRun.id || '-'))}</div><div class="text-xs text-violet-700">状态：${escapeHtml(evaluationRun.status || '-')} · 风险：${escapeHtml(trace.risk_level || '-')} · 用例 ID：${escapeHtml(String(trace.evaluation_case_id || '-'))}</div><div class="text-xs text-violet-700">该 Trace 是操作员主动运行的质量验证，不等同于线上 SLA 或自动放量。</div></div>` : '';
         const config = runtimeEvidence.config_snapshot || {};
-        const violations = runtimeEvidence.contract_violations || [];
-        const runtimeContractHtml = Object.keys(runtimeEvidence).length ? `
+        const violations = projectedViolations;
+        const runtimeContractHtml = evidenceProjectionAvailable ? `
           <div class="rounded-xl border ${violations.length ? 'border-amber-200 bg-amber-50' : 'border-emerald-200 bg-emerald-50'} p-3 text-sm">
             <div class="font-medium ${violations.length ? 'text-amber-900' : 'text-emerald-900'}">V1.8 Evidence Ledger</div>
             <div class="mt-1 text-xs text-slate-700">Release：${escapeHtml(config.release_id || '-')} · Snapshot：${escapeHtml(config.snapshot_id || '-')}</div>
+            <div class="mt-1 text-xs text-slate-700">RAG 候选 ${retrievedCitations.length} · 采用 ${usedCitations.length} · 未采用 ${candidateCitations.length} · Tool 依据 ${toolEvidenceLinks.length}</div>
             <div class="mt-1 text-xs text-slate-700">Proposal ${proposals.length} · Approval ${approvals.length} · Receipt ${receipts.length} · Contract violation ${violations.length}</div>
             ${violations.length ? `<details class="mt-2"><summary class="text-xs cursor-pointer">查看契约违规</summary><pre class="mt-1 text-[10px] bg-white/70 p-2 rounded overflow-x-auto">${escapeHtml(safeTraceJson(violations))}</pre></details>` : ''}
           </div>` : '';
+        const withheldEvidenceHtml = withheldEvidence.length ? `<section class="rounded-xl border border-amber-200 bg-amber-50 p-4"><h4 class="font-semibold text-amber-950">未交付的事实与原因</h4><p class="mt-1 text-sm text-amber-900">本轮有 ${withheldEvidence.length} 项内容在交付前被拦截；下方原因直接来自后端运行证据投影。</p><pre class="mt-2 overflow-x-auto rounded bg-white/70 p-2 text-[10px]">${escapeHtml(safeTraceJson(withheldEvidence))}</pre></section>` : '';
+        const toolEvidenceHtml = evidenceProjectionAvailable
+          ? (toolEvidenceLinks.length
+              ? `<div><h4 class="font-medium text-slate-900 mb-2">最终回答采用的 ToolEvidence</h4><pre class="text-[10px] bg-white rounded-lg p-2 border border-slate-200 overflow-x-auto">${escapeHtml(safeTraceJson(toolEvidenceLinks))}</pre></div>`
+              : '<div><h4 class="font-medium text-slate-900 mb-2">最终回答采用的 ToolEvidence</h4><p class="text-sm text-slate-400">无</p></div>')
+          : '<div><h4 class="font-medium text-slate-900 mb-2">最终回答采用的 ToolEvidence</h4><p class="text-sm text-rose-700">证据账本不可用，当前无法核实。</p></div>';
         const reconciliationSummary = data.reconciliation_summary || {};
         const providerRequestCount = Number(reconciliationSummary.included_in_provider_summary_count ?? reconciliationSummary.provider_request_sent_count ?? 0);
-        const summaryText = maskTraceText([`Trace ID：${traceId}`, `Release：${config.release_id || '-'}`, `Snapshot：${config.snapshot_id || '-'}`, `当前 Agent：${currentAgent} (${currentAgentId})`, `激活 Skill：${skills.join('、') || '无'}`, `Provider 请求：${providerRequestCount} 次`, `逻辑/历史记录：${logicalModelRecords.length} 条（不计Provider汇总）`, `MCP 调用：${mcpCalls.length} 次`, `受控写入：${isControlledWorkOrderTrace ? '创建维修工单（ActionGateway）' : '无'}`, `回答实际引用：${usedCitations.map(c => `《${c.doc_title}》分片${c.chunk_index}`).join('、') || '无'}`, `契约违规：${violations.length}`, `链路事件：${traceEvents.map(e => spanLabels[e.span_name] || e.span_name).join(' → ') || '历史 Trace 无 span 记录'}`].join('\n'));
+        const actualCitationSummary = evidenceProjectionAvailable
+          ? (usedCitations.map(c => `《${c.doc_title}》分片${c.chunk_index}`).join('、') || '无')
+          : '运行证据不可用，无法核实';
+        const ragAdoptionSummary = evidenceProjectionAvailable
+          ? `候选 ${retrievedCitations.length} 条，采用 ${usedCitations.length} 条，未采用 ${candidateCitations.length} 条`
+          : '运行证据不可用，无法核实';
+        const summaryText = maskTraceText([`Trace ID：${traceId}`, `Release：${config.release_id || '-'}`, `Snapshot：${config.snapshot_id || '-'}`, `当前 Agent：${currentAgent} (${currentAgentId})`, `激活 Skill：${skills.join('、') || '无'}`, `Provider 请求：${providerRequestCount} 次`, `逻辑/历史记录：${logicalModelRecords.length} 条（不计Provider汇总）`, `MCP 调用：${mcpCalls.length} 次`, `受控写入：${isControlledWorkOrderTrace ? '创建维修工单（ActionGateway）' : '无'}`, `RAG 证据：${ragAdoptionSummary}`, `回答实际引用：${actualCitationSummary}`, `契约违规：${evidenceProjectionAvailable ? violations.length : '无法核实'}`, `链路事件：${traceEvents.map(e => spanLabels[e.span_name] || e.span_name).join(' → ') || '历史 Trace 无 span 记录'}`].join('\n'));
         const controlledWriteConfirmed = Boolean(controlledReceipt && controlledReceipt.status === 'committed' && controlledReceipt.receipt_id && controlledReceipt.resource_id);
         const controlledWriteSummaryHtml = isControlledWorkOrderTrace ? `<div class="rounded-xl border ${controlledWriteConfirmed ? 'border-emerald-200 bg-emerald-50' : 'border-amber-200 bg-amber-50'} p-3 text-sm"><div class="font-medium text-slate-900">受控业务写入</div><div class="mt-1 text-xs text-slate-700">本轮通过 ActionGateway（受控业务写入网关）执行维修工单操作；${controlledWriteConfirmed ? '正式回执证明写入成功。' : '当前证据不足以证明写入成功。'}</div><div class="mt-1 text-xs text-slate-600">它不是 MCP/Tool 调用；业主确认也不等同于人工接管。</div></div>` : '';
         const laneLabels = { A_SAFETY_HANDOFF: 'A路：安全人工协同', B_PROPERTY_GOVERNED: 'B路：物业受控回答', C_ISOLATED_GENERAL: 'C路：隔离通用回答', CLARIFY: '需澄清' };
@@ -947,12 +982,12 @@
         const adoptedEvidence = [
           skills.length ? `${skills.length}项已激活Skill` : '',
           usedCitations.length ? `${usedCitations.length}条已采用RAG引用` : '',
-          (runtimeEvidence.tool_invocations || []).length ? `${(runtimeEvidence.tool_invocations || []).length}次Tool结果` : '',
+          toolEvidenceLinks.length ? `${toolEvidenceLinks.length}条已采用ToolEvidence` : '',
           receipts.length ? `${receipts.length}份Receipt` : '',
           (runtimeEvidence.handoff_events || []).length ? `${(runtimeEvidence.handoff_events || []).length}次Handoff` : ''
-        ].filter(Boolean).join('、') || '无业务Evidence；如属物业事实，系统必须澄清或说明依据不足';
+        ].filter(Boolean).join('、') || (evidenceProjectionAvailable ? '无业务Evidence；如属物业事实，系统必须澄清或说明依据不足' : '运行证据不可用，无法核实');
         const decisionContractHtml = Object.keys(laneDecision).length ? `<section class="rounded-xl border border-indigo-200 bg-indigo-50 p-4"><h4 class="font-semibold text-indigo-950">本轮判断与回答边界</h4><div class="mt-2 grid gap-2 sm:grid-cols-2 text-sm"><div><span class="text-indigo-700">进入哪一路</span><div class="font-medium text-slate-900">${escapeHtml(laneLabels[laneDecision.lane] || '历史记录未采集')}</div></div><div><span class="text-indigo-700">回答模式</span><div class="font-medium text-slate-900">${escapeHtml(modeLabels[answerContract.response_mode] || '历史记录未采集')}</div></div></div><p class="mt-2 text-sm text-indigo-900">为什么：${escapeHtml(laneDecision.reason || laneDecision.explanation || '历史记录未采集结构化原因')}</p><p class="mt-2 text-xs text-slate-700">能力执行：${escapeHtml([capabilityLabel('Skill', capabilityDecision.skill), capabilityLabel('RAG', capabilityDecision.rag), capabilityLabel('Tool', capabilityDecision.tool), capabilityLabel('写入', capabilityDecision.write), capabilityLabel('人工协同', capabilityDecision.handoff)].join('；'))}</p><p class="mt-1 text-xs text-slate-700">最终依据：${escapeHtml(adoptedEvidence)}</p><details class="mt-2"><summary class="cursor-pointer text-xs text-indigo-700">高级信息：查看结构化决策Schema</summary><pre class="mt-2 overflow-x-auto rounded bg-white/70 p-2 text-[10px]">${escapeHtml(safeTraceJson({ lane_decision: laneDecision, answer_contract: answerContract, capability_decision: capabilityDecision }))}</pre></details></section>` : '';
-        const html = `<div class="space-y-5"><section class="rounded-xl border border-blue-200 bg-blue-50 p-4"><h4 class="font-semibold text-blue-950">本轮发生了什么</h4><p class="mt-1 text-sm text-blue-900">由 Agent（AI处理角色）“${escapeHtml(currentAgent)}”处理；加载 ${skills.length} 项 Skill（业务规则），产生 ${providerRequestCount} 次 Provider 请求、${mcpCalls.length} 次 MCP/Tool 调用，回答采用 ${usedCitations.length} 条 RAG（知识依据）。</p><div class="mt-3 grid gap-2 sm:grid-cols-3 text-xs"><div class="rounded-lg bg-white/70 p-2"><span class="text-slate-500">处理角色</span><div class="mt-1 font-medium text-slate-900">${escapeHtml(currentAgent)}</div></div><div class="rounded-lg bg-white/70 p-2"><span class="text-slate-500">已加载业务规则</span><div class="mt-1 font-medium text-slate-900">${escapeHtml(skills.join('、') || '无')}</div></div><div class="rounded-lg bg-white/70 p-2"><span class="text-slate-500">回答依据</span><div class="mt-1 font-medium text-slate-900">${escapeHtml(adoptedEvidence)}</div></div></div><p class="mt-3 text-xs text-blue-800">Provider actual 是当次响应里的Token证据；人民币金额由平台冻结价格快照换算，不是DeepSeek最终账单。Trace不能替代控制台按API Key与时间窗的人工核对。</p><div class="mt-2 text-[10px] text-blue-700">辅助编号：${escapeHtml(traceId)}</div></section>${decisionContractHtml}<section><h4 class="font-medium text-slate-900 mb-2">Provider请求与平台直接成本结论</h4>${costSummaryHtml}</section>${controlledWriteSummaryHtml}<section><h4 class="font-medium text-slate-900 mb-2">回答实际采用的RAG证据</h4>${citationList(usedCitations)}<p class="mt-2 text-xs text-slate-500">仅检索到但未写入回答的候选不能证明回答有依据。</p></section><details class="rounded-xl border border-slate-200 bg-slate-50 p-4"><summary class="font-medium text-slate-800 cursor-pointer">高级信息：查看ID、Snapshot、Span与逐次技术证据</summary><div class="mt-4 space-y-5">${runtimeContractHtml}${evaluationHtml}${controlledWriteEvidenceHtml}${workflowHtml ? `<div><h4 class="font-medium text-slate-900 mb-2">业务工作流</h4>${workflowHtml}</div>` : ''}<div><h4 class="font-medium text-slate-900 mb-2">链路事件（Span）</h4>${eventHtml}</div><div><h4 class="font-medium text-slate-900 mb-2">逐次Provider请求、Token与平台价格快照计算明细</h4><div class="space-y-2">${modelCards}</div></div><div><h4 class="font-medium text-slate-900 mb-2">逻辑聚合与历史记录</h4>${renderLogicalModelRecords(logicalModelRecords)}</div><div><h4 class="font-medium text-slate-900 mb-2">MCP Server / Tool 技术证据</h4><div class="space-y-2">${mcpHtml}</div></div><div><h4 class="font-medium text-slate-900 mb-2">未采用的RAG候选</h4>${citationList(candidateCitations)}</div></div></details><button type="button" id="trace-copy-summary" class="w-full px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white rounded-xl text-sm transition-colors">复制Trace证据摘要</button></div>`;
+        const html = `<div class="space-y-5">${evidenceUnavailableHtml}<section class="rounded-xl border border-blue-200 bg-blue-50 p-4"><h4 class="font-semibold text-blue-950">本轮发生了什么</h4><p class="mt-1 text-sm text-blue-900">由 Agent（AI处理角色）“${escapeHtml(currentAgent)}”处理；加载 ${skills.length} 项 Skill（业务规则），产生 ${providerRequestCount} 次 Provider 请求、${mcpCalls.length} 次 MCP/Tool 调用；RAG 证据：${escapeHtml(ragAdoptionSummary)}。</p><div class="mt-3 grid gap-2 sm:grid-cols-3 text-xs"><div class="rounded-lg bg-white/70 p-2"><span class="text-slate-500">处理角色</span><div class="mt-1 font-medium text-slate-900">${escapeHtml(currentAgent)}</div></div><div class="rounded-lg bg-white/70 p-2"><span class="text-slate-500">已加载业务规则</span><div class="mt-1 font-medium text-slate-900">${escapeHtml(skills.join('、') || '无')}</div></div><div class="rounded-lg bg-white/70 p-2"><span class="text-slate-500">回答依据</span><div class="mt-1 font-medium text-slate-900">${escapeHtml(adoptedEvidence)}</div></div></div><p class="mt-3 text-xs text-blue-800">Provider actual 是当次响应里的Token证据；人民币金额由平台冻结价格快照换算，不是DeepSeek最终账单。Trace不能替代控制台按API Key与时间窗的人工核对。</p><div class="mt-2 text-[10px] text-blue-700">辅助编号：${escapeHtml(traceId)}</div></section>${decisionContractHtml}${withheldEvidenceHtml}<section><h4 class="font-medium text-slate-900 mb-2">Provider请求与平台直接成本结论</h4>${costSummaryHtml}</section>${controlledWriteSummaryHtml}<section><h4 class="font-medium text-slate-900 mb-2">回答实际采用的RAG证据</h4>${citationList(usedCitations, !evidenceProjectionAvailable)}<p class="mt-2 text-xs text-slate-500">仅检索到但未写入回答的候选不能证明回答有依据。</p></section><details class="rounded-xl border border-slate-200 bg-slate-50 p-4"><summary class="font-medium text-slate-800 cursor-pointer">高级信息：查看ID、Snapshot、Span与逐次技术证据</summary><div class="mt-4 space-y-5">${runtimeContractHtml}${evaluationHtml}${controlledWriteEvidenceHtml}${workflowHtml ? `<div><h4 class="font-medium text-slate-900 mb-2">业务工作流</h4>${workflowHtml}</div>` : ''}<div><h4 class="font-medium text-slate-900 mb-2">链路事件（Span）</h4>${eventHtml}</div><div><h4 class="font-medium text-slate-900 mb-2">逐次Provider请求、Token与平台价格快照计算明细</h4><div class="space-y-2">${modelCards}</div></div><div><h4 class="font-medium text-slate-900 mb-2">逻辑聚合与历史记录</h4>${renderLogicalModelRecords(logicalModelRecords)}</div><div><h4 class="font-medium text-slate-900 mb-2">MCP Server / Tool 技术证据</h4><div class="space-y-2">${mcpHtml}</div></div>${toolEvidenceHtml}<div><h4 class="font-medium text-slate-900 mb-2">未采用的RAG候选</h4>${citationList(candidateCitations, !evidenceProjectionAvailable)}</div></div></details><button type="button" id="trace-copy-summary" class="w-full px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white rounded-xl text-sm transition-colors">复制Trace证据摘要</button></div>`;
         openDrawer('Trace（运行调用记录）证据', html);
         setTimeout(() => { const button = $('#trace-copy-summary'); if (button) button.addEventListener('click', async () => { try { await navigator.clipboard.writeText(summaryText); showToast('Trace 摘要已复制', 'success'); } catch (_) { showToast('复制失败', 'error'); } }); }, 0);
       } catch (err) {

@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field
 
 from app.runtime.agent_factory import vertical_agent_cards
 from app.runtime.contracts import RuntimePath, ToolEffect
+from app.runtime.evidence_ledger import project_evidence_for_trace
 from app.runtime.release_compiler import (
     diff_runtime_configs,
     preview_runtime_release,
@@ -349,7 +350,14 @@ async def trace_evidence(trace_id: str):
     ledger = get_evidence_ledger(trace_id)
     if not ledger:
         raise HTTPException(status_code=404, detail="evidence ledger not found")
-    return {"evidence": ledger, "ledger": ledger.get("ledger") or {}}
+    frozen_ledger = ledger.get("ledger") or {}
+    projection = project_evidence_for_trace(frozen_ledger)
+    return {
+        "evidence": ledger,
+        "ledger": frozen_ledger,
+        "projection": projection,
+        **projection,
+    }
 
 
 @router.post("/cost-preview/retrieval")
