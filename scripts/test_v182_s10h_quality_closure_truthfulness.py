@@ -105,6 +105,11 @@ def _sse(event: str, payload: Dict[str, Any]) -> str:
     )
 
 
+def _raw_sse(event: str, raw_payload: str) -> str:
+    """Build an SSE frame whose data is intentionally not normalized JSON."""
+    return f"event: {event}\ndata: {raw_payload}\n\n"
+
+
 def _persist_trace(
     trace_id: str,
     session_id: str,
@@ -182,41 +187,49 @@ def _new_retest_case(
     ) or case
 
 
-def _successful_evaluation_stub(
-    trace_prefix: str,
-) -> Callable[[str, str], Any]:
-    async def run(message: str, session_id: str):
-        trace_id = f"{trace_prefix}-{session_id[-8:]}"
-        _persist_trace(trace_id, session_id, message, status="complete")
-        return (
-            "客服已依据真实流程完成回答。",
-            {
-                "status": "complete",
-                "trace_id": trace_id,
-                "current_agent": "客服 Agent",
-                "current_agent_id": "customer_service",
-                "route_intent": "customer_service",
-                "activated_skills": [],
-                "tool_calls": [],
-                "mcp_calls": [],
-                "citations": [],
-                "handoff": False,
-                "decision_summary": {
-                    "agent": {
-                        "status": "selected",
-                        "agent_id": "customer_service",
-                    }
-                },
-            },
-        )
+def _evaluation_stream_stub(
+    chunks: Iterable[str],
+    *,
+    entries: list[Dict[str, str]],
+    trace_id: str | None = None,
+    trace_status: str = "complete",
+    trace_session_override: str | None = None,
+    raise_after: bool = False,
+) -> Callable[..., AsyncIterator[str]]:
+    """Replace only the SSE source below the real Evaluation runtime parser."""
 
-    return run
+    async def stream(
+        message: str,
+        session_id: str,
+        user_id: str = "evaluation",
+    ) -> AsyncIterator[str]:
+        entries.append(
+            {
+                "message": message,
+                "session_id": session_id,
+                "user_id": user_id,
+            }
+        )
+        if trace_id:
+            _persist_trace(
+                trace_id,
+                trace_session_override or session_id,
+                message,
+                status=trace_status,
+            )
+        for chunk in chunks:
+            yield chunk
+        if raise_after:
+            raise RuntimeError("deterministic stream interruption")
+
+    return stream
 
 
 def assert_evaluation_http_contract(client: TestClient) -> None:
     before_provider = provider_attempt_count()
     persistence_calls: list[Dict[str, Any]] = []
     original_create_run = evaluation_api.create_evaluation_run
+    real_runtime = evaluation_api._run_real_chat
 
     def counting_create_run(*args: Any, **kwargs: Any):
         persistence_calls.append(dict(kwargs))
@@ -225,18 +238,48 @@ def assert_evaluation_http_contract(client: TestClient) -> None:
     evaluation_api.create_evaluation_run = counting_create_run
     try:
         passing_case = db.create_evaluation_case(
-            case_key="S10H-EVALUATION-PASS",
-            title="S10-H Evaluation success",
-            user_message="请给出客服流程回答",
+            case_key="S10H1-EVALUATION-PASS",
+            title="S10-H.1 Evaluation terminal success",
+            user_message="Give the truthful-flow customer-service answer.",
             expected_agent_id="customer_service",
-            required_terms=["真实流程"],
+            required_terms=["truthful-flow"],
             status="active",
-            version_label="V1.8.2-S10-H",
+            version_label="V1.8.2-S10-H.1",
         )
-        evaluation_api._run_real_chat = _successful_evaluation_stub(
-            "s10h-evaluation-pass"
+        success_trace_id = "s10h1-evaluation-pass-trace"
+        success_entries: list[Dict[str, str]] = []
+        chat_api.stream_chat_response = _evaluation_stream_stub(
+            (
+                _sse("delta", {"content": "partial answer"}),
+                _sse(
+                    "final",
+                    {
+                        "content": "truthful-flow final answer",
+                        "current_agent": "Customer Service Agent",
+                        "current_agent_id": "customer_service",
+                    },
+                ),
+                _sse(
+                    "done",
+                    {
+                        "status": "complete",
+                        "trace_id": success_trace_id,
+                        "current_agent": "Customer Service Agent",
+                        "current_agent_id": "customer_service",
+                        "route_intent": "customer_service",
+                        "activated_skills": [],
+                        "tool_calls": [],
+                        "mcp_calls": [],
+                        "citations": [],
+                        "handoff": False,
+                    },
+                ),
+            ),
+            entries=success_entries,
+            trace_id=success_trace_id,
         )
         before_calls = len(persistence_calls)
+        success_provider_before = provider_attempt_count()
         response = client.post(
             f"/api/evaluations/cases/{passing_case['id']}/run",
             json={},
@@ -267,55 +310,362 @@ def assert_evaluation_http_contract(client: TestClient) -> None:
                 for item in payload["rule_results"]
             ),
         )
-
-        failing_case = db.create_evaluation_case(
-            case_key="S10H-EVALUATION-FAIL",
-            title="S10-H Evaluation runtime failure",
-            user_message="模拟真实运行失败",
-            status="active",
-            version_label="V1.8.2-S10-H",
+        check(
+            "Evaluation success enters the SSE source exactly once",
+            len(success_entries) == 1
+            and success_entries[0]["user_id"] == "evaluation",
+        )
+        check(
+            "Evaluation success uses the real runtime parser",
+            evaluation_api._run_real_chat is real_runtime,
+        )
+        check(
+            "Evaluation success creates zero Provider attempts",
+            provider_attempt_count() == success_provider_before,
         )
 
-        async def failed_runtime(message: str, session_id: str):
-            trace_id = f"s10h-evaluation-failed-{session_id[-8:]}"
-            _persist_trace(trace_id, session_id, message, status="failed")
-            raise evaluation_api.RuntimeExecutionError(
-                "deterministic runtime failure",
-                "",
+        failure_specs: list[Dict[str, Any]] = []
+
+        def add_failure(
+            label: str,
+            chunks: Iterable[str],
+            *,
+            expected_reason: str,
+            trace_id: str | None = None,
+            trace_status: str = "complete",
+            trace_session_override: str | None = None,
+            expected_trace_id: str | None = None,
+            raise_after: bool = False,
+        ) -> None:
+            failure_specs.append(
                 {
-                    "status": "failed",
+                    "label": label,
+                    "chunks": tuple(chunks),
+                    "expected_reason": expected_reason,
                     "trace_id": trace_id,
-                    "error_code": "deterministic_failure",
-                },
+                    "trace_status": trace_status,
+                    "trace_session_override": trace_session_override,
+                    "expected_trace_id": expected_trace_id,
+                    "raise_after": raise_after,
+                }
             )
 
-        evaluation_api._run_real_chat = failed_runtime
-        before_calls = len(persistence_calls)
-        failed_response = client.post(
-            f"/api/evaluations/cases/{failing_case['id']}/run",
-            json={},
-        )
-        check(
-            "Evaluation runtime failure is a controlled saved result",
-            failed_response.status_code == 200,
-        )
-        failed_payload = failed_response.json()
-        check(
-            "Evaluation failure is persisted exactly once as failed",
-            len(persistence_calls) == before_calls + 1
-            and len(db.list_evaluation_runs(int(failing_case["id"]))) == 1
-            and failed_payload["run"]["status"] == "failed",
-        )
-        check(
-            "Evaluation failure never fabricates PASS",
-            failed_payload["rule_results"]
-            and all(
-                item.get("status") == "fail"
-                for item in failed_payload["rule_results"]
+        trace = "s10h1-error-without-field"
+        add_failure(
+            "error-event-without-error-field",
+            (
+                _sse("final", {"content": "answer", "trace_id": trace}),
+                _sse("error", {"trace_id": trace}),
+                _sse("done", {"status": "complete", "trace_id": trace}),
             ),
+            expected_reason="evaluation_error_event",
+            trace_id=trace,
+            expected_trace_id=trace,
         )
+        trace = "s10h1-malformed-error"
+        add_failure(
+            "malformed-error-event",
+            (
+                _sse("final", {"content": "answer", "trace_id": trace}),
+                _raw_sse("error", "{malformed-error-json"),
+                _sse("done", {"status": "complete", "trace_id": trace}),
+            ),
+            expected_reason="evaluation_error_event_malformed",
+            trace_id=trace,
+            expected_trace_id=trace,
+        )
+        trace = "s10h1-missing-done"
+        add_failure(
+            "missing-done",
+            (_sse("delta", {"content": "answer", "trace_id": trace}),),
+            expected_reason="evaluation_done_missing",
+            trace_id=trace,
+            expected_trace_id=trace,
+        )
+        trace = "s10h1-duplicate-done"
+        add_failure(
+            "duplicate-done",
+            (
+                _sse("delta", {"content": "answer"}),
+                _sse("done", {"status": "complete", "trace_id": trace}),
+                _sse("done", {"status": "complete", "trace_id": trace}),
+            ),
+            expected_reason="evaluation_multiple_done_events",
+            trace_id=trace,
+            expected_trace_id=trace,
+        )
+        trace = "s10h1-malformed-done"
+        add_failure(
+            "malformed-done-json",
+            (
+                _sse("final", {"content": "answer", "trace_id": trace}),
+                _raw_sse("done", "{malformed-done-json"),
+            ),
+            expected_reason="evaluation_done_malformed",
+            trace_id=trace,
+            expected_trace_id=trace,
+        )
+        trace = "s10h1-done-list"
+        add_failure(
+            "done-json-list",
+            (
+                _sse("final", {"content": "answer", "trace_id": trace}),
+                _raw_sse("done", "[]"),
+            ),
+            expected_reason="evaluation_done_malformed",
+            trace_id=trace,
+            expected_trace_id=trace,
+        )
+        trace = "s10h1-done-scalar"
+        add_failure(
+            "done-json-scalar",
+            (
+                _sse("final", {"content": "answer", "trace_id": trace}),
+                _raw_sse("done", '"complete"'),
+            ),
+            expected_reason="evaluation_done_malformed",
+            trace_id=trace,
+            expected_trace_id=trace,
+        )
+        for label, status_payload in (
+            ("done-missing-status", {}),
+            ("done-unknown-status", {"status": "unknown"}),
+            ("done-failed-status", {"status": "failed"}),
+            ("done-paused-status", {"status": "paused"}),
+        ):
+            trace = f"s10h1-{label}"
+            add_failure(
+                label,
+                (
+                    _sse("delta", {"content": "answer"}),
+                    _sse("done", {**status_payload, "trace_id": trace}),
+                ),
+                expected_reason=(
+                    "evaluation_done_status_missing"
+                    if label == "done-missing-status"
+                    else "evaluation_done_not_complete"
+                ),
+                trace_id=trace,
+                expected_trace_id=trace,
+            )
+        add_failure(
+            "empty-object-done-missing-status",
+            (
+                _sse("delta", {"content": "answer"}),
+                _sse("done", {}),
+            ),
+            expected_reason="evaluation_done_status_missing",
+        )
+        trace = "s10h1-final-only"
+        add_failure(
+            "final-cannot-replace-done",
+            (_sse("final", {"content": "answer", "trace_id": trace}),),
+            expected_reason="evaluation_done_missing",
+            trace_id=trace,
+            expected_trace_id=trace,
+        )
+        trace = "s10h1-message-id-only"
+        add_failure(
+            "message-id-cannot-replace-done",
+            (
+                _sse(
+                    "final",
+                    {
+                        "content": "answer",
+                        "message_id": 12345,
+                        "trace_id": trace,
+                    },
+                ),
+            ),
+            expected_reason="evaluation_done_missing",
+            trace_id=trace,
+            expected_trace_id=trace,
+        )
+        trace = "s10h1-missing-answer"
+        add_failure(
+            "missing-answer",
+            (_sse("done", {"status": "complete", "trace_id": trace}),),
+            expected_reason="evaluation_answer_missing",
+            trace_id=trace,
+            expected_trace_id=trace,
+        )
+        add_failure(
+            "missing-trace-id",
+            (
+                _sse("delta", {"content": "answer"}),
+                _sse("done", {"status": "complete"}),
+            ),
+            expected_reason="evaluation_trace_missing",
+        )
+        trace = "s10h1-trace-not-found"
+        add_failure(
+            "trace-not-persisted",
+            (
+                _sse("delta", {"content": "answer"}),
+                _sse("done", {"status": "complete", "trace_id": trace}),
+            ),
+            expected_reason="evaluation_trace_not_persisted",
+            expected_trace_id=trace,
+        )
+        trace = "s10h1-trace-failed"
+        add_failure(
+            "trace-status-failed",
+            (
+                _sse("delta", {"content": "answer"}),
+                _sse("done", {"status": "complete", "trace_id": trace}),
+            ),
+            expected_reason="evaluation_trace_not_complete",
+            trace_id=trace,
+            trace_status="failed",
+            expected_trace_id=trace,
+        )
+        trace = "s10h1-trace-other-session"
+        add_failure(
+            "trace-session-mismatch",
+            (
+                _sse("delta", {"content": "answer"}),
+                _sse("done", {"status": "complete", "trace_id": trace}),
+            ),
+            expected_reason="evaluation_trace_session_mismatch",
+            trace_id=trace,
+            trace_session_override="s10h1-unrelated-session",
+            expected_trace_id=trace,
+        )
+        trace = "s10h1-error-then-complete"
+        add_failure(
+            "error-then-complete-done",
+            (
+                _sse("delta", {"content": "answer"}),
+                _sse(
+                    "error",
+                    {"error": "deterministic failure", "trace_id": trace},
+                ),
+                _sse("done", {"status": "complete", "trace_id": trace}),
+            ),
+            expected_reason="evaluation_error_event",
+            trace_id=trace,
+            expected_trace_id=trace,
+        )
+        trace = "s10h1-stream-interrupted"
+        add_failure(
+            "stream-interrupted-after-real-evidence",
+            (_sse("final", {"content": "answer", "trace_id": trace}),),
+            expected_reason="evaluation_stream_interrupted",
+            trace_id=trace,
+            expected_trace_id=trace,
+            raise_after=True,
+        )
+        trace = "s10h1-done-before-late-final"
+        add_failure(
+            "event-after-complete-done",
+            (
+                _sse("done", {"status": "complete", "trace_id": trace}),
+                _sse(
+                    "final",
+                    {
+                        "content": "late answer must not rescue the run",
+                        "trace_id": "s10h1-late-final-other-trace",
+                    },
+                ),
+            ),
+            expected_reason="evaluation_event_after_done",
+            trace_id=trace,
+            expected_trace_id=trace,
+        )
+
         check(
-            "Evaluation success and failure create zero Provider attempts",
+            "Evaluation strict-terminal matrix covers at least 22 failures",
+            len(failure_specs) >= 22,
+        )
+        for index, spec in enumerate(failure_specs, start=1):
+            label = str(spec["label"])
+            failing_case = db.create_evaluation_case(
+                case_key=f"S10H1-FAIL-{index:02d}",
+                title=f"S10-H.1 {label}",
+                user_message=f"deterministic Evaluation failure {label}",
+                status="active",
+                version_label="V1.8.2-S10-H.1",
+            )
+            linked_badcase = _new_retest_case(
+                f"evaluation-{label}",
+                last_applied_at="2000-01-01 00:00",
+                linked_evaluation_case_id=int(failing_case["id"]),
+            )
+            entries: list[Dict[str, str]] = []
+            chat_api.stream_chat_response = _evaluation_stream_stub(
+                spec["chunks"],
+                entries=entries,
+                trace_id=spec.get("trace_id"),
+                trace_status=str(spec.get("trace_status") or "complete"),
+                trace_session_override=spec.get("trace_session_override"),
+                raise_after=bool(spec.get("raise_after")),
+            )
+            calls_before = len(persistence_calls)
+            provider_before = provider_attempt_count()
+            failed_response = client.post(
+                f"/api/evaluations/cases/{failing_case['id']}/run",
+                json={"linked_badcase_id": int(linked_badcase["id"])},
+            )
+            check(
+                f"{label}: Evaluation failure is controlled HTTP 200",
+                failed_response.status_code == 200,
+            )
+            failed_payload = failed_response.json()
+            runs = db.list_evaluation_runs(int(failing_case["id"]))
+            check(
+                f"{label}: SSE source is entered exactly once",
+                len(entries) == 1 and entries[0]["user_id"] == "evaluation",
+            )
+            check(
+                f"{label}: exactly one failed Run and zero passed Runs",
+                len(runs) == 1
+                and runs[0]["status"] == "failed"
+                and sum(item["status"] == "passed" for item in runs) == 0
+                and len(persistence_calls) == calls_before + 1
+                and failed_payload["run"]["id"] == runs[0]["id"],
+            )
+            check(
+                f"{label}: failure has a non-empty explainable reason",
+                str((runs[0].get("evidence") or {}).get("runtime_error") or "")
+                .startswith(str(spec["expected_reason"])),
+            )
+            expected_trace_id = spec.get("expected_trace_id")
+            if expected_trace_id:
+                check(
+                    f"{label}: obtainable real Trace evidence is retained",
+                    runs[0].get("trace_id") == expected_trace_id,
+                )
+            check(
+                f"{label}: failure creates zero Provider attempts",
+                provider_attempt_count() == provider_before,
+            )
+            detail = client.get(f"/api/badcases/{linked_badcase['id']}")
+            check(
+                f"{label}: linked Badcase remains readable",
+                detail.status_code == 200,
+            )
+            linked = detail.json()["badcase"]
+            check(
+                f"{label}: linked Badcase never exposes verify-pass",
+                linked.get("status") != "released"
+                and (linked.get("retest_context") or {}).get("run_status")
+                == "failed"
+                and "verify-pass" not in linked.get("allowed_actions", []),
+            )
+            verify = client.post(
+                f"/api/badcases/{linked_badcase['id']}/verify",
+                json={"passed": True, "note": f"must block {label}"},
+            )
+            check(
+                f"{label}: linked Badcase cannot be verified as passed",
+                verify.status_code != 200,
+            )
+            check(
+                f"{label}: real Evaluation runtime parser remains installed",
+                evaluation_api._run_real_chat is real_runtime,
+            )
+        check(
+            "Evaluation success and strict failure matrix create zero Provider attempts",
             provider_attempt_count() == before_provider,
         )
     finally:
@@ -826,7 +1176,7 @@ def assert_evaluation_linked_retest_compatibility(client: TestClient) -> None:
         title="S10-H linked Evaluation retest",
         user_message="linked retest question",
         expected_agent_id="customer_service",
-        required_terms=["真实流程"],
+        required_terms=["truthful-flow"],
         status="active",
         version_label="V1.8.2-S10-H",
     )
@@ -835,8 +1185,24 @@ def assert_evaluation_linked_retest_compatibility(client: TestClient) -> None:
         last_applied_at="2000-01-01 00:00",
         linked_evaluation_case_id=int(case["id"]),
     )
-    evaluation_api._run_real_chat = _successful_evaluation_stub(
-        "s10h-linked-evaluation"
+    trace_id = "s10h-linked-evaluation-trace"
+    entries: list[Dict[str, str]] = []
+    chat_api.stream_chat_response = _evaluation_stream_stub(
+        (
+            _sse("final", {"content": "truthful-flow linked answer"}),
+            _sse(
+                "done",
+                {
+                    "status": "complete",
+                    "trace_id": trace_id,
+                    "current_agent": "Customer Service Agent",
+                    "current_agent_id": "customer_service",
+                    "route_intent": "customer_service",
+                },
+            ),
+        ),
+        entries=entries,
+        trace_id=trace_id,
     )
     before_provider = provider_attempt_count()
     response = client.post(
@@ -849,6 +1215,10 @@ def assert_evaluation_linked_retest_compatibility(client: TestClient) -> None:
         "linked Evaluation retest remains a passed Evaluation run",
         payload["run"]["status"] == "passed"
         and payload["run"]["badcase_id"] == int(badcase["id"]),
+    )
+    check(
+        "linked Evaluation retest enters only the lower SSE source once",
+        len(entries) == 1 and entries[0]["user_id"] == "evaluation",
     )
     detail = client.get(f"/api/badcases/{badcase['id']}")
     check("linked Evaluation Badcase detail is readable", detail.status_code == 200)
@@ -886,7 +1256,6 @@ def assert_evaluation_linked_retest_compatibility(client: TestClient) -> None:
 def main() -> None:
     original_evaluation_gate = evaluation_api._background_budget_gate
     original_badcase_gate = badcase_api._background_budget_gate
-    original_evaluation_runtime = evaluation_api._run_real_chat
     original_chat_stream = chat_api.stream_chat_response
     initial_provider_attempts = provider_attempt_count()
     app = FastAPI()
@@ -913,7 +1282,6 @@ def main() -> None:
     finally:
         evaluation_api._background_budget_gate = original_evaluation_gate
         badcase_api._background_budget_gate = original_badcase_gate
-        evaluation_api._run_real_chat = original_evaluation_runtime
         chat_api.stream_chat_response = original_chat_stream
         client.close()
         socket.create_connection = _ORIGINAL_CREATE_CONNECTION

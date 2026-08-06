@@ -406,52 +406,162 @@ def evaluate_runtime_evidence(case: Dict[str, Any], answer: str, done: Dict[str,
 
 
 class RuntimeExecutionError(RuntimeError):
-    def __init__(self, message: str, answer: str, done: Dict[str, Any]):
+    def __init__(
+        self,
+        message: str,
+        answer: str,
+        done: Dict[str, Any],
+        *,
+        trace_id: Optional[str] = None,
+    ):
         super().__init__(message)
         self.answer = answer
         self.done = done
+        self.trace_id = (
+            str(done.get("trace_id") or trace_id or "").strip() or None
+        )
 
 
 async def _run_real_chat(message: str, session_id: str) -> Tuple[str, Dict[str, Any]]:
-    """Run through the canonical owner runtime and reconstruct its SSE done event."""
-    from app.chat import _stream_agent_response
+    """Run the canonical owner runtime and require one evidenced SSE success."""
+    from app.chat import stream_chat_response
 
     answer = ""
     done: Dict[str, Any] = {}
-    runtime_error = ""
-    async for chunk in _stream_agent_response(message, session_id, "evaluation"):
-        event_name = ""
+    done_event_count = 0
+    valid_done_payload_count = 0
+    done_payload_invalid = False
+    error_event_count = 0
+    valid_error_payload_count = 0
+    malformed_error_event_received = False
+    payload_error_detail = ""
+    evidence_trace_id: Optional[str] = None
+    event_name = ""
+    post_done_event_count = 0
+    stream_exception_type = ""
+
+    def consume_chunk(chunk: str) -> None:
+        nonlocal answer, done, done_event_count, valid_done_payload_count
+        nonlocal done_payload_invalid, error_event_count
+        nonlocal valid_error_payload_count, malformed_error_event_received
+        nonlocal payload_error_detail, evidence_trace_id, event_name
+        nonlocal post_done_event_count
+
         for line in chunk.splitlines():
+            if not line.strip():
+                event_name = ""
+                continue
             if line.startswith("event:"):
                 event_name = line[6:].strip()
+                if done_event_count:
+                    post_done_event_count += 1
+                if event_name == "error":
+                    error_event_count += 1
+                elif event_name == "done":
+                    done_event_count += 1
                 continue
             if not line.startswith("data:"):
                 continue
             raw = line[5:].strip()
             if not raw:
+                if event_name == "error":
+                    malformed_error_event_received = True
+                elif event_name == "done":
+                    done_payload_invalid = True
                 continue
             try:
                 payload = json.loads(raw)
             except Exception:
+                if event_name == "error":
+                    malformed_error_event_received = True
+                elif event_name == "done":
+                    done_payload_invalid = True
                 continue
             if not isinstance(payload, dict):
+                if event_name == "error":
+                    malformed_error_event_received = True
+                elif event_name == "done":
+                    done_payload_invalid = True
                 continue
+
+            if event_name == "error":
+                valid_error_payload_count += 1
+            elif event_name == "done":
+                valid_done_payload_count += 1
+            payload_trace_id = str(payload.get("trace_id") or "").strip()
+            if payload_trace_id:
+                evidence_trace_id = payload_trace_id
             if event_name == "delta" and payload.get("content"):
                 answer += str(payload["content"])
-            elif event_name in {"final", "done"} and payload.get("content"):
-                answer = str(payload["content"])
-            if event_name == "done" or payload.get("message_id"):
+            elif event_name in {"final", "done"}:
+                terminal_answer = payload.get("content") or payload.get("answer")
+                if terminal_answer:
+                    answer = str(terminal_answer)
+            if event_name == "done":
                 done = payload
             if payload.get("error"):
-                runtime_error = str(payload["error"])
-    if not done:
-        done = {"status": "failed" if runtime_error else "complete", "answer": answer}
-    if runtime_error or done.get("status") == "failed":
+                payload_error_detail = str(payload["error"])
+
+    try:
+        async for chunk in stream_chat_response(message, session_id, "evaluation"):
+            consume_chunk(chunk)
+    except Exception as exc:
+        stream_exception_type = type(exc).__name__
+
+    def reject(reason_code: str) -> None:
+        failure_evidence = dict(done)
+        failure_evidence["runtime_error_code"] = reason_code
+        failure_evidence["done_event_count"] = done_event_count
+        if stream_exception_type:
+            failure_evidence["stream_exception_type"] = stream_exception_type
+        detail = payload_error_detail.strip()
+        message_text = f"{reason_code}: {detail}" if detail else reason_code
         raise RuntimeExecutionError(
-            runtime_error or str(done.get("error_code") or "runtime failed"),
+            message_text,
             answer,
-            done,
+            failure_evidence,
+            trace_id=evidence_trace_id,
         )
+
+    if (
+        malformed_error_event_received
+        or error_event_count != valid_error_payload_count
+    ):
+        reject("evaluation_error_event_malformed")
+    if error_event_count:
+        reject("evaluation_error_event")
+    if payload_error_detail:
+        reject("evaluation_payload_error")
+    if stream_exception_type:
+        reject("evaluation_stream_interrupted")
+    if done_event_count == 0:
+        reject("evaluation_done_missing")
+    if done_event_count != 1:
+        reject("evaluation_multiple_done_events")
+    if (
+        done_payload_invalid
+        or valid_done_payload_count != done_event_count
+    ):
+        reject("evaluation_done_malformed")
+    if post_done_event_count:
+        reject("evaluation_event_after_done")
+    if "status" not in done:
+        reject("evaluation_done_status_missing")
+    if done.get("status") != "complete":
+        reject("evaluation_done_not_complete")
+    if not answer.strip():
+        reject("evaluation_answer_missing")
+
+    trace_id = str(done.get("trace_id") or "").strip()
+    if not trace_id:
+        reject("evaluation_trace_missing")
+    trace = get_chat_trace(trace_id)
+    if not trace:
+        reject("evaluation_trace_not_persisted")
+    if trace.get("status") != "complete":
+        reject("evaluation_trace_not_complete")
+    if trace.get("session_id") != session_id:
+        reject("evaluation_trace_session_mismatch")
     return answer, done
 
 
@@ -780,8 +890,9 @@ async def run_case(case_id: int, request: EvaluationRunRequest = EvaluationRunRe
     try:
         answer, done = await _run_real_chat(case["user_message"], session_id)
     except RuntimeExecutionError as exc:
+        failure_trace_id = exc.trace_id or exc.done.get("trace_id")
         done = _enrich_runtime_evidence(
-            exc.done, exc.done.get("trace_id"), session_id
+            exc.done, failure_trace_id, session_id
         )
         checks = [_rule(
             "runtime_completion", "Provider/运行时成功完成", "complete",
@@ -791,15 +902,15 @@ async def run_case(case_id: int, request: EvaluationRunRequest = EvaluationRunRe
         run = create_evaluation_run(
             evaluation_case_id=case_id,
             status="failed",
-            trace_id=done.get("trace_id"),
+            trace_id=failure_trace_id,
             session_id=session_id,
             answer=exc.answer,
             evidence={**evidence, "runtime_error": str(exc)[:500]},
             rule_results=checks,
             total_tokens=_direct_model_tokens(done.get("model_calls") or []),
             estimated_cost_cny=(
-                _direct_model_cost(done.get("trace_id"))
-                if done.get("trace_id") else None
+                _direct_model_cost(failure_trace_id)
+                if failure_trace_id else None
             ),
         )
         badcase = (
