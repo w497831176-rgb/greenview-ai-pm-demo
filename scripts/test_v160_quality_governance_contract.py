@@ -42,7 +42,23 @@ def test_lifecycle() -> None:
     assert is_terminal_status("accepted_limitation")
     assert is_terminal_status("duplicate")
     assert "verify-pass" not in effective_allowed_actions({"status": "verifying", "last_applied_at": "2026-07-18 10:00:00", "last_retest_at": None, "retest_response": ""})
-    assert "verify-pass" in effective_allowed_actions({"status": "verifying", "last_applied_at": "2026-07-18 10:00:00", "last_retest_at": "2026-07-18 10:01:00", "retest_response": "修复后回答"})
+    assert "verify-pass" in effective_allowed_actions({
+        "status": "verifying",
+        "last_applied_at": "2026-07-18 10:00:00",
+        "last_retest_at": "2026-07-18 10:01:00",
+        "retest_response": "修复后回答",
+        "retest_trace_id": "trace-v160-complete-retest",
+        "retest_trace_live_verified": True,
+        "retest_context": {
+            "run_status": "complete",
+            "trace_id": "trace-v160-complete-retest",
+            "trace_persisted": True,
+            "trace_status": "complete",
+            "session_id": "session-v160-complete-retest",
+            "trace_session_id": "session-v160-complete-retest",
+            "retest_started_at": "2026-07-18 10:00:30",
+        },
+    })
     assert "close" in effective_allowed_actions({"status": "released"})
     assert "verify-fail" in effective_allowed_actions({"status": "released"})
 

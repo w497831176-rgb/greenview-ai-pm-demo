@@ -628,14 +628,29 @@ def _link_evaluation_retest(
     badcase: Dict[str, Any],
     case: Dict[str, Any],
     run: Dict[str, Any],
+    retest_started_at: str,
 ) -> Dict[str, Any]:
     """Persist one explicit Evaluation run as the real retest for a Badcase."""
     run_id = int(run["id"])
     update_evaluation_run(run_id, badcase_id=int(badcase["id"]))
     run = get_evaluation_run(run_id) or run
     passed = run.get("status") == "passed"
+    trace_id = str(run.get("trace_id") or "").strip()
+    trace = get_chat_trace(trace_id) if trace_id else None
+    session_id = str(run.get("session_id") or "").strip()
+    trace_complete = bool(
+        trace
+        and trace.get("status") == "complete"
+        and session_id
+        and trace.get("session_id") == session_id
+    )
+    retest_complete = bool(
+        passed
+        and str(run.get("answer") or "").strip()
+        and trace_complete
+    )
     before_status = str(badcase.get("status") or "verifying")
-    after_status = before_status if passed else "fixing"
+    after_status = before_status if retest_complete else "fixing"
     retest_at = now_cn()
     baseline_run_id = badcase.get("linked_evaluation_run_id")
     baseline_trace_id = badcase.get("trace_id")
@@ -644,7 +659,14 @@ def _link_evaluation_retest(
         "evaluation_case_id": case.get("id"),
         "evaluation_case_key": case.get("case_key"),
         "evaluation_run_id": run_id,
-        "run_status": run.get("status"),
+        "run_status": "complete" if retest_complete else "failed",
+        "evaluation_run_status": run.get("status"),
+        "trace_id": trace_id,
+        "retest_started_at": retest_started_at,
+        "session_id": session_id,
+        "trace_persisted": bool(trace),
+        "trace_status": (trace or {}).get("status"),
+        "trace_session_id": (trace or {}).get("session_id"),
         "rule_results": run.get("rule_results") or [],
         "evidence": run.get("evidence") or {},
         "baseline_evaluation_run_id": baseline_run_id,
@@ -669,6 +691,7 @@ def _link_evaluation_retest(
             "evaluation_run_id": run_id,
             "trace_id": run.get("trace_id"),
             "result": run.get("status"),
+            "retest_run_status": retest_context["run_status"],
             "failed_rule_keys": [
                 item.get("key") for item in (run.get("rule_results") or [])
                 if item.get("status") == "fail"
@@ -753,6 +776,7 @@ async def run_case(case_id: int, request: EvaluationRunRequest = EvaluationRunRe
         )
 
     session_id = f"evaluation-{case['case_key'][:32]}-{uuid.uuid4().hex[:8]}"
+    retest_started_at = now_cn()
     try:
         answer, done = await _run_real_chat(case["user_message"], session_id)
     except RuntimeExecutionError as exc:
@@ -779,7 +803,7 @@ async def run_case(case_id: int, request: EvaluationRunRequest = EvaluationRunRe
             ),
         )
         badcase = (
-            _link_evaluation_retest(linked_badcase, case, run)
+            _link_evaluation_retest(linked_badcase, case, run, retest_started_at)
             if linked_badcase else _ensure_badcase_for_run(run["id"])
         )
         return {
@@ -802,7 +826,7 @@ async def run_case(case_id: int, request: EvaluationRunRequest = EvaluationRunRe
             rule_results=checks,
         )
         badcase = (
-            _link_evaluation_retest(linked_badcase, case, run)
+            _link_evaluation_retest(linked_badcase, case, run, retest_started_at)
             if linked_badcase else _ensure_badcase_for_run(run["id"])
         )
         return {
@@ -845,7 +869,9 @@ async def run_case(case_id: int, request: EvaluationRunRequest = EvaluationRunRe
             metadata={"evaluation_case_id": case_id, "evaluation_run_id": run.get("id"), "risk_level": case.get("risk_level")},
         )
     if linked_badcase:
-        badcase = _link_evaluation_retest(linked_badcase, case, run)
+        badcase = _link_evaluation_retest(
+            linked_badcase, case, run, retest_started_at
+        )
     else:
         badcase = _ensure_badcase_for_run(run["id"]) if run_status == "failed" else None
     if badcase:
@@ -855,7 +881,7 @@ async def run_case(case_id: int, request: EvaluationRunRequest = EvaluationRunRe
         "run": run,
         "rule_results": checks,
         "badcase": badcase,
-        "budget": budget,
+        "budget": budget_gate,
         "message": "硬规则结果已生成；涉及业务可用性、语气和复杂 SOP 的 Rubric 仍需人工审核。",
     }
 

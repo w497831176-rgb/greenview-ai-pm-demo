@@ -7,6 +7,7 @@ it can be unit-tested without installing the full project dependency tree.
 """
 
 import json
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Set
 
 VALID_CATEGORIES = {
@@ -229,15 +230,52 @@ def allowed_actions(status: str) -> List[str]:
 
 
 def _has_post_apply_retest(badcase: Dict[str, Any]) -> bool:
-    """Return True iff a retest was performed after the most recent draft apply."""
+    """Return True only for a completed, evidenced retest after the latest apply."""
     last_applied_at = badcase.get("last_applied_at")
     last_retest_at = badcase.get("last_retest_at")
-    if not last_retest_at:
+    response = str(badcase.get("retest_response") or "").strip()
+    trace_id = str(badcase.get("retest_trace_id") or "").strip()
+    context = badcase.get("retest_context")
+    if not isinstance(context, dict):
+        context = _parse_json_field(badcase.get("retest_context_json"))
+    if (
+        not last_applied_at
+        or not last_retest_at
+        or not response
+        or not trace_id
+        or badcase.get("retest_trace_live_verified") is not True
+        or not isinstance(context, dict)
+        or context.get("run_status") != "complete"
+        or context.get("trace_persisted") is not True
+        or context.get("trace_status") != "complete"
+        or str(context.get("trace_id") or "").strip() != trace_id
+        or not str(context.get("session_id") or "").strip()
+        or str(context.get("trace_session_id") or "").strip()
+        != str(context.get("session_id") or "").strip()
+    ):
         return False
-    if not last_applied_at:
-        # No apply recorded yet; any retest is acceptable.
-        return bool(badcase.get("retest_response"))
-    return last_retest_at >= last_applied_at
+
+    def _evidence_time(value: Any) -> Optional[datetime]:
+        try:
+            parsed = value if isinstance(value, datetime) else datetime.fromisoformat(
+                str(value).strip().replace("Z", "+00:00")
+            )
+        except (TypeError, ValueError):
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone(timedelta(hours=8)))
+        return parsed.astimezone(timezone.utc)
+
+    applied_at = _evidence_time(last_applied_at)
+    started_at = _evidence_time(context.get("retest_started_at"))
+    retested_at = _evidence_time(last_retest_at)
+    return bool(
+        applied_at
+        and started_at
+        and retested_at
+        and started_at >= applied_at
+        and retested_at >= started_at
+    )
 
 
 def effective_allowed_actions(badcase: Dict[str, Any]) -> List[str]:

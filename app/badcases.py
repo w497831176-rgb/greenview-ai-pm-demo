@@ -31,7 +31,7 @@ from app.badcase_schema import (
     ROOT_CAUSE_DOMAINS,
     VALID_CATEGORIES,
     VALID_STATUSES,
-    _enrich_badcase,
+    _enrich_badcase as _schema_enrich_badcase,
     _has_post_apply_retest,
     allowed_actions,
     effective_allowed_actions,
@@ -73,6 +73,7 @@ from db.property_db import (
     get_agent_knowledge_bindings,
     get_agent_tools,
     get_badcase as db_get_badcase,
+    get_chat_trace,
     get_capability_gap_draft as db_get_capability_gap_draft,
     get_chat_message,
     get_enabled_price_for_model,
@@ -102,6 +103,32 @@ from db.property_db import (
 )
 
 router = APIRouter(tags=["badcases"])
+
+
+def _validated_retest_trace(badcase: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Return the live complete Trace bound to this retest context, if any."""
+    try:
+        context = json.loads(badcase.get("retest_context_json") or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        context = {}
+    trace_id = str(badcase.get("retest_trace_id") or "").strip()
+    trace = get_chat_trace(trace_id) if trace_id else None
+    if not (
+        trace
+        and trace.get("status") == "complete"
+        and str(trace.get("session_id") or "").strip()
+        == str(context.get("session_id") or "").strip()
+    ):
+        return None
+    return trace
+
+
+def _enrich_badcase(badcase: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Add schema presentation plus a live Trace gate for visible actions."""
+    live_trace = _validated_retest_trace(badcase or {})
+    payload = dict(badcase or {})
+    payload["retest_trace_live_verified"] = bool(live_trace)
+    return _schema_enrich_badcase(payload)
 
 
 def _enforce_background_budget(strategy: str) -> Dict[str, Any]:
@@ -1754,10 +1781,17 @@ async def verify_badcase(case_id: int, request: VerifyRequest = VerifyRequest())
 
     if request.passed:
         _require_case_status(case, "verify-pass", {"verifying"})
+        live_retest_trace = _validated_retest_trace(case)
+        case = {**case, "retest_trace_live_verified": bool(live_retest_trace)}
         if not _has_post_apply_retest(case):
             raise HTTPException(
                 status_code=400,
                 detail="请先在当前修复应用后完成一次真实复测",
+            )
+        if not live_retest_trace:
+            raise HTTPException(
+                status_code=400,
+                detail="复测 Trace 不存在、未完成或与本次复测会话不一致",
             )
         if not (request.verification_evidence or request.note).strip():
             raise HTTPException(status_code=400, detail="请记录原案例/同类或边界验证结论后再发布观察")
@@ -2021,31 +2055,120 @@ async def mark_duplicate(case_id: int, request: DuplicateRequest):
     return {"badcase": _enrich_badcase(updated)}
 
 
+class RetestRuntimeError(RuntimeError):
+    """Controlled retest failure carrying only non-sensitive runtime evidence."""
+
+    def __init__(
+        self,
+        reason_code: str,
+        *,
+        answer: str = "",
+        done: Optional[Dict[str, Any]] = None,
+        trace_id: Optional[str] = None,
+    ) -> None:
+        super().__init__(reason_code)
+        self.reason_code = reason_code
+        self.answer = answer
+        self.done = dict(done or {})
+        self.trace_id = str(trace_id or self.done.get("trace_id") or "").strip() or None
+
+
 async def _consume_chat_stream(message: str, session_id: str, user_id: str = "retest") -> Dict[str, Any]:
-    """Run a real chat stream and return the final answer + done context."""
+    """Run a real chat stream and require one truthful successful terminal event."""
     # Lazy import to avoid circular dependency between routers.
     from app.chat import stream_chat_response
 
     final_answer = ""
     done_payload: Dict[str, Any] = {}
+    done_received = False
+    done_count = 0
+    noncomplete_done_received = False
+    error_event_received = False
+    evidence_trace_id: Optional[str] = None
+    event_name = ""
     async for chunk in stream_chat_response(message, session_id, user_id):
         for line in chunk.splitlines():
-            if line.startswith("data:"):
-                data = line[5:].strip()
-                if not data:
-                    continue
-                try:
-                    payload = json.loads(data)
-                except Exception:
-                    continue
-                if isinstance(payload, dict):
-                    if "content" in payload and payload.get("content"):
-                        final_answer += str(payload["content"])
-                    # The done event carries the full context.
-                    if payload.get("status") == "complete" or "message_id" in payload:
-                        done_payload = payload
-    if not done_payload and final_answer:
-        done_payload = {"status": "complete", "answer": final_answer}
+            if not line.strip():
+                event_name = ""
+                continue
+            if line.startswith("event:"):
+                event_name = line[6:].strip()
+                continue
+            if not line.startswith("data:"):
+                continue
+            data = line[5:].strip()
+            if not data:
+                continue
+            try:
+                payload = json.loads(data)
+            except Exception:
+                if event_name == "error":
+                    error_event_received = True
+                continue
+            if not isinstance(payload, dict):
+                if event_name == "error":
+                    error_event_received = True
+                continue
+
+            payload_trace_id = str(payload.get("trace_id") or "").strip()
+            if payload_trace_id:
+                evidence_trace_id = payload_trace_id
+            content = payload.get("content")
+            if event_name == "delta" and content:
+                final_answer += str(content)
+            elif event_name in {"final", "done"}:
+                terminal_answer = content or payload.get("answer")
+                if terminal_answer:
+                    final_answer = str(terminal_answer)
+            if event_name == "error":
+                error_event_received = True
+            elif event_name == "done":
+                done_received = True
+                done_count += 1
+                if payload.get("status") != "complete":
+                    noncomplete_done_received = True
+                done_payload = payload
+
+    if error_event_received:
+        raise RetestRuntimeError(
+            "retest_runtime_error_event",
+            answer=final_answer,
+            done=done_payload,
+            trace_id=evidence_trace_id,
+        )
+    if not done_received:
+        raise RetestRuntimeError(
+            "retest_done_missing",
+            answer=final_answer,
+            trace_id=evidence_trace_id,
+        )
+    if noncomplete_done_received or done_payload.get("status") != "complete":
+        raise RetestRuntimeError(
+            "retest_done_not_complete",
+            answer=final_answer,
+            done=done_payload,
+            trace_id=evidence_trace_id,
+        )
+    if done_count != 1:
+        raise RetestRuntimeError(
+            "retest_multiple_done_events",
+            answer=final_answer,
+            done=done_payload,
+            trace_id=evidence_trace_id,
+        )
+    if not str(done_payload.get("trace_id") or "").strip():
+        raise RetestRuntimeError(
+            "retest_trace_missing",
+            answer=final_answer,
+            done=done_payload,
+            trace_id=evidence_trace_id,
+        )
+    if not final_answer.strip():
+        raise RetestRuntimeError(
+            "retest_answer_missing",
+            done=done_payload,
+            trace_id=evidence_trace_id,
+        )
     return {"answer": final_answer, "done": done_payload}
 
 
@@ -2075,8 +2198,69 @@ async def retest_badcase(case_id: int, request: SwitchModelRetryRequest = Switch
     _enforce_background_budget("badcase_retest")
 
     retest_session_id = f"retest-{uuid.uuid4().hex[:12]}"
+    retest_started_at = now_cn()
+    case_anchor = (case.get("status"), case.get("last_applied_at"))
     try:
         result = await _consume_chat_stream(user_message, retest_session_id, user_id="retest")
+        answer = str(result.get("answer") or "").strip()
+        done = result.get("done") or {}
+        retest_trace_id = str(done.get("trace_id") or "").strip()
+        trace = get_chat_trace(retest_trace_id) if retest_trace_id else None
+        if not trace:
+            raise RetestRuntimeError(
+                "retest_trace_not_persisted",
+                answer=answer,
+                done=done,
+                trace_id=retest_trace_id,
+            )
+        if trace.get("status") != "complete":
+            raise RetestRuntimeError(
+                "retest_trace_not_complete",
+                answer=answer,
+                done=done,
+                trace_id=retest_trace_id,
+            )
+        if trace.get("session_id") != retest_session_id:
+            raise RetestRuntimeError(
+                "retest_trace_session_mismatch",
+                answer=answer,
+                done=done,
+                trace_id=retest_trace_id,
+            )
+        current_case = _load_case(case_id)
+        current_anchor = (
+            current_case.get("status"),
+            current_case.get("last_applied_at"),
+        )
+        if current_anchor != case_anchor:
+            raise RetestRuntimeError(
+                "retest_case_changed_during_run",
+                answer=answer,
+                done=done,
+                trace_id=retest_trace_id,
+            )
+        case = current_case
+    except RetestRuntimeError as exc:
+        logger.warning("retest rejected: %s", exc.reason_code)
+        current_case = db_get_badcase(case_id) or case
+        current_status = current_case.get("status") or case["status"]
+        _record_action(
+            case_id,
+            "retest",
+            {
+                "retest_session_id": retest_session_id,
+                "retest_trace_id": exc.trace_id,
+                "result": "failed",
+                "reason_code": exc.reason_code,
+                "run_status": exc.done.get("status") or "failed",
+            },
+            current_status,
+            current_status,
+        )
+        raise HTTPException(
+            status_code=502,
+            detail=f"retest failed ({exc.reason_code}); see retained Trace evidence",
+        )
     except Exception as e:
         logger.exception("retest chat stream failed")
         # Keep the case in fixing on retest error.
@@ -2092,10 +2276,7 @@ async def retest_badcase(case_id: int, request: SwitchModelRetryRequest = Switch
         )
         raise HTTPException(status_code=502, detail="retest failed; see retained Trace evidence")
 
-    answer = result.get("answer", "")
-    done = result.get("done", {})
     token_detail = done.get("token_detail") or {}
-    retest_trace_id = done.get("trace_id") or f"retest-{uuid.uuid4().hex[:16]}"
     model_id = done.get("model_id") or MODEL_ID
     total_tokens = token_detail.get("total_tokens") or done.get("token_count")
 
@@ -2118,7 +2299,12 @@ async def retest_badcase(case_id: int, request: SwitchModelRetryRequest = Switch
         "record_kind": "logical_aggregate",
         "include_in_provider_aggregate": False,
         "provider_evidence_source": "referenced_underlying_trace_attempts",
+        "run_status": "complete",
+        "retest_started_at": retest_started_at,
         "session_id": retest_session_id,
+        "trace_persisted": True,
+        "trace_status": trace.get("status"),
+        "trace_session_id": trace.get("session_id"),
         "route_intent": done.get("route_intent"),
         "current_agent": done.get("current_agent"),
         "activated_skills": done.get("activated_skills"),
@@ -2143,7 +2329,6 @@ async def retest_badcase(case_id: int, request: SwitchModelRetryRequest = Switch
     retest_at = now_cn()
     updated = db_update_badcase(
         case_id,
-        status=new_status,
         retest_response=answer,
         retest_context_json=json.dumps(retest_context, ensure_ascii=False, default=str),
         retest_trace_id=retest_trace_id,
