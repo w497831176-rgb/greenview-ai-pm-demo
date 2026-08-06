@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 from types import SimpleNamespace
 
 from app.runtime.citation_renderer import (
@@ -162,6 +163,65 @@ def test_calculator_structured_result_keeps_result_84_compatibility():
     assert fact.unit is None
 
 
+def _production_agno_result(payload):
+    return SimpleNamespace(
+        structured_content={"result": json.dumps(payload, ensure_ascii=False)}
+    )
+
+
+def test_production_agno_result_json_unwraps_weather_and_work_order_facts():
+    weather_payload = {
+        "status": "success",
+        "data": {
+            "city": "\u4e0a\u6d77",
+            "temperature_c": 29,
+            "condition": "\u591a\u4e91",
+            "humidity_pct": 70,
+            "wind": "\u4e1c\u98ce3\u7ea7",
+        },
+    }
+    _, _, weather = _evaluate(_production_agno_result(weather_payload))
+    weather_facts = _facts_by_path(weather)
+
+    assert "$.result" not in weather_facts
+    assert weather_facts["$.data.temperature_c"].normalized_value == "29"
+    assert weather_facts["$.data.humidity_pct"].display_value == "70%"
+    assert weather_facts["$.data.wind"].value == "\u4e1c\u98ce3\u7ea7"
+
+    orders_payload = {
+        "status": "success",
+        "data": [
+            {
+                "work_order_id": "WO-20260806-001",
+                "status": "\u5904\u7406\u4e2d",
+            }
+        ],
+    }
+    _, _, orders = _evaluate(_production_agno_result(orders_payload))
+    order_facts = _facts_by_path(orders)
+
+    assert "$.result" not in order_facts
+    assert order_facts["$.data[0].work_order_id"].value == "WO-20260806-001"
+    assert order_facts["$.data[0].status"].value == "\u5904\u7406\u4e2d"
+
+
+def test_root_result_wrapper_is_narrow_and_preserves_calculator_semantics():
+    _, _, calculator = _evaluate(SimpleNamespace(structured_content={"result": 84}))
+    calculator_fact = _facts_by_path(calculator)["$.result"]
+    assert calculator_fact.normalized_value == "84"
+    assert calculator_fact.semantic_type == "calculated_result"
+
+    for payload in (
+        {"result": "84"},
+        {"result": "not-json"},
+        {"result": json.dumps({"value": 1}), "kind": "business"},
+        {"data": {"result": json.dumps({"value": 1})}},
+    ):
+        _, _, evidence = _evaluate(SimpleNamespace(structured_content=payload))
+        paths = _facts_by_path(evidence)
+        assert any(path.endswith("result") for path in paths), (payload, paths)
+
+
 def test_preinvoke_context_is_rendered_from_facts_not_summary():
     _, _, evidence = _evaluate(
         {"status": "success", "data": {"humidity_pct": 70}}
@@ -202,6 +262,161 @@ def _successful_invocation(result, *, arguments=None, result_contract=None):
         result_summary=summary,
         tool_evidence=evidence,
     )
+
+
+def _production_invocation(payload, *, invocation_id, server_name, tool_name):
+    status, summary, evidence = _evaluate(
+        _production_agno_result(payload),
+        invocation_id=invocation_id,
+    )
+    return ToolInvocation(
+        invocation_id=invocation_id,
+        server_name=server_name,
+        tool_name=tool_name,
+        effect=ToolEffect.READ,
+        discovery_status="success",
+        transport_status="success",
+        invocation_status="success",
+        business_status=status,
+        result_summary=summary,
+        tool_evidence=evidence,
+    )
+
+
+def test_rag_and_two_production_tool_markers_share_one_evidence_contract():
+    policy_text = (
+        "\u300a\u7269\u4e1a\u7ef4\u4fee\u670d\u52a1\u627f\u8bfa\u300b\u89c4\u5b9a\uff1a"
+        "\u7d27\u6025\u7ef4\u4fee5\u5206\u949f\u5185\u5b8c\u6210\u5de5\u5355\u767b\u8bb0\uff0c"
+        "\u5de5\u7a0b\u4eba\u545830\u5206\u949f\u5185\u5230\u573a\u3002"
+    )
+    rag = EvidenceItem(
+        evidence_id="ev_maintenance_commitment",
+        knowledge_id="doc-maintenance",
+        knowledge_version="v1",
+        document_id="doc-maintenance",
+        document_version="v1",
+        document_hash=content_hash("doc-maintenance"),
+        chunk_id="chunk-1",
+        chunk_index=1,
+        chunk_hash=content_hash(policy_text),
+        content_snapshot=policy_text,
+        retrieval_score=0.99,
+        retrieval_mode="fixture",
+        title="\u7269\u4e1a\u7ef4\u4fee\u670d\u52a1\u627f\u8bfa",
+    )
+    weather = _production_invocation(
+        {
+            "status": "success",
+            "data": {
+                "city": "\u4e0a\u6d77",
+                "temperature_c": 29,
+                "condition": "\u591a\u4e91",
+                "humidity_pct": 70,
+                "wind": "\u4e1c\u98ce3\u7ea7",
+            },
+        },
+        invocation_id="tool_weather_production",
+        server_name="weather-server",
+        tool_name="get_weather",
+    )
+    orders = _production_invocation(
+        {
+            "status": "success",
+            "data": [
+                {
+                    "work_order_id": "WO-20260806-001",
+                    "status": "\u5904\u7406\u4e2d",
+                }
+            ],
+        },
+        invocation_id="tool_orders_production",
+        server_name="workorder-server",
+        tool_name="list_recent_work_orders",
+    )
+    evidence = EvidenceSet(
+        query="\u7ef4\u4fee\u65f6\u9650\u3001\u4e0a\u6d77\u5929\u6c14\u548c\u6700\u8fd1\u5de5\u5355",
+        items=[rag],
+        retrieval_status="success",
+    )
+    bundle = build_run_evidence_bundle(
+        evidence,
+        tool_invocations=[weather, orders],
+    )
+    weather_id = weather.tool_evidence.evidence_id
+    orders_id = orders.tool_evidence.evidence_id
+    answer = (
+        "\u6839\u636e\u300a\u7269\u4e1a\u7ef4\u4fee\u670d\u52a1\u627f\u8bfa\u300b\uff0c"
+        "\u7d27\u6025\u7ef4\u4fee5\u5206\u949f\u5185\u5b8c\u6210\u767b\u8bb0\uff0c"
+        "\u5de5\u7a0b\u4eba\u545830\u5206\u949f\u5185\u5230\u573a\u3002"
+        f" [[evidence:{rag.evidence_id}]]\n"
+        "\u4e0a\u6d77\u5929\u6c14\u4e3a29\u2103\u3001\u591a\u4e91\uff0c\u6e7f\u5ea670%\uff0c"
+        "\u4e1c\u98ce3\u7ea7\uff08\u6f14\u793a\u56fa\u5b9a\u6837\u4f8b\uff09\u3002"
+        f" [[evidence:{weather_id}]]\n"
+        "\u6700\u8fd1\u7ef4\u4fee\u5de5\u5355WO-20260806-001\uff0c\u72b6\u6001\u5904\u7406\u4e2d\u3002"
+        f" [[evidence:{orders_id}]]"
+    )
+
+    rendered, citations, violations, final_bundle = render_bundle_citations(
+        answer,
+        bundle,
+    )
+
+    assert not violations, violations
+    assert len(citations) == 1
+    assert final_bundle.validated_rag_evidence_ids == [rag.evidence_id]
+    assert {link.evidence_id for link in final_bundle.tool_evidence_links} == {
+        weather_id,
+        orders_id,
+    }
+    assert set(final_bundle.delivered_evidence_ids) == {
+        rag.evidence_id,
+        weather_id,
+        orders_id,
+    }
+    assert weather_id not in rendered and orders_id not in rendered
+
+    for wrong_answer in (
+        answer.replace("29\u2103", "30\u2103"),
+        answer.replace("70%", "71%"),
+        answer.replace("\u72b6\u6001\u5904\u7406\u4e2d", "\u72b6\u6001\u5df2\u5b8c\u6210"),
+    ):
+        _, _, wrong_violations, wrong_bundle = render_bundle_citations(
+            wrong_answer,
+            bundle,
+        )
+        assert wrong_violations, wrong_answer
+        assert wrong_bundle.delivered_evidence_ids == []
+        assert wrong_bundle.tool_evidence_links == []
+
+    for unknown_answer in (
+        answer.replace(weather_id, "tool_ev_unknown"),
+        answer + "\n[[evidence:tool_ev_unknown]]",
+    ):
+        _, _, unknown_violations, unknown_bundle = render_bundle_citations(
+            unknown_answer,
+            bundle,
+        )
+        assert any(
+            item.get("code") == "invalid_evidence_id"
+            and item.get("evidence_id") == "tool_ev_unknown"
+            for item in unknown_violations
+        ), unknown_violations
+        assert unknown_bundle.delivered_evidence_ids == []
+
+    swapped_markers = (
+        answer.replace(weather_id, "tool_ev_swap_placeholder")
+        .replace(orders_id, weather_id)
+        .replace("tool_ev_swap_placeholder", orders_id)
+    )
+    _, _, swapped_violations, swapped_bundle = render_bundle_citations(
+        swapped_markers,
+        bundle,
+    )
+    assert any(
+        item.get("code") == "unsupported_tool_evidence_marker"
+        for item in swapped_violations
+    ), swapped_violations
+    assert swapped_bundle.tool_evidence_links == []
 
 
 def test_renderer_requires_exact_tool_value_and_unit():

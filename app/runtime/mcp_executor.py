@@ -180,7 +180,12 @@ def _json_safe(value: Any, depth: int = 0) -> Any:
     return str(value)
 
 
-def _canonical_result_payload(value: Any, depth: int = 0) -> Any:
+def _canonical_result_payload(
+    value: Any,
+    depth: int = 0,
+    *,
+    allow_root_result_wrapper: bool = True,
+) -> Any:
     """Unwrap only MCP transport envelopes and retain the complete payload.
 
     Unlike ``_structured_result`` this function never selects the first matching
@@ -194,7 +199,11 @@ def _canonical_result_payload(value: Any, depth: int = 0) -> Any:
         if hasattr(value, attribute):
             structured = getattr(value, attribute)
             if structured is not None:
-                return _canonical_result_payload(structured, depth + 1)
+                return _canonical_result_payload(
+                    structured,
+                    depth + 1,
+                    allow_root_result_wrapper=allow_root_result_wrapper,
+                )
     if hasattr(value, "model_dump"):
         try:
             value = value.model_dump(mode="json")
@@ -207,23 +216,55 @@ def _canonical_result_payload(value: Any, depth: int = 0) -> Any:
         if not stripped:
             return ""
         try:
-            return _canonical_result_payload(json.loads(stripped), depth + 1)
+            return _canonical_result_payload(
+                json.loads(stripped),
+                depth + 1,
+                allow_root_result_wrapper=allow_root_result_wrapper,
+            )
         except Exception:
             return value
     if isinstance(value, dict):
         for key in ("structured_content", "structuredContent"):
             if key in value and value[key] is not None:
-                return _canonical_result_payload(value[key], depth + 1)
+                return _canonical_result_payload(
+                    value[key],
+                    depth + 1,
+                    allow_root_result_wrapper=allow_root_result_wrapper,
+                )
         metadata = value.get("metadata")
         if isinstance(metadata, dict):
             for key in ("structured_content", "structuredContent"):
                 if key in metadata and metadata[key] is not None:
-                    return _canonical_result_payload(metadata[key], depth + 1)
+                    return _canonical_result_payload(
+                        metadata[key],
+                        depth + 1,
+                        allow_root_result_wrapper=allow_root_result_wrapper,
+                    )
+        # Agno's production MCP adapter wraps a complete business JSON object
+        # or array as the string value of a root-level, single-key ``result``
+        # object.  Unwrap exactly that transport shape once.  A calculator's
+        # business payload ``{"result": 84}``, JSON scalars, multi-key business
+        # objects and nested ``result`` fields retain their original semantics.
+        if (
+            allow_root_result_wrapper
+            and set(value) == {"result"}
+            and isinstance(value.get("result"), str)
+        ):
+            try:
+                parsed_result = json.loads(value["result"])
+            except Exception:
+                parsed_result = None
+            if isinstance(parsed_result, (dict, list)):
+                return _json_safe(parsed_result, depth + 1)
         # Content blocks are a transport envelope only when no business fields
         # are present.  A business object containing a ``content`` field remains
         # intact and is hashed as returned.
         if set(value).issubset(_MCP_ENVELOPE_KEYS) and "content" in value:
-            return _canonical_result_payload(value.get("content"), depth + 1)
+            return _canonical_result_payload(
+                value.get("content"),
+                depth + 1,
+                allow_root_result_wrapper=allow_root_result_wrapper,
+            )
         return _json_safe(value, depth + 1)
     if isinstance(value, (list, tuple)):
         # A single MCP text content block is an envelope around its text.  Real
@@ -231,8 +272,19 @@ def _canonical_result_payload(value: Any, depth: int = 0) -> Any:
         if len(value) == 1 and isinstance(value[0], dict):
             block = value[0]
             if set(block).issubset(_MCP_ENVELOPE_KEYS) and "text" in block:
-                return _canonical_result_payload(block.get("text"), depth + 1)
-        return [_canonical_result_payload(item, depth + 1) for item in value]
+                return _canonical_result_payload(
+                    block.get("text"),
+                    depth + 1,
+                    allow_root_result_wrapper=allow_root_result_wrapper,
+                )
+        return [
+            _canonical_result_payload(
+                item,
+                depth + 1,
+                allow_root_result_wrapper=False,
+            )
+            for item in value
+        ]
     return _json_safe(value, depth + 1)
 
 
