@@ -140,9 +140,6 @@ _VIOLATION_DETAILS = {
     "unsupported_evidence_citation": (
         "The cited RAG snapshot did not support the associated claim."
     ),
-    "unsupported_tool_evidence_marker": (
-        "The referenced ToolEvidence did not support the associated claim."
-    ),
     "unsupported_critical_value": (
         "The cited RAG evidence did not support every critical value in the claim."
     ),
@@ -1555,7 +1552,6 @@ def render_bundle_citations(
 
     evidence = bundle.retrieved_rag_candidates
     by_id = evidence.by_id()
-    tool_by_id = {item.evidence_id: item for item in bundle.tool_evidence}
     ordered_ids: List[str] = []
     violations: List[Dict[str, Any]] = []
     # Only governed runtime evidence can support business facts. Values in the
@@ -1586,7 +1582,6 @@ def render_bundle_citations(
     atomic_tool_values = _atomic_tool_supported_values(normalized, bundle)
     claims, ignored_marker_starts = _build_atomic_claims(normalized)
     marker_decisions: Dict[int, Tuple[str, Optional[str]]] = {}
-    marker_tool_links: List[ToolEvidenceLink] = []
 
     def resolved_evidence_id(raw_evidence_id: str) -> str:
         evidence_id = normalize_evidence_id(raw_evidence_id)
@@ -1602,33 +1597,6 @@ def render_bundle_citations(
     for marker_start in ignored_marker_starts:
         marker_decisions[marker_start] = ("ignored_display", None)
 
-    invalid_marker_starts: Set[int] = set()
-    for marker_start, marker in all_markers.items():
-        evidence_id = resolved_evidence_id(marker.group(1))
-        if evidence_id in by_id or evidence_id in tool_by_id:
-            continue
-        violations.append(
-            {"code": "invalid_evidence_id", "evidence_id": evidence_id}
-        )
-        invalid_marker_starts.add(marker_start)
-        marker_decisions[marker_start] = ("rejected", None)
-
-    for marker_start in ignored_marker_starts:
-        marker = all_markers.get(marker_start)
-        if marker is None or marker_start in invalid_marker_starts:
-            continue
-        evidence_id = resolved_evidence_id(marker.group(1))
-        if evidence_id not in tool_by_id:
-            continue
-        violations.append(
-            {
-                "code": "unsupported_tool_evidence_marker",
-                "evidence_id": evidence_id,
-                "claim_context": "",
-            }
-        )
-        marker_decisions[marker_start] = ("rejected", None)
-
     for claim_index, claim in enumerate(claims):
         marker_starts = list(claim.get("marker_starts") or [])
         if not marker_starts:
@@ -1640,33 +1608,6 @@ def render_bundle_citations(
             if marker is None:
                 continue
             evidence_id = resolved_evidence_id(marker.group(1))
-            if marker_start in invalid_marker_starts:
-                continue
-            if evidence_id in tool_by_id:
-                restricted_bundle = bundle.model_copy(
-                    update={"tool_evidence": [tool_by_id[evidence_id]]}
-                )
-                scoped_links = [
-                    link
-                    for link in _tool_links_for_answer(
-                        claim_text,
-                        restricted_bundle,
-                    )
-                    if link.evidence_id == evidence_id
-                ]
-                if not scoped_links:
-                    violations.append(
-                        {
-                            "code": "unsupported_tool_evidence_marker",
-                            "evidence_id": evidence_id,
-                            "claim_context": claim_text[:240],
-                        }
-                    )
-                    marker_decisions[marker_start] = ("rejected", None)
-                    continue
-                marker_tool_links.extend(scoped_links)
-                marker_decisions[marker_start] = ("accepted_tool", evidence_id)
-                continue
             if evidence_id not in by_id:
                 violations.append(
                     {"code": "invalid_evidence_id", "evidence_id": evidence_id}
@@ -1733,8 +1674,6 @@ def render_bundle_citations(
         decision, evidence_id = marker_decisions.get(
             match.start(), ("ignored_display", None)
         )
-        if decision == "accepted_tool":
-            return ""
         if decision != "accepted" or not evidence_id:
             return ""
         if evidence_id not in ordered_ids:
@@ -1794,29 +1733,7 @@ def render_bundle_citations(
                 retrieval_mode=item.retrieval_mode,
             )
         )
-    merged_tool_links: Dict[Tuple[str, str], Dict[str, Set[str]]] = {}
-    for link in [
-        *_tool_links_for_answer(normalized, bundle),
-        *marker_tool_links,
-    ]:
-        key = (link.evidence_id, link.invocation_id)
-        slot = merged_tool_links.setdefault(
-            key,
-            {"fact_ids": set(), "claim_values": set()},
-        )
-        slot["fact_ids"].update(link.fact_ids)
-        slot["claim_values"].update(link.claim_values)
-    tool_links = [
-        ToolEvidenceLink(
-            evidence_id=evidence_id,
-            invocation_id=invocation_id,
-            fact_ids=sorted(payload["fact_ids"]),
-            claim_values=sorted(payload["claim_values"]),
-        )
-        for (evidence_id, invocation_id), payload in sorted(
-            merged_tool_links.items()
-        )
-    ]
+    tool_links = _tool_links_for_answer(normalized, bundle)
     validated_ids = [item.evidence_id for item in citations]
     delivered_ids = [
         *validated_ids,
