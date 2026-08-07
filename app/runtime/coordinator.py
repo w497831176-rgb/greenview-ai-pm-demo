@@ -423,6 +423,28 @@ def _knowledge_evidence_decision(
     }
 
 
+def _requires_rag_citation(
+    answer_contract: AnswerContract,
+    *,
+    evidence_count: int,
+    linked_skill_evidence_count: int,
+    successful_tool_evidence_count: int,
+) -> bool:
+    """Require a RAG citation only when RAG is the remaining answer evidence.
+
+    A successful read Tool is first-class evidence for a realtime business
+    result. Incidental retrieval candidates must not force a Tool-only answer
+    to cite an unrelated knowledge chunk. Pure RAG answers remain fail-closed.
+    """
+
+    return bool(
+        int(evidence_count or 0) > 0
+        and int(linked_skill_evidence_count or 0) == 0
+        and int(successful_tool_evidence_count or 0) == 0
+        and answer_contract.response_mode == ResponseMode.GROUNDED_ANSWER
+    )
+
+
 def _answer_contract_for(
     decision: LaneDecision,
     runtime_path: RuntimePath = RuntimePath.CONSULTATION,
@@ -3078,10 +3100,11 @@ class RuntimeCoordinator:
             full_content,
             build.skill_evidence_sources,
         )
-        citation_required = bool(
-            evidence.items
-            and not linked_skill_evidence
-            and state.answer_contract.response_mode == ResponseMode.GROUNDED_ANSWER
+        citation_required = _requires_rag_citation(
+            state.answer_contract,
+            evidence_count=len(evidence.items),
+            linked_skill_evidence_count=len(linked_skill_evidence),
+            successful_tool_evidence_count=len(successful_tool_evidence),
         )
         if citation_required and not citations:
             citation_violations.append(

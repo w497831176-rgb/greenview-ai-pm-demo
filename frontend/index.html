@@ -801,6 +801,35 @@
       return `${controlledWriteHtml}${tagHtml}`;
     }
 
+    function traceCapabilityStatusLabel(value) {
+      const status = (value || {}).status || 'skipped';
+      const labels = {
+        selected: '已选择',
+        required: '需要',
+        skipped: '已跳过',
+        not_required: '不需要',
+        available: '可选'
+      };
+      return labels[status] || `状态：${status}`;
+    }
+
+    function isSuccessfulToolEvidence(invocation) {
+      return Boolean(
+        invocation
+        && invocation.invocation_status === 'success'
+        && invocation.business_status === 'success'
+      );
+    }
+
+    function isCommittedReceiptEvidence(receipt) {
+      return Boolean(
+        receipt
+        && receipt.status === 'committed'
+        && receipt.receipt_id
+        && receipt.resource_id
+      );
+    }
+
     async function openTraceDrawer(traceId) {
       try {
         const [data, runtimeEvidenceData] = await Promise.all([
@@ -824,6 +853,8 @@
         const proposals = runtimeEvidence.action_proposals || [];
         const approvals = runtimeEvidence.approval_events || [];
         const receipts = runtimeEvidence.action_receipts || [];
+        const successfulToolEvidence = (runtimeEvidence.tool_invocations || []).filter(isSuccessfulToolEvidence);
+        const committedReceiptEvidence = receipts.filter(isCommittedReceiptEvidence);
         const workflowCalls = assistantToolCalls.filter(isWorkOrderWorkflowCall);
         const controlledWriteCalls = assistantToolCalls.filter(isControlledWorkOrderCall);
         const controlledGatewayCall = controlledWriteCalls[0] || null;
@@ -941,14 +972,13 @@
         const laneLabels = { A_SAFETY_HANDOFF: 'A路：安全人工协同', B_PROPERTY_GOVERNED: 'B路：物业受控回答', C_ISOLATED_GENERAL: 'C路：隔离通用回答', CLARIFY: '需澄清' };
         const modeLabels = { emergency_handoff: '安全协同', clarify_only: '仅澄清', grounded_answer: '依据回答', realtime_read: '实时读取', controlled_write: '受控写入', safe_general: '安全通用回答', safe_refusal: '安全拒绝' };
         const capabilityLabel = (name, value) => {
-          const status = (value || {}).status || 'skipped';
-          return `${name}${['selected', 'required'].includes(status) ? '已执行/需要' : '已跳过'}（${(value || {}).reason_code || '无运行证据'}）`;
+          return `${name}${traceCapabilityStatusLabel(value)}（${(value || {}).reason_code || '无运行证据'}）`;
         };
         const adoptedEvidence = [
           skills.length ? `${skills.length}项已激活Skill` : '',
           usedCitations.length ? `${usedCitations.length}条已采用RAG引用` : '',
-          (runtimeEvidence.tool_invocations || []).length ? `${(runtimeEvidence.tool_invocations || []).length}次Tool结果` : '',
-          receipts.length ? `${receipts.length}份Receipt` : '',
+          successfulToolEvidence.length ? `${successfulToolEvidence.length}次成功Tool结果` : '',
+          committedReceiptEvidence.length ? `${committedReceiptEvidence.length}份已提交Receipt` : '',
           (runtimeEvidence.handoff_events || []).length ? `${(runtimeEvidence.handoff_events || []).length}次Handoff` : ''
         ].filter(Boolean).join('、') || '无业务Evidence；如属物业事实，系统必须澄清或说明依据不足';
         const decisionContractHtml = Object.keys(laneDecision).length ? `<section class="rounded-xl border border-indigo-200 bg-indigo-50 p-4"><h4 class="font-semibold text-indigo-950">本轮判断与回答边界</h4><div class="mt-2 grid gap-2 sm:grid-cols-2 text-sm"><div><span class="text-indigo-700">进入哪一路</span><div class="font-medium text-slate-900">${escapeHtml(laneLabels[laneDecision.lane] || '历史记录未采集')}</div></div><div><span class="text-indigo-700">回答模式</span><div class="font-medium text-slate-900">${escapeHtml(modeLabels[answerContract.response_mode] || '历史记录未采集')}</div></div></div><p class="mt-2 text-sm text-indigo-900">为什么：${escapeHtml(laneDecision.reason || laneDecision.explanation || '历史记录未采集结构化原因')}</p><p class="mt-2 text-xs text-slate-700">能力执行：${escapeHtml([capabilityLabel('Skill', capabilityDecision.skill), capabilityLabel('RAG', capabilityDecision.rag), capabilityLabel('Tool', capabilityDecision.tool), capabilityLabel('写入', capabilityDecision.write), capabilityLabel('人工协同', capabilityDecision.handoff)].join('；'))}</p><p class="mt-1 text-xs text-slate-700">最终依据：${escapeHtml(adoptedEvidence)}</p><details class="mt-2"><summary class="cursor-pointer text-xs text-indigo-700">高级信息：查看结构化决策Schema</summary><pre class="mt-2 overflow-x-auto rounded bg-white/70 p-2 text-[10px]">${escapeHtml(safeTraceJson({ lane_decision: laneDecision, answer_contract: answerContract, capability_decision: capabilityDecision }))}</pre></details></section>` : '';
