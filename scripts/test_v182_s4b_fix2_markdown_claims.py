@@ -5,7 +5,6 @@ from pathlib import Path
 
 from app.runtime.citation_renderer import render_citations
 from app.runtime.contracts import EvidenceItem, EvidenceSet
-from app.runtime.mcp_executor import _evaluate_read_tool_result
 
 
 FIXTURE_PATH = (
@@ -35,18 +34,6 @@ def _item(evidence_id: str, content: str, chunk_index: int = 0) -> EvidenceItem:
 
 def _fixture():
     payload = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
-    for index, invocation in enumerate(payload["tool_invocations"], start=1):
-        invocation_id = f"fixture_tool_{index}"
-        _, summary, tool_evidence = _evaluate_read_tool_result(
-            invocation.pop("structured_result"),
-            {},
-            invocation_id=invocation_id,
-            server_name=invocation["server_name"],
-            tool_name=invocation["tool_name"],
-        )
-        invocation["invocation_id"] = invocation_id
-        invocation["result_summary"] = summary
-        invocation["tool_evidence"] = tool_evidence.model_dump(mode="json")
     evidence = EvidenceSet(
         query=payload["question"],
         items=[

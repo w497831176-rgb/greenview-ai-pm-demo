@@ -224,39 +224,6 @@ class ToolPlan(ImmutableModel):
     result_contract: Dict[str, Any] = Field(default_factory=dict)
 
 
-class ToolEvidenceFact(ImmutableModel):
-    """One safe scalar fact frozen from an untruncated successful Tool result."""
-
-    fact_id: str
-    json_path: str
-    field_name: str
-    value_type: str
-    value: Any
-    normalized_value: str
-    unit: Optional[str] = None
-    display_value: str
-    semantic_type: str = "business_result"
-
-
-class ToolEvidence(ImmutableModel):
-    """Immutable result evidence; request arguments are deliberately absent."""
-
-    evidence_id: str
-    invocation_id: str
-    server_name: str
-    tool_name: str
-    business_status: Literal["success"] = "success"
-    payload_hash: str
-    facts: List[ToolEvidenceFact] = Field(default_factory=list)
-
-
-class ToolEvidenceLink(ImmutableModel):
-    evidence_id: str
-    invocation_id: str
-    fact_ids: List[str] = Field(default_factory=list)
-    claim_values: List[str] = Field(default_factory=list)
-
-
 class ToolInvocation(ImmutableModel):
     invocation_id: str = Field(default_factory=lambda: f"tool_{uuid.uuid4().hex}")
     plan_id: Optional[str] = None
@@ -274,7 +241,6 @@ class ToolInvocation(ImmutableModel):
     result_summary: Optional[str] = None
     error_summary: Optional[str] = None
     receipt_id: Optional[str] = None
-    tool_evidence: Optional[ToolEvidence] = None
 
 
 class EvidenceItem(ImmutableModel):
@@ -291,10 +257,6 @@ class EvidenceItem(ImmutableModel):
     retrieval_score: Optional[float] = None
     retrieval_mode: str
     title: str = ""
-    subquery: Optional[str] = None
-    named_document_scope: Optional[Dict[str, Any]] = None
-    retrieval_path: Optional[str] = None
-    retrieval_matches: List[Dict[str, Any]] = Field(default_factory=list)
 
 
 class EvidenceSet(ImmutableModel):
@@ -394,20 +356,6 @@ class ActionReceipt(ImmutableModel):
         return self.status == "committed" and bool(self.resource_id)
 
 
-class RunEvidenceBundle(ImmutableModel):
-    """The single immutable fact contract for one runtime answer."""
-
-    retrieved_rag_candidates: EvidenceSet = Field(default_factory=EvidenceSet)
-    skill_evidence: List[Dict[str, Any]] = Field(default_factory=list)
-    tool_evidence: List[ToolEvidence] = Field(default_factory=list)
-    committed_receipts: List[ActionReceipt] = Field(default_factory=list)
-    validated_rag_evidence_ids: List[str] = Field(default_factory=list)
-    delivered_evidence_ids: List[str] = Field(default_factory=list)
-    tool_evidence_links: List[ToolEvidenceLink] = Field(default_factory=list)
-    withheld: List[Dict[str, Any]] = Field(default_factory=list)
-    violations: List[Dict[str, Any]] = Field(default_factory=list)
-
-
 class RunConfigSnapshot(ImmutableModel):
     snapshot_id: str
     release_id: str
@@ -439,7 +387,6 @@ class RunState(BaseModel):
     model_calls: List[Dict[str, Any]] = Field(default_factory=list)
     citations: List[Citation] = Field(default_factory=list)
     cost_entries: List[CostEntry] = Field(default_factory=list)
-    evidence_bundle: Optional[RunEvidenceBundle] = None
     status: RunStatus = RunStatus.CREATED
     next_step: Optional[str] = None
 
@@ -469,4 +416,3 @@ class RunEvidenceLedger(BaseModel):
     contract_violations: List[Dict[str, Any]] = Field(default_factory=list)
     system_observations: List[Dict[str, Any]] = Field(default_factory=list)
     badcase_links: List[Dict[str, Any]] = Field(default_factory=list)
-    run_evidence_bundle: Optional[Dict[str, Any]] = None

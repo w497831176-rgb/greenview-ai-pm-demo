@@ -14,11 +14,10 @@ from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 from app.runtime.agent_factory import build_agent_from_snapshot, vertical_agent_cards
 from app.runtime.badcase_capture import capture_runtime_badcase
 from app.runtime.citation_renderer import (
-    build_run_evidence_bundle,
     build_skill_evidence,
     build_evidence_set,
-    prompt_run_evidence_bundle,
-    render_bundle_citations,
+    prompt_evidence_allowlist,
+    render_citations,
 )
 from app.runtime.contracts import (
     ActionProposal,
@@ -31,7 +30,6 @@ from app.runtime.contracts import (
     ResponseMode,
     RiskLevel,
     RouteDecision,
-    RunEvidenceBundle,
     RunState,
     RunStatus,
     RuntimeLane,
@@ -560,29 +558,6 @@ def _record_citation_violations(
     ledger: EvidenceLedger,
     violations: List[Dict[str, Any]],
 ) -> None:
-    default_details = {
-        "ungrounded_critical_value": (
-            "The answer contained a critical value not supported by the frozen run evidence bundle."
-        ),
-        "unsupported_critical_value": (
-            "The cited RAG evidence did not support every critical value in the claim."
-        ),
-        "unsupported_evidence_citation": (
-            "The cited RAG snapshot did not support the associated claim."
-        ),
-        "invalid_evidence_id": (
-            "The answer referenced an evidence ID outside the frozen run evidence bundle."
-        ),
-        "required_citation_missing": (
-            "The answer required a validated RAG citation but delivered none."
-        ),
-        "unsupported_tool_fact": (
-            "The answer changed a categorical fact from frozen ToolEvidence."
-        ),
-        "no_linked_governed_evidence": (
-            "The property answer did not link any governed run evidence."
-        ),
-    }
     for violation in violations:
         code = str(violation.get("code") or "citation_violation")
         metadata = {
@@ -594,8 +569,7 @@ def _record_citation_violations(
             code,
             str(
                 violation.get("detail")
-                or default_details.get(code)
-                or "The answer violated the frozen run evidence contract."
+                or "Model citation was not present in the immutable EvidenceSet."
             ),
             **metadata,
         )
@@ -657,7 +631,6 @@ def _results_from_snapshot(
     allowed_document_ids: set[int],
     top_k: int,
     context_threshold: float = 0.2,
-    retrieval_plan: Optional[List[Dict[str, Any]]] = None,
 ) -> Tuple[List[Dict[str, Any]], bool]:
     import rag_retrieval
 
@@ -703,175 +676,44 @@ def _results_from_snapshot(
             }
         )
         seen.add((doc_id, chunk_index))
-    document_catalog = [
-        {
-            "knowledge_doc_id": doc_id,
-            "title": str((knowledge_versions.get(doc_id) or {}).get("title") or ""),
-            "document_version": (knowledge_versions.get(doc_id) or {}).get(
-                "document_version"
-            ),
-            "document_hash": (knowledge_versions.get(doc_id) or {}).get(
-                "document_hash"
-            ),
-        }
-        for doc_id in sorted(allowed_document_ids)
-    ]
-    plan = list(
-        retrieval_plan
-        or rag_retrieval.build_retrieval_plan(
-            query,
-            document_catalog=document_catalog,
-            allowed_document_ids=allowed_document_ids,
-        )
-    )
-    named_plan_ids = {
-        str(item.get("retrieval_query_id"))
-        for item in plan
-        if item.get("named_document_scope")
-        and item.get("allowed_document_ids")
-    }
-    covered_named_plan_ids = {
-        str(match.get("retrieval_query_id"))
-        for item in verified
-        for match in (item.get("retrieval_matches") or [])
-        if str(match.get("retrieval_query_id")) in named_plan_ids
-    }
-    plans_to_fill = [
-        item
-        for item in plan
-        if not verified
-        or (
-            str(item.get("retrieval_query_id")) in named_plan_ids
-            and str(item.get("retrieval_query_id")) not in covered_named_plan_ids
-        )
-    ]
+    if verified:
+        return verified[:top_k], False
 
     fallback: List[Dict[str, Any]] = []
-    for plan_item in plans_to_fill:
-        subquery = str(plan_item.get("subquery") or "").strip()
-        plan_scope_raw = plan_item.get("allowed_document_ids")
-        plan_scope = (
-            allowed_document_ids
-            if plan_scope_raw is None
-            else {int(item) for item in plan_scope_raw}
-        )
-        if plan_item.get("named_document_scope") and not plan_scope:
+    for (doc_id, chunk_index), snapshot_chunk in published_chunks.items():
+        document = snapshot_chunk["document"]
+        content = str(snapshot_chunk.get("content") or "")
+        if rag_retrieval._is_structural_chunk(
+            content,
+            document.get("title") or "",
+        ):
             continue
-        for (doc_id, chunk_index), snapshot_chunk in published_chunks.items():
-            if doc_id not in plan_scope:
-                continue
-            document = snapshot_chunk["document"]
-            content = str(snapshot_chunk.get("content") or "")
-            if rag_retrieval._is_structural_chunk(
-                content,
-                document.get("title") or "",
-            ):
-                continue
-            query_values = rag_retrieval._required_evidence_values(subquery)
-            if query_values and not query_values.issubset(
-                rag_retrieval._critical_values(content)
-            ):
-                continue
-            context_score = rag_retrieval._context_relevance_score(
-                subquery, content
-            )
-            if context_score < context_threshold:
-                continue
-            retrieval_path = (
-                "named_document_clause_snapshot_lexical"
-                if plan_item.get("named_document_scope")
-                else "knowledge_clause_snapshot_lexical"
-            )
-            match = {
-                "retrieval_query_id": plan_item.get("retrieval_query_id"),
-                "subquery": subquery,
-                "named_document_scope": plan_item.get(
-                    "named_document_scope"
-                ),
-                "retrieval_path": retrieval_path,
-                "retrieval_sources": [
-                    "runtime_release_snapshot_lexical"
-                ],
+        query_values = rag_retrieval._required_evidence_values(query)
+        if query_values and not query_values.issubset(
+            rag_retrieval._critical_values(content)
+        ):
+            continue
+        context_score = rag_retrieval._context_relevance_score(query, content)
+        if context_score < context_threshold:
+            continue
+        fallback.append(
+            {
+                "doc_id": doc_id,
+                "doc_title": document.get("title") or "",
+                "chunk_index": chunk_index,
+                "content": content,
+                "chunk_hash": snapshot_chunk.get("chunk_hash"),
+                "document_hash": document.get("document_hash"),
+                "document_version": document.get("document_version"),
                 "score": round(context_score, 6),
                 "context_score": round(context_score, 6),
+                "evidence_status": "accepted",
                 "evidence_reason": "accepted_snapshot_lexical",
+                "retrieval_sources": ["runtime_release_snapshot_lexical"],
             }
-            fallback.append(
-                {
-                    "doc_id": doc_id,
-                    "doc_title": document.get("title") or "",
-                    "chunk_index": chunk_index,
-                    "content": content,
-                    "chunk_hash": snapshot_chunk.get("chunk_hash"),
-                    "document_hash": document.get("document_hash"),
-                    "document_version": document.get("document_version"),
-                    "score": round(context_score, 6),
-                    "context_score": round(context_score, 6),
-                    "evidence_status": "accepted",
-                    "evidence_reason": "accepted_snapshot_lexical",
-                    "retrieval_sources": [
-                        "runtime_release_snapshot_lexical"
-                    ],
-                    "subquery": subquery,
-                    "named_document_scope": plan_item.get(
-                        "named_document_scope"
-                    ),
-                    "retrieval_path": retrieval_path,
-                    "retrieval_matches": [match],
-                }
-            )
-
-    merged: Dict[Tuple[int, int], Dict[str, Any]] = {}
-    for item in [*verified, *fallback]:
-        key = (int(item.get("doc_id") or -1), int(item.get("chunk_index") or 0))
-        current = merged.get(key)
-        if current is None:
-            merged[key] = item
-            continue
-        matches = list(current.get("retrieval_matches") or [])
-        for match in item.get("retrieval_matches") or []:
-            if match not in matches:
-                matches.append(match)
-        current["retrieval_matches"] = matches
-
-    ranked = sorted(
-        merged.values(),
-        key=lambda item: float(
-            item.get("context_score", item.get("score")) or 0
-        ),
-        reverse=True,
-    )
-    reserved: List[Dict[str, Any]] = []
-    for plan_item in plan:
-        if not plan_item.get("named_document_scope"):
-            continue
-        plan_id = str(plan_item.get("retrieval_query_id"))
-        candidate = next(
-            (
-                item
-                for item in ranked
-                if any(
-                    str(match.get("retrieval_query_id")) == plan_id
-                    for match in item.get("retrieval_matches") or []
-                )
-            ),
-            None,
         )
-        if candidate is not None and candidate not in reserved:
-            reserved.append(candidate)
-    selected = list(reserved[:top_k])
-    for item in ranked:
-        if len(selected) >= top_k:
-            break
-        if item not in selected:
-            selected.append(item)
-    selected.sort(
-        key=lambda item: float(
-            item.get("context_score", item.get("score")) or 0
-        ),
-        reverse=True,
-    )
-    return selected, bool(plans_to_fill)
+    fallback.sort(key=lambda item: float(item.get("context_score") or 0), reverse=True)
+    return fallback[:top_k], True
 
 
 class RuntimeCoordinator:
@@ -2619,11 +2461,6 @@ class RuntimeCoordinator:
             int(item["knowledge_doc_id"]): item
             for item in snapshot.config.get("knowledge") or []
         }
-        document_catalog = [
-            knowledge_versions[doc_id]
-            for doc_id in sorted(allowed_doc_ids)
-            if doc_id in knowledge_versions
-        ]
         results: List[Dict[str, Any]] = []
         retrieval: Dict[str, Any] = {}
         used_snapshot_fallback = False
@@ -2650,7 +2487,6 @@ class RuntimeCoordinator:
                     message,
                     snapshot.config.get("retrieval_policy") or {},
                     allowed_document_ids=sorted(allowed_doc_ids),
-                    document_catalog=document_catalog,
                 )
                 results = list((retrieval or {}).get("results") or [])
                 results, used_snapshot_fallback = _results_from_snapshot(
@@ -2667,9 +2503,6 @@ class RuntimeCoordinator:
                             "context_threshold"
                         )
                         or 0.2
-                    ),
-                    retrieval_plan=list(
-                        (retrieval or {}).get("retrieval_plan") or []
                     ),
                 )
                 retrieval_status = (
@@ -2739,10 +2572,6 @@ class RuntimeCoordinator:
                         "chunk_index": item.chunk_index,
                         "retrieval_score": item.retrieval_score,
                         "retrieval_mode": item.retrieval_mode,
-                        "subquery": item.subquery,
-                        "named_document_scope": item.named_document_scope,
-                        "retrieval_path": item.retrieval_path,
-                        "retrieval_matches": item.retrieval_matches,
                     }
                     for item in evidence.items
                 ],
@@ -2770,11 +2599,11 @@ class RuntimeCoordinator:
                 {"trace_id": trace_id, "stage": "mcp.invoke", "status": "running"},
             )
         if property_query and read_tool_plans:
-            _mcp_context, invocations = await preinvoke_read_tools(
+            mcp_context, invocations = await preinvoke_read_tools(
                 snapshot.config, selected, message
             )
         else:
-            _mcp_context, invocations = "", []
+            mcp_context, invocations = "", []
         preinvoked_tools = {
             (invocation.server_name, invocation.tool_name)
             for invocation in invocations
@@ -2826,14 +2655,7 @@ class RuntimeCoordinator:
                 invocation_mode="policy_preinvoke",
             )
 
-        preliminary_bundle = build_run_evidence_bundle(
-            evidence,
-            tool_invocations=state.tool_invocations,
-            action_receipts=state.action_receipts,
-        )
-        evidence_prompt = (
-            prompt_run_evidence_bundle(preliminary_bundle) if property_query else ""
-        )
+        evidence_prompt = prompt_evidence_allowlist(evidence) if property_query else ""
         answer_boundary = (
             "\n[回答边界] 这是隔离通用回答。不得调用或声称使用物业Skill、RAG、MCP/Tool、ActionGateway，"
             "不得把一般建议表述为物业官方事实。"
@@ -2845,7 +2667,7 @@ class RuntimeCoordinator:
             selected,
             message,
             tools=model_native_toolkits,
-            evidence_prompt=evidence_prompt + answer_boundary,
+            evidence_prompt=evidence_prompt + mcp_context + answer_boundary,
             enable_skills=(
                 property_query
                 and not structured_realtime_query
@@ -2853,12 +2675,6 @@ class RuntimeCoordinator:
             ),
         )
         state.activated_skills = build.activated_skills
-        state.evidence_bundle = build_run_evidence_bundle(
-            evidence,
-            skill_sources=build.skill_evidence_sources,
-            tool_invocations=state.tool_invocations,
-            action_receipts=state.action_receipts,
-        )
         for call in build.skill_tool_calls:
             record_trace_event(
                 trace_id,
@@ -2872,11 +2688,9 @@ class RuntimeCoordinator:
             )
         successful_tool_evidence = [
             invocation
-            for invocation in state.tool_invocations
+            for invocation in invocations
             if invocation.invocation_status == "success"
             and invocation.business_status == "success"
-            and invocation.tool_evidence is not None
-            and bool(invocation.tool_evidence.facts)
         ]
         knowledge_gate = _knowledge_evidence_decision(
             state.answer_contract,
@@ -3236,13 +3050,6 @@ class RuntimeCoordinator:
                 invocation_mode="model_native",
             )
 
-        state.evidence_bundle = build_run_evidence_bundle(
-            evidence,
-            skill_sources=build.skill_evidence_sources,
-            tool_invocations=state.tool_invocations,
-            action_receipts=state.action_receipts,
-        )
-
         if provider_failure_reason:
             raise ProviderFailureError(
                 f"model Provider returned failure text: {provider_failure_reason}"
@@ -3260,11 +3067,12 @@ class RuntimeCoordinator:
                 ],
             )
 
-        rendered, citations, citation_violations, final_evidence_bundle = (
-            render_bundle_citations(
-                full_content,
-                state.evidence_bundle,
-            )
+        rendered, citations, citation_violations = render_citations(
+            full_content,
+            evidence,
+            tool_invocations=state.tool_invocations,
+            skill_sources=build.skill_evidence_sources,
+            action_receipts=state.action_receipts,
         )
         linked_skill_evidence = build_skill_evidence(
             full_content,
@@ -3285,45 +3093,9 @@ class RuntimeCoordinator:
                     ),
                 }
             )
-            final_evidence_bundle = final_evidence_bundle.model_copy(
-                update={
-                    "delivered_evidence_ids": [],
-                    "tool_evidence_links": [],
-                    "withheld": [
-                        *final_evidence_bundle.withheld,
-                        {
-                            "code": "required_citation_missing",
-                            "values": [],
-                            "detail": (
-                                "The answer required a validated RAG citation."
-                            ),
-                            "claim_context": "",
-                        },
-                    ],
-                    "violations": list(citation_violations),
-                }
-            )
-        successful_tool_evidence = list(final_evidence_bundle.tool_evidence)
         answer_has_governed_evidence = bool(
-            citations
-            or linked_skill_evidence
-            or final_evidence_bundle.tool_evidence_links
+            citations or linked_skill_evidence or successful_tool_evidence
         )
-        if (
-            direct_knowledge_required
-            and not answer_has_governed_evidence
-            and not citation_violations
-        ):
-            citation_violations.append(
-                {
-                    "code": "no_linked_governed_evidence",
-                    "detail": (
-                        "The answer did not link any validated RAG, Skill, "
-                        "ToolEvidence or committed Receipt fact."
-                    ),
-                    "claim_context": rendered[:240],
-                }
-            )
         knowledge_grounding_failed = bool(
             direct_knowledge_required
             and (citation_violations or not answer_has_governed_evidence)
@@ -3331,28 +3103,6 @@ class RuntimeCoordinator:
         if knowledge_grounding_failed:
             rendered = KNOWLEDGE_INSUFFICIENT_RESPONSE
             citations = []
-            final_evidence_bundle = final_evidence_bundle.model_copy(
-                update={
-                    "delivered_evidence_ids": [],
-                    "tool_evidence_links": [],
-                    "withheld": [
-                        {
-                            "code": str(
-                                item.get("code")
-                                or "knowledge_evidence_gate_blocked"
-                            ),
-                            "values": list(item.get("values") or []),
-                            "detail": str(item.get("detail") or ""),
-                            "claim_context": str(
-                                item.get("claim_context") or ""
-                            ),
-                        }
-                        for item in citation_violations
-                    ],
-                    "violations": list(citation_violations),
-                }
-            )
-        state.evidence_bundle = final_evidence_bundle
         state.citations = citations
         _record_citation_violations(ledger, citation_violations)
         rendered = _append_runtime_evidence_summary(

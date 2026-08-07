@@ -8,7 +8,6 @@ reranking, and score threshold filtering.
 import json
 import math
 import re
-import unicodedata
 from typing import Any, Dict, List, Optional
 
 from db import property_db as db
@@ -497,230 +496,6 @@ def _extract_sub_queries(query: str) -> List[str]:
     return [segment for segment in segments if not (segment in seen or seen.add(segment))]
 
 
-_CLAUSE_CONNECTOR = re.compile(r"\s*(?:同时|另外|此外|然后|随后|还要)\s*")
-_LEADING_LIST_MARKER = re.compile(r"^\s*(?:[-*•]+|\d{1,2}[.、)])\s*")
-
-
-def _normalize_document_title(value: str) -> str:
-    """Normalize an explicit title for exact RuntimeRelease catalog matching."""
-
-    normalized = unicodedata.normalize("NFKC", str(value or "")).casefold()
-    return re.sub(r"\s+", "", normalized).strip()
-
-
-def _split_semantic_clauses(query: str) -> List[str]:
-    """Split a composite request without breaking text inside ``《...》``.
-
-    This is deliberately a deterministic transport-level splitter, not a
-    question-specific query planner.  Strong punctuation, list boundaries and
-    clause-level conjunctions form independent retrieval questions so a Tool
-    task or a no-write instruction cannot dilute a knowledge clause's content
-    relevance score.
-    """
-
-    raw = str(query or "").strip()
-    if not raw:
-        return []
-
-    clauses: List[str] = []
-    buffer: List[str] = []
-    quoted_title_depth = 0
-
-    def split_connectors(value: str) -> List[str]:
-        parts: List[str] = []
-        part: List[str] = []
-        depth = 0
-        index = 0
-        while index < len(value):
-            char = value[index]
-            if char == "《":
-                depth += 1
-                part.append(char)
-                index += 1
-                continue
-            if char == "》":
-                depth = max(0, depth - 1)
-                part.append(char)
-                index += 1
-                continue
-            match = _CLAUSE_CONNECTOR.match(value, index) if depth == 0 else None
-            if match:
-                candidate = "".join(part).strip()
-                if candidate:
-                    parts.append(candidate)
-                part.clear()
-                index = match.end()
-                continue
-            part.append(char)
-            index += 1
-        candidate = "".join(part).strip()
-        if candidate:
-            parts.append(candidate)
-        return parts
-
-    def flush() -> None:
-        value = _LEADING_LIST_MARKER.sub("", "".join(buffer)).strip()
-        buffer.clear()
-        if not value:
-            return
-        for part in split_connectors(value):
-            part = _LEADING_LIST_MARKER.sub("", part).strip(" ，,。！？?；;：:")
-            if part:
-                clauses.append(part)
-
-    for char in raw:
-        if char == "《":
-            quoted_title_depth += 1
-            buffer.append(char)
-            continue
-        if char == "》":
-            quoted_title_depth = max(0, quoted_title_depth - 1)
-            buffer.append(char)
-            continue
-        if quoted_title_depth == 0 and char in "\r\n。！？?；;，,":
-            flush()
-            continue
-        buffer.append(char)
-    flush()
-
-    seen: set[str] = set()
-    return [item for item in clauses if not (item in seen or seen.add(item))]
-
-
-def _catalog_entries(
-    document_catalog: Optional[Any],
-    allowed_document_ids: Optional[set[int]],
-) -> List[Dict[str, Any]]:
-    """Project caller-supplied Snapshot documents onto a stable title catalog."""
-
-    if document_catalog is None:
-        rows: List[Any] = list(db.list_knowledge_docs())
-    elif isinstance(document_catalog, dict):
-        rows = list(document_catalog.values())
-    else:
-        rows = list(document_catalog or [])
-
-    entries: List[Dict[str, Any]] = []
-    seen: set[int] = set()
-    for raw in rows:
-        if not isinstance(raw, dict):
-            continue
-        raw_id = raw.get(
-            "knowledge_doc_id",
-            raw.get("doc_id", raw.get("document_id", raw.get("id"))),
-        )
-        try:
-            document_id = int(raw_id)
-        except (TypeError, ValueError):
-            continue
-        if document_id in seen:
-            continue
-        if allowed_document_ids is not None and document_id not in allowed_document_ids:
-            continue
-        if raw.get("is_indexed") is False:
-            continue
-        title = str(raw.get("title") or raw.get("doc_title") or "").strip()
-        if not title:
-            continue
-        seen.add(document_id)
-        entries.append(
-            {
-                "document_id": document_id,
-                "title": title,
-                "normalized_title": _normalize_document_title(title),
-                "document_version": raw.get("document_version"),
-                "document_hash": raw.get("document_hash"),
-            }
-        )
-    return sorted(entries, key=lambda item: (item["document_id"], item["title"]))
-
-
-def build_retrieval_plan(
-    query: str,
-    *,
-    document_catalog: Optional[Any] = None,
-    allowed_document_ids: Optional[set[int]] = None,
-) -> List[Dict[str, Any]]:
-    """Build deterministic, Snapshot-scoped retrieval clauses.
-
-    Explicit ``《document titles》`` are resolved only against the caller's
-    catalog after Agent binding scope has been applied.  A named clause never
-    falls back to unrelated documents.  Unnamed clauses retain the Agent's
-    normal RAG scope and are scored independently rather than as one composite
-    request.
-    """
-
-    clauses = _split_semantic_clauses(query)
-    if not clauses and str(query or "").strip():
-        clauses = [str(query).strip()]
-
-    quoted_titles = [
-        title
-        for clause in clauses
-        for title in _extract_quoted_titles(clause)
-    ]
-    catalog = (
-        _catalog_entries(document_catalog, allowed_document_ids)
-        if quoted_titles
-        else []
-    )
-    catalog_by_title: Dict[str, List[Dict[str, Any]]] = {}
-    for entry in catalog:
-        catalog_by_title.setdefault(entry["normalized_title"], []).append(entry)
-
-    plan: List[Dict[str, Any]] = []
-    sequence = 0
-    for clause_index, clause in enumerate(clauses, start=1):
-        titles = _extract_quoted_titles(clause)
-        if not titles:
-            sequence += 1
-            plan.append(
-                {
-                    "retrieval_query_id": f"rq_{sequence:02d}",
-                    "clause_index": clause_index,
-                    "original_clause": clause,
-                    "subquery": clause,
-                    "named_document_scope": None,
-                    "allowed_document_ids": (
-                        None
-                        if allowed_document_ids is None
-                        else sorted(allowed_document_ids)
-                    ),
-                    "retrieval_path": "knowledge_clause_hybrid",
-                }
-            )
-            continue
-
-        for title in titles:
-            matched = catalog_by_title.get(_normalize_document_title(title), [])
-            document_ids = [int(item["document_id"]) for item in matched]
-            sequence += 1
-            plan.append(
-                {
-                    "retrieval_query_id": f"rq_{sequence:02d}",
-                    "clause_index": clause_index,
-                    "original_clause": clause,
-                    "subquery": _content_query(clause, title),
-                    "named_document_scope": {
-                        "requested_title": title,
-                        "matched": bool(matched),
-                        "documents": [
-                            {
-                                "document_id": item["document_id"],
-                                "title": item["title"],
-                                "document_version": item.get("document_version"),
-                                "document_hash": item.get("document_hash"),
-                            }
-                            for item in matched
-                        ],
-                    },
-                    "allowed_document_ids": document_ids,
-                    "retrieval_path": "named_document_clause_hybrid",
-                }
-            )
-    return plan
-
-
 DEFAULT_RETRIEVAL_SETTINGS = {
     "top_k": 5,
     "keyword_weight": 0.3,
@@ -925,7 +700,6 @@ def advanced_search(
     query: str,
     settings: Optional[Dict[str, Any]] = None,
     allowed_document_ids: Optional[List[int]] = None,
-    document_catalog: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """Run composite-aware RAG inside an Agent's published document scope.
 
@@ -953,175 +727,84 @@ def advanced_search(
             },
         }
     top_k = settings["top_k"]
-    retrieval_plan = build_retrieval_plan(
-        query,
-        document_catalog=document_catalog,
-        allowed_document_ids=scope,
-    )
     merged: Dict[tuple, Dict[str, Any]] = {}
 
-    def add_results(
-        results: List[Dict[str, Any]],
-        plan_item: Dict[str, Any],
-    ) -> None:
+    def add_results(results: List[Dict[str, Any]], path: str) -> None:
         for result in results:
             item = dict(result)
-            path = str(plan_item["retrieval_path"])
-            match = {
-                "retrieval_query_id": plan_item["retrieval_query_id"],
-                "subquery": plan_item["subquery"],
-                "named_document_scope": plan_item.get("named_document_scope"),
-                "retrieval_path": path,
-                "retrieval_sources": list(item.get("retrieval_sources") or []),
-                "score": item.get("score"),
-                "context_score": item.get("context_score"),
-                "evidence_reason": item.get("evidence_reason"),
-            }
-            item.update(
-                {
-                    "subquery": plan_item["subquery"],
-                    "named_document_scope": plan_item.get("named_document_scope"),
-                    "retrieval_path": path,
-                    "retrieval_matches": [match],
-                    "retrieval_paths": list(
-                        dict.fromkeys(item.get("retrieval_paths", []) + [path])
-                    ),
-                }
+            item["retrieval_paths"] = list(
+                dict.fromkeys(item.get("retrieval_paths", []) + [path])
             )
             key = (item.get("doc_id"), item.get("chunk_index"))
             current = merged.get(key)
             if current is None:
                 merged[key] = item
                 continue
-
             paths = list(
-                dict.fromkeys(
-                    current.get("retrieval_paths", []) + item["retrieval_paths"]
-                )
+                dict.fromkeys(current.get("retrieval_paths", []) + item["retrieval_paths"])
             )
             sources = list(
-                dict.fromkeys(
-                    current.get("retrieval_sources", [])
-                    + item.get("retrieval_sources", [])
-                )
+                dict.fromkeys(current.get("retrieval_sources", []) + item.get("retrieval_sources", []))
             )
-            matches = list(current.get("retrieval_matches") or [])
-            known_matches = {
-                (
-                    entry.get("retrieval_query_id"),
-                    entry.get("retrieval_path"),
-                    entry.get("subquery"),
-                )
-                for entry in matches
-            }
-            match_key = (
-                match.get("retrieval_query_id"),
-                match.get("retrieval_path"),
-                match.get("subquery"),
-            )
-            if match_key not in known_matches:
-                matches.append(match)
-
-            if float(item.get("score") or 0) > float(current.get("score") or 0):
+            if item.get("score", 0) > current.get("score", 0):
                 item["retrieval_paths"] = paths
-                item["retrieval_matches"] = matches
                 if sources:
                     item["retrieval_sources"] = sources
                 merged[key] = item
             else:
                 current["retrieval_paths"] = paths
-                current["retrieval_matches"] = matches
                 if sources:
                     current["retrieval_sources"] = sources
-                if (
-                    current.get("named_document_scope") is None
-                    and item.get("named_document_scope") is not None
-                ):
-                    current["subquery"] = item["subquery"]
-                    current["named_document_scope"] = item["named_document_scope"]
-                    current["retrieval_path"] = item["retrieval_path"]
 
-    for plan_item in retrieval_plan:
-        plan_scope_raw = plan_item.get("allowed_document_ids")
-        plan_scope = (
-            None
-            if plan_scope_raw is None
-            else {int(item) for item in plan_scope_raw}
-        )
-        if plan_item.get("named_document_scope") and not plan_scope:
-            # An unknown or unbound explicit title is explainable evidence of a
-            # scope miss, never permission to search every other document.
-            continue
+    add_results(
+        _single_query_search(query, settings, allowed_document_ids=scope),
+        "full_query",
+    )
+    for title in _extract_quoted_titles(query):
         add_results(
-            _single_query_search(
-                str(plan_item["subquery"]),
+            _title_boosted_results(
+                query,
+                title,
                 settings,
-                allowed_document_ids=plan_scope,
+                allowed_document_ids=scope,
             ),
-            plan_item,
+            "quoted_title",
         )
-
-    ranked = sorted(
-        merged.items(),
-        key=lambda pair: float(pair[1].get("score") or 0),
-        reverse=True,
-    )
-    reserved_keys: List[tuple] = []
-    for plan_item in retrieval_plan:
-        named_scope = plan_item.get("named_document_scope") or {}
-        for document in named_scope.get("documents") or []:
-            try:
-                document_id = int(document.get("document_id"))
-            except (TypeError, ValueError):
-                continue
-            if any(key[0] == document_id for key in reserved_keys):
-                continue
-            candidate = next(
-                (
-                    key
-                    for key, item in ranked
-                    if int(item.get("doc_id") or -1) == document_id
-                    and any(
-                        match.get("retrieval_query_id")
-                        == plan_item.get("retrieval_query_id")
-                        for match in item.get("retrieval_matches") or []
-                    )
+    for sub_query in _extract_sub_queries(query):
+        if sub_query != query:
+            add_results(
+                _single_query_search(
+                    sub_query,
+                    settings,
+                    allowed_document_ids=scope,
                 ),
-                None,
+                "sub_query",
             )
-            if candidate is not None:
-                reserved_keys.append(candidate)
 
-    selected_keys = list(reserved_keys[:top_k])
-    for key, _ in ranked:
-        if len(selected_keys) >= top_k:
-            break
-        if key not in selected_keys:
-            selected_keys.append(key)
-    results = sorted(
-        [merged[key] for key in selected_keys],
-        key=lambda item: float(item.get("score") or 0),
-        reverse=True,
+    results = sorted(merged.values(), key=lambda item: item.get("score", 0), reverse=True)[:top_k]
+    keyword_results = _keyword_search(
+        query,
+        top_k=top_k * 2,
+        allowed_document_ids=scope,
     )
-    keyword_count = sum(
-        1
-        for item in merged.values()
-        if "keyword" in set(item.get("retrieval_sources") or [])
-    )
-    semantic_count = sum(
-        1
-        for item in merged.values()
-        if "semantic" in set(item.get("retrieval_sources") or [])
-    )
+    semantic_results = [
+        result
+        for result in _semantic_search(
+            query,
+            top_k=top_k * 2,
+            threshold=settings["score_threshold"],
+            allowed_document_ids=scope,
+        )
+        if result.get("is_indexed")
+    ]
     return {
         "query": query,
         "mode": "advanced",
         "settings": settings,
-        "keyword_count": keyword_count,
-        "semantic_count": semantic_count,
+        "keyword_count": len(keyword_results),
+        "semantic_count": len(semantic_results),
         "count": len(results),
         "results": results,
-        "retrieval_plan": retrieval_plan,
         "embedding_runtime": rag_embeddings.get_runtime_info(),
         "scope": {
             "mode": "global_debug" if scope is None else "agent_bound",
@@ -1131,12 +814,6 @@ def advanced_search(
             "score_threshold": settings["score_threshold"],
             "context_threshold": settings["context_threshold"],
             "top_k": settings["top_k"],
-        },
-        "filter_summary": {
-            "clause_count": len(retrieval_plan),
-            "accepted_candidate_count": len(merged),
-            "named_document_coverage_count": len(reserved_keys),
-            "top_k": top_k,
         },
     }
 

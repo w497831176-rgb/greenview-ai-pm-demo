@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from agno.agent import Agent, AgentFactory
 from agno.factory import RequestContext
 
-from app.runtime.contracts import RunConfigSnapshot, SkillActivation, content_hash
+from app.runtime.contracts import RunConfigSnapshot, SkillActivation
 from app.runtime.skill_projector import project_skills
 from app.settings import MODEL_ID, agent_db, build_model
 from app.skill_runtime import select_skills
@@ -34,7 +34,7 @@ class AgentBuild:
 def _preload_skill_instructions(
     skills: Any,
     activations: List[SkillActivation],
-) -> Tuple[List[str], List[Dict[str, Any]], List[Dict[str, Any]]]:
+) -> Tuple[List[str], List[Dict[str, Any]]]:
     """Load selected Agno Skills deterministically before the model call.
 
     Trigger selection belongs to the runtime control plane. Relying on the
@@ -44,7 +44,7 @@ def _preload_skill_instructions(
     """
 
     if skills is None or not activations:
-        return [], [], []
+        return [], []
     access_tool = next(
         (
             tool
@@ -58,7 +58,6 @@ def _preload_skill_instructions(
 
     contexts: List[str] = []
     calls: List[Dict[str, Any]] = []
-    evidence_sources: List[Dict[str, Any]] = []
     for activation in activations:
         skill_name = f"skill-{activation.skill_id}"
         raw = access_tool.entrypoint(skill_name)
@@ -68,12 +67,11 @@ def _preload_skill_instructions(
                 f"failed to load published Skill {activation.skill_id}: "
                 f"{payload['error']}"
             )
-        loaded_instructions = str(payload.get("instructions") or "")
         contexts.append(
             "\n".join(
                 [
                     f"[已加载动态 Skill：{activation.name}]",
-                    loaded_instructions,
+                    str(payload.get("instructions") or ""),
                 ]
             )
         )
@@ -88,17 +86,7 @@ def _preload_skill_instructions(
                 "skill_content_hash": activation.content_hash,
             }
         )
-        evidence_sources.append(
-            {
-                "skill_id": activation.skill_id,
-                "name": activation.name,
-                "version": activation.version,
-                "content_hash": content_hash(loaded_instructions),
-                "published_content_hash": activation.content_hash,
-                "content_snapshot": loaded_instructions,
-            }
-        )
-    return contexts, calls, evidence_sources
+    return contexts, calls
 
 
 def _skills_exposed_to_model(
@@ -286,7 +274,7 @@ def build_agent_from_snapshot(
     agno_skills = None
     if skills_root and Skills is not None and LocalSkills is not None:
         agno_skills = Skills(loaders=[LocalSkills(str(skills_root))])
-    skill_contexts, skill_tool_calls, loaded_skill_sources = _preload_skill_instructions(
+    skill_contexts, skill_tool_calls = _preload_skill_instructions(
         agno_skills,
         activations,
     )
@@ -361,8 +349,15 @@ def build_agent_from_snapshot(
         skill_decisions=decisions,
         skill_tool_calls=skill_tool_calls,
         skill_evidence_sources=[
-            {"snapshot_id": snapshot.snapshot_id, **item}
-            for item in loaded_skill_sources
+            {
+                "skill_id": int(item["skill_id"]),
+                "name": str(item.get("name") or f"Skill {item['skill_id']}"),
+                "version": str(item.get("version") or ""),
+                "snapshot_id": snapshot.snapshot_id,
+                "content_hash": str(item.get("content_hash") or ""),
+                "content_snapshot": str(item.get("instructions_fallback") or ""),
+            }
+            for item in selected
         ],
     )
 

@@ -27,7 +27,6 @@
       "server_name": "mars-calculator-mcp",
       "tool_name": "multiply",
       "arguments": {"a": 4, "b": 7},
-      "structured_result": {"result": 28.0},
       "invocation_status": "success",
       "business_status": "success",
       "result_summary": "content='28.0' metadata={'structured_content': {'result': 28.0}} images=None videos=None audios=None files=None"
@@ -36,7 +35,6 @@
       "server_name": "mars-calculator-mcp",
       "tool_name": "multiply",
       "arguments": {"a": 28, "b": 3},
-      "structured_result": {"result": 84.0},
       "invocation_status": "success",
       "business_status": "success",
       "result_summary": "content='84.0' metadata={'structured_content': {'result': 84.0}} images=None videos=None audios=None files=None"

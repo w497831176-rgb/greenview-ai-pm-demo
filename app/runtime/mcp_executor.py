@@ -4,24 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import json
-import math
 import os
-import re
 import shlex
 import time
-import uuid
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from app.runtime.contracts import (
-    RuntimePath,
-    ToolEffect,
-    ToolEvidence,
-    ToolEvidenceFact,
-    ToolInvocation,
-    ToolPlan,
-    content_hash,
-    stable_id,
-)
+from app.runtime.contracts import RuntimePath, ToolEffect, ToolInvocation, ToolPlan
 from app.runtime.tool_gateway import ToolGateway
 from app.runtime.tool_planner import plan_tools, validate_arguments
 
@@ -68,45 +56,34 @@ if MCPTools is not None:
                 arguments = kwargs if kwargs else (args[0] if args else {})
                 if not isinstance(arguments, dict):
                     arguments = {"value": str(arguments)}
-                invocation_id = f"tool_{uuid.uuid4().hex}"
                 started = time.time()
                 try:
                     if asyncio.iscoroutinefunction(original):
                         result = await original(*args, **kwargs)
                     else:
                         result = await asyncio.to_thread(original, *args, **kwargs)
-                    business_status, result_summary, tool_evidence = (
-                        _evaluate_read_tool_result(
-                            result,
-                            self.result_contracts.get(function_name),
-                            invocation_id=invocation_id,
+                    business_status, result_summary = _business_status(
+                        result,
+                        self.result_contracts.get(function_name),
+                    )
+                    self.recorded_invocations.append(
+                        ToolInvocation(
                             server_name=self.server_name,
                             tool_name=function_name,
+                            effect=ToolEffect.READ,
+                            arguments=arguments,
+                            discovery_status="success",
+                            transport_status="success",
+                            invocation_status="success",
+                            business_status=business_status,
+                            latency_ms=int((time.time() - started) * 1000),
+                            result_summary=result_summary,
                         )
                     )
-                    invocation = ToolInvocation(
-                        invocation_id=invocation_id,
-                        server_name=self.server_name,
-                        tool_name=function_name,
-                        effect=ToolEffect.READ,
-                        arguments=arguments,
-                        discovery_status="success",
-                        transport_status="success",
-                        invocation_status="success",
-                        business_status=business_status,
-                        latency_ms=int((time.time() - started) * 1000),
-                        result_summary=result_summary,
-                        tool_evidence=tool_evidence,
-                    )
-                    self.recorded_invocations.append(invocation)
-                    # The model sees the same safe structured facts that enter
-                    # RunEvidenceBundle. Raw payloads, request parameters and
-                    # non-success result bodies never become answer evidence.
-                    return _tool_evidence_context(invocation)
+                    return result
                 except Exception as exc:
                     self.recorded_invocations.append(
                         ToolInvocation(
-                            invocation_id=invocation_id,
                             server_name=self.server_name,
                             tool_name=function_name,
                             effect=ToolEffect.READ,
@@ -124,116 +101,6 @@ if MCPTools is not None:
             return wrapper
 else:
     GovernedMCPTools = None  # type: ignore
-
-
-_MCP_ENVELOPE_KEYS = {
-    "content",
-    "isError",
-    "is_error",
-    "metadata",
-    "structuredContent",
-    "structured_content",
-    "text",
-    "type",
-}
-_SENSITIVE_FIELD_MARKERS = {
-    "access_key",
-    "api_key",
-    "apikey",
-    "auth_header",
-    "authorization",
-    "cookie",
-    "credential",
-    "password",
-    "passwd",
-    "private_key",
-    "refresh_token",
-    "secret",
-    "session_cookie",
-    "token",
-}
-
-
-def _json_safe(value: Any, depth: int = 0) -> Any:
-    """Return a deterministic JSON-compatible value without truncating it."""
-
-    if depth > 24:
-        return str(value)
-    if hasattr(value, "model_dump"):
-        try:
-            value = value.model_dump(mode="json")
-        except TypeError:
-            value = value.model_dump()
-        except Exception:
-            pass
-    if value is None or isinstance(value, (str, bool, int)):
-        return value
-    if isinstance(value, float):
-        return value if math.isfinite(value) else str(value)
-    if isinstance(value, dict):
-        return {
-            str(key): _json_safe(nested, depth + 1)
-            for key, nested in value.items()
-        }
-    if isinstance(value, (list, tuple, set)):
-        return [_json_safe(item, depth + 1) for item in value]
-    return str(value)
-
-
-def _canonical_result_payload(value: Any, depth: int = 0) -> Any:
-    """Unwrap only MCP transport envelopes and retain the complete payload.
-
-    Unlike ``_structured_result`` this function never selects the first matching
-    child from a business object.  The complete result is needed for hashing and
-    scalar evidence extraction; display truncation happens separately.
-    """
-
-    if depth > 12:
-        return _json_safe(value)
-    for attribute in ("structured_content", "structuredContent"):
-        if hasattr(value, attribute):
-            structured = getattr(value, attribute)
-            if structured is not None:
-                return _canonical_result_payload(structured, depth + 1)
-    if hasattr(value, "model_dump"):
-        try:
-            value = value.model_dump(mode="json")
-        except TypeError:
-            value = value.model_dump()
-        except Exception:
-            pass
-    if isinstance(value, str):
-        stripped = value.strip()
-        if not stripped:
-            return ""
-        try:
-            return _canonical_result_payload(json.loads(stripped), depth + 1)
-        except Exception:
-            return value
-    if isinstance(value, dict):
-        for key in ("structured_content", "structuredContent"):
-            if key in value and value[key] is not None:
-                return _canonical_result_payload(value[key], depth + 1)
-        metadata = value.get("metadata")
-        if isinstance(metadata, dict):
-            for key in ("structured_content", "structuredContent"):
-                if key in metadata and metadata[key] is not None:
-                    return _canonical_result_payload(metadata[key], depth + 1)
-        # Content blocks are a transport envelope only when no business fields
-        # are present.  A business object containing a ``content`` field remains
-        # intact and is hashed as returned.
-        if set(value).issubset(_MCP_ENVELOPE_KEYS) and "content" in value:
-            return _canonical_result_payload(value.get("content"), depth + 1)
-        return _json_safe(value, depth + 1)
-    if isinstance(value, (list, tuple)):
-        # A single MCP text content block is an envelope around its text.  Real
-        # business arrays retain every item rather than the former first match.
-        if len(value) == 1 and isinstance(value[0], dict):
-            block = value[0]
-            if set(block).issubset(_MCP_ENVELOPE_KEYS) and "text" in block:
-                return _canonical_result_payload(block.get("text"), depth + 1)
-        return [_canonical_result_payload(item, depth + 1) for item in value]
-    return _json_safe(value, depth + 1)
 
 
 def _business_status(
@@ -284,215 +151,6 @@ def _business_status(
     # status field. Reaching here means discovery, transport and invocation all
     # succeeded and the result is non-empty, so it is a real success.
     return "success", summary
-
-
-def _normalized_scalar(value: Any) -> Tuple[str, str]:
-    if isinstance(value, bool):
-        return ("true" if value else "false"), "boolean"
-    if isinstance(value, int):
-        return str(value), "integer"
-    if isinstance(value, float):
-        if not math.isfinite(value):
-            return str(value), "string"
-        if value.is_integer():
-            return str(int(value)), "number"
-        return format(value, ".15g"), "number"
-    normalized = re.sub(r"\s+", " ", str(value or "")).strip()
-    return normalized, "string"
-
-
-def _safe_field_name(field_name: str) -> bool:
-    normalized = re.sub(r"[^a-z0-9]+", "_", field_name.lower()).strip("_")
-    return not any(marker in normalized for marker in _SENSITIVE_FIELD_MARKERS)
-
-
-def _json_path(parent: str, key: Any) -> str:
-    if isinstance(key, int):
-        return f"{parent}[{key}]"
-    name = str(key)
-    if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
-        return f"{parent}.{name}"
-    return f"{parent}[{json.dumps(name, ensure_ascii=False)}]"
-
-
-def _unit_hint(
-    field_name: str,
-    json_path: str,
-    result_contract: Optional[Dict[str, Any]],
-) -> Tuple[Optional[str], Optional[str]]:
-    contract = result_contract or {}
-    mappings = (
-        contract.get("evidence_units")
-        or contract.get("field_units")
-        or contract.get("unit_by_path")
-        or {}
-    )
-    hint = mappings.get(json_path) or mappings.get(field_name)
-    if isinstance(hint, dict):
-        return (
-            str(hint.get("unit")) if hint.get("unit") is not None else None,
-            str(hint.get("semantic_type"))
-            if hint.get("semantic_type")
-            else None,
-        )
-    if hint is not None:
-        return str(hint), None
-
-    normalized = re.sub(r"[^a-z0-9]+", "_", field_name.lower()).strip("_")
-    unit_rules = (
-        (("pct", "percent", "percentage"), "%"),
-        (("temperature_c", "temp_c", "celsius", "c"), "℃"),
-        (("minutes", "minute", "mins"), "分钟"),
-        (("seconds", "second", "secs"), "秒"),
-        (("hours", "hour", "hrs"), "小时"),
-        (("days", "day"), "天"),
-        (("yuan", "cny"), "元"),
-        (("level", "grade"), "级"),
-    )
-    for suffixes, unit in unit_rules:
-        if any(normalized == suffix or normalized.endswith(f"_{suffix}") for suffix in suffixes):
-            return unit, None
-    return None, None
-
-
-def _semantic_type(field_name: str, explicit: Optional[str]) -> str:
-    if explicit:
-        return explicit
-    normalized = re.sub(r"[^a-z0-9]+", "_", field_name.lower()).strip("_")
-    if normalized == "result":
-        return "calculated_result"
-    if normalized == "status" or normalized.endswith("_status"):
-        return "business_status"
-    if normalized == "id" or normalized.endswith("_id"):
-        return "business_identifier"
-    if any(token in normalized for token in ("condition", "weather")):
-        return "weather_condition"
-    if "wind" in normalized:
-        return "wind_condition"
-    if any(token in normalized for token in ("city", "location", "address")):
-        return "location"
-    return "business_result"
-
-
-def _safe_scalar_facts(
-    payload: Any,
-    *,
-    invocation_id: str,
-    result_contract: Optional[Dict[str, Any]],
-) -> List[ToolEvidenceFact]:
-    facts: List[ToolEvidenceFact] = []
-
-    def visit(value: Any, path: str, field_name: str) -> None:
-        if isinstance(value, dict):
-            for key, nested in value.items():
-                key_name = str(key)
-                if not _safe_field_name(key_name):
-                    continue
-                visit(nested, _json_path(path, key_name), key_name)
-            return
-        if isinstance(value, list):
-            for index, nested in enumerate(value):
-                visit(nested, _json_path(path, index), field_name)
-            return
-        if value is None or isinstance(value, (dict, list, tuple, set)):
-            return
-        # Root operation status is represented by ToolEvidence.business_status;
-        # nested business statuses remain useful facts (for example work orders).
-        if path == "$.status":
-            return
-        normalized, value_type = _normalized_scalar(value)
-        if not normalized:
-            return
-        unit, explicit_semantic = _unit_hint(
-            field_name,
-            path,
-            result_contract,
-        )
-        display_value = (
-            f"{normalized}{unit}"
-            if unit and value_type in {"integer", "number"}
-            else normalized
-        )
-        fact_payload = {
-            "invocation_id": invocation_id,
-            "json_path": path,
-            "normalized_value": normalized,
-            "unit": unit,
-        }
-        facts.append(
-            ToolEvidenceFact(
-                fact_id=stable_id("tool_fact", fact_payload),
-                json_path=path,
-                field_name=field_name,
-                value_type=value_type,
-                value=value,
-                normalized_value=normalized,
-                unit=unit,
-                display_value=display_value,
-                semantic_type=_semantic_type(field_name, explicit_semantic),
-            )
-        )
-
-    visit(payload, "$", "result")
-    return facts
-
-
-def _evaluate_read_tool_result(
-    result: Any,
-    result_contract: Optional[Dict[str, Any]],
-    *,
-    invocation_id: str,
-    server_name: str,
-    tool_name: str,
-) -> Tuple[str, str, Optional[ToolEvidence]]:
-    """Freeze one successful read result; request arguments are not accepted."""
-
-    business_status, result_summary = _business_status(result, result_contract)
-    if business_status != "success":
-        return business_status, result_summary, None
-    payload = _canonical_result_payload(result)
-    payload_hash = content_hash(payload)
-    facts = _safe_scalar_facts(
-        payload,
-        invocation_id=invocation_id,
-        result_contract=result_contract,
-    )
-    evidence_payload = {
-        "invocation_id": invocation_id,
-        "server_name": server_name,
-        "tool_name": tool_name,
-        "payload_hash": payload_hash,
-    }
-    return (
-        business_status,
-        result_summary,
-        ToolEvidence(
-            evidence_id=stable_id("tool_ev", evidence_payload),
-            invocation_id=invocation_id,
-            server_name=server_name,
-            tool_name=tool_name,
-            payload_hash=payload_hash,
-            facts=facts,
-        ),
-    )
-
-
-def _tool_evidence_context(invocation: ToolInvocation) -> str:
-    """Render model context from safe facts, never from the display summary."""
-
-    header = (
-        f"[MCP {invocation.server_name}/{invocation.tool_name}] "
-        f"business_status={invocation.business_status}"
-    )
-    evidence = invocation.tool_evidence
-    if evidence is None:
-        return header
-    lines = [f"{header}; evidence_id={evidence.evidence_id}"]
-    lines.extend(
-        f"- {fact.json_path} = {fact.display_value}"
-        for fact in evidence.facts
-    )
-    return "\n".join(lines)
 
 
 def _structured_result(value: Any, depth: int = 0) -> Optional[Dict[str, Any]]:
@@ -674,45 +332,39 @@ async def preinvoke_read_tools(
                     )
                 )
                 continue
-            invocation_id = f"tool_{uuid.uuid4().hex}"
             started = time.time()
             try:
                 result = await asyncio.wait_for(
                     function.entrypoint(**arguments),
                     timeout=8,
                 )
-                business_status, result_summary, tool_evidence = (
-                    _evaluate_read_tool_result(
-                        result,
-                        plan.result_contract,
-                        invocation_id=invocation_id,
+                business_status, result_summary = _business_status(
+                    result,
+                    plan.result_contract,
+                )
+                invocations.append(
+                    ToolInvocation(
+                        plan_id=plan.plan_id,
                         server_name=server_name,
                         tool_name=tool_name,
+                        effect=policy.effect,
+                        arguments=arguments,
+                        planner_source=plan.planner_source,
+                        match_reason=plan.match_reason,
+                        discovery_status=discovery_status,
+                        transport_status="success",
+                        invocation_status="success",
+                        business_status=business_status,
+                        latency_ms=int((time.time() - started) * 1000),
+                        result_summary=result_summary,
                     )
                 )
-                invocation = ToolInvocation(
-                    invocation_id=invocation_id,
-                    plan_id=plan.plan_id,
-                    server_name=server_name,
-                    tool_name=tool_name,
-                    effect=policy.effect,
-                    arguments=arguments,
-                    planner_source=plan.planner_source,
-                    match_reason=plan.match_reason,
-                    discovery_status=discovery_status,
-                    transport_status="success",
-                    invocation_status="success",
-                    business_status=business_status,
-                    latency_ms=int((time.time() - started) * 1000),
-                    result_summary=result_summary,
-                    tool_evidence=tool_evidence,
+                context.append(
+                    f"[MCP {server_name}/{tool_name}] business_status={business_status}; result={result_summary}"
                 )
-                invocations.append(invocation)
-                context.append(_tool_evidence_context(invocation))
             except asyncio.TimeoutError:
                 invocations.append(
                     ToolInvocation(
-                        invocation_id=invocation_id,
                         plan_id=plan.plan_id,
                         server_name=server_name,
                         tool_name=tool_name,
@@ -731,7 +383,6 @@ async def preinvoke_read_tools(
             except Exception as exc:
                 invocations.append(
                     ToolInvocation(
-                        invocation_id=invocation_id,
                         plan_id=plan.plan_id,
                         server_name=server_name,
                         tool_name=tool_name,
