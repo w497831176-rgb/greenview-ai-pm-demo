@@ -168,7 +168,9 @@ def create_semantic_lane_router(*, model: Any) -> Agent:
             "现实安全描述优先于包装方式；正在发生或即将发生的现实危险即使被称为玩笑、假设、脑筋急转弯、科普或不危险，或用户要求不转人工，仍选A。明确要求创作小说、剧本或纯虚构故事且没有现实事件指向时选C。",
             "出现物业相关字样但实际任务是翻译、技术、数学、创作或娱乐时仍选C；危险配方、违法、越权或侵犯隐私但没有正在发生的现实危险时也选C，由下游安全边界拒绝。",
             "当用户的真实目的明确是停止AI对话并由工作人员接手时，必须同时输出A_SAFETY_HANDOFF和business_intent=user_requested_handoff；否定人工协同、询问人工协同规则或原因、以及仅讨论未来可能性时不得写这个值。必须结合整句目的与可见对话判断，不得用关键词、正则或短语字典。",
-            "business_intent只写简短业务意图；reason只写一句中文判断理由。只输出一个JSON对象，不输出Markdown或解释文字。",
+            "当且仅当Lane为B、且用户的完整真实诉求是启动一张新的维修工单创建流程时，business_intent必须精确写work_order_create。用户要求先形成草稿或Proposal、先由本人确认、不要直接提交，仍属于启动受控创建流程；这只授权进入Draft/Proposal，不授权实际写入。",
+            "查询已有工单、仅查询、明确不创建，或其他B类业务意图都不得使用work_order_create。必须按完整语义判断，不得把上述保留值做成关键词、正则、白名单或固定句式映射。",
+            "除A类保留值和B类work_order_create外，business_intent只写简短业务意图；reason只写一句中文判断理由。只输出一个JSON对象，不输出Markdown或解释文字。",
         ],
         add_datetime_to_context=True,
         add_history_to_context=False,
@@ -215,7 +217,7 @@ async def classify_lane_decision(
         "current_user_message": message,
         "decision_schema": {
             "lane": "A_SAFETY_HANDOFF | B_PROPERTY_GOVERNED | C_ISOLATED_GENERAL",
-            "business_intent": "A类使用user_requested_handoff或safety_risk；其他类写简短业务意图",
+            "business_intent": "A类使用user_requested_handoff或safety_risk；B类明确启动维修工单创建流程使用work_order_create；其他类写简短业务意图",
             "reason": "简短中文理由",
         },
     }

@@ -52,12 +52,12 @@ from app.runtime.provider_accounting import merge_non_null, provider_accounting_
 from app.runtime.provider_evidence import provider_evidence_from_run
 from app.settings import MODEL_ID, USE_THINKING, build_model
 from app.work_order_workflow import (
+    WORK_ORDER_CREATE_INTENT,
     _is_draft_follow_up,
     action_gateway,
     advance_work_order_workflow,
     is_cancel_request,
     is_confirmation,
-    is_explicit_work_order_request,
 )
 from db.property_db import (
     create_chat_trace,
@@ -1080,6 +1080,13 @@ class RuntimeCoordinator:
             return RuntimePath.CONTROLLED_ACTION
         if draft and _is_draft_follow_up(message, draft):
             return RuntimePath.CONTROLLED_ACTION
+        if is_confirmation(message):
+            latest_work_order = get_latest_action_proposal(
+                session_id,
+                "work_order.create",
+            )
+            if latest_work_order and latest_work_order.get("status") == "committed":
+                return RuntimePath.CONTROLLED_ACTION
         if RuntimeCoordinator._latest_committed_dynamic_action(session_id, message):
             return RuntimePath.CONTROLLED_ACTION
         return RuntimePath.CONSULTATION
@@ -1235,10 +1242,7 @@ class RuntimeCoordinator:
                 },
             )
 
-        if (
-            state.lane_decision.lane == RuntimeLane.PROPERTY_GOVERNED
-            and self._is_work_order_action_context(session_id, message)
-        ):
+        if self._is_new_work_order_start_authorized(state.lane_decision):
             state.path = RuntimePath.CONTROLLED_ACTION
         state.answer_contract = _answer_contract_for(state.lane_decision, state.path)
         lane_payload = state.lane_decision.model_dump(mode="json")
@@ -1879,7 +1883,19 @@ class RuntimeCoordinator:
         )
 
     @staticmethod
+    def _is_new_work_order_start_authorized(decision: LaneDecision) -> bool:
+        """Accept only the Router's exact structured authorization for a new Draft."""
+
+        return bool(
+            decision.lane == RuntimeLane.PROPERTY_GOVERNED
+            and str(decision.business_intent or "").strip()
+            == WORK_ORDER_CREATE_INTENT
+        )
+
+    @staticmethod
     def _is_work_order_action_context(session_id: str, message: str) -> bool:
+        """Continue only persisted work-order state; never reclassify new text."""
+
         pending = get_pending_action_proposal(session_id)
         draft = get_work_order_draft(session_id)
         latest = (
@@ -1894,7 +1910,6 @@ class RuntimeCoordinator:
                 and pending.get("action_type") == "work_order.create"
                 and (is_confirmation(message) or is_cancel_request(message))
             )
-            or is_explicit_work_order_request(message)
             or latest
         )
 
@@ -2033,9 +2048,15 @@ class RuntimeCoordinator:
         started: float,
     ) -> AsyncIterator[str]:
         state.next_step = "collect_or_resume_action"
-        use_work_order = self._is_work_order_action_context(
-            session_id,
-            message,
+        start_authorized = self._is_new_work_order_start_authorized(
+            state.lane_decision
+        )
+        use_work_order = bool(
+            start_authorized
+            or self._is_work_order_action_context(
+                session_id,
+                message,
+            )
         )
         if use_work_order:
             result = advance_work_order_workflow(
@@ -2043,6 +2064,7 @@ class RuntimeCoordinator:
                 message,
                 trace_id=trace_id,
                 release_id=snapshot.release_id,
+                start_authorized=start_authorized,
             )
         else:
             result = await self._advance_dynamic_mcp_action(

@@ -23,6 +23,7 @@ from db.property_db import (
 DEFAULT_ROOM_ID = "3-2-1201"
 DEFAULT_OWNER_NAME = "王先生"
 ACTION_TYPE = "work_order.create"
+WORK_ORDER_CREATE_INTENT = "work_order_create"
 action_gateway = ActionGateway()
 
 
@@ -48,6 +49,15 @@ def _contact_name(text: str) -> str:
 
 def _urgency(text: str) -> str:
     lowered = text.lower()
+    explicit = re.search(
+        r"(?:紧急程度|优先级)\s*(?:为|是|[：:])?\s*(紧急|高|中等?|一般|低)",
+        lowered,
+    )
+    if explicit:
+        value = explicit.group(1)
+        if value in {"中", "中等", "一般"}:
+            return "中"
+        return value
     if any(word in lowered for word in ("紧急", "立刻", "马上", "水漫", "爆管", "漏电", "燃气泄漏", "火灾")):
         return "紧急"
     if any(word in lowered for word in ("高优先", "很严重", "严重", "尽快处理")):
@@ -267,8 +277,16 @@ def advance_work_order_workflow(
     message: str,
     trace_id: Optional[str] = None,
     release_id: Optional[str] = None,
+    *,
+    start_authorized: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """Advance a repair draft without relying on a model tool call.
+
+    ``start_authorized`` is the structured, exact authorization compiled by the
+    Coordinator from ``B_PROPERTY_GOVERNED + work_order_create``.  A new draft
+    cannot start without it.  Once a Draft or Proposal exists, follow-up field
+    collection, cancellation, confirmation and idempotent replay remain owned
+    by the persisted state machine.
 
     Returns ``None`` for ordinary chat.  Every non-None result is authoritative
     and can be safely rendered by the chat API without claiming a fictitious
@@ -306,7 +324,7 @@ def advance_work_order_workflow(
                     receipt=receipt,
                     work_order_id=actual_id,
                 )
-        if not is_explicit_work_order_request(message):
+        if not start_authorized:
             return None
     elif not _is_draft_follow_up(message, existing):
         # Preserve the unconfirmed draft, but do not turn every subsequent
@@ -383,15 +401,13 @@ def advance_work_order_workflow(
     save_work_order_draft(session_id=session_id, **draft)
     missing = _missing(draft)
     if missing:
-        ask_now = missing[:2]
         return _result(
             "draft_updated",
             "我已记录为待确认的维修工单草稿（尚未创建正式工单）。\n\n"
             + _summary(draft)
             + "\n\n请先补充："
-            + "、".join(ask_now)
-            + "。"
-            + ("其余信息收齐后，我会请您确认创建。" if len(missing) > len(ask_now) else ""),
+            + "、".join(missing)
+            + "。信息收齐后，我会请您确认创建。",
             draft,
         )
     proposal = action_gateway.propose(
