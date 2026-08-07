@@ -67,6 +67,7 @@ class AllowedDomain(str, Enum):
 
 
 class ResponseMode(str, Enum):
+    HUMAN_HANDOFF = "human_handoff"
     EMERGENCY_HANDOFF = "emergency_handoff"
     CLARIFY_ONLY = "clarify_only"
     GROUNDED_ANSWER = "grounded_answer"
@@ -111,6 +112,21 @@ class UsageSource(str, Enum):
 
 class ImmutableModel(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
+
+
+class HandoffKind(str, Enum):
+    USER_REQUESTED = "user_requested"
+    SAFETY_RISK = "safety_risk"
+
+
+class HandoffExecutionContract(ImmutableModel):
+    """Immutable A-lane subtype used by execution and evidence projection."""
+
+    kind: HandoffKind
+    reason_code: Literal["user_requested", "safety_risk"]
+    queue: Literal["property_service", "emergency"]
+    safety_override: bool
+    response_mode: ResponseMode
 
 
 class RouteDecision(ImmutableModel):

@@ -25,6 +25,8 @@ from app.runtime.contracts import (
     AnswerContract,
     ApprovalEvent,
     CapabilityDecision,
+    HandoffExecutionContract,
+    HandoffKind,
     LaneDecision,
     LaneDecisionSource,
     ResponseMode,
@@ -360,7 +362,7 @@ def _is_internal_control_payload(text: str) -> bool:
 
 def _lane_explanation(decision: LaneDecision) -> str:
     labels = {
-        RuntimeLane.SAFETY_HANDOFF: "安全人工协同",
+        RuntimeLane.SAFETY_HANDOFF: "人工协同",
         RuntimeLane.PROPERTY_GOVERNED: "物业受控回答",
         RuntimeLane.ISOLATED_GENERAL: "隔离通用回答",
     }
@@ -445,6 +447,95 @@ def _requires_rag_citation(
     )
 
 
+def _effective_lane_decision(
+    decision: LaneDecision,
+    *,
+    handoff_status: str = "none",
+    handoff_reason_code: str = "",
+    handoff_queue: str = "",
+) -> Tuple[LaneDecision, Optional[str]]:
+    """Enforce the product invariant before Lane SSE or evidence persistence.
+
+    The Router remains the only semantic classifier. This function consumes
+    only its structured result (plus an already-persisted Handoff state); it
+    never inspects user text. The optional return value preserves the Router's
+    reported lane for audit when normalization was required.
+    """
+
+    active_handoff = str(handoff_status or "none") in {
+        "requested",
+        "active",
+        "waiting_user",
+    }
+    persisted_safety = active_handoff and (
+        str(handoff_reason_code or "").strip() == "safety_risk"
+        or str(handoff_queue or "").strip() == "emergency"
+    )
+    user_requested = (
+        str(decision.business_intent or "").strip()
+        == "user_requested_handoff"
+    )
+    if decision.lane == RuntimeLane.SAFETY_HANDOFF:
+        if persisted_safety and user_requested:
+            return (
+                LaneDecision(
+                    lane=RuntimeLane.SAFETY_HANDOFF,
+                    business_intent="safety_risk",
+                    reason="会话已有现实安全风险人工协同，本轮继续由紧急队列处理。",
+                    decision_source=decision.decision_source,
+                ),
+                decision.lane.value,
+            )
+        return decision, None
+    if not (user_requested or active_handoff):
+        return decision, None
+    effective_intent = (
+        "safety_risk" if persisted_safety else "user_requested_handoff"
+    )
+    return (
+        LaneDecision(
+            lane=RuntimeLane.SAFETY_HANDOFF,
+            business_intent=effective_intent,
+            reason=(
+                (
+                    "会话已有现实安全风险人工协同，本轮继续由紧急队列处理。"
+                    if persisted_safety
+                    else "会话已有普通人工协同，本轮继续由工作人员处理。"
+                )
+                if active_handoff and not user_requested
+                else (
+                    decision.reason
+                    or "本轮已确认需要由工作人员接手。"
+                )
+            ),
+            decision_source=decision.decision_source,
+        ),
+        decision.lane.value,
+    )
+
+
+def _handoff_contract_for(
+    decision: LaneDecision,
+) -> HandoffExecutionContract:
+    if decision.lane != RuntimeLane.SAFETY_HANDOFF:
+        raise ValueError("Handoff execution contract requires effective A lane")
+    if str(decision.business_intent or "").strip() == "user_requested_handoff":
+        return HandoffExecutionContract(
+            kind=HandoffKind.USER_REQUESTED,
+            reason_code="user_requested",
+            queue="property_service",
+            safety_override=False,
+            response_mode=ResponseMode.HUMAN_HANDOFF,
+        )
+    return HandoffExecutionContract(
+        kind=HandoffKind.SAFETY_RISK,
+        reason_code="safety_risk",
+        queue="emergency",
+        safety_override=True,
+        response_mode=ResponseMode.EMERGENCY_HANDOFF,
+    )
+
+
 def _answer_contract_for(
     decision: LaneDecision,
     runtime_path: RuntimePath = RuntimePath.CONSULTATION,
@@ -457,8 +548,9 @@ def _answer_contract_for(
         "internal_control_payload",
     ]
     if decision.lane == RuntimeLane.SAFETY_HANDOFF:
+        handoff_contract = _handoff_contract_for(decision)
         return AnswerContract(
-            response_mode=ResponseMode.EMERGENCY_HANDOFF,
+            response_mode=handoff_contract.response_mode,
             evidence_required=False,
             skill_policy="skipped",
             rag_policy="skipped",
@@ -466,7 +558,11 @@ def _answer_contract_for(
             write_policy="forbidden",
             handoff_policy="required",
             forbidden_claims=common_forbidden,
-            decision_reason="现实安全风险优先，语义判断后立即发起安全人工协同。",
+            decision_reason=(
+                "业主明确要求工作人员接手，立即发起普通人工协同。"
+                if handoff_contract.kind == HandoffKind.USER_REQUESTED
+                else "现实安全风险优先，语义判断后立即发起紧急人工协同。"
+            ),
         )
     if decision.lane == RuntimeLane.ISOLATED_GENERAL:
         return AnswerContract(
@@ -833,7 +929,7 @@ class RuntimeCoordinator:
             )
 
             if state.lane_decision.lane == RuntimeLane.SAFETY_HANDOFF:
-                async for event in self._stream_semantic_safety_handoff(
+                async for event in self._stream_a_handoff(
                     message, session_id, trace_id, snapshot, state, ledger, started
                 ):
                     yield event
@@ -843,122 +939,6 @@ class RuntimeCoordinator:
                 path = RuntimePath.CONTROLLED_ACTION
                 state.path = path
                 ledger.runtime_path = path.value
-
-            handoff = await self._maybe_handoff(
-                message,
-                session_id,
-                trace_id,
-                snapshot.release_id,
-                decision=state.lane_decision,
-            )
-            if handoff:
-                reply, handoff_state, handoff_policy = handoff
-                handoff_reason = str(
-                    handoff_policy.get("reason_code") or "user_requested"
-                )
-                decision_summary = {
-                    "agent": _decision("skipped", "handoff_preempted"),
-                    "skill": _decision("skipped", "handoff_preempted"),
-                    "rag": _decision("skipped", "handoff_preempted"),
-                    "tool": _decision("skipped", "handoff_preempted"),
-                    "handoff": _decision(
-                        "selected",
-                        handoff_reason,
-                        level=handoff_policy.get("level"),
-                        matched_signals=handoff_policy.get("matched_signals") or [],
-                    ),
-                }
-                state.capability_decision = CapabilityDecision(
-                    selected_agent_id=None,
-                    skill={"status": "skipped", "reason_code": "handoff_preempted"},
-                    rag={"status": "skipped", "reason_code": "handoff_preempted"},
-                    tool={"status": "skipped", "reason_code": "handoff_preempted"},
-                    write={"status": "not_required", "reason_code": "handoff_preempted"},
-                    handoff={
-                        "status": "required",
-                        "reason_code": handoff_reason,
-                        "details": {
-                            "level": handoff_policy.get("level"),
-                            "matched_signals": handoff_policy.get("matched_signals") or [],
-                        },
-                    },
-                )
-                state.status = RunStatus.COMPLETED
-                state.next_step = None
-                ledger.capture_state(state)
-                ledger.append(
-                    "handoff_events",
-                    {
-                        "status": handoff_state,
-                        "reason_code": handoff_reason,
-                        "safety_override": "safety_override"
-                        in (handoff_policy.get("matched_signals") or []),
-                        "model_invoked": False,
-                    },
-                )
-                ledger.append(
-                    "evaluation_results",
-                    {"case": "handoff_policy", "passed": True, "state": handoff_state},
-                )
-                ledger.append(
-                    "evaluation_results",
-                    {
-                        "case": "capability_decision",
-                        "passed": True,
-                        "decision_summary": decision_summary,
-                    },
-                )
-                ledger.persist("complete")
-                record_trace_event(
-                    trace_id,
-                    "capability_decision",
-                    "success",
-                    output_summary=f"handoff selected: {handoff_reason}",
-                    metadata={"decision_summary": decision_summary},
-                )
-                saved = save_chat_message(
-                    session_id=session_id,
-                    role="assistant",
-                    content=reply,
-                    trace_id=trace_id,
-                    current_agent="人工协同控制器",
-                    current_agent_id="human_copilot",
-                    status="success",
-                    usage_source="not_applicable",
-                )
-                update_chat_trace(
-                    trace_id,
-                    intent="handoff",
-                    agent_name="人工协同控制器",
-                    agent_id="human_copilot",
-                    status="complete",
-                )
-                yield _sse("delta", {"content": reply})
-                yield _sse(
-                    "done",
-                    {
-                        "status": "complete",
-                        "message_id": saved.get("id"),
-                        "trace_id": trace_id,
-                        "handoff": True,
-                        "handoff_state": handoff_state,
-                        "handoff_reason": handoff_reason,
-                        "lane_decision": (
-                            state.lane_decision.model_dump(mode="json")
-                            if state.lane_decision
-                            else None
-                        ),
-                        "capability_decision": state.capability_decision.model_dump(
-                            mode="json"
-                        ),
-                        "answer_contract": state.answer_contract.model_dump(mode="json"),
-                        "decision_summary": decision_summary,
-                        "release_id": snapshot.release_id,
-                        "snapshot_id": snapshot.snapshot_id,
-                        "usage_source": "not_applicable",
-                    },
-                )
-                return
 
             if path == RuntimePath.CONTROLLED_ACTION:
                 state.capability_decision = CapabilityDecision(
@@ -1133,7 +1113,7 @@ class RuntimeCoordinator:
                 )
             if selected_card is None:
                 raise RuntimeError("structured action state has no Published property Agent")
-            state.lane_decision = LaneDecision(
+            reported_decision = LaneDecision(
                 lane=RuntimeLane.PROPERTY_GOVERNED,
                 business_intent="continue_controlled_action",
                 reason="会话中存在未完成的受控业务状态，继续原状态机。",
@@ -1224,7 +1204,36 @@ class RuntimeCoordinator:
                 if provider_status != "success":
                     raise ProviderFailureError("semantic Router Provider call failed")
                 raise RuntimeError("semantic LaneDecision schema validation failed")
-            state.lane_decision = result["decision"]
+            reported_decision = result["decision"]
+
+        current_session = get_chat_session(session_id) or {}
+        effective_decision, normalized_from_lane = _effective_lane_decision(
+            reported_decision,
+            handoff_status=str(
+                current_session.get("handoff_status") or "none"
+            ),
+            handoff_reason_code=str(
+                current_session.get("handoff_reason_code") or ""
+            ),
+            handoff_queue=str(current_session.get("handoff_queue") or ""),
+        )
+        state.lane_decision = effective_decision
+        if normalized_from_lane:
+            ledger.append(
+                "system_observations",
+                {
+                    "type": "effective_lane_invariant",
+                    "router_reported_lane": normalized_from_lane,
+                    "router_reported_business_intent": reported_decision.business_intent,
+                    "effective_lane": RuntimeLane.SAFETY_HANDOFF.value,
+                    "business_intent": state.lane_decision.business_intent,
+                    "reason_code": (
+                        "safety_risk"
+                        if state.lane_decision.business_intent == "safety_risk"
+                        else "user_requested"
+                    ),
+                },
+            )
 
         if (
             state.lane_decision.lane == RuntimeLane.PROPERTY_GOVERNED
@@ -1439,7 +1448,7 @@ class RuntimeCoordinator:
             },
         )
 
-    async def _stream_semantic_safety_handoff(
+    async def _stream_a_handoff(
         self,
         message: str,
         session_id: str,
@@ -1449,37 +1458,101 @@ class RuntimeCoordinator:
         ledger: EvidenceLedger,
         started: float,
     ) -> AsyncIterator[str]:
-        """Execute A lane after semantic validation; no business capability is eligible."""
+        """Execute either A-lane Handoff subtype from one immutable contract."""
 
         if state.lane_decision is None or state.answer_contract is None:
-            raise RuntimeError("safety handoff started without contracts")
-        handoff = request_handoff(
-            session_id,
-            state.lane_decision.reason or "检测到明确、现实的安全风险。",
-            risk_level="L3",
-            reason_code="safety_risk",
-            queue="emergency",
-            handoff_package={
-                "trace_id": trace_id,
-                "release_id": snapshot.release_id,
-                "trigger_message": message,
-                "semantic_lane": state.lane_decision.model_dump(mode="json"),
-                "safety_override": True,
-            },
+            raise RuntimeError("A handoff started without contracts")
+        handoff_contract = _handoff_contract_for(state.lane_decision)
+        current_handoff = get_chat_session(session_id) or {}
+        current_handoff_status = str(
+            current_handoff.get("handoff_status") or "none"
         )
-        handoff_state = str(handoff.get("handoff_status") or "requested")
-        reply = (
-            "请立即远离危险源，不要触碰设备或积水，并提醒周围人员避开；如存在火灾、"
-            "触电、燃气或人身危险，请立即联系119、120、110等当地紧急渠道。系统已发起"
-            "安全人工协同，但物业协同不能替代现实紧急救援。"
-        )
+        if handoff_contract.kind == HandoffKind.USER_REQUESTED:
+            handoff_result = await self._maybe_handoff(
+                message,
+                session_id,
+                trace_id,
+                snapshot.release_id,
+                decision=state.lane_decision,
+            )
+            if handoff_result is None:
+                raise RuntimeError("A user-requested Handoff was not persisted")
+            reply, handoff_state, handoff_policy = handoff_result
+        else:
+            persisted_safety = (
+                str(current_handoff.get("handoff_reason_code") or "")
+                == "safety_risk"
+                or str(current_handoff.get("handoff_queue") or "")
+                == "emergency"
+            )
+            active_handoff = current_handoff_status in {
+                "requested",
+                "active",
+                "waiting_user",
+            }
+            handoff = current_handoff
+            if not active_handoff or not persisted_safety:
+                handoff = request_handoff(
+                    session_id,
+                    state.lane_decision.reason or "检测到明确、现实的安全风险。",
+                    risk_level="L3",
+                    reason_code=handoff_contract.reason_code,
+                    queue=handoff_contract.queue,
+                    handoff_package={
+                        "trace_id": trace_id,
+                        "release_id": snapshot.release_id,
+                        "trigger_message": message,
+                        "semantic_lane": state.lane_decision.model_dump(mode="json"),
+                        "handoff_kind": handoff_contract.kind.value,
+                        "safety_override": handoff_contract.safety_override,
+                    },
+                )
+            if current_handoff_status == "waiting_user":
+                handoff = resume_handoff_after_owner_message(session_id)
+            handoff_state = str(
+                handoff.get("handoff_status") or current_handoff_status or "requested"
+            )
+            handoff_policy = {
+                "level": "L3",
+                "reason_code": handoff_contract.reason_code,
+                "queue": handoff_contract.queue,
+                "safety_override": handoff_contract.safety_override,
+                "matched_signals": ["semantic_safety_risk"],
+            }
+            reply = (
+                "请立即远离危险源，不要触碰设备或积水，并提醒周围人员避开；如存在火灾、"
+                "触电、燃气或人身危险，请立即联系119、120、110等当地紧急渠道。系统已发起"
+                "安全人工协同，但物业协同不能替代现实紧急救援。"
+            )
+        decision_summary = {
+            "agent": _decision("skipped", "handoff_preempted"),
+            "skill": _decision("skipped", "handoff_preempted"),
+            "rag": _decision("skipped", "handoff_preempted"),
+            "tool": _decision("skipped", "handoff_preempted"),
+            "write": _decision("skipped", "handoff_preempted"),
+            "handoff": _decision(
+                "selected",
+                handoff_contract.reason_code,
+                queue=handoff_contract.queue,
+                safety_override=handoff_contract.safety_override,
+            ),
+        }
         state.capability_decision = CapabilityDecision(
             selected_agent_id=None,
-            skill={"status": "skipped", "reason_code": "safety_lane"},
-            rag={"status": "skipped", "reason_code": "safety_lane"},
-            tool={"status": "skipped", "reason_code": "safety_lane"},
-            write={"status": "not_required", "reason_code": "safety_lane"},
-            handoff={"status": "required", "reason_code": "semantic_safety_risk"},
+            skill={"status": "skipped", "reason_code": "handoff_preempted"},
+            rag={"status": "skipped", "reason_code": "handoff_preempted"},
+            tool={"status": "skipped", "reason_code": "handoff_preempted"},
+            write={"status": "not_required", "reason_code": "handoff_preempted"},
+            handoff={
+                "status": "required",
+                "reason_code": handoff_contract.reason_code,
+                "details": {
+                    "queue": handoff_contract.queue,
+                    "safety_override": handoff_contract.safety_override,
+                    "handler": "human_copilot",
+                    "matched_signals": handoff_policy.get("matched_signals") or [],
+                },
+            },
         )
         state.status = RunStatus.COMPLETED
         state.next_step = None
@@ -1488,10 +1561,23 @@ class RuntimeCoordinator:
             "handoff_events",
             {
                 "status": handoff_state,
-                "reason_code": "safety_risk",
-                "safety_override": True,
-                "router_model_invoked": True,
+                "reason_code": handoff_contract.reason_code,
+                "handoff_kind": handoff_contract.kind.value,
+                "queue": handoff_contract.queue,
+                "safety_override": handoff_contract.safety_override,
+                "handler": "human_copilot",
+                "router_model_invoked": any(
+                    item.get("stage") == "router" for item in state.model_calls
+                ),
                 "vertical_model_invoked": False,
+            },
+        )
+        ledger.append(
+            "evaluation_results",
+            {
+                "case": "a_handoff_contract",
+                "passed": True,
+                "decision_summary": decision_summary,
             },
         )
         ledger.persist("complete")
@@ -1510,19 +1596,24 @@ class RuntimeCoordinator:
         )
         update_chat_trace(
             trace_id,
-            intent=state.lane_decision.business_intent,
+            intent=state.lane_decision.business_intent or handoff_contract.reason_code,
             agent_name="人工协同控制器",
             agent_id="human_copilot",
             status="complete",
         )
         record_trace_event(
             trace_id,
-            "safety_handoff",
+            "a_handoff",
             "success",
             latency_ms=int((time.time() - started) * 1000),
-            output_summary="semantic safety lane created Handoff; business capabilities skipped",
+            output_summary=(
+                f"A Handoff created: {handoff_contract.reason_code}; "
+                "business capabilities skipped"
+            ),
             metadata={
-                "safety_override": True,
+                "reason_code": handoff_contract.reason_code,
+                "queue": handoff_contract.queue,
+                "safety_override": handoff_contract.safety_override,
                 "answer_contract": state.answer_contract.model_dump(mode="json"),
                 "capability_decision": state.capability_decision.model_dump(mode="json"),
             },
@@ -1537,9 +1628,14 @@ class RuntimeCoordinator:
                 "trace_id": trace_id,
                 "handoff": True,
                 "handoff_state": handoff_state,
+                "handoff_reason": handoff_contract.reason_code,
+                "handoff_queue": handoff_contract.queue,
+                "safety_override": handoff_contract.safety_override,
+                "handler": "human_copilot",
                 "lane_decision": state.lane_decision.model_dump(mode="json"),
                 "answer_contract": state.answer_contract.model_dump(mode="json"),
                 "capability_decision": state.capability_decision.model_dump(mode="json"),
+                "decision_summary": decision_summary,
                 "release_id": snapshot.release_id,
                 "snapshot_id": snapshot.snapshot_id,
                 "cost_entries": [item.model_dump(mode="json") for item in state.cost_entries],
@@ -1858,11 +1954,47 @@ class RuntimeCoordinator:
             "level": "L3",
             "reason_code": "user_requested",
             "queue": "property_service",
+            "safety_override": False,
             "matched_signals": ["semantic_user_requested_handoff"] if requested_by_user else [],
         }
+        current = get_chat_session(session_id) or {}
+        current_status = str(current.get("handoff_status") or "none")
+        if current_status == "waiting_user":
+            resumed = resume_handoff_after_owner_message(session_id)
+            return (
+                "已将补充信息同步给接管工作人员，人工处理已恢复。",
+                str(resumed.get("handoff_status") or "active"),
+                {
+                    **policy,
+                    "reason_code": str(
+                        current.get("handoff_reason_code") or "user_requested"
+                    ),
+                    "queue": str(
+                        current.get("handoff_queue") or "property_service"
+                    ),
+                    "matched_signals": ["waiting_user"],
+                },
+            )
+        if current_status in {"requested", "active"}:
+            return (
+                (
+                    "人工协同已在等待领取。"
+                    if current_status == "requested"
+                    else "工作人员已领取，当前正在人工协同处理中。"
+                ),
+                current_status,
+                {
+                    **policy,
+                    "reason_code": str(
+                        current.get("handoff_reason_code") or "user_requested"
+                    ),
+                    "queue": str(
+                        current.get("handoff_queue") or "property_service"
+                    ),
+                    "matched_signals": [current_status],
+                },
+            )
         if policy.get("should_request_handoff"):
-            before = get_chat_session(session_id) or {}
-            before_status = str(before.get("handoff_status") or "none")
             session = request_handoff(
                 session_id,
                 str(policy.get("reason") or "需要人工协同"),
@@ -1874,46 +2006,19 @@ class RuntimeCoordinator:
                     "release_id": release_id,
                     "trigger_message": message,
                     "policy": policy,
+                    "handoff_kind": HandoffKind.USER_REQUESTED.value,
+                    "safety_override": False,
                 },
             )
             status = str(session.get("handoff_status") or "requested")
             if status == "active":
                 reply = "工作人员已领取，当前正在人工协同处理中。"
-            elif before_status == "requested" and status == "requested":
-                reply = "人工协同已在等待领取。"
             else:
                 reply = "已发起人工协同：等待工作人员领取。"
             return (
                 reply,
                 status,
                 policy,
-            )
-        current = get_chat_session(session_id) or {}
-        status = str(current.get("handoff_status") or "none")
-        if status == "waiting_user":
-            resumed = resume_handoff_after_owner_message(session_id)
-            return (
-                "已将补充信息同步给接管工作人员，人工处理已恢复。",
-                str(resumed.get("handoff_status") or "active"),
-                {
-                    "level": "L3",
-                    "reason_code": "handoff_active",
-                    "matched_signals": ["waiting_user"],
-                },
-            )
-        if status in {"requested", "active"}:
-            return (
-                (
-                    "人工协同已在等待领取。"
-                    if status == "requested"
-                    else "工作人员已领取，当前正在人工协同处理中。"
-                ),
-                status,
-                {
-                    "level": "L3",
-                    "reason_code": "handoff_active",
-                    "matched_signals": [status],
-                },
             )
         return None
 
