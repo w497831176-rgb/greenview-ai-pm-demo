@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import uuid
 from collections import Counter
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from app.runtime.contracts import (
@@ -14,8 +13,16 @@ from app.runtime.contracts import (
     ToolPolicy,
     content_hash,
 )
+from app.runtime.capability_catalog import (
+    CATALOG_VERSION,
+    TRUSTED_SOURCE,
+    TRUSTED_STATUS,
+    CapabilityCatalogError,
+    assert_trusted_capability,
+    get_trusted_metadata,
+)
 from app.runtime.tool_planner import (
-    effective_tool_metadata,
+    DEFAULT_RESULT_CONTRACT,
     validate_tool_metadata,
 )
 from db.property_db import (
@@ -41,19 +48,9 @@ from db.property_db import (
 
 
 def _tool_effect(tool: Dict[str, Any]) -> ToolEffect:
-    metadata = tool.get("tool_metadata") or {}
-    declared = str(metadata.get("effect") or metadata.get("operation") or "").lower()
-    effect_source = str(metadata.get("effect_source") or "")
-    if (
-        declared in {item.value for item in ToolEffect}
-        and effect_source
-        in {
-            "operator_declared",
-            "operator_declared_legacy",
-            "builtin_compatibility",
-        }
-    ):
-        return ToolEffect(declared)
+    manifest = get_trusted_metadata("mcp_tool", tool.get("id") or tool.get("tool_id"))
+    if manifest and manifest.get("effect") == ToolEffect.READ.value:
+        return ToolEffect.READ
     return ToolEffect.UNKNOWN
 
 
@@ -74,10 +71,10 @@ def compile_tool_policy(server: Dict[str, Any], tool: Dict[str, Any]) -> ToolPol
                 if declared_risk in {"L0", "L1"}
                 else RiskLevel.L1
             ),
-            allowed_paths=[RuntimePath.CONSULTATION, RuntimePath.EXTENSION_ACCEPTANCE],
+            allowed_paths=[RuntimePath.CONSULTATION],
             requires_confirmation=False,
             enabled=bool(server.get("enabled")),
-            policy_reason="只读工具可在已发布白名单内自动执行。",
+            policy_reason="代码评审可信目录中的只读工具可进入已发布白名单。",
         )
     if effect in {ToolEffect.CREATE, ToolEffect.UPDATE, ToolEffect.DELETE}:
         return ToolPolicy(
@@ -110,46 +107,6 @@ def compile_tool_policy(server: Dict[str, Any], tool: Dict[str, Any]) -> ToolPol
 def _skill_version(skill: Dict[str, Any]) -> str:
     metadata = skill.get("skill_metadata") or {}
     return str(metadata.get("version") or "legacy-1.0.0")
-
-
-def _skill_reference_snapshots(skill: Dict[str, Any]) -> List[Dict[str, str]]:
-    source: Optional[Path] = None
-    storage_path = str(skill.get("storage_path") or "").strip()
-    if storage_path:
-        candidate = Path(storage_path)
-        if candidate.exists():
-            source = candidate
-    if source is None:
-        try:
-            import skill_storage
-
-            candidate = Path(skill_storage._skill_dir(int(skill["id"])))
-            if candidate.exists():
-                source = candidate
-        except Exception:
-            source = None
-    references_root = source / "references" if source else None
-    if not references_root or not references_root.is_dir():
-        return []
-    snapshots: List[Dict[str, str]] = []
-    consumed = 0
-    for reference in sorted(references_root.rglob("*")):
-        if not reference.is_file():
-            continue
-        raw = reference.read_bytes()
-        if consumed + len(raw) > 256_000:
-            break
-        relative = reference.relative_to(references_root).as_posix()
-        content = raw.decode("utf-8", errors="replace")
-        snapshots.append(
-            {
-                "path": relative,
-                "content": content,
-                "content_hash": content_hash(raw.hex()),
-            }
-        )
-        consumed += len(raw)
-    return snapshots
 
 
 def _public_model_config(config: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -192,9 +149,36 @@ def _compile_graph() -> Tuple[Dict[str, Any], List[ToolPolicy]]:
     docs = list_knowledge_docs()
     servers = list_mcp_servers()
     all_tools = list_mcp_tools()
+    catalog_errors: List[Dict[str, Any]] = []
+
+    def resolve_reviewed(
+        capability_type: str,
+        stable_id: Any,
+    ) -> Optional[Dict[str, Any]]:
+        # Unregistered rows remain stored as historical/untrusted inventory but
+        # never enter the candidate graph. Only drift of a manifest identity is
+        # a blocking supply-chain error.
+        if not get_trusted_metadata(capability_type, stable_id):
+            return None
+        try:
+            return assert_trusted_capability(capability_type, stable_id)
+        except CapabilityCatalogError as exc:
+            catalog_errors.append(
+                {
+                    "code": "trusted_capability_storage_drift",
+                    "capability_type": capability_type,
+                    "stable_id": stable_id,
+                    "detail": str(exc),
+                }
+            )
+            return None
 
     skill_nodes = []
     for skill in skills:
+        resolved = resolve_reviewed("skill", skill.get("id"))
+        if not resolved:
+            continue
+        manifest = resolved["metadata"]
         instructions = skill.get("instructions") or ""
         skill_nodes.append(
             {
@@ -206,7 +190,18 @@ def _compile_graph() -> Tuple[Dict[str, Any], List[ToolPolicy]]:
                 "trigger_condition": skill.get("trigger_condition") or "",
                 "metadata": skill.get("skill_metadata") or {},
                 "content_hash": content_hash(instructions),
-                "reference_snapshots": _skill_reference_snapshots(skill),
+                "domain_scope": manifest["domain_scope"],
+                "trust_status": manifest["trust_status"],
+                "trusted_source": manifest["source"],
+                "catalog_version": manifest["version"],
+                "reviewed_content_hash": manifest["reviewed_content_hash"],
+                "reviewed_artifact_hash": manifest.get(
+                    "reviewed_artifact_hash"
+                ),
+                "artifact_hash": resolved["artifact"].get("hash"),
+                "reference_snapshots": resolved["artifact"].get(
+                    "reference_snapshots", []
+                ),
                 # Runtime progressive loading uses the immutable package.  The
                 # body remains here only as a compatibility fallback for
                 # legacy DB Skills that have not yet been packaged.
@@ -215,12 +210,12 @@ def _compile_graph() -> Tuple[Dict[str, Any], List[ToolPolicy]]:
         )
 
     knowledge_nodes = []
-    published_doc_ids = []
     for doc in docs:
-        if not doc.get("is_indexed") or doc.get("source_type") == "demo_test":
+        resolved = resolve_reviewed("knowledge", doc.get("id"))
+        if not resolved:
             continue
+        manifest = resolved["metadata"]
         doc_id = int(doc["id"])
-        published_doc_ids.append(doc_id)
         body = doc.get("content") or ""
         digest = content_hash(body)
         knowledge_nodes.append(
@@ -230,6 +225,12 @@ def _compile_graph() -> Tuple[Dict[str, Any], List[ToolPolicy]]:
                 "category": doc.get("category") or "",
                 "document_version": digest[:16],
                 "document_hash": digest,
+                "enabled": bool(doc.get("is_indexed")),
+                "domain_scope": manifest["domain_scope"],
+                "trust_status": manifest["trust_status"],
+                "trusted_source": manifest["source"],
+                "catalog_version": manifest["version"],
+                "reviewed_content_hash": manifest["reviewed_content_hash"],
                 "index_status": doc.get("index_status") or "unknown",
                 "chunk_count": int(doc.get("chunk_count") or 0),
                 "chunk_size": int(doc.get("chunk_size") or 512),
@@ -242,14 +243,62 @@ def _compile_graph() -> Tuple[Dict[str, Any], List[ToolPolicy]]:
     policies: List[ToolPolicy] = []
     server_nodes = []
     for server in servers:
-        tools = [item for item in all_tools if int(item.get("server_id") or 0) == int(server["id"])]
+        server_resolved = resolve_reviewed("mcp_server", server.get("id"))
+        if not server_resolved:
+            continue
+        server_manifest = server_resolved["metadata"]
+        tools = [
+            item
+            for item in all_tools
+            if int(item.get("server_id") or 0) == int(server["id"])
+            and get_trusted_metadata("mcp_tool", item.get("id"))
+        ]
         compiled_tools = []
         for tool in tools:
-            runtime_metadata = effective_tool_metadata(
-                str(server.get("name") or ""),
-                str(tool.get("name") or ""),
-                tool.get("tool_metadata") or {},
+            tool_resolved = resolve_reviewed("mcp_tool", tool.get("id"))
+            if not tool_resolved:
+                continue
+            tool_manifest = tool_resolved["metadata"]
+            if int(tool_manifest.get("server_id") or 0) != int(server["id"]):
+                catalog_errors.append(
+                    {
+                        "code": "trusted_mcp_tool_server_mismatch",
+                        "tool_id": tool.get("id"),
+                        "server_id": server.get("id"),
+                        "expected_server_id": tool_manifest.get("server_id"),
+                    }
+                )
+                continue
+            runtime_metadata = dict(tool.get("tool_metadata") or {})
+            declared_effect = str(
+                runtime_metadata.get("effect")
+                or runtime_metadata.get("operation")
+                or ""
+            ).strip().lower()
+            if declared_effect and declared_effect != ToolEffect.READ.value:
+                catalog_errors.append(
+                    {
+                        "code": "trusted_mcp_tool_declared_non_read",
+                        "tool_id": tool.get("id"),
+                        "server_id": server.get("id"),
+                        "effect": declared_effect,
+                    }
+                )
+                continue
+            runtime_metadata.update(
+                {
+                    "effect": ToolEffect.READ.value,
+                    "effect_source": TRUSTED_SOURCE,
+                    "runtime_metadata_source": TRUSTED_SOURCE,
+                    "risk_level": "L1",
+                    "execution_mode": "model_native",
+                }
             )
+            runtime_metadata.setdefault("result_contract", dict(DEFAULT_RESULT_CONTRACT))
+            runtime_metadata.setdefault("natural_language_intents", [])
+            runtime_metadata.setdefault("trigger_keywords", [])
+            runtime_metadata.setdefault("trigger_mode", "any")
+            runtime_metadata.setdefault("argument_bindings", {})
             effective_tool = {**tool, "tool_metadata": runtime_metadata}
             policy = compile_tool_policy(server, effective_tool)
             if policy.effect != ToolEffect.READ:
@@ -265,6 +314,20 @@ def _compile_graph() -> Tuple[Dict[str, Any], List[ToolPolicy]]:
                     "input_schema": tool.get("input_schema") or {},
                     "tool_metadata": runtime_metadata,
                     "policy": policy.model_dump(mode="json"),
+                    "domain_scope": tool_manifest.get("domain_scope"),
+                    "trust_status": tool_manifest.get("trust_status"),
+                    "trusted_source": tool_manifest.get("source"),
+                    "catalog_version": tool_manifest.get("version"),
+                    "reviewed_content_hash": tool_manifest.get(
+                        "reviewed_content_hash"
+                    ),
+                    "content_hash": content_hash(
+                        {
+                            "description": tool.get("description") or "",
+                            "input_schema": tool.get("input_schema") or {},
+                            "tool_metadata": runtime_metadata,
+                        }
+                    ),
                 }
             )
         server_nodes.append(
@@ -274,6 +337,24 @@ def _compile_graph() -> Tuple[Dict[str, Any], List[ToolPolicy]]:
                 "description": server.get("description") or "",
                 "enabled": bool(server.get("enabled")),
                 "is_builtin": bool(server.get("is_builtin")),
+                "domain_scope": server_manifest["domain_scope"],
+                "trust_status": server_manifest["trust_status"],
+                "trusted_source": server_manifest["source"],
+                "catalog_version": server_manifest["version"],
+                "reviewed_content_hash": server_manifest[
+                    "reviewed_content_hash"
+                ],
+                "reviewed_artifact_hash": server_manifest.get(
+                    "reviewed_artifact_hash"
+                ),
+                "artifact_hash": server_resolved["artifact"].get("hash"),
+                "content_hash": content_hash(
+                    {
+                        "command": server.get("command"),
+                        "args": server.get("args") or [],
+                        "description": server.get("description") or "",
+                    }
+                ),
                 "command": server.get("command"),
                 "args": server.get("args") or [],
                 # Credentials remain deployment-owned.  A RuntimeRelease pins
@@ -283,27 +364,131 @@ def _compile_graph() -> Tuple[Dict[str, Any], List[ToolPolicy]]:
             }
         )
 
+    server_name_counts = Counter(
+        str(item.get("name") or "") for item in server_nodes
+    )
+    for server_name, count in server_name_counts.items():
+        if not server_name or count > 1:
+            catalog_errors.append(
+                {
+                    "code": "trusted_mcp_binding_name_invalid",
+                    "server_name": server_name,
+                    "count": count,
+                }
+            )
+
+    skill_by_id = {int(item["skill_id"]): item for item in skill_nodes}
+    knowledge_by_id = {
+        int(item["knowledge_doc_id"]): item for item in knowledge_nodes
+    }
+    server_by_name = {
+        str(item.get("name") or ""): item for item in server_nodes
+    }
+
+    def admitted_binding(
+        *,
+        agent_id: str,
+        agent_scope: str,
+        capability_type: str,
+        stable_id: Any,
+        node: Optional[Dict[str, Any]],
+    ) -> bool:
+        manifest = get_trusted_metadata(capability_type, stable_id)
+        if not manifest or node is None:
+            catalog_errors.append(
+                {
+                    "code": "agent_binding_not_in_trusted_catalog",
+                    "agent_id": agent_id,
+                    "capability_type": capability_type,
+                    "stable_id": stable_id,
+                }
+            )
+            return False
+        if manifest.get("domain_scope") != agent_scope:
+            catalog_errors.append(
+                {
+                    "code": "agent_capability_domain_mismatch",
+                    "agent_id": agent_id,
+                    "agent_domain_scope": agent_scope,
+                    "capability_type": capability_type,
+                    "stable_id": stable_id,
+                    "capability_domain_scope": manifest.get("domain_scope"),
+                }
+            )
+            return False
+        return bool(node.get("enabled", True))
+
     agent_nodes = []
     for agent in agents:
         agent_id = str(agent.get("agent_id") or "")
-        bound_skill_ids = [int(item) for item in get_agent_skills(agent_id)]
-        bound_servers = [
+        agent_resolved = resolve_reviewed("agent", agent_id)
+        if not agent_resolved:
+            continue
+        agent_manifest = agent_resolved["metadata"]
+        agent_scope = str(agent_manifest["domain_scope"])
+        configured_scope = str(agent.get("domain_scope") or "")
+        if configured_scope != agent_scope:
+            catalog_errors.append(
+                {
+                    "code": "trusted_agent_domain_drift",
+                    "agent_id": agent_id,
+                    "configured_domain_scope": configured_scope,
+                    "catalog_domain_scope": agent_scope,
+                }
+            )
+
+        requested_skill_ids = [int(item) for item in get_agent_skills(agent_id)]
+        bound_skill_ids = [
+            skill_id
+            for skill_id in requested_skill_ids
+            if admitted_binding(
+                agent_id=agent_id,
+                agent_scope=agent_scope,
+                capability_type="skill",
+                stable_id=skill_id,
+                node=skill_by_id.get(skill_id),
+            )
+        ]
+        requested_servers = [
             str(item.get("tool_name") or "")
             for item in get_agent_tools(agent_id)
             if item.get("tool_name")
         ]
-        # V1.7 had no Agent-RAG binding table/UI.  The bootstrap compiler turns
-        # its former "all published business docs" behavior into an explicit
-        # release-level binding.  Later releases may narrow this list through
-        # the V1.8 binding API without changing existing snapshots.
+        bound_servers: List[str] = []
+        for server_name in requested_servers:
+            server_node = server_by_name.get(server_name)
+            stable_id = (server_node or {}).get("server_id", server_name)
+            if admitted_binding(
+                agent_id=agent_id,
+                agent_scope=agent_scope,
+                capability_type="mcp_server",
+                stable_id=stable_id,
+                node=server_node,
+            ):
+                bound_servers.append(server_name)
+
         explicit_knowledge_ids = get_agent_knowledge_bindings(agent_id)
         if agent_id == "router":
             bound_knowledge_ids = []
         elif explicit_knowledge_ids is None:
-            bound_knowledge_ids = list(published_doc_ids)
+            catalog_errors.append(
+                {
+                    "code": "agent_knowledge_binding_not_explicit",
+                    "agent_id": agent_id,
+                }
+            )
+            bound_knowledge_ids = []
         else:
             bound_knowledge_ids = [
-                item for item in explicit_knowledge_ids if item in published_doc_ids
+                int(doc_id)
+                for doc_id in explicit_knowledge_ids
+                if admitted_binding(
+                    agent_id=agent_id,
+                    agent_scope=agent_scope,
+                    capability_type="knowledge",
+                    stable_id=doc_id,
+                    node=knowledge_by_id.get(int(doc_id)),
+                )
             ]
         agent_nodes.append(
             {
@@ -312,21 +497,40 @@ def _compile_graph() -> Tuple[Dict[str, Any], List[ToolPolicy]]:
                 "description": agent.get("description") or "",
                 "instructions": agent.get("instructions") or "",
                 "category": agent.get("category") or "vertical",
-                "domain_scope": agent.get("domain_scope") or "property",
+                "domain_scope": agent_scope,
+                "trust_status": agent_manifest["trust_status"],
+                "trusted_source": agent_manifest["source"],
+                "catalog_version": agent_manifest["version"],
+                "reviewed_content_hash": agent_manifest[
+                    "reviewed_content_hash"
+                ],
+                "content_hash": content_hash(
+                    {
+                        "name": agent.get("name") or "",
+                        "description": agent.get("description") or "",
+                        "instructions": agent.get("instructions") or "",
+                        "category": agent.get("category") or "vertical",
+                        "model_id": agent.get("model_id"),
+                    }
+                ),
                 "enabled": bool(agent.get("enabled")),
                 "model_id": agent.get("model_id"),
                 "skill_ids": bound_skill_ids,
                 "mcp_server_names": bound_servers,
                 "knowledge_doc_ids": bound_knowledge_ids,
+                "system_tool_ids": [],
             }
         )
 
     graph = {
-        "schema_version": "1.0",
+        "schema_version": "2.0",
+        "catalog_version": CATALOG_VERSION,
+        "catalog_errors": catalog_errors,
         "agents": agent_nodes,
         "skills": skill_nodes,
         "knowledge": knowledge_nodes,
         "mcp_servers": server_nodes,
+        "system_tools": [],
         "bindings": {
             "agent_skill": [
                 {"agent_id": agent["agent_id"], "skill_id": skill_id}
@@ -847,15 +1051,92 @@ def summarize_release(release: Optional[Dict[str, Any]]) -> Optional[Dict[str, A
 
 
 def validate_release_graph(graph: Dict[str, Any], policies: List[ToolPolicy]) -> Dict[str, Any]:
-    errors: List[Dict[str, Any]] = []
+    errors: List[Dict[str, Any]] = list(graph.get("catalog_errors") or [])
     warnings: List[Dict[str, Any]] = []
     agents = graph.get("agents") or []
     skills = graph.get("skills") or []
     knowledge = graph.get("knowledge") or []
     servers = graph.get("mcp_servers") or []
+    system_tools = graph.get("system_tools") or []
 
-    for field, nodes in (("agent", agents), ("skill", skills), ("mcp_server", servers)):
-        key = "agent_id" if field == "agent" else "name"
+    if graph.get("catalog_version") != CATALOG_VERSION:
+        errors.append(
+            {
+                "code": "trusted_catalog_version_missing",
+                "expected": CATALOG_VERSION,
+                "actual": graph.get("catalog_version"),
+            }
+        )
+
+    def validate_catalog_node(
+        capability_type: str,
+        node: Dict[str, Any],
+        stable_id: Any,
+    ) -> None:
+        manifest = get_trusted_metadata(capability_type, stable_id)
+        if not manifest:
+            errors.append(
+                {
+                    "code": "capability_not_in_trusted_catalog",
+                    "capability_type": capability_type,
+                    "stable_id": stable_id,
+                }
+            )
+            return
+        required = {
+            "domain_scope": manifest["domain_scope"],
+            "trust_status": TRUSTED_STATUS,
+            "trusted_source": TRUSTED_SOURCE,
+            "catalog_version": manifest["version"],
+            "reviewed_content_hash": manifest["reviewed_content_hash"],
+        }
+        if manifest.get("reviewed_artifact_hash") is not None:
+            required["reviewed_artifact_hash"] = manifest[
+                "reviewed_artifact_hash"
+            ]
+            required["artifact_hash"] = manifest["reviewed_artifact_hash"]
+        for field, expected in required.items():
+            if node.get(field) != expected:
+                errors.append(
+                    {
+                        "code": "trusted_capability_metadata_invalid",
+                        "capability_type": capability_type,
+                        "stable_id": stable_id,
+                        "field": field,
+                        "expected": expected,
+                        "actual": node.get(field),
+                    }
+                )
+        if not str(node.get("content_hash") or "").strip() and not str(
+            node.get("catalog_version") or ""
+        ).strip():
+            errors.append(
+                {
+                    "code": "trusted_capability_version_hash_missing",
+                    "capability_type": capability_type,
+                    "stable_id": stable_id,
+                }
+            )
+
+    for agent in agents:
+        validate_catalog_node("agent", agent, agent.get("agent_id"))
+    for skill in skills:
+        validate_catalog_node("skill", skill, skill.get("skill_id"))
+    for doc in knowledge:
+        validate_catalog_node("knowledge", doc, doc.get("knowledge_doc_id"))
+    for server in servers:
+        validate_catalog_node("mcp_server", server, server.get("server_id"))
+        for tool in server.get("tools") or []:
+            validate_catalog_node("mcp_tool", tool, tool.get("tool_id"))
+    for tool in system_tools:
+        validate_catalog_node("system_tool", tool, tool.get("tool_id"))
+
+    for field, nodes, key in (
+        ("agent", agents, "agent_id"),
+        ("skill", skills, "skill_id"),
+        ("knowledge", knowledge, "knowledge_doc_id"),
+        ("mcp_server", servers, "server_id"),
+    ):
         counts = Counter(str(node.get(key) or "").strip().lower() for node in nodes)
         for value, count in counts.items():
             if not value:
@@ -863,9 +1144,37 @@ def validate_release_graph(graph: Dict[str, Any], policies: List[ToolPolicy]) ->
             elif count > 1:
                 errors.append({"code": f"{field}_identity_duplicate", "value": value})
 
+    mcp_binding_names = Counter(
+        str(item.get("name") or "").strip() for item in servers
+    )
+    for value, count in mcp_binding_names.items():
+        if not value or count > 1:
+            errors.append(
+                {
+                    "code": "mcp_binding_name_invalid",
+                    "value": value,
+                    "count": count,
+                }
+            )
+
     enabled_skill_ids = {int(item["skill_id"]) for item in skills if item.get("enabled")}
-    knowledge_ids = {int(item["knowledge_doc_id"]) for item in knowledge}
+    knowledge_ids = {
+        int(item["knowledge_doc_id"])
+        for item in knowledge
+        if item.get("enabled", True)
+    }
     server_names = {str(item["name"]) for item in servers if item.get("enabled")}
+    skill_domains = {
+        int(item["skill_id"]): item.get("domain_scope") for item in skills
+    }
+    knowledge_domains = {
+        int(item["knowledge_doc_id"]): item.get("domain_scope")
+        for item in knowledge
+    }
+    server_domains = {
+        str(item.get("name") or ""): item.get("domain_scope")
+        for item in servers
+    }
     for agent in agents:
         if not agent.get("enabled") or agent.get("category") in {"router", "orchestration"}:
             continue
@@ -888,14 +1197,56 @@ def validate_release_graph(graph: Dict[str, Any], policies: List[ToolPolicy]) ->
             errors.append({"code": "agent_knowledge_binding_invalid", "agent_id": agent["agent_id"], "ids": sorted(missing_docs)})
         if missing_servers:
             errors.append({"code": "agent_mcp_binding_invalid", "agent_id": agent["agent_id"], "names": sorted(missing_servers)})
+        for skill_id in agent.get("skill_ids") or []:
+            if skill_domains.get(int(skill_id)) != agent.get("domain_scope"):
+                errors.append(
+                    {
+                        "code": "agent_skill_domain_mismatch",
+                        "agent_id": agent["agent_id"],
+                        "skill_id": int(skill_id),
+                        "agent_domain_scope": agent.get("domain_scope"),
+                        "capability_domain_scope": skill_domains.get(int(skill_id)),
+                    }
+                )
+        for doc_id in agent.get("knowledge_doc_ids") or []:
+            if knowledge_domains.get(int(doc_id)) != agent.get("domain_scope"):
+                errors.append(
+                    {
+                        "code": "agent_knowledge_domain_mismatch",
+                        "agent_id": agent["agent_id"],
+                        "knowledge_doc_id": int(doc_id),
+                        "agent_domain_scope": agent.get("domain_scope"),
+                        "capability_domain_scope": knowledge_domains.get(int(doc_id)),
+                    }
+                )
+        for server_name in agent.get("mcp_server_names") or []:
+            if server_domains.get(str(server_name)) != agent.get("domain_scope"):
+                errors.append(
+                    {
+                        "code": "agent_mcp_domain_mismatch",
+                        "agent_id": agent["agent_id"],
+                        "server_name": server_name,
+                        "agent_domain_scope": agent.get("domain_scope"),
+                        "capability_domain_scope": server_domains.get(str(server_name)),
+                    }
+                )
+        if agent.get("system_tool_ids"):
+            errors.append(
+                {
+                    "code": "system_tool_binding_unavailable",
+                    "agent_id": agent["agent_id"],
+                    "ids": agent.get("system_tool_ids"),
+                }
+            )
 
     for policy in policies:
-        if policy.effect == ToolEffect.UNKNOWN:
-            warnings.append(
+        if policy.effect != ToolEffect.READ:
+            errors.append(
                 {
-                    "code": "tool_unclassified_disabled",
+                    "code": "mcp_policy_must_be_read_only",
                     "server_name": policy.server_name,
                     "tool_name": policy.tool_name,
+                    "effect": policy.effect.value,
                 }
             )
 
@@ -905,19 +1256,18 @@ def validate_release_graph(graph: Dict[str, Any], policies: List[ToolPolicy]) ->
             policy = tool.get("policy") or {}
             effect = str(policy.get("effect") or "unknown")
             if effect != ToolEffect.READ.value:
-                if server.get("enabled"):
-                    errors.append(
-                        {
-                            "code": "enabled_mcp_tool_must_be_read_only",
-                            "server_name": server.get("name"),
-                            "tool_name": tool.get("name"),
-                            "effect": effect,
-                            "detail": (
-                                "MCP is permanently read-only; configure business "
-                                "writes as explicit internal service Actions."
-                            ),
-                        }
-                    )
+                errors.append(
+                    {
+                        "code": "mcp_tool_must_be_read_only",
+                        "server_name": server.get("name"),
+                        "tool_name": tool.get("name"),
+                        "effect": effect,
+                        "detail": (
+                            "MCP is permanently read-only; configure business "
+                            "writes as explicit internal service Actions."
+                        ),
+                    }
+                )
                 # Non-read MCP metadata is intentionally not interpreted as a
                 # planner or Proposal contract, even on a disabled server.
                 continue
@@ -944,6 +1294,8 @@ def validate_release_graph(graph: Dict[str, Any], policies: List[ToolPolicy]) ->
             "skills": len(skills),
             "knowledge_docs": len(knowledge),
             "mcp_servers": len(servers),
+            "mcp_tools": sum(len(item.get("tools") or []) for item in servers),
+            "system_tools": len(system_tools),
             "tool_policies": len(policies),
         },
     }

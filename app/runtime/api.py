@@ -10,6 +10,12 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
+from app.runtime.capability_catalog import (
+    CapabilityCatalogError,
+    list_trusted_capabilities,
+    set_trusted_agent_bindings,
+    set_trusted_capability_enabled,
+)
 from app.runtime.release_compiler import (
     diff_runtime_configs,
     preview_runtime_release,
@@ -20,7 +26,6 @@ from app.runtime.acceptance import ACCEPTANCE_CASES
 from app.runtime.snapshot_resolver import resolve_snapshot
 from db.property_db import (
     count_runtime_releases,
-    get_agent_by_agent_id,
     get_current_runtime_release,
     get_evidence_ledger,
     get_runtime_release,
@@ -28,10 +33,8 @@ from db.property_db import (
     list_runtime_release_summaries,
     list_runtime_releases,
     list_tool_policies,
-    publish_runtime_release,
     rollback_runtime_release,
     save_runtime_acceptance_run,
-    set_agent_knowledge_bindings,
 )
 
 
@@ -50,6 +53,17 @@ class KnowledgeBindingRequest(BaseModel):
     knowledge_doc_ids: List[int] = Field(default_factory=list)
     publish: bool = False
     created_by: str = "platform-operator"
+
+
+class CatalogToggleRequest(BaseModel):
+    enabled: bool
+
+
+class CatalogBindingsRequest(BaseModel):
+    skill_ids: List[int] = Field(default_factory=list)
+    knowledge_doc_ids: List[int] = Field(default_factory=list)
+    mcp_server_ids: List[int] = Field(default_factory=list)
+    system_tool_ids: List[str] = Field(default_factory=list)
 
 
 class ContractAcceptanceRequest(BaseModel):
@@ -106,6 +120,72 @@ async def acceptance_cases():
 async def acceptance_runs(limit: int = 50):
     items = list_runtime_acceptance_runs(limit)
     return {"runs": items, "count": len(items)}
+
+
+def _catalog_http_error(exc: CapabilityCatalogError) -> HTTPException:
+    return HTTPException(
+        status_code=422,
+        detail={
+            "code": "trusted_catalog_operation_rejected",
+            "message": str(exc),
+        },
+    )
+
+
+@router.get("/catalog")
+async def trusted_catalog():
+    """List only code-reviewed capabilities available to the control plane."""
+
+    return list_trusted_capabilities()
+
+
+@router.patch("/catalog/{capability_type}/{stable_id}/enabled")
+async def toggle_trusted_catalog_item(
+    capability_type: str,
+    stable_id: str,
+    request: CatalogToggleRequest,
+):
+    """Mutate Draft enablement; never alter the current RuntimeRelease."""
+
+    try:
+        item = set_trusted_capability_enabled(
+            capability_type,
+            stable_id,
+            request.enabled,
+        )
+    except CapabilityCatalogError as exc:
+        raise _catalog_http_error(exc) from exc
+    return {
+        "item": item,
+        "draft_updated": True,
+        "current_release_unchanged": True,
+        "effective_on": "next_published_release_new_session",
+    }
+
+
+@router.put("/catalog/agents/{agent_id}/bindings")
+async def replace_trusted_agent_bindings(
+    agent_id: str,
+    request: CatalogBindingsRequest,
+):
+    """Replace one trusted Agent's Draft bindings after fail-closed checks."""
+
+    try:
+        bindings = set_trusted_agent_bindings(
+            agent_id,
+            request.skill_ids,
+            request.knowledge_doc_ids,
+            mcp_server_ids=request.mcp_server_ids,
+            system_tool_ids=request.system_tool_ids,
+        )
+    except CapabilityCatalogError as exc:
+        raise _catalog_http_error(exc) from exc
+    return {
+        "bindings": bindings,
+        "draft_updated": True,
+        "current_release_unchanged": True,
+        "effective_on": "next_published_release_new_session",
+    }
 
 
 def _redact_release(release: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -289,19 +369,36 @@ async def publish_current_config(request: PublishRequest):
 
 @router.post("/releases/{release_id}/publish")
 async def publish_existing_release(release_id: str):
-    try:
-        release = publish_runtime_release(release_id)
-    except ValueError as exc:
-        raise HTTPException(status_code=409, detail=str(exc))
-    return {
-        "release": _redact_release(release),
-        "published": True,
-        "effective_on": "new_session",
-    }
+    del release_id
+    raise HTTPException(
+        status_code=410,
+        detail={
+            "code": "stale_release_publish_retired",
+            "message": (
+                "历史或旧草稿不能直接发布；请从当前可信目录 Draft 重新预览、"
+                "校验并发布新的不可变 RuntimeRelease。"
+            ),
+        },
+    )
 
 
 @router.post("/releases/rollback")
 async def rollback_release(request: RollbackRequest):
+    target = get_runtime_release(request.release_id)
+    if not target:
+        raise HTTPException(status_code=404, detail="RuntimeRelease not found")
+    if str(target.get("status") or "") not in {
+        "published",
+        "superseded",
+        "retired",
+    }:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "rollback_target_not_historical_release",
+                "message": "只能回滚到已发布的不可变历史 RuntimeRelease。",
+            },
+        )
     try:
         release = rollback_runtime_release(request.release_id)
     except ValueError as exc:
@@ -430,18 +527,17 @@ async def retrieval_cost_preview(request: RetrievalCostPreviewRequest):
 
 @router.put("/agents/{agent_id}/knowledge-bindings")
 async def bind_agent_knowledge(agent_id: str, request: KnowledgeBindingRequest):
-    if not get_agent_by_agent_id(agent_id):
-        raise HTTPException(status_code=404, detail="agent not found")
-    set_agent_knowledge_bindings(agent_id, request.knowledge_doc_ids)
-    release = None
-    if request.publish:
-        release = publish_compiled_release(created_by=request.created_by)
-    return {
-        "agent_id": agent_id,
-        "knowledge_doc_ids": sorted(set(request.knowledge_doc_ids)),
-        "release": _redact_release(release),
-        "effective_on": "new_session" if release else "after_publish",
-    }
+    del agent_id, request
+    raise HTTPException(
+        status_code=410,
+        detail={
+            "code": "fragmented_binding_endpoint_retired",
+            "message": (
+                "请使用可信能力目录中的统一 Agent 绑定接口；绑定只进入 Draft，"
+                "不得在绑定请求中直接发布。"
+            ),
+        },
+    )
 
 
 @router.post("/acceptance/contract")

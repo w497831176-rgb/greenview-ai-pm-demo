@@ -59,6 +59,7 @@ init_db()
 import agents.router as router_module  # noqa: E402
 import app.runtime.action_gateway as action_gateway_module  # noqa: E402
 import app.runtime.agent_factory as agent_factory_module  # noqa: E402
+import app.runtime.capability_catalog as capability_catalog_module  # noqa: E402
 import app.runtime.citation_renderer as citation_renderer_module  # noqa: E402
 import app.runtime.contracts as contracts_module  # noqa: E402
 import app.runtime.coordinator as coordinator_module  # noqa: E402
@@ -86,6 +87,61 @@ from app.runtime.provider_accounting import (  # noqa: E402
     provider_accounting_scope,
     reset_active_provider_attempt,
 )
+
+
+# Target 1 intentionally uses symbolic capabilities so its Router and binding
+# assertions cannot become a natural-language production case table.  Target 2
+# now fail-closes every enabled object against the code-owned trusted manifest.
+# Keep that production manifest unchanged: this process-local lookup supplies
+# trust metadata only for the explicit symbolic fixture IDs below and delegates
+# every real ID to the production catalog.
+_PRODUCTION_TRUSTED_METADATA = capability_catalog_module.get_trusted_metadata
+_SYMBOLIC_TRUSTED_METADATA: Dict[tuple[str, str], Dict[str, Any]] = {
+    ("agent", "agent_b_01"): {"domain_scope": "property"},
+    ("agent", "agent_b_02"): {"domain_scope": "property"},
+    ("agent", "agent_c_01"): {"domain_scope": "isolated_general"},
+    ("skill", "101"): {"domain_scope": "property"},
+    ("skill", "102"): {"domain_scope": "property"},
+    ("skill", "103"): {"domain_scope": "isolated_general"},
+    ("knowledge", "201"): {"domain_scope": "property"},
+    ("knowledge", "202"): {"domain_scope": "property"},
+    ("knowledge", "203"): {"domain_scope": "isolated_general"},
+    ("mcp_server", "301"): {"domain_scope": "property"},
+    ("mcp_server", "302"): {"domain_scope": "isolated_general"},
+    ("mcp_tool", "30101"): {
+        "domain_scope": "property",
+        "effect": "read",
+        "server_id": 301,
+    },
+    ("mcp_tool", "30201"): {
+        "domain_scope": "isolated_general",
+        "effect": "read",
+        "server_id": 302,
+    },
+}
+
+
+def _target1_fixture_trusted_metadata(
+    capability_type: str,
+    stable_id: Any,
+) -> Any:
+    fixture = _SYMBOLIC_TRUSTED_METADATA.get(
+        (str(capability_type), str(stable_id))
+    )
+    if fixture is not None:
+        return {
+            "capability_type": str(capability_type),
+            "stable_id": stable_id,
+            "version": "target1-symbolic-fixture-v1",
+            "trust_status": "trusted",
+            "source": "deterministic_test_fixture",
+            **fixture,
+        }
+    return _PRODUCTION_TRUSTED_METADATA(capability_type, stable_id)
+
+
+agent_factory_module.get_trusted_metadata = _target1_fixture_trusted_metadata
+tool_gateway_module.get_trusted_metadata = _target1_fixture_trusted_metadata
 
 
 SYMBOLIC_MESSAGES = [
@@ -165,11 +221,13 @@ def _config() -> Dict[str, Any]:
         "mcp_servers": [
             {
                 "id": 301,
+                "server_id": 301,
                 "name": "server_b_01",
                 "enabled": True,
                 "description": "server_b_secret",
                 "tools": [
                     {
+                        "tool_id": 30101,
                         "name": "read_b_01",
                         "policy": {
                             "server_id": 301,
@@ -187,11 +245,13 @@ def _config() -> Dict[str, Any]:
             },
             {
                 "id": 302,
+                "server_id": 302,
                 "name": "server_c_01",
                 "enabled": True,
                 "description": "server_c_secret",
                 "tools": [
                     {
+                        "tool_id": 30201,
                         "name": "read_c_01",
                         "policy": {
                             "server_id": 302,

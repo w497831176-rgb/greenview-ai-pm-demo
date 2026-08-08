@@ -105,6 +105,20 @@ from db.property_db import (
 router = APIRouter(tags=["badcases"])
 
 
+def _capability_apply_retired(operation: str) -> None:
+    raise HTTPException(
+        status_code=410,
+        detail={
+            "code": "trusted_catalog_supply_chain_locked",
+            "operation": operation,
+            "message": (
+                "Darwin/Badcase 草稿不得直接修改 Agent、Skill、RAG、MCP 或 Tool "
+                "实现；新增或实现变更必须经过代码级受控入库。"
+            ),
+        },
+    )
+
+
 def _validated_retest_trace(badcase: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Return the live complete Trace bound to this retest context, if any."""
     try:
@@ -893,6 +907,9 @@ async def extract_knowledge(case_id: int, request: ExtractKnowledgeRequest = Ext
 
 @router.post("/{case_id}/publish-draft/{draft_id}")
 async def publish_knowledge_draft(case_id: int, draft_id: int):
+    del case_id, draft_id
+    _capability_apply_retired("badcase.knowledge_draft.apply")
+
     """Backward-compatible alias: apply an approved knowledge draft."""
     case = _load_case(case_id)
     _require_case_status(case, "publish-draft", {"fixing"})
@@ -909,6 +926,9 @@ async def publish_knowledge_draft(case_id: int, draft_id: int):
 async def publish_skill_prompt_draft_endpoint(
     case_id: int, draft_id: int, request: PublishSkillDraftRequest = PublishSkillDraftRequest()
 ):
+    del case_id, draft_id, request
+    _capability_apply_retired("badcase.skill_draft.apply")
+
     """Backward-compatible alias: apply an approved skill/prompt draft to an agent."""
     case = _load_case(case_id)
     _require_case_status(case, "publish-skill-draft", {"fixing"})
@@ -927,6 +947,9 @@ async def publish_skill_prompt_draft_endpoint(
 async def accept_capability_gap_endpoint(
     case_id: int, draft_id: int, request: AcceptGapRequest = AcceptGapRequest()
 ):
+    del case_id, draft_id, request
+    _capability_apply_retired("badcase.capability_gap.apply")
+
     """Backward-compatible alias: accept an approved capability gap as backlog."""
     case = _load_case(case_id)
     _require_case_status(case, "accept-capability-gap", {"fixing"})
@@ -1228,6 +1251,9 @@ async def review_knowledge_draft(
 
 @router.post("/{case_id}/knowledge-drafts/{draft_id}/apply")
 async def apply_knowledge_draft(case_id: int, draft_id: int):
+    del case_id, draft_id
+    _capability_apply_retired("badcase.knowledge_draft.apply")
+
     """Apply an approved knowledge draft to the official knowledge base and reindex."""
     case = _load_case(case_id)
     _require_case_status(case, "apply-knowledge-draft", {"fixing"})
@@ -1301,6 +1327,9 @@ async def review_skill_prompt_draft(
 async def apply_skill_prompt_draft(
     case_id: int, draft_id: int, request: PublishSkillDraftRequest = PublishSkillDraftRequest()
 ):
+    del case_id, draft_id
+    _capability_apply_retired("badcase.skill_draft.apply")
+
     """Apply an approved skill/prompt draft to a target agent."""
     case = _load_case(case_id)
     _require_case_status(case, "apply-skill-prompt-draft", {"fixing"})
@@ -1376,6 +1405,9 @@ async def review_capability_gap_draft(
 async def apply_capability_gap_draft(
     case_id: int, draft_id: int, request: AcceptGapRequest = AcceptGapRequest()
 ):
+    del case_id, draft_id
+    _capability_apply_retired("badcase.capability_gap.apply")
+
     """Apply an approved capability gap draft as a product backlog item (no real tool created)."""
     case = _load_case(case_id)
     _require_case_status(case, "apply-capability-gap-draft", {"fixing"})

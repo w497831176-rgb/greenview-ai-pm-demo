@@ -10,6 +10,12 @@ from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
+from app.runtime.capability_catalog import (
+    CapabilityCatalogError,
+    assert_trusted_capability,
+    set_trusted_capability_enabled,
+    trusted_capability_ids,
+)
 
 from db.property_db import (
     create_badcase as db_create_badcase,
@@ -52,6 +58,20 @@ router = APIRouter(prefix="/api/knowledge", tags=["knowledge"])
 
 # Standalone retrieval router so the same endpoints can also be mounted at /api/retrieval.
 retrieval_router = APIRouter(tags=["retrieval"])
+
+
+def _supply_chain_locked(operation: str) -> None:
+    raise HTTPException(
+        status_code=410,
+        detail={
+            "code": "trusted_catalog_supply_chain_locked",
+            "operation": operation,
+            "message": (
+                "RAG 文档新增、内容编辑、删除、重建实现及运行策略直改已停用；"
+                "新增能力需经过代码级受控入库。"
+            ),
+        },
+    )
 
 
 class KnowledgeDocCreate(BaseModel):
@@ -141,6 +161,9 @@ async def get_retrieval_settings_top():
 @retrieval_router.post("/settings")
 async def update_retrieval_settings_top(request: RetrievalSettingsUpdate):
     """Update advanced RAG retrieval settings (mounted at /api/retrieval)."""
+    del request
+    _supply_chain_locked("retrieval_policy.update")
+
     settings = db_update_retrieval_settings(
         name="default",
         top_k=request.top_k,
@@ -185,6 +208,9 @@ async def get_retrieval_settings():
 @router.post("/retrieval/settings")
 async def update_retrieval_settings(request: RetrievalSettingsUpdate):
     """Update advanced RAG retrieval settings."""
+    del request
+    _supply_chain_locked("retrieval_policy.update")
+
     settings = db_update_retrieval_settings(
         name="default",
         top_k=request.top_k,
@@ -229,6 +255,9 @@ async def get_retrieval_settings_alias():
 @router.post("/retrieval-settings")
 async def update_retrieval_settings_alias(request: RetrievalSettingsUpdate):
     """Frontend alias for /retrieval/settings."""
+    del request
+    _supply_chain_locked("retrieval_policy.update")
+
     settings = db_update_retrieval_settings(
         name="default",
         top_k=request.top_k,
@@ -255,6 +284,9 @@ async def approve_knowledge_draft(draft_id: int):
 
     Mirrors the behaviour of /badcases/{id}/publish-draft/{draft_id}.
     """
+    del draft_id
+    _supply_chain_locked("knowledge_draft.apply")
+
     draft = db_get_knowledge_draft(draft_id)
     if not draft:
         raise HTTPException(status_code=404, detail="draft not found")
@@ -279,15 +311,21 @@ async def approve_knowledge_draft(draft_id: int):
 @router.get("/docs")
 async def list_knowledge_docs():
     """List all knowledge documents."""
-    docs = db_list_knowledge_docs()
+    allowed = {int(item) for item in trusted_capability_ids("knowledge")}
+    docs = [
+        doc
+        for doc in db_list_knowledge_docs()
+        if int(doc.get("id") or 0) in allowed
+    ]
     return {"knowledge_docs": docs, "count": len(docs)}
 
 
 @router.get("/docs/{doc_id}")
 async def get_knowledge_doc(doc_id: int):
     """Get a single knowledge document."""
-    doc = db_get_knowledge_doc(doc_id)
-    if not doc:
+    try:
+        doc = assert_trusted_capability("knowledge", doc_id)["object"]
+    except CapabilityCatalogError:
         raise HTTPException(status_code=404, detail="not found")
     return {"knowledge_doc": doc}
 
@@ -295,6 +333,9 @@ async def get_knowledge_doc(doc_id: int):
 @router.post("/docs")
 async def create_knowledge_doc(request: KnowledgeDocCreate):
     """Create a document and index only owner-facing business evidence."""
+    del request
+    _supply_chain_locked("knowledge.create")
+
     source_type = _validate_source_type(request.source_type)
     doc = db_create_knowledge_doc(
         title=request.title,
@@ -327,6 +368,9 @@ async def create_knowledge_doc(request: KnowledgeDocCreate):
 @router.put("/docs/{doc_id}")
 async def update_knowledge_doc(doc_id: int, request: KnowledgeDocUpdate):
     """Update a knowledge document and reindex if content changed."""
+    del doc_id, request
+    _supply_chain_locked("knowledge.implementation.update")
+
     old_doc = db_get_knowledge_doc(doc_id)
     if not old_doc:
         raise HTTPException(status_code=404, detail="not found")
@@ -352,18 +396,16 @@ async def update_knowledge_doc(doc_id: int, request: KnowledgeDocUpdate):
 @router.delete("/docs/{doc_id}")
 async def delete_knowledge_doc(doc_id: int):
     """Delete a knowledge document and its vectors."""
-    deleted = db_delete_knowledge_doc(doc_id)
-    if not deleted:
-        raise HTTPException(status_code=404, detail="not found")
-    rag_store.delete_chunks_for_doc(doc_id)
-    return {"ok": True, "deleted_id": doc_id}
+    del doc_id
+    _supply_chain_locked("knowledge.delete")
 
 
 @router.get("/docs/{doc_id}/chunks")
 async def list_doc_chunks(doc_id: int):
     """List vector chunks for a document."""
-    doc = db_get_knowledge_doc(doc_id)
-    if not doc:
+    try:
+        doc = assert_trusted_capability("knowledge", doc_id)["object"]
+    except CapabilityCatalogError:
         raise HTTPException(status_code=404, detail="not found")
     chunks = rag_store.list_chunks_for_doc(doc_id)
     return {"knowledge_doc": doc, "chunks": chunks, "count": len(chunks)}
@@ -372,23 +414,24 @@ async def list_doc_chunks(doc_id: int):
 @router.post("/docs/{doc_id}/reindex")
 async def reindex_doc(doc_id: int):
     """Manually re-chunk and reindex a document."""
-    doc = db_get_knowledge_doc(doc_id)
-    if not doc:
-        raise HTTPException(status_code=404, detail="not found")
-    ok = rag_indexer.reindex_document(doc_id)
-    if not ok:
-        raise HTTPException(status_code=500, detail="indexing failed")
-    return {"knowledge_doc": db_get_knowledge_doc(doc_id)}
+    del doc_id
+    _supply_chain_locked("knowledge.reindex")
 
 
 @router.patch("/docs/{doc_id}/indexed")
 async def toggle_doc_indexed(doc_id: int, request: IndexedFlagUpdate):
     """Enable or disable a document from retrieval."""
-    doc = db_get_knowledge_doc(doc_id)
-    if not doc:
-        raise HTTPException(status_code=404, detail="not found")
-    db_set_knowledge_doc_indexed_flag(doc_id, request.is_indexed)
-    return {"knowledge_doc": db_get_knowledge_doc(doc_id)}
+    try:
+        set_trusted_capability_enabled(
+            "knowledge", doc_id, request.is_indexed
+        )
+        doc = assert_trusted_capability("knowledge", doc_id)["object"]
+    except CapabilityCatalogError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "trusted_catalog_toggle_rejected", "message": str(exc)},
+        ) from exc
+    return {"knowledge_doc": doc}
 
 
 @router.get("/search")

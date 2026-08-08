@@ -258,12 +258,7 @@
         { id: 'handoff-orders', label: '人工接管', icon: 'handoff' }
       ],
       platform: [
-        { id: 'agents', label: 'Agent', icon: 'agent', group: '能力配置' },
-        { id: 'skills', label: 'Skill', icon: 'skill', group: '能力配置' },
-        { id: 'knowledge', label: 'RAG', icon: 'knowledge', group: '能力配置' },
-        { id: 'mcp', label: 'MCP Server / Tool', icon: 'mcp', group: '能力配置' },
-        { id: 'models', label: '模型策略', icon: 'model', group: '能力配置' },
-        { id: 'runtime', label: 'RuntimeRelease', icon: 'release', group: '版本发布' },
+        { id: 'runtime', label: '可信能力目录与运行版本', icon: 'release', group: '能力编排' },
         { id: 'badcases', label: 'Badcase', icon: 'badcase', group: '质量闭环' },
         { id: 'evaluations', label: 'Evaluation / Golden Set', icon: 'evaluation', group: '质量闭环' },
         { id: 'cost-governance', label: 'Trace 与成本', icon: 'cost', group: '调用与成本' }
@@ -1149,12 +1144,15 @@
         case 'work-orders': await renderStaffWorkOrdersPage(main); break;
         case 'handoff-orders': await renderHandoffPage(main); break;
         case 'runtime': await renderRuntimePage(main); break;
-        case 'agents': await renderAgentsPage(main); break;
-        case 'models': await renderModelsPage(main); break;
-        case 'model-ab': await renderModelAbPage(main); break;
-        case 'skills': await renderSkillsPage(main); break;
-        case 'mcp': await renderMcpPage(main); break;
-        case 'knowledge': await renderKnowledgePage(main); break;
+        case 'agents':
+        case 'models':
+        case 'model-ab':
+        case 'skills':
+        case 'mcp':
+        case 'knowledge':
+          STATE.subTab = 'runtime';
+          await renderRuntimePage(main);
+          break;
         case 'badcases': await renderBadcasesPage(main); break;
         case 'badcase-detail': await renderBadcaseDetailPage(main); break;
         case 'evaluations': await renderEvaluationsPage(main); break;
@@ -3353,10 +3351,8 @@
             actionButtons += `<button data-draft-id="${d.id}" data-draft-type="${type}" data-review="draft" class="badcase-draft-review px-2 py-1 bg-amber-50 hover:bg-amber-100 text-amber-700 rounded-lg text-xs transition-colors" ${allowed.has('review-draft') ? '' : 'disabled title="当前状态不可审核"'}>退回草稿</button>`;
             actionButtons += `<button data-draft-id="${d.id}" data-draft-type="${type}" data-review="rejected" class="badcase-draft-review px-2 py-1 bg-red-50 hover:bg-red-100 text-red-700 rounded-lg text-xs transition-colors" ${allowed.has('review-draft') ? '' : 'disabled title="当前状态不可审核"'}>驳回</button>`;
           } else if (status === 'approved') {
-            if (type === 'knowledge' && allowed.has('apply-draft')) {
-              actionButtons += `<button data-draft-id="${d.id}" data-draft-type="${type}" data-confirm="${escapeHtml(applyConfirm.knowledge)}" class="badcase-draft-apply px-2 py-1 bg-brand-600 hover:bg-brand-700 text-white rounded-lg text-xs transition-colors">应用到正式知识库</button>`;
-            } else if (type === 'skill_prompt' && allowed.has('apply-draft')) {
-              actionButtons += `<button data-draft-id="${d.id}" data-draft-type="${type}" class="badcase-draft-skill-apply px-2 py-1 bg-brand-600 hover:bg-brand-700 text-white rounded-lg text-xs transition-colors">选择 Agent 并应用</button>`;
+            if (type === 'knowledge' || type === 'skill_prompt') {
+              actionButtons += '<span class="px-2 py-1 rounded-lg bg-indigo-50 text-indigo-700 text-xs">需代码级受控入库，不能从 Badcase 直接转正</span>';
             } else if (type === 'capability_gap' && allowed.has('apply-draft')) {
               actionButtons += `<button data-draft-id="${d.id}" data-draft-type="${type}" data-confirm="${escapeHtml(applyConfirm.capability_gap)}" class="badcase-draft-apply px-2 py-1 bg-brand-600 hover:bg-brand-700 text-white rounded-lg text-xs transition-colors">采纳为产品待办</button>`;
             }
@@ -5211,19 +5207,90 @@
         <div class="max-w-6xl mx-auto p-4 md:p-6 space-y-5">
           <div class="flex flex-col md:flex-row md:items-end md:justify-between gap-3">
             <div>
-              <h2 class="text-xl font-semibold text-slate-900">版本发布 · RuntimeRelease（运行版本）</h2>
-              <p class="text-sm text-slate-500 mt-1">默认只看唯一当前生效版本；Draft 是待发布配置，历史版本仅用于追溯、比较和回滚。</p>
+              <h2 class="text-xl font-semibold text-slate-900">可信能力目录与运行版本</h2>
+              <p class="text-sm text-slate-500 mt-1">新增能力需经过代码级受控入库；目录内能力支持运行时热编排。</p>
             </div>
             <div class="flex flex-wrap gap-2">
               <button id="runtime-preview-btn" class="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl text-sm">重新检查Draft变化</button>
               <button id="runtime-publish-btn" class="px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white rounded-xl text-sm disabled:opacity-40 disabled:cursor-not-allowed">发布当前Draft</button>
             </div>
           </div>
-          <div class="rounded-2xl border border-indigo-200 bg-indigo-50 p-4 text-sm text-indigo-950"><b>版本关系：</b>Draft 保存 Agent / Skill / RAG / MCP 的待发布配置；发布后生成唯一当前生效 RuntimeRelease，仅对下一新会话生效。v18、v19、v27 等都是不可变历史快照，只供追溯、比较或人工回滚。</div>
+          <div class="rounded-2xl border border-indigo-200 bg-indigo-50 p-4 text-sm text-indigo-950"><b>热编排边界：</b>这里只编排已经受控入库的 Agent / Skill / RAG / 只读 MCP / 系统 Tool，不支持任意新增、上传、导入、自定义 MCP 地址或修改能力实现。所有启停和绑定先进入 Draft，经 Diff 与校验后发布不可变 RuntimeRelease；仅下一新会话生效，旧会话保持原 Snapshot。</div>
           <div id="runtime-content">${loadingState()}</div>
         </div>`;
 
       let overview = null;
+      let catalog = null;
+
+      const catalogTypeLabels = {
+        agent: 'Agent',
+        skill: 'Skill',
+        knowledge: 'RAG',
+        mcp_server: '只读 MCP Server',
+        mcp_tool: '只读 MCP Tool',
+        system_tool: '系统 Tool'
+      };
+
+      const catalogScopeLabels = {
+        property: '物业域',
+        isolated_general: '非物业隔离域',
+        control_plane: '控制面'
+      };
+
+      const renderCatalogItem = item => {
+        const canToggle = ['agent', 'skill', 'knowledge', 'mcp_server'].includes(item.capability_type);
+        const canBind = item.capability_type === 'agent';
+        const hash = String(item.content_hash || '');
+        return `
+          <div class="rounded-xl border border-slate-200 bg-white p-3">
+            <div class="flex flex-wrap items-start justify-between gap-2">
+              <div class="min-w-0">
+                <div class="font-medium text-sm text-slate-900 break-words">${escapeHtml(item.name || String(item.stable_id))}</div>
+                <div class="mt-1 text-[11px] font-mono text-slate-400 break-all">ID ${escapeHtml(String(item.stable_id))}</div>
+              </div>
+              <span class="px-2 py-1 rounded-full text-[11px] ${item.enabled ? 'bg-emerald-50 text-emerald-700' : 'bg-slate-100 text-slate-500'}">${item.enabled ? 'Draft启用' : 'Draft停用'}</span>
+            </div>
+            <div class="mt-2 flex flex-wrap gap-1.5 text-[10px]">
+              <span class="px-2 py-1 rounded bg-indigo-50 text-indigo-700">${escapeHtml(catalogScopeLabels[item.domain_scope] || item.domain_scope || '缺少域')}</span>
+              <span class="px-2 py-1 rounded bg-slate-50 text-slate-600">${escapeHtml(item.version || '缺少版本')}</span>
+              ${item.effect ? `<span class="px-2 py-1 rounded ${item.effect === 'read' ? 'bg-emerald-50 text-emerald-700' : 'bg-red-50 text-red-700'}">effect=${escapeHtml(item.effect)}</span>` : ''}
+              <span class="px-2 py-1 rounded bg-slate-50 text-slate-600">受控来源</span>
+            </div>
+            <details class="mt-2 text-[10px] text-slate-400"><summary class="cursor-pointer">版本与内容Hash</summary><div class="mt-1 font-mono break-all">${escapeHtml(item.source || '-')} · ${escapeHtml(hash || '-')}</div></details>
+            ${(canToggle || canBind) ? `<div class="mt-3 flex flex-wrap gap-2">
+              ${canToggle ? `<button class="runtime-catalog-toggle px-2.5 py-1.5 rounded-lg border text-xs ${item.enabled ? 'border-amber-200 text-amber-700' : 'border-emerald-200 text-emerald-700'}" data-type="${escapeHtml(item.capability_type)}" data-id="${escapeHtml(String(item.stable_id))}" data-enabled="${item.enabled ? 'true' : 'false'}">${item.enabled ? '停用到Draft' : '启用到Draft'}</button>` : ''}
+              ${canBind ? `<button class="runtime-agent-bind px-2.5 py-1.5 rounded-lg border border-indigo-200 text-indigo-700 text-xs" data-agent-id="${escapeHtml(String(item.stable_id))}">编排能力绑定</button>` : ''}
+            </div>` : '<div class="mt-3 text-[11px] text-slate-400">由所属可信对象统一启停，不支持修改实现。</div>'}
+          </div>`;
+      };
+
+      const renderTrustedCatalog = data => {
+        const items = data?.items || [];
+        const errors = data?.errors || [];
+        const order = ['agent', 'skill', 'knowledge', 'mcp_server', 'mcp_tool', 'system_tool'];
+        return `
+          <section class="rounded-2xl border border-indigo-200 bg-slate-50 p-4 md:p-5">
+            <div class="flex flex-wrap items-start justify-between gap-3">
+              <div>
+                <h3 class="font-semibold text-slate-900">可信能力目录</h3>
+                <p class="mt-1 text-xs text-slate-500">稳定ID、结构化域、版本/Hash、可信来源和只读 effect 均由代码评审清单定义；名称和当前绑定不参与可信或领域判断。</p>
+              </div>
+              <div class="text-[11px] font-mono text-slate-500">${escapeHtml(data?.catalog_version || '-')}</div>
+            </div>
+            <div class="mt-3 grid grid-cols-2 md:grid-cols-6 gap-2">
+              ${order.map(type => `<div class="rounded-xl bg-white border border-slate-200 p-2 text-center"><div class="text-lg font-semibold text-slate-900">${Number(data?.trusted_counts?.[type] || 0)}</div><div class="text-[10px] text-slate-500">${escapeHtml(catalogTypeLabels[type])}</div><div class="text-[9px] text-slate-400">raw ${Number(data?.raw_counts?.[type] || 0)} · 未受控 ${Number(data?.untrusted_counts?.[type] || 0)}</div></div>`).join('')}
+            </div>
+            ${errors.length ? `<div class="mt-3 rounded-xl border border-red-200 bg-red-50 p-3 text-xs text-red-700">目录结构错误 ${errors.length} 项；发布将 fail closed。</div>` : ''}
+            ${Number(data?.trusted_counts?.system_tool || 0) === 0 ? '<div class="mt-3 rounded-xl border border-amber-200 bg-amber-50 p-3 text-xs text-amber-800">当前数据模型没有独立系统 Tool 目录对象；这是演示内容缺口，不会临时造一项来凑数。</div>' : ''}
+            <div class="mt-4 space-y-3">
+              ${order.map(type => {
+                const group = items.filter(item => item.capability_type === type);
+                if (!group.length) return '';
+                return `<details class="rounded-xl border border-slate-200 bg-white p-3" ${type === 'agent' ? 'open' : ''}><summary class="cursor-pointer text-sm font-semibold text-slate-800">${escapeHtml(catalogTypeLabels[type])}（${group.length}）</summary><div class="mt-3 grid md:grid-cols-2 xl:grid-cols-3 gap-2">${group.map(renderCatalogItem).join('')}</div></details>`;
+              }).join('')}
+            </div>
+          </section>`;
+      };
 
       const changeLabels = {
         added: '新增',
@@ -5721,12 +5788,80 @@
         }));
       };
 
+      async function openTrustedBindingEditor(agentId) {
+        try {
+          const payload = await apiGet(`/api/agents/${encodeURIComponent(agentId)}`);
+          const agent = payload.agent || {};
+          if (agent.is_router) {
+            showToast('唯一 Router 不挂载业务能力', 'error');
+            return;
+          }
+          const sameDomain = item => item.domain_scope === agent.domain_scope;
+          const skills = (catalog?.items || []).filter(item => item.capability_type === 'skill' && sameDomain(item));
+          const docs = (catalog?.items || []).filter(item => item.capability_type === 'knowledge' && sameDomain(item));
+          const servers = (catalog?.items || []).filter(item => item.capability_type === 'mcp_server' && sameDomain(item));
+          const selectedSkills = new Set((agent.skill_ids || []).map(Number));
+          const selectedDocs = new Set((agent.knowledge_doc_ids || []).map(Number));
+          const selectedServers = new Set(agent.available_mcp_tools || []);
+          const renderChecks = (type, values, selected, valueOf) => values.length
+            ? values.map(item => {
+                const value = valueOf(item);
+                return `<label class="flex items-start gap-2 rounded-lg border border-slate-200 bg-white p-2 text-xs"><input class="runtime-binding-choice mt-0.5" type="checkbox" data-type="${type}" value="${escapeHtml(String(value))}" ${selected.has(value) ? 'checked' : ''}><span><b>${escapeHtml(item.name || String(item.stable_id))}</b><br><span class="text-[10px] text-slate-400">${escapeHtml(String(item.stable_id))} · ${escapeHtml(catalogScopeLabels[item.domain_scope] || item.domain_scope)}</span></span></label>`;
+              }).join('')
+            : '<div class="text-xs text-slate-400">该域没有已受控入库对象。</div>';
+          openModal(
+            `编排 ${escapeHtml(agent.name || agentId)} 的可信能力`,
+            `<div class="space-y-4 text-sm">
+              <div class="rounded-xl border border-indigo-100 bg-indigo-50 p-3 text-xs text-indigo-800">保存只修改 Draft；发布前当前 RuntimeRelease 与既有 Session Snapshot 完全不变。域不兼容、未知ID、非只读 MCP 会被后端拒绝。</div>
+              ${agent.knowledge_doc_ids === null ? '<div class="rounded-xl border border-amber-200 bg-amber-50 p-3 text-xs text-amber-800">该 Agent 仍是历史隐式 RAG 范围；可信目录要求本次保存时显式选择 RAG。</div>' : ''}
+              <section><h4 class="font-semibold text-slate-800 mb-2">Skill</h4><div class="grid md:grid-cols-2 gap-2">${renderChecks('skill', skills, selectedSkills, item => Number(item.stable_id))}</div></section>
+              <section><h4 class="font-semibold text-slate-800 mb-2">RAG</h4><div class="grid md:grid-cols-2 gap-2 max-h-56 overflow-y-auto">${renderChecks('knowledge', docs, selectedDocs, item => Number(item.stable_id))}</div></section>
+              <section><h4 class="font-semibold text-slate-800 mb-2">只读 MCP Server</h4><div class="grid md:grid-cols-2 gap-2">${renderChecks('mcp_server', servers, selectedServers, item => item.name)}</div></section>
+            </div>`,
+            async () => {
+              const choices = Array.from($('#modal-body').querySelectorAll('.runtime-binding-choice:checked'));
+              const values = type => choices.filter(item => item.dataset.type === type).map(item => item.value);
+              const serverNames = values('mcp_server');
+              const serverIds = servers.filter(item => serverNames.includes(item.name)).map(item => Number(item.stable_id));
+              await apiPut(`/api/runtime/catalog/agents/${encodeURIComponent(agentId)}/bindings`, {
+                skill_ids: values('skill').map(Number),
+                knowledge_doc_ids: values('knowledge').map(Number),
+                mcp_server_ids: serverIds,
+                system_tool_ids: []
+              });
+              closeModal();
+              showToast('可信能力绑定已写入 Draft；尚未发布');
+              await loadOverview();
+            },
+            '保存到Draft'
+          );
+        } catch (err) {
+          showToast('加载可信绑定失败：' + (err.message || err), 'error');
+        }
+      }
+
+      const bindCatalogActions = root => {
+        root.querySelectorAll('.runtime-catalog-toggle').forEach(button => button.addEventListener('click', async () => {
+          const currentEnabled = button.dataset.enabled === 'true';
+          const nextEnabled = !currentEnabled;
+          if (!confirm(`确认把该可信对象${nextEnabled ? '启用' : '停用'}到 Draft？当前生产版本不会立即改变。`)) return;
+          try {
+            await apiPatch(`/api/runtime/catalog/${encodeURIComponent(button.dataset.type)}/${encodeURIComponent(button.dataset.id)}/enabled`, { enabled: nextEnabled });
+            showToast(`已${nextEnabled ? '启用' : '停用'}到 Draft；需校验并发布后才对新会话生效`);
+            await loadOverview();
+          } catch (err) {
+            showToast('可信目录启停失败：' + (err.message || err), 'error');
+          }
+        }));
+        root.querySelectorAll('.runtime-agent-bind').forEach(button => button.addEventListener('click', () => openTrustedBindingEditor(button.dataset.agentId)));
+      };
+
       async function openAdvancedAcceptance() {
         await _renderRuntimePageLegacy(container);
         const heading = container.querySelector('h2');
         if (heading) heading.textContent = 'RuntimeRelease 高级验收';
         const subtitle = heading?.nextElementSibling;
-        if (subtitle) subtitle.textContent = '按需加载 Trace、新增能力、组合验收、固定矩阵与运行记录。';
+        if (subtitle) subtitle.textContent = '按需加载 Trace、组合验收、固定矩阵与运行记录；不提供能力新增或导入入口。';
         const actionBar = container.querySelector('.flex.gap-2');
         if (actionBar) {
           actionBar.innerHTML = '<button id="runtime-back-center-btn" class="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl text-sm">返回发布中心</button>';
@@ -5737,12 +5872,18 @@
       async function loadOverview() {
         requireElement('#runtime-content', 'RuntimeRelease 发布中心').innerHTML = loadingState();
         try {
-          overview = await apiGet('/api/runtime/releases/overview');
+          const [releaseOverview, catalogData] = await Promise.all([
+            apiGet('/api/runtime/releases/overview'),
+            apiGet('/api/runtime/catalog')
+          ]);
+          overview = releaseOverview;
+          catalog = catalogData;
           const current = overview.current || {};
           const draft = overview.draft || {};
           const history = overview.history || [];
           requireElement('#runtime-content', 'RuntimeRelease 发布中心').innerHTML = `
             <div class="space-y-5">
+              ${renderTrustedCatalog(catalog)}
               <section>
                 <h3 class="text-sm font-semibold text-slate-700 mb-2">当前生效版本</h3>
                 ${renderReleaseSummary(current, true)}
@@ -5770,7 +5911,7 @@
               <details class="rounded-2xl border border-dashed border-indigo-200 bg-indigo-50/50 p-5">
                 <summary class="cursor-pointer font-semibold text-indigo-900">高级版本验收</summary>
                 <div class="mt-3 flex flex-col md:flex-row md:items-center md:justify-between gap-3">
-                  <p class="text-xs text-indigo-700">按需加载Trace、新增能力、组合验收、固定矩阵和运行记录；默认演示不运行这些操作。</p>
+                  <p class="text-xs text-indigo-700">按需加载Trace、组合验收、固定矩阵和运行记录；这里不提供能力新增或导入入口。</p>
                   <button id="runtime-advanced-btn" class="px-4 py-2 bg-indigo-600 text-white rounded-xl text-sm">进入高级验收</button>
                 </div>
               </details>
@@ -5780,6 +5921,7 @@
           publishButton.disabled = !draft.can_publish;
           publishButton.title = draft.block_reason === 'no_changes' ? '当前没有待发布变更' : '';
 
+          bindCatalogActions(requireElement('#runtime-content', '可信能力目录'));
           bindHistoryActions(requireElement('#runtime-history-list', 'RuntimeRelease 历史版本'), current);
 
           const fullPreviewButton = $('#runtime-full-preview-btn');
