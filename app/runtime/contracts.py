@@ -31,9 +31,19 @@ class RuntimePath(str, Enum):
 
 
 class RuntimeLane(str, Enum):
-    SAFETY_HANDOFF = "A_SAFETY_HANDOFF"
+    HANDOFF = "A_HANDOFF"
+    # Source compatibility for historical code/tests.  Serialization always
+    # emits the unified active wire value above; historical persisted rows are
+    # accepted by ``_missing_`` without rewriting them.
+    SAFETY_HANDOFF = "A_HANDOFF"
     PROPERTY_GOVERNED = "B_PROPERTY_GOVERNED"
     ISOLATED_GENERAL = "C_ISOLATED_GENERAL"
+
+    @classmethod
+    def _missing_(cls, value: object) -> Optional["RuntimeLane"]:
+        if value == "A_SAFETY_HANDOFF":
+            return cls.HANDOFF
+        return None
 
 
 class LaneDecisionSource(str, Enum):
@@ -170,7 +180,7 @@ class RouterDecisionPayload(StrictImmutableModel):
         if not self.reason.strip() or self.reason.strip() != self.reason:
             raise ValueError("reason must be non-empty without surrounding whitespace")
         selected = str(self.selected_agent_id or "").strip()
-        if self.lane == RuntimeLane.SAFETY_HANDOFF:
+        if self.lane == RuntimeLane.HANDOFF:
             if self.selected_agent_id is not None:
                 raise ValueError("A lane selected_agent_id must be null")
             return self

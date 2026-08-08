@@ -551,8 +551,8 @@ def test_router_cards_and_schema_are_strict() -> None:
 
     assert RouterDecisionPayload.model_config.get("extra") == "forbid"
     invalid = (
-        {"lane": "A_SAFETY_HANDOFF", "reason": "reason_00"},
-        {"lane": "A_SAFETY_HANDOFF", "selected_agent_id": "agent_b_01", "reason": "reason_01"},
+        {"lane": "A_HANDOFF", "reason": "reason_00"},
+        {"lane": "A_HANDOFF", "selected_agent_id": "agent_b_01", "reason": "reason_01"},
         {"lane": "B_PROPERTY_GOVERNED", "selected_agent_id": None, "reason": "reason_02"},
         {"lane": "C_ISOLATED_GENERAL", "selected_agent_id": "", "reason": "reason_03"},
         {"lane": "B_PROPERTY_GOVERNED", "selected_agent_id": "agent_b_01", "reason": "reason_04", "business_intent": "work_order_create"},
@@ -572,7 +572,7 @@ def test_a_unified_handoff_short_circuits() -> None:
 
     async def classify(*, messages: List[Dict[str, Any]], **_kwargs: Any) -> Dict[str, Any]:
         router_calls.append(copy.deepcopy(messages))
-        return _router_result(RuntimeLane.SAFETY_HANDOFF, None, "reason_a_01")
+        return _router_result(RuntimeLane.HANDOFF, None, "reason_a_01")
 
     def request_handoff(session_id: str, reason: str, **kwargs: Any) -> Dict[str, Any]:
         handoff_calls.append({"session_id": session_id, "reason": reason, **kwargs})
