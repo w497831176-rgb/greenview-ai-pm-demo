@@ -21,12 +21,25 @@ class ToolGateway:
                 return agent
         raise ToolPolicyError(f"agent is not in RunConfigSnapshot: {agent_id}")
 
+    def _validated_agent(self, agent_id: str) -> Dict[str, Any]:
+        # Import lazily to avoid coupling agent construction to gateway module
+        # import order. The validator uses only immutable scope/binding fields.
+        from app.runtime.agent_factory import validate_agent_binding_isolation
+
+        try:
+            validate_agent_binding_isolation(self.config, agent_id)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ToolPolicyError(
+                f"agent binding isolation configuration error: {exc}"
+            ) from exc
+        return self._agent(agent_id)
+
     def policies_for_agent(
         self,
         agent_id: str,
         runtime_path: RuntimePath,
     ) -> List[ToolPolicy]:
-        agent = self._agent(agent_id)
+        agent = self._validated_agent(agent_id)
         bound_servers = set(agent.get("mcp_server_names") or [])
         result: List[ToolPolicy] = []
         for server in self.config.get("mcp_servers") or []:
@@ -74,23 +87,8 @@ class ToolGateway:
         tool_name: str,
         agent_id: Optional[str] = None,
     ) -> ToolPolicy:
-        if agent_id is not None:
-            agent = self._agent(agent_id)
-            if server_name not in set(agent.get("mcp_server_names") or []):
-                raise ToolPolicyError("write server is not bound to the selected agent")
-        for server in self.config.get("mcp_servers") or []:
-            if server.get("name") != server_name:
-                continue
-            if not server.get("enabled"):
-                raise ToolPolicyError("write server is disabled in the published snapshot")
-            for tool in server.get("tools") or []:
-                if tool.get("name") == tool_name:
-                    policy = ToolPolicy.model_validate(tool.get("policy") or {})
-                    if policy.effect not in {ToolEffect.CREATE, ToolEffect.UPDATE}:
-                        raise ToolPolicyError("tool is not a governed create/update action")
-                    if not policy.enabled or not policy.requires_confirmation:
-                        raise ToolPolicyError("write tool is not enabled for confirmed execution")
-                    if RuntimePath.CONTROLLED_ACTION not in policy.allowed_paths:
-                        raise ToolPolicyError("write tool is not allowed on controlled action path")
-                    return policy
-        raise ToolPolicyError("write tool is absent from the published snapshot")
+        del server_name, tool_name, agent_id
+        raise ToolPolicyError(
+            "MCP is permanently read-only; write policies and confirmed MCP "
+            "execution are forbidden"
+        )

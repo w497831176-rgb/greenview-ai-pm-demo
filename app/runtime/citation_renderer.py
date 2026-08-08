@@ -443,7 +443,7 @@ def prompt_evidence_allowlist(evidence: EvidenceSet) -> str:
     return "\n".join(lines)
 
 
-def render_citations(
+def _render_citations_legacy(
     answer: str,
     evidence: EvidenceSet,
     tool_invocations: Optional[Iterable[Any]] = None,
@@ -618,6 +618,69 @@ def render_citations(
                 "values": ungrounded_values,
             }
         )
+    citations: List[Citation] = []
+    for index, evidence_id in enumerate(ordered_ids, start=1):
+        item = by_id[evidence_id]
+        citations.append(
+            Citation(
+                index=index,
+                evidence_id=evidence_id,
+                label=f"[{index}] {item.title}",
+                title=item.title,
+                document_id=item.document_id,
+                document_version=item.document_version,
+                chunk_id=item.chunk_id,
+                chunk_index=item.chunk_index,
+                content_snapshot=item.content_snapshot,
+                retrieval_score=item.retrieval_score,
+                retrieval_mode=item.retrieval_mode,
+            )
+        )
+    return rendered, citations, violations
+
+
+def render_citations(
+    answer: str,
+    evidence: EvidenceSet,
+    tool_invocations: Optional[Iterable[Any]] = None,
+    skill_sources: Optional[Iterable[Dict[str, Any]]] = None,
+    action_receipts: Optional[Iterable[Any]] = None,
+) -> Tuple[str, List[Citation], List[Dict[str, Any]]]:
+    """Render only structurally valid citations from this run's evidence set.
+
+    Citation validation is intentionally limited to ID provenance.  The backend
+    must not reinterpret the selected Agent's prose or replace its answer based
+    on a second semantic judgement.  Tool/skill/action arguments remain in the
+    signature for API compatibility, but they do not confer synthetic evidence.
+    """
+    del tool_invocations, skill_sources, action_receipts
+    by_id = evidence.by_id()
+    ordered_ids: List[str] = []
+    violations: List[Dict[str, Any]] = []
+
+    def replace_id(match: re.Match) -> str:
+        evidence_id = match.group(1).strip()
+        if evidence_id not in by_id:
+            violations.append(
+                {"code": "unknown_evidence_id", "evidence_id": evidence_id}
+            )
+            return ""
+        if evidence_id not in ordered_ids:
+            ordered_ids.append(evidence_id)
+        return f"【引用{ordered_ids.index(evidence_id) + 1}】"
+
+    rendered = EVIDENCE_MARKER.sub(replace_id, answer or "")
+
+    def remove_unstructured_marker(match: re.Match) -> str:
+        violations.append(
+            {
+                "code": "unstructured_reference_marker",
+                "marker": match.group(1).strip()[:160],
+            }
+        )
+        return ""
+
+    rendered = UNSTRUCTURED_MARKER.sub(remove_unstructured_marker, rendered)
     citations: List[Citation] = []
     for index, evidence_id in enumerate(ordered_ids, start=1):
         item = by_id[evidence_id]

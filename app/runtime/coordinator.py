@@ -11,20 +11,25 @@ from contextlib import nullcontext
 from types import SimpleNamespace
 from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 
-from app.runtime.agent_factory import build_agent_from_snapshot, vertical_agent_cards
+from app.runtime.agent_factory import (
+    build_agent_from_snapshot,
+    router_agent_cards,
+    validate_agent_binding_isolation,
+)
 from app.runtime.badcase_capture import capture_runtime_badcase
 from app.runtime.citation_renderer import (
     build_skill_evidence,
     build_evidence_set,
     prompt_evidence_allowlist,
-    render_citations,
 )
 from app.runtime.contracts import (
+    AgentResponseEnvelope,
     ActionProposal,
     ActionReceipt,
     AnswerContract,
     ApprovalEvent,
     CapabilityDecision,
+    Citation,
     HandoffExecutionContract,
     HandoffKind,
     LaneDecision,
@@ -42,22 +47,14 @@ from app.runtime.contracts import (
 )
 from app.runtime.cost_ledger import build_cost_entry
 from app.runtime.evidence_ledger import EvidenceLedger
-from app.runtime.mcp_executor import (
-    build_model_native_read_tools,
-    preinvoke_read_tools,
-)
+from app.runtime.mcp_executor import build_model_native_read_tools
 from app.runtime.snapshot_resolver import resolve_snapshot
-from app.runtime.tool_planner import plan_tools, unique_write_plan
 from app.runtime.provider_accounting import merge_non_null, provider_accounting_scope
 from app.runtime.provider_evidence import provider_evidence_from_run
 from app.settings import MODEL_ID, USE_THINKING, build_model
 from app.work_order_workflow import (
-    WORK_ORDER_CREATE_INTENT,
-    _is_draft_follow_up,
     action_gateway,
-    advance_work_order_workflow,
-    is_cancel_request,
-    is_confirmation,
+    advance_structured_work_order_workflow,
 )
 from db.property_db import (
     create_chat_trace,
@@ -65,7 +62,6 @@ from db.property_db import (
     get_chat_session,
     get_action_proposal,
     get_action_receipt_by_idempotency_key,
-    get_latest_action_proposal,
     get_pending_action_proposal,
     get_work_order_draft,
     list_chat_messages,
@@ -141,6 +137,14 @@ class ProviderFailureError(RuntimeError):
 
 class InternalControlPayloadLeakError(RuntimeError):
     """A control-plane JSON payload reached the user-answer boundary."""
+
+
+class RouterContractError(RuntimeError):
+    """The single Router call returned an invalid structured decision."""
+
+
+class AgentEnvelopeError(RuntimeError):
+    """The selected Agent returned an invalid structured execution envelope."""
 
 
 def _json(value: Any) -> str:
@@ -291,45 +295,33 @@ def _lane_candidates(
 
 def _visible_chat_history(
     session_id: str,
-    *,
-    current_trace_id: Optional[str] = None,
-    rounds: int = 5,
 ) -> List[Dict[str, str]]:
-    """Return only successful user-visible messages; control-plane runs are excluded."""
+    """Return every visible Session message, unchanged, ordered and timestamped."""
 
     visible: List[Dict[str, str]] = []
     for item in list_chat_messages(session_id):
         role = str(item.get("role") or "").lower()
-        status = str(item.get("status") or "success").lower()
-        content = str(item.get("content") or "").strip()
-        if role not in {"user", "owner", "assistant"} or not content:
-            continue
-        if status not in {"success", "complete", "completed"}:
-            continue
-        if current_trace_id and str(item.get("trace_id") or "") == current_trace_id:
-            continue
-        if _is_internal_control_payload(content):
+        content = str(item.get("content") or "")
+        if role not in {"user", "owner", "assistant", "staff"} or not content:
             continue
         visible.append(
-            {"role": "user" if role in {"user", "owner"} else "assistant", "content": content}
+            {
+                "timestamp": str(item.get("created_at") or ""),
+                "role": role,
+                "content": content,
+            }
         )
-    return visible[-max(0, int(rounds)) * 2 :]
+    return visible
 
 
 def _render_visible_history_context(
-    history: List[Dict[str, str]],
-    current_message: str,
+    messages: List[Dict[str, str]],
     *,
     boundary: str,
 ) -> str:
-    lines = [f"[执行边界] {boundary}"]
-    if history:
-        lines.append("[最近成功可见对话]")
-        for item in history:
-            label = "用户" if item.get("role") == "user" else "助手"
-            lines.append(f"{label}：{item.get('content', '')}")
-    lines.extend(["[本轮用户问题]", current_message])
-    return "\n".join(lines)
+    """Serialize one chronological sequence; the current bubble is only its tail."""
+
+    return _json({"execution_boundary": boundary, "conversation": messages})
 
 
 def _is_internal_control_payload(text: str) -> bool:
@@ -360,21 +352,33 @@ def _is_internal_control_payload(text: str) -> bool:
     return bool(control_keys.intersection(payload))
 
 
+def _parse_agent_envelope(raw: Any) -> AgentResponseEnvelope:
+    """Parse exactly one selected-Agent envelope; do not infer or repair fields."""
+
+    if isinstance(raw, dict):
+        payload = raw
+    else:
+        value = str(raw or "").strip().lstrip("\ufeff").strip()
+        payload = json.loads(value)
+    if not isinstance(payload, dict):
+        raise ValueError("selected Agent response must be one JSON object")
+    return AgentResponseEnvelope.model_validate(payload)
+
+
 def _lane_explanation(decision: LaneDecision) -> str:
     labels = {
         RuntimeLane.SAFETY_HANDOFF: "人工协同",
         RuntimeLane.PROPERTY_GOVERNED: "物业受控回答",
         RuntimeLane.ISOLATED_GENERAL: "隔离通用回答",
     }
-    return (
-        f"进入{labels[decision.lane]}路径；识别任务为"
-        f"{decision.business_intent or '未命名意图'}。{decision.reason or 'Router未返回判断理由。'}"
-    )
+    return f"进入{labels[decision.lane]}路径。{decision.reason}"
 
 
 def _agent_domain_scope(agent: Optional[Dict[str, Any]]) -> str:
-    value = str((agent or {}).get("domain_scope") or "property")
-    return value if value in {"property", "isolated_general"} else "property"
+    value = str((agent or {}).get("domain_scope") or "").strip()
+    if value not in {"property", "isolated_general"}:
+        raise RuntimeError("Agent is missing a valid structured domain_scope")
+    return value
 
 
 def _knowledge_evidence_decision(
@@ -519,20 +523,12 @@ def _handoff_contract_for(
 ) -> HandoffExecutionContract:
     if decision.lane != RuntimeLane.SAFETY_HANDOFF:
         raise ValueError("Handoff execution contract requires effective A lane")
-    if str(decision.business_intent or "").strip() == "user_requested_handoff":
-        return HandoffExecutionContract(
-            kind=HandoffKind.USER_REQUESTED,
-            reason_code="user_requested",
-            queue="property_service",
-            safety_override=False,
-            response_mode=ResponseMode.HUMAN_HANDOFF,
-        )
     return HandoffExecutionContract(
-        kind=HandoffKind.SAFETY_RISK,
-        reason_code="safety_risk",
-        queue="emergency",
-        safety_override=True,
-        response_mode=ResponseMode.EMERGENCY_HANDOFF,
+        kind=HandoffKind.USER_REQUESTED,
+        reason_code="unified_handoff",
+        queue="property_service",
+        safety_override=False,
+        response_mode=ResponseMode.HUMAN_HANDOFF,
     )
 
 
@@ -548,9 +544,8 @@ def _answer_contract_for(
         "internal_control_payload",
     ]
     if decision.lane == RuntimeLane.SAFETY_HANDOFF:
-        handoff_contract = _handoff_contract_for(decision)
         return AnswerContract(
-            response_mode=handoff_contract.response_mode,
+            response_mode=ResponseMode.HUMAN_HANDOFF,
             evidence_required=False,
             skill_policy="skipped",
             rag_policy="skipped",
@@ -558,53 +553,36 @@ def _answer_contract_for(
             write_policy="forbidden",
             handoff_policy="required",
             forbidden_claims=common_forbidden,
-            decision_reason=(
-                "业主明确要求工作人员接手，立即发起普通人工协同。"
-                if handoff_contract.kind == HandoffKind.USER_REQUESTED
-                else "现实安全风险优先，语义判断后立即发起紧急人工协同。"
-            ),
+            decision_reason="A类立即创建统一Handoff；所有Agent、能力和写操作短路。",
         )
     if decision.lane == RuntimeLane.ISOLATED_GENERAL:
         return AnswerContract(
             response_mode=ResponseMode.SAFE_GENERAL,
             evidence_required=False,
-            skill_policy="skipped",
-            rag_policy="skipped",
-            tool_policy="skipped",
+            skill_policy="selected",
+            rag_policy="selected",
+            tool_policy="selected",
             write_policy="forbidden",
             handoff_policy="skipped",
             forbidden_claims=common_forbidden
             + ["property_official_fact", "harmful_instructions"],
-            decision_reason="C只允许隔离通用回答；物业能力全部跳过，危险或越权内容由回答安全边界拒绝。",
-        )
-    if runtime_path == RuntimePath.CONTROLLED_ACTION:
-        return AnswerContract(
-            response_mode=ResponseMode.CONTROLLED_WRITE,
-            evidence_required=True,
-            evidence_requirements=["proposal", "permission", "owner_confirmation", "receipt"],
-            skill_policy="skipped",
-            rag_policy="skipped",
-            tool_policy="selected",
-            write_policy="allowed_after_confirmation",
-            handoff_policy="optional",
-            forbidden_claims=common_forbidden + ["write_success_without_receipt"],
-            decision_reason="已存在的受控业务状态继续原流程，并保持Proposal、权限、确认、ActionGateway和Receipt边界。",
+            decision_reason="C由选定通用Agent回答；自有非物业增强能力可用但不是回答前置条件。",
         )
     return AnswerContract(
         response_mode=ResponseMode.GROUNDED_ANSWER,
-        evidence_required=True,
-        evidence_requirements=["activated_skill_or_adopted_rag_or_successful_tool"],
+        evidence_required=False,
+        evidence_requirements=[],
         skill_policy="selected",
         rag_policy="selected",
         tool_policy="selected",
-        write_policy="forbidden",
+        write_policy="allowed_after_confirmation",
         handoff_policy="optional",
         forbidden_claims=common_forbidden
         + [
             "property_process_or_timing_without_evidence",
             "realtime_value_without_successful_tool",
         ],
-        decision_reason="B只允许物业Agent；物业事实依赖Skill/RAG，实时状态依赖成功Tool，写入另走受控流程。",
+        decision_reason="B只构建选定物业Agent；它自行依据证据回答或拒答，并可输出结构化受控写请求。",
     )
 
 
@@ -742,6 +720,60 @@ def _thinking_for_snapshot(snapshot_config: Dict[str, Any], model_id: str) -> bo
     return bool(params.get("use_thinking", USE_THINKING))
 
 
+def _capture_vertical_provider_requests(
+    *,
+    state: RunState,
+    snapshot_config: Dict[str, Any],
+    model_id: str,
+    provider_requests: List[Dict[str, Any]],
+) -> Tuple[List[Any], List[str], bool]:
+    """Project every real vertical Provider attempt before post-validation."""
+
+    vertical_cost_entries: List[Any] = []
+    vertical_usage_sources: List[str] = []
+    vertical_thinking = _thinking_for_snapshot(snapshot_config, model_id)
+    for index, request_evidence in enumerate(provider_requests, start=1):
+        sequence = int(request_evidence.get("provider_request_sequence") or index)
+        usage = dict(request_evidence.get("usage") or {})
+        response_model = request_evidence.get("provider_response_model")
+        billing_model = response_model or model_id
+        cost = build_cost_entry(
+            stage="vertical_agent",
+            provider=_model_provider(snapshot_config, model_id),
+            requested_model=model_id,
+            response_model=None,
+            provider_response_model=response_model,
+            thinking_enabled=vertical_thinking,
+            model_policy_version=str(
+                (snapshot_config.get("model_policy") or {}).get("version") or "v1.8"
+            ),
+            provider_usage=usage if usage else None,
+            price_row=_price_for_snapshot(snapshot_config, billing_model),
+            local_estimate_tokens=None,
+            provider_succeeded=str(request_evidence.get("status") or "success")
+            == "success",
+        )
+        vertical_cost_entries.append(cost)
+        vertical_usage_sources.append(cost.usage_source.value)
+        state.cost_entries.append(cost)
+        state.model_calls.append(
+            {
+                "stage": "vertical_agent",
+                "model_id": model_id,
+                "requested_model": model_id,
+                "provider_response_model": response_model,
+                "provider_request_id": request_evidence.get("provider_request_id"),
+                "provider_request_sequence": sequence,
+                "thinking_enabled": vertical_thinking,
+                "latency_ms": None,
+                "usage": usage,
+                "usage_source": cost.usage_source.value,
+                "status": request_evidence.get("status") or "success",
+            }
+        )
+    return vertical_cost_entries, vertical_usage_sources, vertical_thinking
+
+
 def _results_from_snapshot(
     query: str,
     live_results: List[Dict[str, Any]],
@@ -848,7 +880,9 @@ class RuntimeCoordinator:
         started = time.time()
         ensure_chat_session(session_id)
         snapshot = resolve_snapshot(session_id)
-        path = self._select_path(session_id, message, snapshot.config)
+        # Every bubble enters the same Router-first chain. Persisted Draft or
+        # Proposal state is context for the selected B Agent, never a pre-route.
+        path = RuntimePath.CONSULTATION
         state = RunState(
             run_id=run_id,
             trace_id=trace_id,
@@ -862,7 +896,7 @@ class RuntimeCoordinator:
             trace_id=trace_id,
             session_id=session_id,
             user_message=message,
-            risk_level="L2" if path == RuntimePath.CONTROLLED_ACTION else "L0",
+            risk_level="L0",
             version_snapshot=snapshot.snapshot_hash,
         )
         save_chat_message(
@@ -929,33 +963,13 @@ class RuntimeCoordinator:
             )
 
             if state.lane_decision.lane == RuntimeLane.SAFETY_HANDOFF:
-                async for event in self._stream_a_handoff(
+                async for event in self._stream_unified_handoff(
                     message, session_id, trace_id, snapshot, state, ledger, started
                 ):
                     yield event
                 return
 
-            if state.answer_contract.response_mode == ResponseMode.CONTROLLED_WRITE:
-                path = RuntimePath.CONTROLLED_ACTION
-                state.path = path
-                ledger.runtime_path = path.value
-
-            if path == RuntimePath.CONTROLLED_ACTION:
-                state.capability_decision = CapabilityDecision(
-                    selected_agent_id=None,
-                    skill={"status": "skipped", "reason_code": "controlled_action"},
-                    rag={"status": "skipped", "reason_code": "controlled_action"},
-                    tool={"status": "skipped", "reason_code": "controlled_action"},
-                    write={"status": "required", "reason_code": "controlled_action"},
-                    handoff={"status": "available", "reason_code": "owner_can_request"},
-                )
-                async for event in self._stream_controlled_action(
-                    message, session_id, trace_id, snapshot, state, ledger, started
-                ):
-                    yield event
-                return
-
-            async for event in self._stream_consultation(
+            async for event in self._stream_selected_agent(
                 message,
                 session_id,
                 user_id,
@@ -996,13 +1010,29 @@ class RuntimeCoordinator:
                 else (
                     "internal_control_payload_leak"
                     if isinstance(exc, InternalControlPayloadLeakError)
-                    else "runtime_failure"
+                    else (
+                        "router_contract_error"
+                        if isinstance(exc, RouterContractError)
+                        else (
+                            "agent_envelope_error"
+                            if isinstance(exc, AgentEnvelopeError)
+                            else "runtime_failure"
+                        )
+                    )
                 )
             )
             public_error = (
                 PROVIDER_FAILURE_PUBLIC_MESSAGE
                 if failure_code == "provider_failure"
-                else RUNTIME_FAILURE_PUBLIC_MESSAGE
+                else (
+                    "Router结构结果无效，本轮已透明终止且未调用任何业务Agent或写操作。"
+                    if failure_code == "router_contract_error"
+                    else (
+                        "选定Agent的结构化执行结果无效，本轮已透明终止且未改选Agent。"
+                        if failure_code == "agent_envelope_error"
+                        else RUNTIME_FAILURE_PUBLIC_MESSAGE
+                    )
+                )
             )
             state.status = RunStatus.FAILED
             state.next_step = None
@@ -1101,149 +1131,125 @@ class RuntimeCoordinator:
         state: RunState,
         ledger: EvidenceLedger,
     ) -> None:
-        """Resolve one strict semantic decision and account for its Provider call."""
+        """Call one Router over the complete timestamped Session and freeze its Agent."""
 
-        cards = vertical_agent_cards(snapshot.config)
-        if state.path == RuntimePath.CONTROLLED_ACTION:
-            pending = get_pending_action_proposal(session_id) or {}
-            payload = pending.get("payload") or {}
-            requested_agent_id = str(payload.get("agent_id") or "")
-            property_cards = _lane_candidates(cards, RuntimeLane.PROPERTY_GOVERNED)
-            selected_card = next(
-                (item for item in property_cards if str(item.get("agent_id")) == requested_agent_id),
-                None,
+        from agents.router import classify_lane_decision
+
+        cards = router_agent_cards(snapshot.config)
+        messages = _visible_chat_history(session_id)
+        if not messages:
+            raise RouterContractError("Router conversation is empty after user message persistence")
+
+        router_config = next(
+            (
+                item
+                for item in snapshot.config.get("agents") or []
+                if item.get("agent_id") == "router"
+                or item.get("category") in {"router", "orchestration"}
+            ),
+            {},
+        )
+        default_model = (snapshot.config.get("model_policy") or {}).get("default") or {}
+        router_model_id = str(
+            router_config.get("model_id")
+            or default_model.get("model_id")
+            or MODEL_ID
+        )
+        if router_model_id.lower() != "deepseek-v4-flash":
+            raise RouterContractError("Router must use deepseek-v4-flash")
+
+        router_started = time.time()
+        router_thinking = _thinking_for_snapshot(snapshot.config, router_model_id)
+        with provider_accounting_scope(
+            trace_id=trace_id,
+            session_id=session_id,
+            stage="router",
+            model_selection_reason="single A/B/C classification and Agent selection",
+            price_snapshot=_price_for_snapshot(snapshot.config, router_model_id),
+            model_policy_version=str(
+                (snapshot.config.get("model_policy") or {}).get("version") or "v1.8"
+            ),
+        ):
+            result = await classify_lane_decision(
+                messages=messages,
+                vertical_agents=cards,
+                user_id=user_id,
+                session_id=f"{session_id}::router::{trace_id}",
+                model=_build_model_from_snapshot(snapshot.config, router_model_id),
             )
-            if selected_card is None:
-                selected_card = next(
-                    (item for item in property_cards if str(item.get("agent_id")) == "maintenance"),
-                    property_cards[0] if property_cards else None,
-                )
-            if selected_card is None:
-                raise RuntimeError("structured action state has no Published property Agent")
-            reported_decision = LaneDecision(
-                lane=RuntimeLane.PROPERTY_GOVERNED,
-                business_intent="continue_controlled_action",
-                reason="会话中存在未完成的受控业务状态，继续原状态机。",
-                decision_source=LaneDecisionSource.STRUCTURED_STATE,
+
+        evidence = result.get("provider_evidence") or {}
+        usage = evidence.get("usage") or result.get("metrics") or {}
+        response_model = evidence.get("provider_response_model")
+        provider_status = str(result.get("provider_status") or "failed")
+        billing_model = response_model or router_model_id
+        cost = build_cost_entry(
+            stage="router",
+            provider=_model_provider(snapshot.config, router_model_id),
+            requested_model=router_model_id,
+            response_model=None,
+            provider_response_model=response_model,
+            thinking_enabled=router_thinking,
+            model_policy_version=str(
+                (snapshot.config.get("model_policy") or {}).get("version") or "v1.8"
+            ),
+            provider_usage=usage if usage else None,
+            price_row=_price_for_snapshot(snapshot.config, billing_model),
+            local_estimate_tokens=_estimate_tokens(_json({"conversation": messages, "agent_candidates": cards})),
+            provider_succeeded=provider_status == "success",
+        )
+        state.cost_entries.append(cost)
+        state.model_calls.append(
+            {
+                "stage": "router",
+                "model_id": router_model_id,
+                "requested_model": router_model_id,
+                "provider_response_model": response_model,
+                "provider_request_id": evidence.get("provider_request_id"),
+                "thinking_enabled": router_thinking,
+                "latency_ms": int((time.time() - router_started) * 1000),
+                "usage": usage,
+                "usage_source": cost.usage_source.value,
+                "status": provider_status,
+            }
+        )
+        if result.get("decision") is None:
+            if provider_status != "success":
+                raise ProviderFailureError("single Router Provider call failed")
+            raise RouterContractError(
+                str(result.get("validation_error") or "Router schema validation failed")
             )
+
+        decision = result["decision"]
+        state.lane_decision = decision
+        selected_id = str(decision.selected_agent_id or "").strip()
+        if decision.lane == RuntimeLane.SAFETY_HANDOFF:
+            state.selected_agent = None
         else:
-            from agents.router import classify_lane_decision
-
-            router_config = next(
+            expected_scope = (
+                "property"
+                if decision.lane == RuntimeLane.PROPERTY_GOVERNED
+                else "isolated_general"
+            )
+            validate_agent_binding_isolation(
+                snapshot.config,
+                selected_id,
+                expected_scope=expected_scope,
+            )
+            state.selected_agent = next(
                 (
                     item
                     for item in snapshot.config.get("agents") or []
-                    if item.get("agent_id") == "router"
-                    or item.get("category") in {"router", "orchestration"}
+                    if item.get("enabled")
+                    and str(item.get("agent_id") or "").strip() == selected_id
                 ),
-                {},
+                None,
             )
-            default_model = (snapshot.config.get("model_policy") or {}).get("default") or {}
-            router_model_id = str(
-                router_config.get("model_id")
-                or default_model.get("model_id")
-                or MODEL_ID
-            )
-            if router_model_id.lower() != "deepseek-v4-flash":
-                raise RuntimeError("semantic Router must use deepseek-v4-flash")
-            visible_history = _visible_chat_history(
-                session_id,
-                current_trace_id=trace_id,
-                rounds=5,
-            )
-            router_started = time.time()
-            router_thinking = _thinking_for_snapshot(snapshot.config, router_model_id)
-            with provider_accounting_scope(
-                trace_id=trace_id,
-                session_id=session_id,
-                stage="router",
-                model_selection_reason="semantic LaneDecision from Published Snapshot",
-                price_snapshot=_price_for_snapshot(snapshot.config, router_model_id),
-                model_policy_version=str(
-                    (snapshot.config.get("model_policy") or {}).get("version") or "v1.8"
-                ),
-            ):
-                result = await classify_lane_decision(
-                    message,
-                    vertical_agents=cards,
-                    user_id=user_id,
-                    session_id=f"{session_id}::semantic_router::{trace_id}",
-                    model=_build_model_from_snapshot(snapshot.config, router_model_id),
-                    visible_history=visible_history,
+            if state.selected_agent is None:
+                raise RouterContractError(
+                    "Router selected an Agent absent from the current Release"
                 )
-            evidence = result.get("provider_evidence") or {}
-            usage = evidence.get("usage") or result.get("metrics") or {}
-            response_model = evidence.get("provider_response_model")
-            provider_status = str(result.get("provider_status") or "failed")
-            billing_model = response_model or router_model_id
-            thinking = router_thinking
-            cost = build_cost_entry(
-                stage="router",
-                provider=_model_provider(snapshot.config, router_model_id),
-                requested_model=router_model_id,
-                response_model=None,
-                provider_response_model=response_model,
-                thinking_enabled=thinking,
-                model_policy_version=str(
-                    (snapshot.config.get("model_policy") or {}).get("version") or "v1.8"
-                ),
-                provider_usage=usage if usage else None,
-                price_row=_price_for_snapshot(snapshot.config, billing_model),
-                local_estimate_tokens=_estimate_tokens(message),
-                provider_succeeded=provider_status == "success",
-            )
-            state.cost_entries.append(cost)
-            state.model_calls.append(
-                {
-                    "stage": "router",
-                    "model_id": router_model_id,
-                    "requested_model": router_model_id,
-                    "provider_response_model": response_model,
-                    "provider_request_id": evidence.get("provider_request_id"),
-                    "thinking_enabled": thinking,
-                    "latency_ms": int((time.time() - router_started) * 1000),
-                    "usage": usage,
-                    "usage_source": cost.usage_source.value,
-                    "status": provider_status,
-                }
-            )
-            if result.get("decision") is None:
-                if provider_status != "success":
-                    raise ProviderFailureError("semantic Router Provider call failed")
-                raise RuntimeError("semantic LaneDecision schema validation failed")
-            reported_decision = result["decision"]
 
-        current_session = get_chat_session(session_id) or {}
-        effective_decision, normalized_from_lane = _effective_lane_decision(
-            reported_decision,
-            handoff_status=str(
-                current_session.get("handoff_status") or "none"
-            ),
-            handoff_reason_code=str(
-                current_session.get("handoff_reason_code") or ""
-            ),
-            handoff_queue=str(current_session.get("handoff_queue") or ""),
-        )
-        state.lane_decision = effective_decision
-        if normalized_from_lane:
-            ledger.append(
-                "system_observations",
-                {
-                    "type": "effective_lane_invariant",
-                    "router_reported_lane": normalized_from_lane,
-                    "router_reported_business_intent": reported_decision.business_intent,
-                    "effective_lane": RuntimeLane.SAFETY_HANDOFF.value,
-                    "business_intent": state.lane_decision.business_intent,
-                    "reason_code": (
-                        "safety_risk"
-                        if state.lane_decision.business_intent == "safety_risk"
-                        else "user_requested"
-                    ),
-                },
-            )
-
-        if self._is_new_work_order_start_authorized(state.lane_decision):
-            state.path = RuntimePath.CONTROLLED_ACTION
         state.answer_contract = _answer_contract_for(state.lane_decision, state.path)
         lane_payload = state.lane_decision.model_dump(mode="json")
         lane_payload["explanation"] = _lane_explanation(state.lane_decision)
@@ -1257,6 +1263,8 @@ class RuntimeCoordinator:
             metadata={
                 **lane_payload,
                 "answer_contract": state.answer_contract.model_dump(mode="json"),
+                "selected_agent_id": selected_id or None,
+                "router_candidate_count": len(cards),
             },
         )
 
@@ -1449,6 +1457,862 @@ class RuntimeCoordinator:
                 "cost_entries": [item.model_dump(mode="json") for item in state.cost_entries],
                 "vertical_provider_request_count": 0,
                 "round_token_count": router_tokens,
+            },
+        )
+
+    async def _stream_unified_handoff(
+        self,
+        message: str,
+        session_id: str,
+        trace_id: str,
+        snapshot: Any,
+        state: RunState,
+        ledger: EvidenceLedger,
+        started: float,
+    ) -> AsyncIterator[str]:
+        """Create the one A-lane Handoff and short-circuit every business ability."""
+
+        del message
+        if state.lane_decision is None or state.answer_contract is None:
+            raise RuntimeError("A handoff started without Router contracts")
+        if state.lane_decision.selected_agent_id is not None:
+            raise RouterContractError("A lane must not select an Agent")
+
+        conversation = _visible_chat_history(session_id)
+        handoff = request_handoff(
+            session_id,
+            state.lane_decision.reason,
+            risk_level="L2",
+            reason_code="unified_handoff",
+            queue="property_service",
+            handoff_package={
+                "trace_id": trace_id,
+                "release_id": snapshot.release_id,
+                "conversation": conversation,
+                "lane_decision": state.lane_decision.model_dump(mode="json"),
+            },
+        )
+        handoff_state = str(handoff.get("handoff_status") or "requested")
+        reply = (
+            state.lane_decision.reason.rstrip("。！？!? ")
+            + "。已为你发起人工协同，工作人员会沿用本会话完整记录接续处理。"
+        )
+        decision_summary = {
+            "agent": _decision("skipped", "a_handoff_short_circuit"),
+            "skill": _decision("skipped", "a_handoff_short_circuit"),
+            "rag": _decision("skipped", "a_handoff_short_circuit"),
+            "tool": _decision("skipped", "a_handoff_short_circuit"),
+            "write": _decision("skipped", "a_handoff_short_circuit"),
+            "handoff": _decision("selected", "unified_handoff"),
+        }
+        state.capability_decision = CapabilityDecision(
+            selected_agent_id=None,
+            skill={"status": "skipped", "reason_code": "a_handoff_short_circuit"},
+            rag={"status": "skipped", "reason_code": "a_handoff_short_circuit"},
+            tool={"status": "skipped", "reason_code": "a_handoff_short_circuit"},
+            write={"status": "not_required", "reason_code": "a_handoff_short_circuit"},
+            handoff={
+                "status": "required",
+                "reason_code": "unified_handoff",
+                "details": {"handler": "human_copilot"},
+            },
+        )
+        state.status = RunStatus.COMPLETED
+        state.next_step = None
+        handoff_event = {
+            "status": handoff_state,
+            "reason_code": "unified_handoff",
+            "handler": "human_copilot",
+            "router_model_invoked": True,
+            "vertical_model_invoked": False,
+        }
+        ledger.capture_state(state)
+        ledger.append("handoff_events", handoff_event)
+        ledger.append(
+            "evaluation_results",
+            {
+                "case": "a_unified_handoff_short_circuit",
+                "passed": True,
+                "decision_summary": decision_summary,
+            },
+        )
+        ledger.persist("complete")
+
+        router_tokens = sum(int(item.total_tokens or 0) for item in state.cost_entries)
+        saved = save_chat_message(
+            session_id=session_id,
+            role="assistant",
+            content=reply,
+            token_count=0,
+            round_token_count=router_tokens,
+            route_intent=RuntimeLane.SAFETY_HANDOFF.value,
+            route_reason=state.lane_decision.reason,
+            current_agent="人工协同控制器",
+            current_agent_id="human_copilot",
+            trace_id=trace_id,
+            status="success",
+            usage_source="not_applicable",
+        )
+        update_chat_trace(
+            trace_id,
+            intent=RuntimeLane.SAFETY_HANDOFF.value,
+            agent_name="人工协同控制器",
+            agent_id="human_copilot",
+            status="complete",
+        )
+        record_trace_event(
+            trace_id,
+            "a_handoff",
+            "success",
+            latency_ms=int((time.time() - started) * 1000),
+            output_summary="unified Handoff created; all business capabilities short-circuited",
+            metadata={
+                "handoff_state": handoff_state,
+                "reason_code": "unified_handoff",
+                "vertical_model_invoked": False,
+                "decision_summary": decision_summary,
+            },
+        )
+        yield _sse("delta", {"content": reply})
+        yield _sse(
+            "final",
+            {
+                "content": reply,
+                "current_agent": "人工协同控制器",
+                "current_agent_id": "human_copilot",
+            },
+        )
+        yield _sse(
+            "done",
+            {
+                "status": "complete",
+                "message_id": saved.get("id"),
+                "trace_id": trace_id,
+                "handoff": True,
+                "handoff_state": handoff_state,
+                "handoff_reason": "unified_handoff",
+                "handler": "human_copilot",
+                "release_id": snapshot.release_id,
+                "snapshot_id": snapshot.snapshot_id,
+                "lane_decision": state.lane_decision.model_dump(mode="json"),
+                "answer_contract": state.answer_contract.model_dump(mode="json"),
+                "capability_decision": state.capability_decision.model_dump(mode="json"),
+                "decision_summary": decision_summary,
+                "cost_entries": [item.model_dump(mode="json") for item in state.cost_entries],
+                "vertical_provider_request_count": 0,
+                "round_token_count": router_tokens,
+            },
+        )
+
+    async def _stream_selected_agent(
+        self,
+        message: str,
+        session_id: str,
+        user_id: str,
+        trace_id: str,
+        snapshot: Any,
+        state: RunState,
+        ledger: EvidenceLedger,
+        started: float,
+    ) -> AsyncIterator[str]:
+        """Run exactly the B/C Agent frozen by the single Router decision."""
+
+        if state.lane_decision is None or state.answer_contract is None:
+            raise RuntimeError("selected Agent path started without Router contracts")
+        if state.lane_decision.lane == RuntimeLane.SAFETY_HANDOFF:
+            raise RuntimeError("A lane cannot enter selected Agent execution")
+        if not state.selected_agent:
+            raise RouterContractError("B/C lane has no frozen selected Agent")
+
+        selected = str(state.lane_decision.selected_agent_id or "").strip()
+        if selected != str(state.selected_agent.get("agent_id") or ""):
+            raise RouterContractError("frozen Agent does not match Router selection")
+        domain_scope = _agent_domain_scope(state.selected_agent)
+        expected_scope = (
+            "property"
+            if state.lane_decision.lane == RuntimeLane.PROPERTY_GOVERNED
+            else "isolated_general"
+        )
+        if domain_scope != expected_scope:
+            raise RouterContractError("Router selected an Agent outside the fixed lane")
+
+        cards = router_agent_cards(snapshot.config)
+        candidates = [
+            str(card["agent_id"])
+            for card in cards
+            if card.get("scope") == expected_scope
+        ]
+        route = RouteDecision(
+            candidates=candidates,
+            selected_agent_id=selected,
+            reason=state.lane_decision.reason,
+            confidence=None,
+            required_capability_types=["selected_agent_own_bindings"],
+        )
+        state.route_decision = route
+        yield _sse(
+            "route",
+            {
+                "intent": selected,
+                "reason": state.lane_decision.reason,
+                "current_agent": state.selected_agent.get("name"),
+                "current_agent_id": selected,
+                "domain_scope": domain_scope,
+                "lane": state.lane_decision.lane.value,
+                "trace_id": trace_id,
+            },
+        )
+
+        router_cost = next(
+            (item for item in state.cost_entries if item.stage == "router"),
+            None,
+        )
+        if router_cost is None:
+            raise RuntimeError("selected Agent path has no accounted Router request")
+
+        visible_messages = _visible_chat_history(session_id)
+        allowed_doc_ids = {
+            int(value) for value in state.selected_agent.get("knowledge_doc_ids") or []
+        }
+        knowledge_versions = {
+            int(item["knowledge_doc_id"]): item
+            for item in snapshot.config.get("knowledge") or []
+        }
+        results: List[Dict[str, Any]] = []
+        retrieval_status = "skipped_no_bound_knowledge"
+        used_snapshot_fallback = False
+        retrieval_started = time.time()
+        if allowed_doc_ids:
+            yield _sse(
+                "progress",
+                {"trace_id": trace_id, "stage": "rag.retrieve", "status": "running"},
+            )
+            try:
+                if domain_scope == "property":
+                    import rag_retrieval
+
+                    retrieval = await asyncio.to_thread(
+                        rag_retrieval.advanced_search,
+                        message,
+                        snapshot.config.get("retrieval_policy") or {},
+                        allowed_document_ids=sorted(allowed_doc_ids),
+                    )
+                    live_results = list((retrieval or {}).get("results") or [])
+                else:
+                    # C may use its Release-bound non-property snapshots, but it
+                    # must not enter the live property/business retrieval path.
+                    live_results = []
+                results, used_snapshot_fallback = _results_from_snapshot(
+                    message,
+                    live_results,
+                    knowledge_versions,
+                    allowed_doc_ids,
+                    int((snapshot.config.get("retrieval_policy") or {}).get("top_k") or 5),
+                    float(
+                        (snapshot.config.get("retrieval_policy") or {}).get(
+                            "context_threshold"
+                        )
+                        or 0.2
+                    ),
+                )
+                retrieval_status = (
+                    "completed_snapshot_fallback"
+                    if used_snapshot_fallback
+                    else "completed"
+                )
+            except Exception as exc:
+                retrieval_status = "failed"
+                ledger.violation(
+                    "selected_agent_rag_failed",
+                    str(exc),
+                    selected_agent_id=selected,
+                )
+
+        evidence = build_evidence_set(
+            message,
+            results,
+            knowledge_versions=knowledge_versions,
+            allowed_document_ids=allowed_doc_ids,
+            retrieval_status=retrieval_status,
+        )
+        state.retrieval_evidence = evidence
+        record_trace_event(
+            trace_id,
+            "retrieval",
+            "failed" if retrieval_status == "failed" else (
+                "skipped" if not allowed_doc_ids else "success"
+            ),
+            latency_ms=int((time.time() - retrieval_started) * 1000),
+            output_summary=f"{len(evidence.items)} evidence items for frozen Agent {selected}",
+            metadata={
+                "selected_agent_id": selected,
+                "allowed_document_ids": sorted(allowed_doc_ids),
+                "evidence_ids": [item.evidence_id for item in evidence.items],
+                "retrieval_status": retrieval_status,
+                "snapshot_fallback": used_snapshot_fallback,
+            },
+        )
+
+        workflow_context: Dict[str, Any] = {}
+        if domain_scope == "property":
+            # Business state is loaded only after a B Agent is frozen. C never
+            # executes these calls and never receives ActionGateway context.
+            workflow_context = {
+                "draft": get_work_order_draft(session_id),
+                "pending_proposal": get_pending_action_proposal(
+                    session_id,
+                    "work_order.create",
+                ),
+            }
+
+        evidence_prompt = _json(
+            {
+                "evidence_contract": (
+                    "citation_ids may contain only exact IDs from this list; "
+                    "an empty list is valid; decide your own refusal when support is insufficient"
+                ),
+                "rag_evidence": [item.model_dump(mode="json") for item in evidence.items],
+                "work_order_state": workflow_context,
+            }
+        )
+        model_native_toolkits = build_model_native_read_tools(
+            snapshot.config,
+            selected,
+            message,
+        )
+        build = build_agent_from_snapshot(
+            snapshot,
+            selected,
+            message,
+            tools=model_native_toolkits,
+            evidence_prompt=evidence_prompt,
+            enable_skills=True,
+        )
+        state.activated_skills = build.activated_skills
+        for call in build.skill_tool_calls:
+            record_trace_event(
+                trace_id,
+                f"skill.{call['skill_id']}.get_skill_instructions",
+                "success",
+                output_summary=f"loaded selected Agent Skill {call['skill_id']}",
+                metadata=call,
+            )
+
+        decision_summary = {
+            "agent": _decision(
+                "selected",
+                "router_frozen",
+                agent_id=selected,
+                domain_scope=domain_scope,
+            ),
+            "skill": _decision(
+                "selected" if build.activated_skills else "skipped",
+                "selected_agent_binding" if build.activated_skills else "no_bound_skill",
+                skill_ids=[item.skill_id for item in build.activated_skills],
+            ),
+            "rag": _decision(
+                "selected" if allowed_doc_ids else "skipped",
+                "selected_agent_binding" if allowed_doc_ids else "no_bound_knowledge",
+                evidence_count=len(evidence.items),
+            ),
+            "tool": _decision(
+                "selected" if model_native_toolkits else "skipped",
+                "selected_agent_binding" if model_native_toolkits else "no_bound_read_tool",
+            ),
+            "write": _decision(
+                "available" if domain_scope == "property" else "skipped",
+                "b_agent_structured_only" if domain_scope == "property" else "c_forbidden",
+            ),
+            "handoff": _decision("skipped", "not_a_lane"),
+        }
+        state.capability_decision = CapabilityDecision(
+            selected_agent_id=selected,
+            skill={
+                "status": "selected" if build.activated_skills else "skipped",
+                "reason_code": (
+                    "selected_agent_binding" if build.activated_skills else "no_bound_skill"
+                ),
+                "details": {"skill_ids": [item.skill_id for item in build.activated_skills]},
+            },
+            rag={
+                "status": "selected" if allowed_doc_ids else "skipped",
+                "reason_code": (
+                    "selected_agent_binding" if allowed_doc_ids else "no_bound_knowledge"
+                ),
+                "details": {
+                    "retrieval_status": retrieval_status,
+                    "evidence_count": len(evidence.items),
+                },
+            },
+            tool={
+                "status": "selected" if model_native_toolkits else "skipped",
+                "reason_code": (
+                    "selected_agent_binding" if model_native_toolkits else "no_bound_read_tool"
+                ),
+                "details": {},
+            },
+            write={
+                "status": "not_required",
+                "reason_code": (
+                    "b_agent_structured_only" if domain_scope == "property" else "c_forbidden"
+                ),
+            },
+            handoff={"status": "not_required", "reason_code": "not_a_lane"},
+        )
+        ledger.append(
+            "evaluation_results",
+            {
+                "case": "single_frozen_agent",
+                "passed": True,
+                "decision_summary": decision_summary,
+            },
+        )
+        record_trace_event(
+            trace_id,
+            "capability_decision",
+            "success",
+            output_summary=f"only frozen Agent {selected} and its own bindings constructed",
+            metadata={"decision_summary": decision_summary},
+        )
+
+        contextual_message = _render_visible_history_context(
+            visible_messages,
+            boundary=(
+                "Use the complete chronological conversation. Return exactly the published "
+                "AgentResponseEnvelope JSON. Do not select another Agent."
+            ),
+        )
+        model_id = str(
+            state.selected_agent.get("model_id")
+            or ((snapshot.config.get("model_policy") or {}).get("default") or {}).get(
+                "model_id"
+            )
+            or MODEL_ID
+        )
+        full_content = ""
+        tool_calls: List[Dict[str, Any]] = list(build.skill_tool_calls)
+        final_metrics: Dict[str, Optional[int]] = {}
+        agent_started = time.time()
+        yield _sse(
+            "progress",
+            {"trace_id": trace_id, "stage": "model.invoke", "status": "running"},
+        )
+        provider_scope: Any = None
+        agent_failure: Optional[BaseException] = None
+        try:
+            with provider_accounting_scope(
+                trace_id=trace_id,
+                session_id=session_id,
+                stage="vertical_agent",
+                model_selection_reason=f"Router-frozen Agent from snapshot:{selected}",
+                price_snapshot=_price_for_snapshot(snapshot.config, model_id),
+                model_policy_version=str(
+                    (snapshot.config.get("model_policy") or {}).get("version") or "v1.8"
+                ),
+            ) as provider_scope:
+                response_stream = build.agent.arun(
+                    contextual_message,
+                    user_id=user_id,
+                    session_id=f"{session_id}::vertical::{selected}::{trace_id}",
+                    stream=True,
+                    stream_events=True,
+                )
+                async for chunk in response_stream:
+                    content = getattr(chunk, "content", None) or getattr(chunk, "delta", None)
+                    raw_event = getattr(chunk, "event", "")
+                    event_name = str(getattr(raw_event, "value", raw_event) or "")
+                    if content and event_name in {
+                        "RunContent",
+                        "RunContentCompleted",
+                        "RunCompleted",
+                    }:
+                        value = (
+                            json.dumps(content, ensure_ascii=False)
+                            if isinstance(content, dict)
+                            else str(content)
+                        )
+                        if event_name in {"RunContentCompleted", "RunCompleted"}:
+                            if not full_content:
+                                full_content = value
+                        else:
+                            full_content += value
+                    for call in _extract_tool_calls(chunk):
+                        if call not in tool_calls:
+                            tool_calls.append(call)
+                    metrics = _metrics_dict(chunk)
+                    if metrics:
+                        final_metrics.update(metrics)
+        except BaseException as exc:
+            agent_failure = exc
+        finally:
+            for toolkit in model_native_toolkits:
+                if hasattr(toolkit, "close"):
+                    try:
+                        await asyncio.wait_for(toolkit.close(), timeout=3)
+                    except Exception:
+                        pass
+
+        provider_requests = list(provider_scope.attempts) if provider_scope else []
+        vertical_cost_entries: List[Any] = []
+        vertical_usage_sources: List[str] = []
+        vertical_thinking = _thinking_for_snapshot(snapshot.config, model_id)
+        if provider_requests:
+            (
+                vertical_cost_entries,
+                vertical_usage_sources,
+                vertical_thinking,
+            ) = _capture_vertical_provider_requests(
+                state=state,
+                snapshot_config=snapshot.config,
+                model_id=model_id,
+                provider_requests=provider_requests,
+            )
+        state.tool_invocations = []
+        for toolkit in model_native_toolkits:
+            state.tool_invocations.extend(
+                list(getattr(toolkit, "recorded_invocations", []) or [])
+            )
+        for invocation in state.tool_invocations:
+            invocation_status = (
+                "success"
+                if invocation.invocation_status == "success"
+                and invocation.business_status == "success"
+                else "failed"
+            )
+            record_trace_event(
+                trace_id,
+                f"mcp.{invocation.server_name}.{invocation.tool_name}",
+                invocation_status,
+                latency_ms=invocation.latency_ms,
+                output_summary=invocation.result_summary or invocation.error_summary,
+                metadata=invocation.model_dump(mode="json"),
+            )
+            record_mcp_call_audit(
+                trace_id=trace_id,
+                server_name=invocation.server_name,
+                tool_name=invocation.tool_name,
+                arguments=invocation.arguments,
+                status=(
+                    invocation.business_status
+                    if invocation.invocation_status == "success"
+                    else invocation.invocation_status
+                ),
+                result_summary=invocation.result_summary,
+                error_summary=invocation.error_summary,
+                latency_ms=invocation.latency_ms,
+                invocation_mode="model_native",
+            )
+
+        if agent_failure is not None:
+            raise agent_failure
+        if not provider_requests:
+            raise ProviderFailureError(
+                "selected Agent completed without a recorded physical Provider request"
+            )
+
+        provider_failure_reason = _provider_failure_reason(full_content)
+        if provider_failure_reason:
+            raise ProviderFailureError(
+                f"selected Agent Provider returned failure text: {provider_failure_reason}"
+            )
+        try:
+            envelope = _parse_agent_envelope(full_content).validate_for_scope(
+                domain_scope
+            )
+        except Exception as exc:
+            raise AgentEnvelopeError(f"invalid selected Agent envelope: {exc}") from exc
+
+        evidence_by_id = evidence.by_id()
+        successful_tools = {
+            item.invocation_id: item
+            for item in state.tool_invocations
+            if item.invocation_status == "success" and item.business_status == "success"
+        }
+        allowed_reference_ids = set(evidence_by_id) | set(successful_tools)
+        invalid_reference_ids = [
+            value for value in envelope.citation_ids if value not in allowed_reference_ids
+        ]
+        if invalid_reference_ids:
+            record_trace_event(
+                trace_id,
+                "citation_reference_validation",
+                "failed",
+                output_summary="Agent cited IDs absent from this run's RAG/Tool results",
+                metadata={"invalid_reference_ids": invalid_reference_ids},
+            )
+            raise AgentEnvelopeError(
+                "citation_ids are not present in this run: "
+                + ", ".join(invalid_reference_ids)
+            )
+
+        citations: List[Citation] = []
+        citations_payload: List[Dict[str, Any]] = []
+        for reference_id in envelope.citation_ids:
+            item = evidence_by_id.get(reference_id)
+            if item is None:
+                invocation = successful_tools[reference_id]
+                citation = Citation(
+                    index=len(citations) + 1,
+                    evidence_id=invocation.invocation_id,
+                    label=f"[{len(citations) + 1}]",
+                    title=f"MCP {invocation.server_name}/{invocation.tool_name}",
+                    document_id=f"mcp:{invocation.server_name}",
+                    document_version=snapshot.release_id,
+                    chunk_id=invocation.invocation_id,
+                    chunk_index=0,
+                    content_snapshot=str(invocation.result_summary or ""),
+                    retrieval_score=None,
+                    retrieval_mode="model_native_tool",
+                )
+            else:
+                citation = Citation(
+                    index=len(citations) + 1,
+                    evidence_id=item.evidence_id,
+                    label=f"[{len(citations) + 1}]",
+                    title=item.title,
+                    document_id=item.document_id,
+                    document_version=item.document_version,
+                    chunk_id=item.chunk_id,
+                    chunk_index=item.chunk_index,
+                    content_snapshot=item.content_snapshot,
+                    retrieval_score=item.retrieval_score,
+                    retrieval_mode=item.retrieval_mode,
+                )
+            citations.append(citation)
+            payload = citation.model_dump(mode="json")
+            payload.update(
+                {
+                    "doc_id": citation.document_id,
+                    "doc_title": citation.title,
+                    "content": citation.content_snapshot,
+                    "used_in_answer": True,
+                }
+            )
+            citations_payload.append(payload)
+        state.citations = citations
+
+        if domain_scope != "property" and (
+            envelope.proposal_request is not None
+            or envelope.confirmation_request is not None
+        ):
+            raise AgentEnvelopeError("C Agent is forbidden from requesting ActionGateway")
+
+        workflow_result: Optional[Dict[str, Any]] = None
+        if domain_scope == "property":
+            try:
+                workflow_result = advance_structured_work_order_workflow(
+                    session_id=session_id,
+                    selected_agent_id=selected,
+                    selected_agent_scope=domain_scope,
+                    trace_id=trace_id,
+                    release_id=snapshot.release_id,
+                    proposal_request=envelope.proposal_request,
+                    confirmation_request=envelope.confirmation_request,
+                )
+            except Exception as exc:
+                raise AgentEnvelopeError(f"structured work-order request rejected: {exc}") from exc
+
+        proposal_id = (workflow_result or {}).get("proposal_id")
+        if proposal_id:
+            proposal_row = get_action_proposal(str(proposal_id))
+            if proposal_row:
+                state.pending_actions.append(
+                    ActionProposal(
+                        proposal_id=proposal_row["proposal_id"],
+                        session_id=proposal_row["session_id"],
+                        trace_id=proposal_row.get("trace_id"),
+                        release_id=proposal_row.get("release_id"),
+                        action_type=proposal_row["action_type"],
+                        risk_level=proposal_row["risk_level"],
+                        payload=proposal_row.get("payload") or {},
+                        parameter_hash=content_hash(proposal_row.get("payload") or {}),
+                        idempotency_key=proposal_row["idempotency_key"],
+                        status=proposal_row["status"],
+                    )
+                )
+                for approval in list_action_approvals(str(proposal_id)):
+                    state.approval_events.append(
+                        ApprovalEvent(
+                            proposal_id=str(proposal_id),
+                            decision=str(approval["decision"]),
+                            actor=str(approval["actor"]),
+                            parameter_hash=content_hash(proposal_row.get("payload") or {}),
+                            comment=approval.get("comment"),
+                            decided_at=str(approval["decided_at"]),
+                        )
+                    )
+        receipt_data = (workflow_result or {}).get("receipt")
+        if receipt_data:
+            state.action_receipts.append(_action_receipt_from_payload(receipt_data))
+
+        rendered = envelope.answer
+        if workflow_result and workflow_result.get("reply"):
+            rendered = rendered.rstrip() + "\n\n" + str(workflow_result["reply"])
+        state.status = (
+            RunStatus.PAUSED
+            if workflow_result
+            and workflow_result.get("action") in {"draft_updated", "awaiting_confirmation"}
+            else RunStatus.COMPLETED
+        )
+        state.next_step = (
+            "await_user_confirmation" if state.status == RunStatus.PAUSED else None
+        )
+
+        vertical_usage_source = _aggregate_usage_source(
+            vertical_usage_sources,
+            model_invoked=True,
+        )
+        vertical_total_tokens = _aggregate_cost_field(
+            vertical_cost_entries,
+            "total_tokens",
+        )
+        token_count = vertical_total_tokens or 0
+        router_tokens = int(router_cost.total_tokens or 0)
+        skills_payload = [
+            item.model_dump(mode="json") for item in state.activated_skills
+        ]
+        mcp_payload = []
+        for item in state.tool_invocations:
+            payload = item.model_dump(mode="json")
+            payload["status"] = (
+                item.business_status
+                if item.invocation_status == "success"
+                else item.invocation_status
+            )
+            payload["invocation_mode"] = "model_native"
+            mcp_payload.append(payload)
+
+        if workflow_result:
+            record_trace_event(
+                trace_id,
+                "action_gateway",
+                "success",
+                output_summary=str(workflow_result.get("reply") or "")[:240],
+                metadata={
+                    "selected_agent_id": selected,
+                    "action": workflow_result.get("action"),
+                    "proposal_id": proposal_id,
+                    "receipt_id": (
+                        state.action_receipts[-1].receipt_id
+                        if state.action_receipts
+                        else None
+                    ),
+                },
+            )
+        ledger.capture_state(state)
+        ledger.append(
+            "evaluation_results",
+            {
+                "case": "reference_id_allowlist_only",
+                "passed": True,
+                "citation_ids": list(envelope.citation_ids),
+            },
+        )
+        ledger.persist("paused" if state.status == RunStatus.PAUSED else "complete")
+        saved = save_chat_message(
+            session_id=session_id,
+            role="assistant",
+            content=rendered,
+            token_count=token_count,
+            round_token_count=router_tokens + token_count,
+            token_detail={
+                "input_tokens": _aggregate_cost_field(vertical_cost_entries, "input_tokens"),
+                "output_tokens": _aggregate_cost_field(vertical_cost_entries, "output_tokens"),
+                "reasoning_tokens": _aggregate_cost_field(
+                    vertical_cost_entries,
+                    "reasoning_tokens",
+                ),
+                "cached_tokens": _aggregate_cost_field(
+                    vertical_cost_entries,
+                    "cached_input_tokens",
+                ),
+                "total_tokens": vertical_total_tokens,
+                "provider_request_count": len(vertical_cost_entries),
+                "model_invoked": True,
+            },
+            citations=citations_payload,
+            activated_skills=skills_payload,
+            route_intent=selected,
+            route_reason=state.lane_decision.reason,
+            current_agent=str(state.selected_agent.get("name") or selected),
+            current_agent_id=selected,
+            tool_calls=tool_calls or None,
+            model_id=model_id,
+            thinking_enabled=vertical_thinking,
+            model_selection_reason=f"Router-frozen snapshot Agent:{snapshot.release_id}",
+            trace_id=trace_id,
+            status="success",
+            latency_ms=int((time.time() - agent_started) * 1000),
+            mcp_calls=mcp_payload or None,
+            usage_source=vertical_usage_source,
+        )
+        update_chat_trace(
+            trace_id,
+            intent=selected,
+            agent_name=str(state.selected_agent.get("name") or selected),
+            agent_id=selected,
+            status="complete",
+        )
+        record_trace_event(
+            trace_id,
+            "final_response",
+            "success",
+            latency_ms=int((time.time() - started) * 1000),
+            output_summary=rendered[:240],
+            metadata={
+                "selected_agent_id": selected,
+                "domain_scope": domain_scope,
+                "evidence_ids": list(evidence_by_id),
+                "citation_ids": list(envelope.citation_ids),
+                "model_invoked": True,
+                "provider_request_count": len(vertical_cost_entries),
+                "workflow_action": (workflow_result or {}).get("action"),
+            },
+        )
+        yield _sse("delta", {"content": rendered})
+        yield _sse(
+            "final",
+            {
+                "content": rendered,
+                "citations": citations_payload,
+                "current_agent": state.selected_agent.get("name"),
+                "current_agent_id": selected,
+                "domain_scope": domain_scope,
+            },
+        )
+        if tool_calls:
+            yield _sse("tool_calls", {"tool_calls": tool_calls})
+        yield _sse(
+            "done",
+            {
+                "status": state.status.value,
+                "message_id": saved.get("id"),
+                "trace_id": trace_id,
+                "runtime_path": RuntimePath.CONSULTATION.value,
+                "release_id": snapshot.release_id,
+                "snapshot_id": snapshot.snapshot_id,
+                "current_agent": state.selected_agent.get("name"),
+                "current_agent_id": selected,
+                "route_intent": selected,
+                "route_reason": state.lane_decision.reason,
+                "content": rendered,
+                "citations": citations_payload,
+                "activated_skills": skills_payload,
+                "tool_calls": tool_calls,
+                "mcp_calls": mcp_payload,
+                "proposal_id": proposal_id,
+                "action_receipts": [
+                    item.model_dump(mode="json") for item in state.action_receipts
+                ],
+                "decision_summary": decision_summary,
+                "lane_decision": state.lane_decision.model_dump(mode="json"),
+                "answer_contract": state.answer_contract.model_dump(mode="json"),
+                "capability_decision": state.capability_decision.model_dump(mode="json"),
+                "cost_entries": [item.model_dump(mode="json") for item in state.cost_entries],
+                "usage_source": vertical_usage_source,
+                "token_count": token_count,
+                "vertical_provider_request_count": len(vertical_cost_entries),
+                "round_token_count": router_tokens + token_count,
             },
         )
 
