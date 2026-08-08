@@ -154,11 +154,11 @@ _REVIEWED_ARTIFACT_HASHES: Dict[str, str] = {
     "skill:115": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
     "skill:116": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
     "skill:117": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
-    "mcp_server:8": "98040d20959d1c7bdf6ef9183b5998fcb2a3196106826618ccd249e03dc43bac",
-    "mcp_server:55": "79ac319aa65416650eac781d7a970ca47a568ddee7e2a8ee403b4f822a7b8013",
-    "mcp_server:56": "e30f8d92d356b7f4c1a3f98ce82866086e669777dd1674601a29719588093ece",
+    "mcp_server:8": "8f8084bdd4abed79c763fdda0a93a456644471f8d65368ff8c5e6c7ee9b44136",
+    "mcp_server:55": "415cc4e433db1d8a2169a1516ead9e1ede43c4496b878ac8687577e7d812c9be",
+    "mcp_server:56": "a7227cedefa7f480a8d7dba04878194ffe5e7efedb613867ba050a42ab6bf516",
     "mcp_server:500": "59ed0980ccd0334a7ce131133eaf4fa73767de560b3c18ec8c1302bae84c53d4",
-    "mcp_server:501": "041c320f1b318e1d3a93841ba8af1d48bd5565467e1e836d13de0feebbe27ca2",
+    "mcp_server:501": "0554f02e1f3b18519d22ff87050a9119824073a768de3bb41bb88b9af5de3839",
 }
 
 
@@ -535,11 +535,11 @@ def _mcp_artifact_records(server: Dict[str, Any]) -> List[Dict[str, str]]:
         for artifact in _walk_controlled_files(root):
             label = _artifact_label(artifact)
             if _is_deployment_env_file(artifact):
-                # Secret values are deployment-owned and must never be read or
-                # embedded in a code-review hash. Presence is recorded only.
-                records.append(
-                    {"path": label, "content_hash": "deployment_env_excluded"}
-                )
+                # Deployment-owned secret files are outside the reviewed code
+                # package.  Ignore both bytes and presence so the same code
+                # has one portable digest whether a deployment injects .env,
+                # .env.local, or no env file at all.  This branch deliberately
+                # runs before read_bytes().
                 continue
             raw = artifact.read_bytes()
             consumed += len(raw)
