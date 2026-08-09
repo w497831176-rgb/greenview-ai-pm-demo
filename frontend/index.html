@@ -1009,10 +1009,10 @@
         const summaryText = maskTraceText([`Trace ID：${traceId}`, `Release：${config.release_id || '-'}`, `Snapshot：${config.snapshot_id || '-'}`, `当前 Agent：${currentAgent} (${currentAgentId})`, `激活 Skill：${skills.join('、') || '无'}`, `Provider 请求：${providerRequestCount} 次`, `逻辑/历史记录：${logicalModelRecords.length} 条（不计Provider汇总）`, `MCP 调用：${mcpCalls.length} 次`, `受控写入：${isControlledWorkOrderTrace ? '创建维修工单（ActionGateway）' : '无'}`, `回答实际引用：${usedCitations.map(c => `《${c.doc_title}》分片${c.chunk_index}`).join('、') || '无'}`, `契约违规：${violations.length}`, `链路事件：${traceEvents.map(e => spanLabels[e.span_name] || e.span_name).join(' → ') || '历史 Trace 无 span 记录'}`].join('\n'));
         const controlledWriteConfirmed = Boolean(controlledReceipt && controlledReceipt.status === 'committed' && controlledReceipt.receipt_id && controlledReceipt.resource_id);
         const controlledWriteSummaryHtml = isControlledWorkOrderTrace ? `<div class="rounded-xl border ${controlledWriteConfirmed ? 'border-emerald-200 bg-emerald-50' : 'border-amber-200 bg-amber-50'} p-3 text-sm"><div class="font-medium text-slate-900">受控业务写入</div><div class="mt-1 text-xs text-slate-700">本轮通过 ActionGateway（受控业务写入网关）执行维修工单操作；${controlledWriteConfirmed ? '正式回执证明写入成功。' : '当前证据不足以证明写入成功。'}</div><div class="mt-1 text-xs text-slate-600">它不是 MCP/Tool 调用；业主确认也不等同于人工接管。</div></div>` : '';
-        const laneLabels = { A_SAFETY_HANDOFF: 'A路：人工协同', B_PROPERTY_GOVERNED: 'B路：物业受控回答', C_ISOLATED_GENERAL: 'C路：隔离通用回答', CLARIFY: '需澄清' };
+        const laneLabels = { A_HANDOFF: 'A路：人工协同', B_PROPERTY_GOVERNED: 'B路：物业受控回答', C_ISOLATED_GENERAL: 'C路：隔离通用回答', CLARIFY: '需澄清' };
         const modeLabels = { human_handoff: '普通人工协同', emergency_handoff: '紧急人工协同', clarify_only: '仅澄清', grounded_answer: '依据回答', realtime_read: '实时读取', controlled_write: '受控写入', safe_general: '安全通用回答', safe_refusal: '安全拒绝' };
         const latestHandoff = handoffEvents.length ? handoffEvents[handoffEvents.length - 1] : {};
-        const handoffReasonCode = latestHandoff.reason_code || (laneDecision.lane === 'A_SAFETY_HANDOFF' ? laneDecision.business_intent : '');
+        const handoffReasonCode = latestHandoff.reason_code || (laneDecision.lane === 'A_HANDOFF' ? laneDecision.business_intent : '');
         const handoffReasonLabels = {
           user_requested: '业主主动要求人工协同',
           user_requested_handoff: '业主主动要求人工协同',

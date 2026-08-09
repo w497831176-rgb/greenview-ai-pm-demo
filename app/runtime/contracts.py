@@ -31,7 +31,8 @@ class RuntimePath(str, Enum):
 
 
 class RuntimeLane(str, Enum):
-    SAFETY_HANDOFF = "A_SAFETY_HANDOFF"
+    HANDOFF = "A_HANDOFF"
+    SAFETY_HANDOFF = "A_HANDOFF"  # Backward-compatible member alias; never serialized as a subtype.
     PROPERTY_GOVERNED = "B_PROPERTY_GOVERNED"
     ISOLATED_GENERAL = "C_ISOLATED_GENERAL"
 

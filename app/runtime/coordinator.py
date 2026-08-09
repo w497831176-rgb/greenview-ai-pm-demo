@@ -290,7 +290,7 @@ def _claims_business_success(text: str) -> bool:
 def _lane_candidates(
     cards: List[Dict[str, Any]], lane: RuntimeLane
 ) -> List[Dict[str, Any]]:
-    if lane == RuntimeLane.SAFETY_HANDOFF:
+    if lane == RuntimeLane.HANDOFF:
         return []
     scope = "property" if lane == RuntimeLane.PROPERTY_GOVERNED else "isolated_general"
     return [card for card in cards if _agent_domain_scope(card) == scope]
@@ -408,7 +408,7 @@ def _parse_agent_turn_result(raw: str) -> AgentTurnResult:
 
 def _lane_explanation(decision: LaneDecision) -> str:
     labels = {
-        RuntimeLane.SAFETY_HANDOFF: "人工协同",
+        RuntimeLane.HANDOFF: "人工协同",
         RuntimeLane.PROPERTY_GOVERNED: "物业受控回答",
         RuntimeLane.ISOLATED_GENERAL: "隔离通用回答",
     }
@@ -518,11 +518,11 @@ def _effective_lane_decision(
         str(decision.business_intent or "").strip()
         == "user_requested_handoff"
     )
-    if decision.lane == RuntimeLane.SAFETY_HANDOFF:
+    if decision.lane == RuntimeLane.HANDOFF:
         if persisted_safety and user_requested:
             return (
                 LaneDecision(
-                    lane=RuntimeLane.SAFETY_HANDOFF,
+                    lane=RuntimeLane.HANDOFF,
                     business_intent="safety_risk",
                     reason="会话已有现实安全风险人工协同，本轮继续由紧急队列处理。",
                     decision_source=decision.decision_source,
@@ -537,7 +537,7 @@ def _effective_lane_decision(
     )
     return (
         LaneDecision(
-            lane=RuntimeLane.SAFETY_HANDOFF,
+            lane=RuntimeLane.HANDOFF,
             business_intent=effective_intent,
             reason=(
                 (
@@ -560,7 +560,7 @@ def _effective_lane_decision(
 def _handoff_contract_for(
     decision: LaneDecision,
 ) -> HandoffExecutionContract:
-    if decision.lane != RuntimeLane.SAFETY_HANDOFF:
+    if decision.lane != RuntimeLane.HANDOFF:
         raise ValueError("Handoff execution contract requires effective A lane")
     return HandoffExecutionContract(
         kind=HandoffKind.USER_REQUESTED,
@@ -582,7 +582,7 @@ def _answer_contract_for(
         "unverified_execution_success",
         "internal_control_payload",
     ]
-    if decision.lane == RuntimeLane.SAFETY_HANDOFF:
+    if decision.lane == RuntimeLane.HANDOFF:
         handoff_contract = _handoff_contract_for(decision)
         return AnswerContract(
             response_mode=handoff_contract.response_mode,
@@ -1026,7 +1026,7 @@ class RuntimeCoordinator:
                 },
             )
 
-            if state.lane_decision.lane == RuntimeLane.SAFETY_HANDOFF:
+            if state.lane_decision.lane == RuntimeLane.HANDOFF:
                 async for event in self._stream_a_handoff(
                     message, session_id, trace_id, snapshot, state, ledger, started
                 ):
@@ -1446,7 +1446,7 @@ class RuntimeCoordinator:
                     "type": "effective_lane_invariant",
                     "router_reported_lane": normalized_from_lane,
                     "router_reported_business_intent": reported_decision.business_intent,
-                    "effective_lane": RuntimeLane.SAFETY_HANDOFF.value,
+                    "effective_lane": RuntimeLane.HANDOFF.value,
                     "business_intent": state.lane_decision.business_intent,
                     "reason_code": (
                         "safety_risk"

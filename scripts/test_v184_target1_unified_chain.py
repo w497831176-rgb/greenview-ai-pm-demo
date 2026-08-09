@@ -232,7 +232,7 @@ def test_full_history_and_a_short_circuit() -> None:
     )
     current = "u-final-a"
     ROUTER_DECISIONS[current] = LaneDecision(
-        lane=RuntimeLane.SAFETY_HANDOFF,
+        lane=RuntimeLane.HANDOFF,
         selected_agent_id=None,
         reason="ordinary handoff",
     )
@@ -450,7 +450,12 @@ def test_static_contracts() -> None:
         raise AssertionError("Router candidate scope must fail closed")
     root = Path(__file__).resolve().parents[1]
     coordinator_source = (root / "app/runtime/coordinator.py").read_text(encoding="utf-8")
+    router_source = (root / "agents/router.py").read_text(encoding="utf-8")
     frontend_source = (root / "frontend/index.html").read_text(encoding="utf-8")
+    assert RuntimeLane.HANDOFF.value == "A_HANDOFF"
+    assert "A_SAFETY_HANDOFF" not in router_source
+    assert "A_SAFETY_HANDOFF" not in coordinator_source
+    assert "A_SAFETY_HANDOFF" not in frontend_source
     assert "await self._select_agent_after_lane(" not in coordinator_source.split("async def _stream_consultation", 1)[1]
     assert "plan_tools(" not in coordinator_source.split("async def _stream_consultation", 1)[1]
     assert "必须按AgentTurnResult返回结构化proposal_request" in coordinator_source
