@@ -518,6 +518,8 @@ def test_public_stream_retrieval_uses_segmented_visible_context() -> None:
 
     def fake_search(query: str, *_args: Any, **_kwargs: Any) -> Dict[str, Any]:
         captured_queries.append(query)
+        if query != current:
+            raise RuntimeError("symbolic contextual segment failure")
         return {
             "results": [
                 {
@@ -546,6 +548,17 @@ def test_public_stream_retrieval_uses_segmented_visible_context() -> None:
     )
     assert retrieval_event["metadata"]["query_message_count"] == 3
     assert retrieval_event["metadata"]["query_segment_count"] == 2
+    stored = get_evidence_ledger(done["trace_id"])
+    ledger_payload = (stored or {}).get("ledger") or {}
+    assert not any(
+        item.get("code") == "live_retrieval_failed"
+        for item in ledger_payload.get("contract_violations") or []
+    )
+    assert any(
+        item.get("code") == "live_retrieval_partial_failure"
+        and item.get("delivery_status") == "recovered_with_evidence"
+        for item in ledger_payload.get("system_observations") or []
+    )
 
     snapshot_results, used_fallback = _results_from_snapshot(
         [

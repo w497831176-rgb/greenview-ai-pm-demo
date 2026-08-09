@@ -3064,13 +3064,6 @@ class RuntimeCoordinator:
                     "filter_summary": {"candidate_count": len(results)},
                     "evidence_policy": first_part.get("evidence_policy"),
                 }
-                if failed_parts:
-                    ledger.violation(
-                        "live_retrieval_failed",
-                        "one or more contextual retrieval segments failed",
-                        failed_query_count=len(failed_parts),
-                        query_count=len(retrieval_queries),
-                    )
                 results, used_snapshot_fallback = _results_from_snapshot(
                     retrieval_queries,
                     results,
@@ -3102,6 +3095,25 @@ class RuntimeCoordinator:
                         else "completed"
                     )
                 )
+                if failed_parts:
+                    if results:
+                        ledger.append(
+                            "system_observations",
+                            {
+                                "code": "live_retrieval_partial_failure",
+                                "component": "rag_retrieval",
+                                "failed_query_count": len(failed_parts),
+                                "query_count": len(retrieval_queries),
+                                "delivery_status": "recovered_with_evidence",
+                            },
+                        )
+                    else:
+                        ledger.violation(
+                            "live_retrieval_failed",
+                            "one or more contextual retrieval segments failed",
+                            failed_query_count=len(failed_parts),
+                            query_count=len(retrieval_queries),
+                        )
             except Exception as exc:
                 results, _ = _results_from_snapshot(
                     retrieval_queries,
@@ -3128,11 +3140,23 @@ class RuntimeCoordinator:
                 retrieval_status = (
                     "completed_snapshot_fallback" if results else "failed"
                 )
-                ledger.violation(
-                    "live_retrieval_failed",
-                    str(exc),
-                    snapshot_fallback_count=len(results),
-                )
+                if results:
+                    ledger.append(
+                        "system_observations",
+                        {
+                            "code": "live_retrieval_recovered",
+                            "component": "rag_retrieval",
+                            "error_type": type(exc).__name__,
+                            "snapshot_fallback_count": len(results),
+                            "delivery_status": "recovered_with_evidence",
+                        },
+                    )
+                else:
+                    ledger.violation(
+                        "live_retrieval_failed",
+                        str(exc),
+                        snapshot_fallback_count=0,
+                    )
         evidence = build_evidence_set(
             retrieval_query,
             results,
