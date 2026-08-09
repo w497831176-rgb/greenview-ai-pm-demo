@@ -10,8 +10,10 @@ import re
 from typing import Any, Dict, List, Optional
 
 from app.runtime.action_gateway import ActionGateway
+from app.runtime.contracts import content_hash
 from db.property_db import (
     delete_work_order_draft,
+    get_action_proposal,
     get_action_receipt_by_idempotency_key,
     get_latest_action_proposal,
     get_pending_action_proposal,
@@ -25,6 +27,16 @@ DEFAULT_OWNER_NAME = "王先生"
 ACTION_TYPE = "work_order.create"
 WORK_ORDER_CREATE_INTENT = "work_order_create"
 action_gateway = ActionGateway()
+
+STRUCTURED_WORK_ORDER_FIELDS = (
+    "room_id",
+    "issue_type",
+    "issue_desc",
+    "urgency",
+    "contact_name",
+    "contact_phone",
+    "appointment_time",
+)
 
 
 def _room_id(text: str) -> str:
@@ -425,3 +437,130 @@ def advance_work_order_workflow(
         draft,
         proposal_id=proposal.proposal_id,
     )
+
+
+def apply_structured_proposal_request(
+    *,
+    session_id: str,
+    proposal_request: Dict[str, Any],
+    trace_id: Optional[str] = None,
+    release_id: Optional[str] = None,
+    selected_agent_id: str,
+) -> Dict[str, Any]:
+    """Consume only a frozen B Agent's strict proposal_request.
+
+    No field is extracted from prose here. Missing fields remain a Draft;
+    complete fields create only a pending Proposal and never an Approval,
+    Receipt, or real work order.
+    """
+
+    if not selected_agent_id:
+        raise ValueError("structured proposal requires the selected B Agent")
+    existing = get_work_order_draft(session_id) or {}
+    draft = {
+        field: str(proposal_request.get(field) or existing.get(field) or "").strip()
+        for field in STRUCTURED_WORK_ORDER_FIELDS
+    }
+    save_work_order_draft(session_id=session_id, **draft)
+    missing_keys = [field for field in STRUCTURED_WORK_ORDER_FIELDS if not draft[field]]
+    if missing_keys:
+        return {
+            **_result(
+                "draft_updated",
+                "已保存待确认工单草稿，尚未创建Proposal或正式工单。",
+                draft,
+            ),
+            "missing_field_keys": missing_keys,
+            "agent_id": selected_agent_id,
+            "action_type": ACTION_TYPE,
+        }
+
+    payload = {**draft, "agent_id": selected_agent_id}
+    pending = get_pending_action_proposal(session_id, ACTION_TYPE)
+    if pending:
+        if content_hash(pending.get("payload") or {}) != content_hash(payload):
+            raise RuntimeError("session already has a different pending Proposal")
+        proposal = action_gateway._proposal_contract(pending)
+    else:
+        proposal = action_gateway.propose(
+            session_id=session_id,
+            action_type=ACTION_TYPE,
+            payload=payload,
+            trace_id=trace_id,
+            release_id=release_id,
+        )
+    if proposal.status != "pending_confirmation":
+        raise RuntimeError("new structured Proposal is not pending confirmation")
+    return {
+        **_result(
+            "awaiting_confirmation",
+            "工单信息已完整并生成待确认Proposal；点击确认前不会创建正式工单。",
+            draft,
+            proposal_id=proposal.proposal_id,
+        ),
+        "agent_id": selected_agent_id,
+        "action_type": ACTION_TYPE,
+        "proposal_status": proposal.status,
+    }
+
+
+def decide_work_order_proposal(
+    *,
+    session_id: str,
+    proposal_id: str,
+    decision: str,
+    actor: str,
+) -> Dict[str, Any]:
+    """Apply an explicit button decision without Router/model/text parsing."""
+
+    if decision not in {"confirm", "cancel"}:
+        raise ValueError("decision must be confirm or cancel")
+    proposal = get_action_proposal(proposal_id)
+    if not proposal:
+        raise ValueError("action proposal not found")
+    if proposal.get("session_id") != session_id:
+        raise PermissionError("proposal does not belong to this session")
+    if proposal.get("action_type") != ACTION_TYPE:
+        raise ValueError("proposal is not a work_order.create action")
+
+    status = str(proposal.get("status") or "")
+    if decision == "cancel":
+        if status == "pending_confirmation":
+            action_gateway.reject(proposal_id, actor=actor, comment="owner button cancel")
+            delete_work_order_draft(session_id)
+            status = "rejected"
+        elif status != "rejected":
+            raise PermissionError(f"proposal cannot be cancelled from {status}")
+        return {
+            "action": "rejected",
+            "proposal_id": proposal_id,
+            "proposal_status": status,
+            "reply": "已取消待确认Proposal；未创建正式工单。",
+        }
+
+    if status == "pending_confirmation":
+        proposal_contract = action_gateway.approve(
+            proposal_id,
+            actor=actor,
+            comment="owner button confirmation",
+        )
+        status = proposal_contract.status
+    if status not in {"approved", "committed"}:
+        raise PermissionError(f"proposal cannot be confirmed from {status}")
+    receipt = action_gateway.execute(proposal_id)
+    if receipt.may_claim_success:
+        delete_work_order_draft(session_id)
+    return {
+        "action": "committed" if receipt.may_claim_success else "failed",
+        "proposal_id": proposal_id,
+        "proposal_status": "committed" if receipt.may_claim_success else status,
+        "receipt": receipt.model_dump(mode="json"),
+        "receipt_id": receipt.receipt_id,
+        "resource_id": receipt.resource_id,
+        "work_order_id": receipt.resource_id,
+        "reply": (
+            f"正式维修工单已创建，工单号：{receipt.resource_id}。"
+            if receipt.may_claim_success
+            else "工单创建失败，已保留失败Receipt，未宣称创建成功。"
+        ),
+    }

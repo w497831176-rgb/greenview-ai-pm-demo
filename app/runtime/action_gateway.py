@@ -36,6 +36,8 @@ class ActionGateway:
         }
 
     def register(self, action_type: str, handler: ActionHandler) -> None:
+        if str(action_type or "").startswith("mcp."):
+            raise PermissionError("MCP is read-only and cannot register write actions")
         self._handlers[action_type] = handler
 
     def propose(
@@ -47,6 +49,8 @@ class ActionGateway:
         release_id: Optional[str] = None,
         risk_level: RiskLevel = RiskLevel.L2,
     ) -> ActionProposal:
+        if str(action_type or "").startswith("mcp."):
+            raise PermissionError("MCP is read-only; use an explicit internal action")
         parameter_hash = content_hash(payload)
         idempotency_key = content_hash(
             {
@@ -113,7 +117,7 @@ class ActionGateway:
             return self._failed_receipt(proposal, str(exc))
 
     async def execute_async(self, proposal_id: str) -> ActionReceipt:
-        """Execute a registered backend action or a published MCP write."""
+        """Execute only registered internal actions; MCP is always read-only."""
 
         proposal = get_action_proposal(proposal_id)
         if not proposal:
@@ -123,25 +127,9 @@ class ActionGateway:
             return self._receipt_contract(existing)
         if proposal.get("status") != "approved":
             raise PermissionError("action proposal is not approved")
-        if not str(proposal.get("action_type") or "").startswith("mcp."):
-            return self.execute(proposal_id)
-        try:
-            release = get_runtime_release(str(proposal.get("release_id") or ""))
-            if not release:
-                raise RuntimeError("proposal RuntimeRelease no longer exists")
-            payload = proposal.get("payload") or {}
-            from app.runtime.mcp_executor import invoke_confirmed_write
-
-            result = await invoke_confirmed_write(
-                snapshot_config=release.get("config") or {},
-                agent_id=str(payload.get("agent_id") or ""),
-                server_name=str(payload.get("server_name") or ""),
-                tool_name=str(payload.get("tool_name") or ""),
-                arguments=payload.get("arguments") or {},
-            )
-            return self._committed_receipt(proposal, result)
-        except Exception as exc:
-            return self._failed_receipt(proposal, str(exc))
+        if str(proposal.get("action_type") or "").startswith("mcp."):
+            raise PermissionError("ActionGateway rejects all mcp.* writes")
+        return self.execute(proposal_id)
 
     def _committed_receipt(
         self,

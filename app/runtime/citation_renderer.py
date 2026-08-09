@@ -637,3 +637,79 @@ def render_citations(
             )
         )
     return rendered, citations, violations
+
+
+def render_rag_citations(
+    answer: str,
+    evidence: EvidenceSet,
+    *,
+    declared_evidence_ids: Optional[Iterable[str]] = None,
+) -> Tuple[str, List[Citation], List[Dict[str, Any]]]:
+    """Validate only RAG EvidenceSet membership and render references.
+
+    This boundary deliberately does not understand the answer, judge
+    sufficiency, inspect Tool/Skill output, or replace prose. MCP and ordinary
+    Tool results cannot enter because the allowlist contains only
+    ``rag_document_chunk`` EvidenceItems from this turn.
+    """
+
+    by_id = evidence.by_id()
+    ordered_ids: List[str] = []
+    violations: List[Dict[str, Any]] = []
+
+    def accept(raw_id: str) -> Optional[str]:
+        evidence_id = str(raw_id or "").strip()
+        item = by_id.get(evidence_id)
+        if item is None or item.evidence_type != "rag_document_chunk":
+            violations.append(
+                {
+                    "code": "invalid_evidence_id",
+                    "evidence_id": evidence_id,
+                    "detail": "Citation ID is not a RAG chunk in this turn's EvidenceSet.",
+                }
+            )
+            return None
+        if evidence_id not in ordered_ids:
+            ordered_ids.append(evidence_id)
+        return evidence_id
+
+    for evidence_id in declared_evidence_ids or []:
+        accept(str(evidence_id))
+
+    def replace_marker(match: re.Match) -> str:
+        evidence_id = accept(match.group(1))
+        if evidence_id is None:
+            return ""
+        return f"【引用{ordered_ids.index(evidence_id) + 1}】"
+
+    rendered = EVIDENCE_MARKER.sub(replace_marker, answer or "")
+
+    def remove_unstructured(match: re.Match) -> str:
+        violations.append(
+            {
+                "code": "unstructured_reference_marker",
+                "marker": match.group(1).strip()[:160],
+            }
+        )
+        return ""
+
+    rendered = UNSTRUCTURED_MARKER.sub(remove_unstructured, rendered)
+    citations: List[Citation] = []
+    for index, evidence_id in enumerate(ordered_ids, start=1):
+        item = by_id[evidence_id]
+        citations.append(
+            Citation(
+                index=index,
+                evidence_id=evidence_id,
+                label=f"[{index}] {item.title}",
+                title=item.title,
+                document_id=item.document_id,
+                document_version=item.document_version,
+                chunk_id=item.chunk_id,
+                chunk_index=item.chunk_index,
+                content_snapshot=item.content_snapshot,
+                retrieval_score=item.retrieval_score,
+                retrieval_mode=item.retrieval_mode,
+            )
+        )
+    return rendered, citations, violations

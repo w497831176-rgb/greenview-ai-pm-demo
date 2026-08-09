@@ -423,31 +423,16 @@ def build_model_native_read_tools(
     excluded_servers: Optional[Set[str]] = None,
     excluded_tools: Optional[Set[Tuple[str, str]]] = None,
 ) -> List[Any]:
-    """Build only message-matched model-native tools for Agno's tool loop.
+    """Expose all and only the selected Agent's bound read MCP tools.
 
-    A published binding makes a tool eligible; it does not mean every request
-    should start that MCP server.  Matching the immutable Tool metadata before
-    Agent construction both preserves the control-plane contract and prevents
-    unrelated route-only prompts from being coupled to external tool startup.
+    The frozen Agent's native tool loop decides whether a tool is used. No
+    keyword/regex planner receives routing or execution authority.
     """
 
     if GovernedMCPTools is None:
         return []
     excluded = set(excluded_servers or set())
     excluded_tool_keys = set(excluded_tools or set())
-    planned_tool_keys = {
-        (plan.server_name, plan.tool_name)
-        for plan in plan_tools(
-            snapshot_config,
-            agent_id,
-            message,
-            RuntimePath.CONSULTATION,
-            effects=[ToolEffect.READ],
-            execution_modes=["model_native"],
-        )
-    }
-    if not planned_tool_keys:
-        return []
     gateway = ToolGateway(snapshot_config)
     toolkits: List[Any] = []
     for server in snapshot_config.get("mcp_servers") or []:
@@ -471,15 +456,14 @@ def build_model_native_read_tools(
         allowed = [
             tool_name
             for tool_name in policy_allowed
-            if (
-                (server_name, tool_name) in planned_tool_keys
-                and
-                (
-                    tool_definitions.get(tool_name, {}).get("tool_metadata")
-                    or {}
-                ).get("execution_mode")
-                == "model_native"
+            if tool_name in tool_definitions
+            and str(
+                (tool_definitions[tool_name].get("tool_metadata") or {}).get(
+                    "execution_mode"
+                )
+                or "model_native"
             )
+            == "model_native"
         ]
         if not allowed or not server.get("command"):
             continue
@@ -525,7 +509,9 @@ async def invoke_confirmed_write(
     tool_name: str,
     arguments: Dict[str, Any],
 ) -> Dict[str, Any]:
-    """Invoke one approved create/update MCP tool from its immutable snapshot."""
+    """Compatibility symbol: MCP writes are permanently unreachable."""
+
+    raise PermissionError("MCP is read-only; create/update/delete execution is forbidden")
 
     if MCPTools is None:
         raise RuntimeError("Agno MCP toolkit is unavailable")

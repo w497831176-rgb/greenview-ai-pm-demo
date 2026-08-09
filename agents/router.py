@@ -105,47 +105,129 @@ def create_router_agent(
 
 
 def _semantic_agent_catalog(vertical_agents: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Expose Published capability metadata without turning it into string rules."""
+    """Return the only four fields the Router is allowed to inspect."""
 
     catalog: List[Dict[str, Any]] = []
     for agent in vertical_agents:
         agent_id = str(agent.get("agent_id") or "").strip()
-        if not agent_id or not agent.get("enabled"):
+        if not agent_id or agent.get("enabled") is False:
             continue
-        scope = str(agent.get("domain_scope") or "property")
+        scope = str(agent.get("scope") or agent.get("domain_scope") or "")
         if scope not in {"property", "isolated_general"}:
-            scope = "property"
-        card = agent.get("capability_card") or {}
+            raise ValueError(f"Router candidate has invalid scope: {agent_id}")
         catalog.append(
             {
                 "agent_id": agent_id,
                 "name": str(agent.get("name") or agent_id),
-                "domain_scope": scope,
                 "description": str(agent.get("description") or ""),
-                "service_scope": str(card.get("service_scope") or ""),
-                "skills": [
-                    str(item.get("name"))
-                    for item in card.get("skills") or []
-                    if item.get("name")
-                ],
-                "mcp_capabilities": [
-                    {
-                        "server": str(server.get("name") or ""),
-                        "description": str(server.get("description") or ""),
-                        "intents": [str(value) for value in server.get("natural_language_intents") or []],
-                    }
-                    for server in card.get("mcp_servers") or []
-                ],
-                "knowledge": [
-                    {
-                        "title": str(item.get("title") or ""),
-                        "category": str(item.get("category") or ""),
-                    }
-                    for item in card.get("knowledge_docs") or []
-                ],
+                "scope": scope,
             }
         )
     return catalog
+
+
+def create_unified_abc_router(*, model: Any) -> Agent:
+    """Create the sole A/B/C classifier and B/C Agent selector."""
+
+    return Agent(
+        id="unified_abc_router",
+        name="Unified A/B/C Router",
+        description="Classify one complete visible session and select one eligible Agent.",
+        model=model,
+        db=agent_db,
+        instructions=[
+            "You are the only routing decision in this request.",
+            "Read the complete timestamped conversation in order. The final item is the current bubble; do not privilege or summarize it separately.",
+            "Return exactly one JSON object with only lane, selected_agent_id, and reason.",
+            "A_SAFETY_HANDOFF means ordinary human handoff. Its selected_agent_id must be null.",
+            "B_PROPERTY_GOVERNED means a property-service request. Select exactly one candidate whose scope is property.",
+            "C_ISOLATED_GENERAL is the complete complement of A and B. Select exactly one candidate whose scope is isolated_general.",
+            "Use only candidate agent_id, name, description, and scope. Do not infer or request bindings, instructions, Skills, RAG, MCP, Tools, results, or capability counts.",
+            "The reason must be a short natural-language explanation. Never return business_intent, a fallback, a second choice, or an action decision.",
+        ],
+        add_datetime_to_context=False,
+        add_history_to_context=False,
+        read_chat_history=False,
+        num_history_runs=0,
+        markdown=False,
+    )
+
+
+async def route_session_once(
+    *,
+    messages: List[Dict[str, str]],
+    vertical_agents: List[Dict[str, Any]],
+    user_id: str = "web-user",
+    session_id: str = "",
+    model: Any = None,
+) -> Dict[str, Any]:
+    """Perform and strictly validate the one physical Router request.
+
+    There is deliberately no retry, default Agent, semantic rewrite, or
+    secondary selector in this function.
+    """
+
+    catalog = _semantic_agent_catalog(vertical_agents)
+    prompt_payload = {
+        "messages": [
+            {
+                "role": str(item.get("role") or ""),
+                "content": str(item.get("content") or ""),
+                "timestamp": str(item.get("timestamp") or ""),
+            }
+            for item in messages
+        ],
+        "agent_candidates": catalog,
+        "decision_schema": {
+            "lane": "A_SAFETY_HANDOFF | B_PROPERTY_GOVERNED | C_ISOLATED_GENERAL",
+            "selected_agent_id": "null for A; eligible candidate id for B/C",
+            "reason": "natural-language selection reason",
+        },
+    }
+    result: Dict[str, Any] = {
+        "decision": None,
+        "raw": "",
+        "metrics": {},
+        "provider_evidence": {},
+        "provider_status": "failed",
+        "validation_error": None,
+    }
+    try:
+        router_agent = create_unified_abc_router(model=model or MODEL)
+        response_obj = await router_agent.arun(
+            json.dumps(prompt_payload, ensure_ascii=False),
+            user_id=user_id,
+            session_id=session_id or "unified-abc-router",
+            stream=False,
+        )
+        raw_value = getattr(response_obj, "content", "")
+        raw = raw_value if isinstance(raw_value, dict) else str(raw_value or "").strip()
+        result["raw"] = raw if isinstance(raw, str) else json.dumps(raw, ensure_ascii=False)
+        evidence = provider_evidence_from_run(response_obj)
+        result["provider_evidence"] = evidence
+        result["metrics"] = dict(evidence.get("usage") or {})
+        result["provider_status"] = "success"
+        decision = LaneDecision.model_validate(_strict_json_object(raw))
+
+        candidate_by_id = {str(item["agent_id"]): item for item in catalog}
+        selected = decision.selected_agent_id
+        if decision.lane == RuntimeLane.SAFETY_HANDOFF:
+            if selected is not None:
+                raise ValueError("A lane selected_agent_id must be null")
+        else:
+            if not selected or selected not in candidate_by_id:
+                raise ValueError("B/C lane must select one published candidate")
+            expected_scope = (
+                "property"
+                if decision.lane == RuntimeLane.PROPERTY_GOVERNED
+                else "isolated_general"
+            )
+            if candidate_by_id[selected]["scope"] != expected_scope:
+                raise ValueError("selected Agent is outside the returned lane")
+        result["decision"] = decision
+    except Exception as exc:
+        result["validation_error"] = f"{type(exc).__name__}: {str(exc)[:240]}"
+    return result
 
 
 def create_semantic_lane_router(*, model: Any) -> Agent:
@@ -305,7 +387,7 @@ async def select_lane_agent(
     catalog = [
         item
         for item in _semantic_agent_catalog(vertical_agents)
-        if item.get("domain_scope") == expected_scope
+        if item.get("scope") == expected_scope
     ]
     base: Dict[str, Any] = {
         "selected_agent_id": None,

@@ -16,6 +16,8 @@ from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
+from app.work_order_workflow import decide_work_order_proposal
+
 from app.handoff_policy import evaluate_handoff_policy
 from db.property_db import (
     add_badcase_action,
@@ -142,6 +144,12 @@ class ChatRequest(BaseModel):
     user_id: Optional[str] = None
 
 
+class WorkOrderProposalDecisionRequest(BaseModel):
+    session_id: str
+    proposal_id: str
+    decision: str
+
+
 class FeedbackRequest(BaseModel):
     session_id: str
     message_id: int
@@ -227,6 +235,24 @@ async def chat_stream(request: ChatRequest):
             "X-Accel-Buffering": "no",
         },
     )
+
+
+@router.post("/work-order-proposal/decision")
+async def work_order_proposal_decision(request: WorkOrderProposalDecisionRequest):
+    """Apply the existing card's explicit confirm/cancel button without a model."""
+
+    try:
+        result = decide_work_order_proposal(
+            session_id=request.session_id,
+            proposal_id=request.proposal_id,
+            decision=request.decision,
+            actor=f"owner:{request.session_id}",
+        )
+        return {"status": "ok", **result, "model_invoked": False}
+    except PermissionError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
 
 @router.get("/stream")
@@ -462,35 +488,12 @@ async def chat_feedback(request: FeedbackRequest):
 
 @router.post("/handoff")
 async def chat_handoff(request: HandoffRequest):
-    """Owner-facing explicit transfer request with an inspectable context package."""
-    reason = (request.reason or "业主主动请求人工服务").strip()
-    before = get_chat_session(request.session_id) or {}
-    before_status = str(before.get("handoff_status") or "none")
-    policy = {
-        **evaluate_handoff_policy("", explicit_reason=reason),
-        "reason_code": "user_requested",
-        "matched_signals": ["explicit_handoff_button"],
-    }
-    session = _request_handoff_with_context(request.session_id, policy, actor="owner")
-    handoff_state = str(session.get("handoff_status") or "requested")
-    message = (
-        "工作人员已领取，当前正在人工协同处理中。"
-        if handoff_state == "active"
-        else "已发起人工协同：等待工作人员领取。"
-        if handoff_state == "requested"
-        and before_status in {"none", "cancelled", "closed", "resolved"}
-        else "人工协同已在等待领取。"
-        if handoff_state == "requested"
-        else f"人工协同当前状态：{handoff_state}。"
+    """Retired owner shortcut; owner bubbles must pass the one Router."""
+
+    raise HTTPException(
+        status_code=410,
+        detail="owner Handoff requests must be sent through /api/chat/stream",
     )
-    return {
-        "status": "ok",
-        "session": session,
-        "handoff_state": handoff_state,
-        "message": message,
-        "policy": policy,
-        "package_available": True,
-    }
 
 
 @router.post("/handoff-policy")

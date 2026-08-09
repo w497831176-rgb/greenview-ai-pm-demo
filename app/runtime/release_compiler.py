@@ -228,6 +228,7 @@ def _compile_graph() -> Tuple[Dict[str, Any], List[ToolPolicy]]:
         published_doc_ids.append(doc_id)
         body = doc.get("content") or ""
         digest = content_hash(body)
+        chunk_snapshots = _knowledge_chunk_snapshots(doc)
         knowledge_nodes.append(
             {
                 "knowledge_doc_id": doc_id,
@@ -236,11 +237,11 @@ def _compile_graph() -> Tuple[Dict[str, Any], List[ToolPolicy]]:
                 "document_version": digest[:16],
                 "document_hash": digest,
                 "index_status": doc.get("index_status") or "unknown",
-                "chunk_count": int(doc.get("chunk_count") or 0),
+                "chunk_count": len(chunk_snapshots),
                 "chunk_size": int(doc.get("chunk_size") or 512),
                 "chunk_overlap": int(doc.get("chunk_overlap") or 64),
                 "split_strategy": doc.get("split_strategy") or "auto",
-                "chunk_snapshots": _knowledge_chunk_snapshots(doc),
+                "chunk_snapshots": chunk_snapshots,
             }
         )
 
@@ -872,6 +873,37 @@ def validate_release_graph(graph: Dict[str, Any], policies: List[ToolPolicy]) ->
     enabled_skill_ids = {int(item["skill_id"]) for item in skills if item.get("enabled")}
     knowledge_ids = {int(item["knowledge_doc_id"]) for item in knowledge}
     server_names = {str(item["name"]) for item in servers if item.get("enabled")}
+    for document in knowledge:
+        chunks = list(document.get("chunk_snapshots") or [])
+        if int(document.get("chunk_count") or 0) != len(chunks):
+            errors.append(
+                {
+                    "code": "knowledge_chunk_count_mismatch",
+                    "knowledge_doc_id": document.get("knowledge_doc_id"),
+                    "chunk_count": document.get("chunk_count"),
+                    "snapshot_count": len(chunks),
+                }
+            )
+        expected_indexes = list(range(len(chunks)))
+        actual_indexes = [int(item.get("chunk_index") or 0) for item in chunks]
+        if actual_indexes != expected_indexes:
+            errors.append(
+                {
+                    "code": "knowledge_chunk_index_invalid",
+                    "knowledge_doc_id": document.get("knowledge_doc_id"),
+                }
+            )
+        for chunk in chunks:
+            if str(chunk.get("chunk_hash") or "") != content_hash(
+                str(chunk.get("content") or "")
+            ):
+                errors.append(
+                    {
+                        "code": "knowledge_chunk_hash_invalid",
+                        "knowledge_doc_id": document.get("knowledge_doc_id"),
+                        "chunk_index": chunk.get("chunk_index"),
+                    }
+                )
     for agent in agents:
         if not agent.get("enabled") or agent.get("category") in {"router", "orchestration"}:
             continue
@@ -896,12 +928,13 @@ def validate_release_graph(graph: Dict[str, Any], policies: List[ToolPolicy]) ->
             errors.append({"code": "agent_mcp_binding_invalid", "agent_id": agent["agent_id"], "names": sorted(missing_servers)})
 
     for policy in policies:
-        if policy.effect == ToolEffect.UNKNOWN:
-            warnings.append(
+        if policy.enabled and policy.effect != ToolEffect.READ:
+            errors.append(
                 {
-                    "code": "tool_unclassified_disabled",
+                    "code": "mcp_tool_not_readonly",
                     "server_name": policy.server_name,
                     "tool_name": policy.tool_name,
+                    "effect": policy.effect.value,
                 }
             )
 

@@ -138,13 +138,39 @@ class RouteDecision(ImmutableModel):
 
 
 class LaneDecision(ImmutableModel):
-    """The Router's coarse domain decision; downstream fields cannot invalidate it."""
+    """The one physical Router call's complete, immutable routing decision."""
 
-    model_config = ConfigDict(frozen=True, extra="ignore")
     lane: RuntimeLane
-    business_intent: Optional[str] = Field(default=None, max_length=160)
-    reason: Optional[str] = Field(default=None, max_length=160)
+    selected_agent_id: Optional[str] = Field(default=None, max_length=160)
+    reason: str = Field(min_length=1, max_length=240)
     decision_source: LaneDecisionSource = LaneDecisionSource.ROUTER_MODEL
+
+
+class WorkOrderProposalRequest(ImmutableModel):
+    """Structured write intent emitted only by the already-selected B Agent."""
+
+    room_id: Optional[str] = Field(default=None, max_length=80)
+    issue_type: Optional[str] = Field(default=None, max_length=80)
+    issue_desc: Optional[str] = Field(default=None, max_length=500)
+    urgency: Optional[str] = Field(default=None, max_length=40)
+    contact_name: Optional[str] = Field(default=None, max_length=80)
+    contact_phone: Optional[str] = Field(default=None, max_length=40)
+    appointment_time: Optional[str] = Field(default=None, max_length=160)
+
+
+class AgentTurnResult(ImmutableModel):
+    """Optional strict envelope for a selected Agent's answer and side effects.
+
+    Plain prose remains a valid read-only answer. A business write, however,
+    is reachable only through ``proposal_request`` in this envelope.
+    """
+
+    answer: str = Field(min_length=1)
+    answer_status: Literal[
+        "answered", "insufficient_evidence", "capability_unavailable"
+    ] = "answered"
+    citation_evidence_ids: List[str] = Field(default_factory=list)
+    proposal_request: Optional[WorkOrderProposalRequest] = None
 
 
 class AnswerContract(ImmutableModel):
@@ -260,6 +286,7 @@ class ToolInvocation(ImmutableModel):
 
 
 class EvidenceItem(ImmutableModel):
+    evidence_type: Literal["rag_document_chunk"] = "rag_document_chunk"
     evidence_id: str
     knowledge_id: str
     knowledge_version: str
@@ -285,6 +312,7 @@ class EvidenceSet(ImmutableModel):
 
 
 class Citation(ImmutableModel):
+    evidence_type: Literal["rag_document_chunk"] = "rag_document_chunk"
     index: int
     evidence_id: str
     label: str

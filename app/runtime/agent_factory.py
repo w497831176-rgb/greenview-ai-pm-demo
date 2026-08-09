@@ -104,6 +104,34 @@ def _find_agent(config: Dict[str, Any], agent_id: str) -> Dict[str, Any]:
     raise ValueError(f"agent is not enabled in RunConfigSnapshot: {agent_id}")
 
 
+def router_agent_cards(config: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Project the strict four-field Router view from one immutable release.
+
+    Bindings and implementation detail are intentionally absent. Missing or
+    unrecognised structured scope is a release configuration error; it is
+    never guessed from a name, description, instruction, or binding.
+    """
+
+    cards: List[Dict[str, Any]] = []
+    for agent in config.get("agents") or []:
+        if not agent.get("enabled") or agent.get("category") in {"router", "orchestration"}:
+            continue
+        scope = str(agent.get("domain_scope") or "").strip()
+        if scope not in {"property", "isolated_general"}:
+            raise ValueError(
+                f"published Agent has invalid domain_scope: {agent.get('agent_id')}"
+            )
+        cards.append(
+            {
+                "agent_id": str(agent.get("agent_id") or ""),
+                "name": str(agent.get("name") or agent.get("agent_id") or ""),
+                "description": str(agent.get("description") or ""),
+                "scope": scope,
+            }
+        )
+    return cards
+
+
 def vertical_agent_cards(config: Dict[str, Any]) -> List[Dict[str, Any]]:
     skill_by_id = {
         int(item["skill_id"]): item for item in config.get("skills") or []
@@ -287,6 +315,15 @@ def build_agent_from_snapshot(
         "不得自行创建、更新、删除业务数据；写操作只能描述为待确认 Proposal。",
         "只有后端 ActionReceipt.status=committed 且包含真实 resource_id 时，才能声称操作成功。",
     ]
+    instructions.extend(
+        [
+            "A normal answer may be plain text. If you need to expose structured runtime status, return one JSON object with only answer, answer_status, citation_evidence_ids, and proposal_request.",
+            "answer_status must be answered, insufficient_evidence, or capability_unavailable. Never request another Agent or another routing decision.",
+            "citation_evidence_ids may contain only RAG evidence IDs supplied in this turn. Skill, MCP, Tool, model output, and configuration are never citations.",
+            "Only a selected property Agent may request work-order creation. It must use proposal_request with room_id, issue_type, issue_desc, urgency, contact_name, contact_phone, and appointment_time. Do not encode a write request in prose.",
+            "If work-order fields are missing, include the known values in proposal_request and ask for the missing values in answer. If no work-order state is requested, proposal_request must be null.",
+        ]
+    )
     if (agent_config.get("domain_scope") or "property") == "isolated_general":
         instructions.extend(
             [

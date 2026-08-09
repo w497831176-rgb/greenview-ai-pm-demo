@@ -11,17 +11,23 @@ from contextlib import nullcontext
 from types import SimpleNamespace
 from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 
-from app.runtime.agent_factory import build_agent_from_snapshot, vertical_agent_cards
+from app.runtime.agent_factory import (
+    build_agent_from_snapshot,
+    router_agent_cards,
+    vertical_agent_cards,
+)
 from app.runtime.badcase_capture import capture_runtime_badcase
 from app.runtime.citation_renderer import (
     build_skill_evidence,
     build_evidence_set,
     prompt_evidence_allowlist,
     render_citations,
+    render_rag_citations,
 )
 from app.runtime.contracts import (
     ActionProposal,
     ActionReceipt,
+    AgentTurnResult,
     AnswerContract,
     ApprovalEvent,
     CapabilityDecision,
@@ -56,6 +62,7 @@ from app.work_order_workflow import (
     _is_draft_follow_up,
     action_gateway,
     advance_work_order_workflow,
+    apply_structured_proposal_request,
     is_cancel_request,
     is_confirmation,
 )
@@ -293,27 +300,31 @@ def _visible_chat_history(
     session_id: str,
     *,
     current_trace_id: Optional[str] = None,
-    rounds: int = 5,
+    rounds: Optional[int] = None,
 ) -> List[Dict[str, str]]:
-    """Return only successful user-visible messages; control-plane runs are excluded."""
+    """Return all visible bubbles verbatim, chronologically and timestamped.
+
+    The compatibility parameters never remove, truncate, reprioritise, or
+    summarise a bubble. The current user bubble is simply the final item.
+    """
 
     visible: List[Dict[str, str]] = []
     for item in list_chat_messages(session_id):
         role = str(item.get("role") or "").lower()
         status = str(item.get("status") or "success").lower()
-        content = str(item.get("content") or "").strip()
+        content = str(item.get("content") or "")
         if role not in {"user", "owner", "assistant"} or not content:
             continue
         if status not in {"success", "complete", "completed"}:
             continue
-        if current_trace_id and str(item.get("trace_id") or "") == current_trace_id:
-            continue
-        if _is_internal_control_payload(content):
-            continue
         visible.append(
-            {"role": "user" if role in {"user", "owner"} else "assistant", "content": content}
+            {
+                "role": "user" if role in {"user", "owner"} else "assistant",
+                "content": content,
+                "timestamp": str(item.get("created_at") or item.get("timestamp") or ""),
+            }
         )
-    return visible[-max(0, int(rounds)) * 2 :]
+    return visible
 
 
 def _render_visible_history_context(
@@ -322,13 +333,18 @@ def _render_visible_history_context(
     *,
     boundary: str,
 ) -> str:
-    lines = [f"[执行边界] {boundary}"]
-    if history:
-        lines.append("[最近成功可见对话]")
-        for item in history:
-            label = "用户" if item.get("role") == "user" else "助手"
-            lines.append(f"{label}：{item.get('content', '')}")
-    lines.extend(["[本轮用户问题]", current_message])
+    lines = [f"[execution boundary] {boundary}", "[complete visible session]"]
+    for item in history:
+        lines.append(
+            json.dumps(
+                {
+                    "role": item.get("role"),
+                    "content": item.get("content", ""),
+                    "timestamp": item.get("timestamp", ""),
+                },
+                ensure_ascii=False,
+            )
+        )
     return "\n".join(lines)
 
 
@@ -360,16 +376,43 @@ def _is_internal_control_payload(text: str) -> bool:
     return bool(control_keys.intersection(payload))
 
 
+def _parse_agent_turn_result(raw: str) -> AgentTurnResult:
+    """Parse the selected Agent's optional strict envelope.
+
+    Plain prose is a read-only answer. JSON that attempts any structured
+    runtime field must validate completely; it is never interpreted
+    semantically or repaired.
+    """
+
+    text = str(raw or "").strip()
+    if not text:
+        raise ValueError("selected Agent returned an empty answer")
+    if not (text.startswith("{") and text.endswith("}")):
+        return AgentTurnResult(answer=text)
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return AgentTurnResult(answer=text)
+    if not isinstance(payload, dict):
+        return AgentTurnResult(answer=text)
+    structured_keys = {
+        "answer",
+        "answer_status",
+        "citation_evidence_ids",
+        "proposal_request",
+    }
+    if not structured_keys.intersection(payload):
+        return AgentTurnResult(answer=text)
+    return AgentTurnResult.model_validate(payload)
+
+
 def _lane_explanation(decision: LaneDecision) -> str:
     labels = {
         RuntimeLane.SAFETY_HANDOFF: "人工协同",
         RuntimeLane.PROPERTY_GOVERNED: "物业受控回答",
         RuntimeLane.ISOLATED_GENERAL: "隔离通用回答",
     }
-    return (
-        f"进入{labels[decision.lane]}路径；识别任务为"
-        f"{decision.business_intent or '未命名意图'}。{decision.reason or 'Router未返回判断理由。'}"
-    )
+    return f"{labels[decision.lane]}：{decision.reason}"
 
 
 def _agent_domain_scope(agent: Optional[Dict[str, Any]]) -> str:
@@ -519,20 +562,12 @@ def _handoff_contract_for(
 ) -> HandoffExecutionContract:
     if decision.lane != RuntimeLane.SAFETY_HANDOFF:
         raise ValueError("Handoff execution contract requires effective A lane")
-    if str(decision.business_intent or "").strip() == "user_requested_handoff":
-        return HandoffExecutionContract(
-            kind=HandoffKind.USER_REQUESTED,
-            reason_code="user_requested",
-            queue="property_service",
-            safety_override=False,
-            response_mode=ResponseMode.HUMAN_HANDOFF,
-        )
     return HandoffExecutionContract(
-        kind=HandoffKind.SAFETY_RISK,
-        reason_code="safety_risk",
-        queue="emergency",
-        safety_override=True,
-        response_mode=ResponseMode.EMERGENCY_HANDOFF,
+        kind=HandoffKind.USER_REQUESTED,
+        reason_code="user_requested",
+        queue="property_service",
+        safety_override=False,
+        response_mode=ResponseMode.HUMAN_HANDOFF,
     )
 
 
@@ -558,24 +593,20 @@ def _answer_contract_for(
             write_policy="forbidden",
             handoff_policy="required",
             forbidden_claims=common_forbidden,
-            decision_reason=(
-                "业主明确要求工作人员接手，立即发起普通人工协同。"
-                if handoff_contract.kind == HandoffKind.USER_REQUESTED
-                else "现实安全风险优先，语义判断后立即发起紧急人工协同。"
-            ),
+            decision_reason="A类同轮创建普通人工协同并短路所有业务能力。",
         )
     if decision.lane == RuntimeLane.ISOLATED_GENERAL:
         return AnswerContract(
             response_mode=ResponseMode.SAFE_GENERAL,
             evidence_required=False,
-            skill_policy="skipped",
-            rag_policy="skipped",
-            tool_policy="skipped",
+            skill_policy="selected",
+            rag_policy="selected",
+            tool_policy="selected",
             write_policy="forbidden",
             handoff_policy="skipped",
             forbidden_claims=common_forbidden
             + ["property_official_fact", "harmful_instructions"],
-            decision_reason="C只允许隔离通用回答；物业能力全部跳过，危险或越权内容由回答安全边界拒绝。",
+            decision_reason="C仅装配所选隔离Agent自身绑定；没有增强能力仍正常回答。",
         )
     if runtime_path == RuntimePath.CONTROLLED_ACTION:
         return AnswerContract(
@@ -749,6 +780,7 @@ def _results_from_snapshot(
     allowed_document_ids: set[int],
     top_k: int,
     context_threshold: float = 0.2,
+    context_token_budget: int = 1800,
 ) -> Tuple[List[Dict[str, Any]], bool]:
     import rag_retrieval
 
@@ -794,8 +826,72 @@ def _results_from_snapshot(
             }
         )
         seen.add((doc_id, chunk_index))
+    def with_adjacent_context(seeds: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Expand generic same-document neighbours inside one shared budget."""
+
+        selected: Dict[Tuple[int, int], Dict[str, Any]] = {}
+        document_order: List[int] = []
+        used_tokens = 0
+
+        def add(item: Dict[str, Any]) -> bool:
+            nonlocal used_tokens
+            key = (int(item["doc_id"]), int(item.get("chunk_index") or 0))
+            if key in selected:
+                return True
+            estimated = int(_estimate_tokens(str(item.get("content") or "")) or 0)
+            if selected and used_tokens + estimated > max(1, int(context_token_budget)):
+                return False
+            selected[key] = item
+            used_tokens += estimated
+            if key[0] not in document_order:
+                document_order.append(key[0])
+            return True
+
+        seed_keys: List[Tuple[int, int]] = []
+        for seed in seeds[:top_k]:
+            key = (int(seed["doc_id"]), int(seed.get("chunk_index") or 0))
+            seed_keys.append(key)
+            add(seed)
+        distance = 1
+        while distance <= 2:
+            added_any = False
+            for doc_id, chunk_index in seed_keys:
+                for adjacent_index in (chunk_index - distance, chunk_index + distance):
+                    snapshot_chunk = published_chunks.get((doc_id, adjacent_index))
+                    if not snapshot_chunk:
+                        continue
+                    document = snapshot_chunk["document"]
+                    adjacent = {
+                        "doc_id": doc_id,
+                        "doc_title": document.get("title") or "",
+                        "chunk_index": adjacent_index,
+                        "content": str(snapshot_chunk.get("content") or ""),
+                        "chunk_hash": snapshot_chunk.get("chunk_hash"),
+                        "document_hash": document.get("document_hash"),
+                        "document_version": document.get("document_version"),
+                        "score": None,
+                        "context_score": None,
+                        "evidence_status": "accepted",
+                        "evidence_reason": "same_document_adjacent_context",
+                        "retrieval_sources": ["runtime_release_snapshot_adjacent"],
+                        "retrieval_mode": "snapshot_adjacent",
+                    }
+                    if add(adjacent):
+                        added_any = True
+            if not added_any:
+                break
+            distance += 1
+        order = {doc_id: index for index, doc_id in enumerate(document_order)}
+        return sorted(
+            selected.values(),
+            key=lambda item: (
+                order.get(int(item["doc_id"]), len(order)),
+                int(item.get("chunk_index") or 0),
+            ),
+        )
+
     if verified:
-        return verified[:top_k], False
+        return with_adjacent_context(verified), False
 
     fallback: List[Dict[str, Any]] = []
     for (doc_id, chunk_index), snapshot_chunk in published_chunks.items():
@@ -831,7 +927,7 @@ def _results_from_snapshot(
             }
         )
     fallback.sort(key=lambda item: float(item.get("context_score") or 0), reverse=True)
-    return fallback[:top_k], True
+    return with_adjacent_context(fallback), True
 
 
 class RuntimeCoordinator:
@@ -848,7 +944,9 @@ class RuntimeCoordinator:
         started = time.time()
         ensure_chat_session(session_id)
         snapshot = resolve_snapshot(session_id)
-        path = self._select_path(session_id, message, snapshot.config)
+        # Every visible bubble enters the same one-Router chain. Persisted
+        # Draft/Proposal state never bypasses or pre-classifies a chat bubble.
+        path = RuntimePath.CONSULTATION
         state = RunState(
             run_id=run_id,
             trace_id=trace_id,
@@ -862,7 +960,7 @@ class RuntimeCoordinator:
             trace_id=trace_id,
             session_id=session_id,
             user_message=message,
-            risk_level="L2" if path == RuntimePath.CONTROLLED_ACTION else "L0",
+            risk_level="L0",
             version_snapshot=snapshot.snapshot_hash,
         )
         save_chat_message(
@@ -930,26 +1028,6 @@ class RuntimeCoordinator:
 
             if state.lane_decision.lane == RuntimeLane.SAFETY_HANDOFF:
                 async for event in self._stream_a_handoff(
-                    message, session_id, trace_id, snapshot, state, ledger, started
-                ):
-                    yield event
-                return
-
-            if state.answer_contract.response_mode == ResponseMode.CONTROLLED_WRITE:
-                path = RuntimePath.CONTROLLED_ACTION
-                state.path = path
-                ledger.runtime_path = path.value
-
-            if path == RuntimePath.CONTROLLED_ACTION:
-                state.capability_decision = CapabilityDecision(
-                    selected_agent_id=None,
-                    skill={"status": "skipped", "reason_code": "controlled_action"},
-                    rag={"status": "skipped", "reason_code": "controlled_action"},
-                    tool={"status": "skipped", "reason_code": "controlled_action"},
-                    write={"status": "required", "reason_code": "controlled_action"},
-                    handoff={"status": "available", "reason_code": "owner_can_request"},
-                )
-                async for event in self._stream_controlled_action(
                     message, session_id, trace_id, snapshot, state, ledger, started
                 ):
                     yield event
@@ -1102,6 +1180,142 @@ class RuntimeCoordinator:
         ledger: EvidenceLedger,
     ) -> None:
         """Resolve one strict semantic decision and account for its Provider call."""
+
+        from agents.router import route_session_once
+
+        cards = router_agent_cards(snapshot.config)
+        visible_messages = _visible_chat_history(session_id)
+        if not visible_messages:
+            raise RuntimeError("Router received no visible session messages")
+        if visible_messages[-1].get("content") != message:
+            raise RuntimeError("current bubble is not the final visible session message")
+
+        router_config = next(
+            (
+                item
+                for item in snapshot.config.get("agents") or []
+                if item.get("agent_id") == "router"
+                or item.get("category") in {"router", "orchestration"}
+            ),
+            {},
+        )
+        default_model = (snapshot.config.get("model_policy") or {}).get("default") or {}
+        router_model_id = str(
+            router_config.get("model_id")
+            or default_model.get("model_id")
+            or MODEL_ID
+        )
+        if router_model_id.lower() != "deepseek-v4-flash":
+            raise RuntimeError("unified Router must use deepseek-v4-flash")
+
+        router_started = time.time()
+        router_thinking = _thinking_for_snapshot(snapshot.config, router_model_id)
+        with provider_accounting_scope(
+            trace_id=trace_id,
+            session_id=session_id,
+            stage="router",
+            model_selection_reason="one-call A/B/C classification and B/C Agent selection",
+            price_snapshot=_price_for_snapshot(snapshot.config, router_model_id),
+            model_policy_version=str(
+                (snapshot.config.get("model_policy") or {}).get("version") or "v1.8"
+            ),
+        ) as router_scope:
+            result = await route_session_once(
+                messages=visible_messages,
+                vertical_agents=cards,
+                user_id=user_id,
+                session_id=f"{session_id}::router::{trace_id}",
+                model=_build_model_from_snapshot(snapshot.config, router_model_id),
+            )
+
+        provider_status = str(result.get("provider_status") or "failed")
+        if result.get("decision") is None:
+            if provider_status != "success":
+                raise ProviderFailureError("unified Router Provider call failed")
+            raise RuntimeError(
+                "unified Router contract invalid: "
+                + str(result.get("validation_error") or "schema validation failed")
+            )
+
+        attempts = list(getattr(router_scope, "attempts", []) or [])
+        if not attempts:
+            attempts = [
+                {
+                    "provider_request_sequence": 1,
+                    "provider_request_id": (result.get("provider_evidence") or {}).get(
+                        "provider_request_id"
+                    ),
+                    "provider_response_model": (result.get("provider_evidence") or {}).get(
+                        "provider_response_model"
+                    ),
+                    "usage": (result.get("provider_evidence") or {}).get("usage")
+                    or result.get("metrics")
+                    or {},
+                    "status": provider_status,
+                }
+            ]
+        for index, attempt in enumerate(attempts, start=1):
+            usage = dict(attempt.get("usage") or {})
+            response_model = attempt.get("provider_response_model")
+            cost = build_cost_entry(
+                stage="router",
+                provider=_model_provider(snapshot.config, router_model_id),
+                requested_model=router_model_id,
+                response_model=None,
+                provider_response_model=response_model,
+                thinking_enabled=router_thinking,
+                model_policy_version=str(
+                    (snapshot.config.get("model_policy") or {}).get("version") or "v1.8"
+                ),
+                provider_usage=usage if usage else None,
+                price_row=_price_for_snapshot(
+                    snapshot.config, response_model or router_model_id
+                ),
+                local_estimate_tokens=None,
+                provider_succeeded=provider_status == "success",
+            )
+            state.cost_entries.append(cost)
+            state.model_calls.append(
+                {
+                    "stage": "router",
+                    "model_id": router_model_id,
+                    "requested_model": router_model_id,
+                    "provider_response_model": response_model,
+                    "provider_request_id": attempt.get("provider_request_id"),
+                    "provider_request_sequence": int(
+                        attempt.get("provider_request_sequence") or index
+                    ),
+                    "thinking_enabled": router_thinking,
+                    "latency_ms": int((time.time() - router_started) * 1000),
+                    "usage": usage,
+                    "usage_source": cost.usage_source.value,
+                    "status": attempt.get("status") or provider_status,
+                }
+            )
+
+        state.lane_decision = result["decision"]
+        state.answer_contract = _answer_contract_for(
+            state.lane_decision, RuntimePath.CONSULTATION
+        )
+        lane_payload = state.lane_decision.model_dump(mode="json")
+        lane_payload["explanation"] = _lane_explanation(state.lane_decision)
+        ledger.set("lane_decision", lane_payload)
+        ledger.set("answer_contract", state.answer_contract.model_dump(mode="json"))
+        record_trace_event(
+            trace_id,
+            "router",
+            "success",
+            latency_ms=int((time.time() - router_started) * 1000),
+            output_summary=lane_payload["explanation"],
+            metadata={
+                **lane_payload,
+                "candidate_fields": ["agent_id", "name", "description", "scope"],
+                "candidate_count": len(cards),
+                "visible_message_count": len(visible_messages),
+                "answer_contract": state.answer_contract.model_dump(mode="json"),
+            },
+        )
+        return
 
         cards = vertical_agent_cards(snapshot.config)
         if state.path == RuntimePath.CONTROLLED_ACTION:
@@ -1471,63 +1685,37 @@ class RuntimeCoordinator:
         current_handoff_status = str(
             current_handoff.get("handoff_status") or "none"
         )
-        if handoff_contract.kind == HandoffKind.USER_REQUESTED:
-            handoff_result = await self._maybe_handoff(
-                message,
-                session_id,
-                trace_id,
-                snapshot.release_id,
-                decision=state.lane_decision,
-            )
-            if handoff_result is None:
-                raise RuntimeError("A user-requested Handoff was not persisted")
-            reply, handoff_state, handoff_policy = handoff_result
-        else:
-            persisted_safety = (
-                str(current_handoff.get("handoff_reason_code") or "")
-                == "safety_risk"
-                or str(current_handoff.get("handoff_queue") or "")
-                == "emergency"
-            )
-            active_handoff = current_handoff_status in {
-                "requested",
-                "active",
-                "waiting_user",
-            }
-            handoff = current_handoff
-            if not active_handoff or not persisted_safety:
-                handoff = request_handoff(
-                    session_id,
-                    state.lane_decision.reason or "检测到明确、现实的安全风险。",
-                    risk_level="L3",
-                    reason_code=handoff_contract.reason_code,
-                    queue=handoff_contract.queue,
-                    handoff_package={
-                        "trace_id": trace_id,
-                        "release_id": snapshot.release_id,
-                        "trigger_message": message,
-                        "semantic_lane": state.lane_decision.model_dump(mode="json"),
-                        "handoff_kind": handoff_contract.kind.value,
-                        "safety_override": handoff_contract.safety_override,
-                    },
-                )
-            if current_handoff_status == "waiting_user":
-                handoff = resume_handoff_after_owner_message(session_id)
-            handoff_state = str(
-                handoff.get("handoff_status") or current_handoff_status or "requested"
-            )
-            handoff_policy = {
-                "level": "L3",
-                "reason_code": handoff_contract.reason_code,
-                "queue": handoff_contract.queue,
-                "safety_override": handoff_contract.safety_override,
-                "matched_signals": ["semantic_safety_risk"],
-            }
-            reply = (
-                "请立即远离危险源，不要触碰设备或积水，并提醒周围人员避开；如存在火灾、"
-                "触电、燃气或人身危险，请立即联系119、120、110等当地紧急渠道。系统已发起"
-                "安全人工协同，但物业协同不能替代现实紧急救援。"
-            )
+        handoff = request_handoff(
+            session_id,
+            state.lane_decision.reason,
+            risk_level="L3",
+            reason_code="user_requested",
+            queue="property_service",
+            handoff_package={
+                "trace_id": trace_id,
+                "release_id": snapshot.release_id,
+                "trigger_message": message,
+                "router_reason": state.lane_decision.reason,
+                "semantic_lane": state.lane_decision.model_dump(mode="json"),
+                "handoff_kind": "ordinary",
+            },
+        )
+        if current_handoff_status == "waiting_user":
+            handoff = resume_handoff_after_owner_message(session_id)
+        handoff_state = str(
+            handoff.get("handoff_status") or current_handoff_status or "requested"
+        )
+        handoff_policy = {
+            "level": "L3",
+            "reason_code": "user_requested",
+            "queue": "property_service",
+            "safety_override": False,
+            "matched_signals": ["unified_router_a_lane"],
+        }
+        reply = (
+            f"{state.lane_decision.reason} 已直接发起人工协同，无需再次确认；"
+            "本轮未调用业务Agent、Skill、RAG、MCP、Tool或写入流程。"
+        )
         decision_summary = {
             "agent": _decision("skipped", "handoff_preempted"),
             "skill": _decision("skipped", "handoff_preempted"),
@@ -1565,10 +1753,10 @@ class RuntimeCoordinator:
             "handoff_events",
             {
                 "status": handoff_state,
-                "reason_code": handoff_contract.reason_code,
-                "handoff_kind": handoff_contract.kind.value,
-                "queue": handoff_contract.queue,
-                "safety_override": handoff_contract.safety_override,
+                "reason_code": "handoff",
+                "handoff_kind": "ordinary",
+                "queue": "property_service",
+                "safety_override": False,
                 "handler": "human_copilot",
                 "router_model_invoked": any(
                     item.get("stage") == "router" for item in state.model_calls
@@ -1600,7 +1788,7 @@ class RuntimeCoordinator:
         )
         update_chat_trace(
             trace_id,
-            intent=state.lane_decision.business_intent or handoff_contract.reason_code,
+            intent="handoff",
             agent_name="人工协同控制器",
             agent_id="human_copilot",
             status="complete",
@@ -1632,9 +1820,9 @@ class RuntimeCoordinator:
                 "trace_id": trace_id,
                 "handoff": True,
                 "handoff_state": handoff_state,
-                "handoff_reason": handoff_contract.reason_code,
-                "handoff_queue": handoff_contract.queue,
-                "safety_override": handoff_contract.safety_override,
+                "handoff_reason": "handoff",
+                "handoff_queue": "property_service",
+                "safety_override": False,
                 "handler": "human_copilot",
                 "lane_decision": state.lane_decision.model_dump(mode="json"),
                 "answer_contract": state.answer_contract.model_dump(mode="json"),
@@ -2508,8 +2696,6 @@ class RuntimeCoordinator:
             raise RuntimeError("consultation started without AnswerContract")
         visible_history = _visible_chat_history(
             session_id,
-            current_trace_id=trace_id,
-            rounds=5,
         )
         all_cards = vertical_agent_cards(snapshot.config)
         cards = _lane_candidates(all_cards, state.lane_decision.lane)
@@ -2521,23 +2707,14 @@ class RuntimeCoordinator:
             return
 
         candidates = [str(item["agent_id"]) for item in cards]
-        selection = await self._select_agent_after_lane(
-            message,
-            session_id,
-            user_id,
-            trace_id,
-            snapshot,
-            state,
-            all_cards,
-            visible_history,
-        )
-        selected = str(selection.get("selected_agent_id") or "")
+        selected = str(state.lane_decision.selected_agent_id or "")
         if selected not in candidates:
-            async for event in self._stream_unconfigured_lane_boundary(
-                session_id, trace_id, snapshot, state, ledger, started
-            ):
-                yield event
-            return
+            raise RuntimeError("Router selected an Agent outside its fixed lane")
+        selection = {
+            "selected_agent_id": selected,
+            "reason": state.lane_decision.reason,
+            "selection_source": "unified_router",
+        }
         selected_card = next(
             item for item in cards if str(item.get("agent_id")) == selected
         )
@@ -2555,6 +2732,19 @@ class RuntimeCoordinator:
         state.selected_agent = next(
             item for item in snapshot.config["agents"] if item.get("agent_id") == selected
         )
+        record_trace_event(
+            trace_id,
+            "agent_frozen",
+            "success",
+            output_summary=f"selected={selected}",
+            metadata={
+                "lane": state.lane_decision.lane.value,
+                "selected_agent_id": selected,
+                "selection_source": "unified_router",
+                "snapshot_id": snapshot.snapshot_id,
+                "immutable_for_turn": True,
+            },
+        )
         yield _sse(
             "route",
             {
@@ -2564,7 +2754,6 @@ class RuntimeCoordinator:
                 "current_agent_id": selected,
                 "domain_scope": domain_scope,
                 "lane": state.lane_decision.lane.value,
-                "business_intent": state.lane_decision.business_intent,
                 "trace_id": trace_id,
             },
         )
@@ -2576,23 +2765,10 @@ class RuntimeCoordinator:
         if router_cost is None:
             raise RuntimeError("consultation has no accounted semantic Router request")
         handoff_policy = {"reason_code": "semantic_no_handoff"}
-        read_tool_plans = (
-            plan_tools(
-                snapshot.config,
-                selected,
-                message,
-                RuntimePath.CONSULTATION,
-                effects=[ToolEffect.READ],
-                execution_modes=["auto_preinvoke", "model_native"],
-            )
-            if property_query
-            and state.answer_contract.tool_policy == "selected"
-            else []
-        )
-        structured_realtime_query = _is_structured_realtime_query(
-            state.answer_contract,
-            read_tool_plans,
-        )
+        # The selected Agent's native tool loop receives its own published
+        # read definitions. No keyword/regex ToolPlanner runs before it.
+        read_tool_plans: List[Any] = []
+        structured_realtime_query = False
         direct_knowledge_required = bool(
             state.answer_contract.evidence_required
             and state.answer_contract.response_mode == ResponseMode.GROUNDED_ANSWER
@@ -2603,7 +2779,7 @@ class RuntimeCoordinator:
             {
                 int(item) for item in state.selected_agent.get("knowledge_doc_ids") or []
             }
-            if property_query and state.answer_contract.rag_policy == "selected"
+            if state.answer_contract.rag_policy == "selected"
             else set()
         )
         knowledge_versions = {
@@ -2622,12 +2798,12 @@ class RuntimeCoordinator:
                 else "not_requested"
             )
         )
-        if property_query and not structured_realtime_query:
+        if not structured_realtime_query:
             yield _sse(
                 "progress",
                 {"trace_id": trace_id, "stage": "rag.retrieve", "status": "running"},
             )
-        if property_query and allowed_doc_ids and not structured_realtime_query:
+        if allowed_doc_ids and not structured_realtime_query:
             try:
                 import rag_retrieval
 
@@ -2653,6 +2829,12 @@ class RuntimeCoordinator:
                         )
                         or 0.2
                     ),
+                    int(
+                        (snapshot.config.get("retrieval_policy") or {}).get(
+                            "context_token_budget"
+                        )
+                        or 1800
+                    ),
                 )
                 retrieval_status = (
                     "completed_snapshot_fallback"
@@ -2674,6 +2856,12 @@ class RuntimeCoordinator:
                             "context_threshold"
                         )
                         or 0.2
+                    ),
+                    int(
+                        (snapshot.config.get("retrieval_policy") or {}).get(
+                            "context_token_budget"
+                        )
+                        or 1800
                     ),
                 )
                 retrieval_status = (
@@ -2742,32 +2930,18 @@ class RuntimeCoordinator:
         )
 
         state.next_step = "readonly_mcp"
-        if read_tool_plans:
-            yield _sse(
-                "progress",
-                {"trace_id": trace_id, "stage": "mcp.invoke", "status": "running"},
-            )
-        if property_query and read_tool_plans:
-            mcp_context, invocations = await preinvoke_read_tools(
-                snapshot.config, selected, message
-            )
-        else:
-            mcp_context, invocations = "", []
+        mcp_context, invocations = "", []
         preinvoked_tools = {
             (invocation.server_name, invocation.tool_name)
             for invocation in invocations
             if invocation.tool_name != "discovery"
             and invocation.invocation_status == "success"
         }
-        model_native_toolkits = (
-            build_model_native_read_tools(
-                snapshot.config,
-                selected,
-                message,
-                excluded_tools=preinvoked_tools,
-            )
-            if property_query and read_tool_plans
-            else []
+        model_native_toolkits = build_model_native_read_tools(
+            snapshot.config,
+            selected,
+            message,
+            excluded_tools=preinvoked_tools,
         )
         state.tool_invocations = list(invocations)
         for invocation in invocations:
@@ -2804,7 +2978,7 @@ class RuntimeCoordinator:
                 invocation_mode="policy_preinvoke",
             )
 
-        evidence_prompt = prompt_evidence_allowlist(evidence) if property_query else ""
+        evidence_prompt = prompt_evidence_allowlist(evidence)
         answer_boundary = (
             "\n[回答边界] 这是隔离通用回答。不得调用或声称使用物业Skill、RAG、MCP/Tool、ActionGateway，"
             "不得把一般建议表述为物业官方事实。"
@@ -2818,8 +2992,7 @@ class RuntimeCoordinator:
             tools=model_native_toolkits,
             evidence_prompt=evidence_prompt + mcp_context + answer_boundary,
             enable_skills=(
-                property_query
-                and not structured_realtime_query
+                not structured_realtime_query
                 and state.answer_contract.skill_policy == "selected"
             ),
         )
@@ -3002,9 +3175,9 @@ class RuntimeCoordinator:
             metadata={"decision_summary": decision_summary},
         )
         state.next_step = "answer"
-        model_invoked = bool(
-            knowledge_gate["model_invoked"] and not out_of_scope_without_agent
-        )
+        # Evidence availability is an Agent answer concern, never authority to
+        # switch Agent, skip C, or replace a selected Agent's answer.
+        model_invoked = True
         if knowledge_evidence_blocked or out_of_scope_without_agent:
             record_trace_event(
                 trace_id,
@@ -3053,8 +3226,18 @@ class RuntimeCoordinator:
             visible_history,
             message,
             boundary=(
-                "本轮是只读咨询路径。只回答本轮用户问题；不得输出 Router、LaneDecision、"
-                "CapabilityDecision 或其他控制 JSON；不得创建工单、草稿或待确认 Action。"
+                (
+                    "本轮由已冻结的物业Agent处理。只回答本轮用户问题；不得输出 Router、"
+                    "LaneDecision、CapabilityDecision 或其他控制 JSON；不得直接提交任何业务写入。"
+                    "若且仅若需要创建工单，必须按AgentTurnResult返回结构化proposal_request；"
+                    "后端最多保存Draft或pending_confirmation Proposal，正式写入必须等待业主按钮确认。"
+                )
+                if state.lane_decision.lane == RuntimeLane.PROPERTY_GOVERNED
+                else (
+                    "本轮由已冻结的隔离通用Agent处理。只回答本轮用户问题；不得输出 Router、"
+                    "LaneDecision、CapabilityDecision 或其他控制 JSON；proposal_request必须为空，"
+                    "不得访问ActionGateway或发起任何物业业务写入。"
+                )
             ),
         )
         full_content = ""
@@ -3199,6 +3382,30 @@ class RuntimeCoordinator:
                 invocation_mode="model_native",
             )
 
+        if model_native_invocations and state.capability_decision is not None:
+            previous_capability = state.capability_decision
+            invoked_names = [
+                f"{item.server_name}/{item.tool_name}"
+                for item in model_native_invocations
+            ]
+            state.capability_decision = CapabilityDecision(
+                selected_agent_id=selected,
+                skill=previous_capability.skill,
+                rag=previous_capability.rag,
+                tool={
+                    "status": "selected",
+                    "reason_code": "selected_agent_native_tool_loop",
+                    "details": {"tools": invoked_names},
+                },
+                write=previous_capability.write,
+                handoff=previous_capability.handoff,
+            )
+            decision_summary["tool"] = _decision(
+                "selected",
+                "selected_agent_native_tool_loop",
+                tools=invoked_names,
+            )
+
         if provider_failure_reason:
             raise ProviderFailureError(
                 f"model Provider returned failure text: {provider_failure_reason}"
@@ -3216,52 +3423,94 @@ class RuntimeCoordinator:
                 ],
             )
 
-        rendered, citations, citation_violations = render_citations(
+        agent_turn = _parse_agent_turn_result(full_content)
+        full_content = agent_turn.answer
+        proposal_result: Optional[Dict[str, Any]] = None
+        if agent_turn.proposal_request is not None:
+            if state.lane_decision.lane != RuntimeLane.PROPERTY_GOVERNED:
+                raise RuntimeError("only the selected B Agent may emit proposal_request")
+            proposal_result = apply_structured_proposal_request(
+                session_id=session_id,
+                proposal_request=agent_turn.proposal_request.model_dump(mode="json"),
+                trace_id=trace_id,
+                release_id=snapshot.release_id,
+                selected_agent_id=selected,
+            )
+            proposal_id = proposal_result.get("proposal_id")
+            if proposal_id:
+                proposal_row = get_action_proposal(str(proposal_id))
+                if proposal_row:
+                    state.pending_actions.append(
+                        ActionProposal(
+                            proposal_id=proposal_row["proposal_id"],
+                            session_id=proposal_row["session_id"],
+                            trace_id=proposal_row.get("trace_id"),
+                            release_id=proposal_row.get("release_id"),
+                            action_type=proposal_row["action_type"],
+                            risk_level=RiskLevel(proposal_row["risk_level"]),
+                            payload=proposal_row.get("payload") or {},
+                            parameter_hash=content_hash(proposal_row.get("payload") or {}),
+                            idempotency_key=proposal_row["idempotency_key"],
+                            status=proposal_row["status"],
+                        )
+                    )
+            tool_calls.append(
+                {
+                    "tool_name": "action_gateway",
+                    "action_type": "work_order.create",
+                    "status": proposal_result.get("action"),
+                    "phase": proposal_result.get("action"),
+                    "proposal_id": proposal_id,
+                    "proposal_status": proposal_result.get("proposal_status"),
+                    "missing_fields": proposal_result.get("missing_field_keys") or [],
+                    "invocation_mode": "selected_b_agent_structured_request",
+                }
+            )
+            record_trace_event(
+                trace_id,
+                "work_order.proposal_request",
+                "success",
+                output_summary=str(proposal_result.get("action") or "draft_updated"),
+                metadata={
+                    "selected_agent_id": selected,
+                    "proposal_id": proposal_id,
+                    "proposal_status": proposal_result.get("proposal_status"),
+                    "missing_field_keys": proposal_result.get("missing_field_keys") or [],
+                    "formal_write": False,
+                },
+            )
+            previous_capability = state.capability_decision
+            if previous_capability is not None:
+                state.capability_decision = CapabilityDecision(
+                    selected_agent_id=selected,
+                    skill=previous_capability.skill,
+                    rag=previous_capability.rag,
+                    tool=previous_capability.tool,
+                    write={
+                        "status": "required",
+                        "reason_code": "selected_b_agent_proposal_request",
+                        "details": {
+                            "phase": proposal_result.get("action"),
+                            "proposal_id": proposal_id,
+                            "formal_write": False,
+                        },
+                    },
+                    handoff=previous_capability.handoff,
+                )
+
+        rendered, citations, citation_violations = render_rag_citations(
             full_content,
             evidence,
-            tool_invocations=state.tool_invocations,
-            skill_sources=build.skill_evidence_sources,
-            action_receipts=state.action_receipts,
+            declared_evidence_ids=agent_turn.citation_evidence_ids,
         )
         linked_skill_evidence = build_skill_evidence(
             full_content,
             build.skill_evidence_sources,
         )
-        citation_required = _requires_rag_citation(
-            state.answer_contract,
-            evidence_count=len(evidence.items),
-            linked_skill_evidence_count=len(linked_skill_evidence),
-            successful_tool_evidence_count=len(successful_tool_evidence),
-        )
-        if citation_required and not citations:
-            citation_violations.append(
-                {
-                    "code": "required_citation_missing",
-                    "detail": (
-                        "The user explicitly requested RAG citations, but no "
-                        "validated EvidenceItem was linked in the answer."
-                    ),
-                }
-            )
-        answer_has_governed_evidence = bool(
-            citations or linked_skill_evidence or successful_tool_evidence
-        )
-        knowledge_grounding_failed = bool(
-            direct_knowledge_required
-            and (citation_violations or not answer_has_governed_evidence)
-        )
-        if knowledge_grounding_failed:
-            rendered = KNOWLEDGE_INSUFFICIENT_RESPONSE
-            citations = []
+        citation_required = False
+        knowledge_grounding_failed = False
         state.citations = citations
         _record_citation_violations(ledger, citation_violations)
-        rendered = _append_runtime_evidence_summary(
-            rendered,
-            message,
-            tool_calls,
-            state.tool_invocations,
-            citations,
-        )
 
         vertical_cost_entries = []
         vertical_usage_sources: List[str] = []

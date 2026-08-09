@@ -74,6 +74,8 @@ class ToolGateway:
         tool_name: str,
         agent_id: Optional[str] = None,
     ) -> ToolPolicy:
+        raise ToolPolicyError("MCP Gateway is read-only and rejects write policies")
+
         if agent_id is not None:
             agent = self._agent(agent_id)
             if server_name not in set(agent.get("mcp_server_names") or []):
