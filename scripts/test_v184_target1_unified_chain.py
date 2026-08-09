@@ -60,6 +60,7 @@ PATCHES: List[Tuple[Any, str, Any]] = []
 ROUTER_INPUTS: List[Dict[str, Any]] = []
 BUILD_CALLS: List[str] = []
 ROUTER_DECISIONS: Dict[str, LaneDecision] = {}
+AGENT_TURN_OVERRIDES: Dict[str, str] = {}
 
 
 def patch(target: Any, name: str, value: Any) -> None:
@@ -173,14 +174,17 @@ def fake_build(
     **_kwargs: Any,
 ) -> AgentBuild:
     BUILD_CALLS.append(agent_id)
-    answer = json.dumps(
-        {
-            "answer": f"answer:{message}",
-            "answer_status": "answered",
-            "citation_evidence_ids": [],
-            "proposal_request": None,
-        },
-        ensure_ascii=False,
+    answer = AGENT_TURN_OVERRIDES.get(
+        message,
+        json.dumps(
+            {
+                "answer": f"answer:{message}",
+                "answer_status": "answered",
+                "citation_evidence_ids": [],
+                "proposal_request": None,
+            },
+            ensure_ascii=False,
+        ),
     )
     config = next(item for item in snap.config["agents"] if item["agent_id"] == agent_id)
     return AgentBuild(
@@ -333,6 +337,49 @@ def work_order_payload(suffix: str) -> Dict[str, str]:
         "contact_phone": f"phone-{suffix}",
         "appointment_time": "slot",
     }
+
+
+def test_fenced_structured_agent_request_creates_pending_proposal_only() -> None:
+    message = "symbol-fenced-proposal"
+    session_id = "session-fenced-proposal"
+    ROUTER_DECISIONS[message] = LaneDecision(
+        lane=RuntimeLane.PROPERTY_GOVERNED,
+        selected_agent_id="b_agent",
+        reason="choose-b-agent",
+    )
+    AGENT_TURN_OVERRIDES[message] = (
+        "```json\n"
+        + json.dumps(
+            {
+                "answer": "symbolic pending confirmation",
+                "answer_status": "answered",
+                "citation_evidence_ids": [],
+                "proposal_request": work_order_payload("fenced"),
+            },
+            ensure_ascii=False,
+        )
+        + "\n```"
+    )
+    before_orders = scalar(
+        "SELECT COUNT(*) FROM work_orders WHERE session_id=?", (session_id,)
+    )
+    events = asyncio.run(consume(message, session_id))
+    done = next(item["data"] for item in events if item["event"] == "done")
+    action_call = next(
+        item for item in done["tool_calls"] if item.get("tool_name") == "action_gateway"
+    )
+    proposal_id = action_call["proposal_id"]
+    assert action_call["proposal_status"] == "pending_confirmation"
+    assert get_action_proposal(proposal_id)["status"] == "pending_confirmation"
+    assert scalar(
+        "SELECT COUNT(*) FROM action_approvals WHERE proposal_id=?", (proposal_id,)
+    ) == 0
+    assert scalar(
+        "SELECT COUNT(*) FROM action_receipts WHERE proposal_id=?", (proposal_id,)
+    ) == 0
+    assert scalar(
+        "SELECT COUNT(*) FROM work_orders WHERE session_id=?", (session_id,)
+    ) == before_orders
 
 
 def test_structured_work_order_state_machine() -> None:
@@ -547,6 +594,7 @@ def main() -> None:
             test_b_and_c_freeze_one_agent_without_fallback,
             test_router_reason_cannot_create_write,
             test_badcase_capture_failure_cannot_suppress_terminal_events,
+            test_fenced_structured_agent_request_creates_pending_proposal_only,
             test_structured_work_order_state_machine,
             test_rag_citation_snapshot_and_mcp_boundaries,
             test_static_contracts,

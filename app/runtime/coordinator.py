@@ -387,10 +387,20 @@ def _parse_agent_turn_result(raw: str) -> AgentTurnResult:
     text = str(raw or "").strip()
     if not text:
         raise ValueError("selected Agent returned an empty answer")
-    if not (text.startswith("{") and text.endswith("}")):
+    structured_text = text
+    lines = structured_text.splitlines()
+    if (
+        len(lines) >= 3
+        and lines[0].strip().lower() in {"```", "```json"}
+        and lines[-1].strip() == "```"
+    ):
+        structured_text = "\n".join(lines[1:-1]).strip()
+    if not (
+        structured_text.startswith("{") and structured_text.endswith("}")
+    ):
         return AgentTurnResult(answer=text)
     try:
-        payload = json.loads(text)
+        payload = json.loads(structured_text)
     except json.JSONDecodeError:
         return AgentTurnResult(answer=text)
     if not isinstance(payload, dict):
