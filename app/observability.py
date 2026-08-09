@@ -22,6 +22,7 @@ from db.property_db import (
     get_budget_thresholds,
     get_chat_trace,
     get_evaluation_run_by_trace_id,
+    get_evidence_ledger,
     get_mcp_call_audits_for_trace,
     get_model_call,
     get_model_price,
@@ -1375,6 +1376,95 @@ def _fetch_reporting_model_calls(
     return rows
 
 
+def _fetch_model_calls_for_trace_ids(
+    trace_ids: List[str],
+    start: Optional[str],
+    end: Optional[str],
+    *,
+    model_id: Optional[str] = None,
+    stage: Optional[str] = None,
+    include_unassignable_attempts: bool = False,
+) -> List[Dict[str, Any]]:
+    """Fetch model rows for one already-paginated Trace page in one query.
+
+    The Trace summary endpoint must never load a whole reporting range and
+    discard rows in Python.  ``trace_ids`` is therefore the page boundary and
+    is applied in SQL before any rows are materialized.
+    """
+    normalized_ids = sorted({str(item) for item in trace_ids if item})
+    if not normalized_ids:
+        return []
+
+    range_conditions, params = _time_range_predicates("created_at", start, end)
+    conditions: List[str] = []
+    if range_conditions:
+        valid_range = " AND ".join(range_conditions)
+        if include_unassignable_attempts:
+            conditions.append(
+                f"(({valid_range}) OR "
+                f"({_provider_attempt_sql_predicate('model_calls')} "
+                "AND yiai_time_epoch(created_at) IS NULL))"
+            )
+        else:
+            conditions.extend(range_conditions)
+    placeholders = ",".join("?" for _ in normalized_ids)
+    conditions.append(f"trace_id IN ({placeholders})")
+    params.extend(normalized_ids)
+    if model_id:
+        conditions.append("model_id = ?")
+        params.append(model_id)
+    if stage:
+        conditions.append("stage = ?")
+        params.append(stage)
+
+    conn = _get_conn()
+    _register_reporting_sql(conn)
+    cursor = conn.cursor()
+    cursor.execute(
+        f"SELECT * FROM model_calls WHERE {' AND '.join(conditions)}",
+        params,
+    )
+    rows = [dict(row) for row in cursor.fetchall()]
+    # The summary page deliberately omits the expensive global duplicate-ID
+    # reconciliation.  Single-Trace advanced diagnostics retains that audit;
+    # first-screen rows only need request counts, accounting totals and status.
+    conn.close()
+    return rows
+
+
+def _fetch_trace_summary_events(
+    trace_ids: List[str],
+) -> Dict[str, List[Dict[str, Any]]]:
+    """Load the few span rows needed by summary cards in one SQL query."""
+    normalized_ids = sorted({str(item) for item in trace_ids if item})
+    if not normalized_ids:
+        return {}
+    placeholders = ",".join("?" for _ in normalized_ids)
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute(
+        f"""
+        SELECT trace_id, span_name, status, latency_ms, metadata_json
+        FROM trace_events
+        WHERE trace_id IN ({placeholders})
+          AND span_name IN ('router', 'agent_frozen', 'final_response')
+        ORDER BY id ASC
+        """,
+        normalized_ids,
+    )
+    grouped: Dict[str, List[Dict[str, Any]]] = {}
+    for row in cursor.fetchall():
+        item = dict(row)
+        raw_metadata = item.pop("metadata_json", None)
+        try:
+            item["metadata"] = json.loads(raw_metadata) if raw_metadata else {}
+        except (TypeError, ValueError, json.JSONDecodeError):
+            item["metadata"] = {}
+        grouped.setdefault(str(item["trace_id"]), []).append(item)
+    conn.close()
+    return grouped
+
+
 def _statistics_status(
     *,
     scope_consistent: bool,
@@ -1678,6 +1768,7 @@ async def overview(
         end=scope.get("end"),
         limit=1,
         offset=0,
+        include_scope_reconciliation=True,
     )
     trace_group_count = int(trace_scope["trace_group_count"])
     scope_consistent = (
@@ -2052,6 +2143,8 @@ def _list_trace_page(
     range_key: Optional[str] = None,
     limit: int = 20,
     offset: int = 0,
+    sort_order: str = "desc",
+    include_scope_reconciliation: bool = False,
 ) -> Dict[str, Any]:
     """Return one range-correct page of chat and model-only Trace groups.
 
@@ -2147,8 +2240,10 @@ def _list_trace_page(
               )
         ), chat_candidates AS (
             SELECT
-                t.trace_id, t.session_id, t.user_message, t.intent,
-                t.agent_name, t.status, t.created_at, t.updated_at,
+                t.trace_id, t.session_id,
+                SUBSTR(COALESCE(t.user_message, ''), 1, 160) AS question_summary,
+                t.intent, t.agent_name, t.agent_id,
+                t.status, t.created_at, t.updated_at,
                 COALESCE(t.run_type, 'chat') AS run_type,
                 COALESCE(mg.provider_last_epoch, yiai_time_epoch(t.created_at)) AS sort_epoch,
                 COALESCE(mg.provider_request_count, 0) AS provider_request_count,
@@ -2160,9 +2255,10 @@ def _list_trace_page(
             SELECT
                 m.trace_id,
                 NULL AS session_id,
-                NULL AS user_message,
+                NULL AS question_summary,
                 NULL AS intent,
                 NULL AS agent_name,
+                NULL AS agent_id,
                 m.status,
                 m.created_at,
                 COALESCE(m.finished_at, m.created_at) AS updated_at,
@@ -2205,23 +2301,13 @@ def _list_trace_page(
     totals = cursor.fetchone()
     total = int(totals["total"] or 0)
     scoped_provider_request_count = int(totals["provider_request_count"] or 0)
-    cursor.execute(
-        f"""
-        {all_traces_sql}
-        SELECT a.trace_id FROM all_traces a
-        WHERE {where_sql}
-        """,
-        query_params,
-    )
-    matching_trace_ids = {
-        str(row["trace_id"]) for row in cursor.fetchall() if row["trace_id"]
-    }
+    order_keyword = "ASC" if str(sort_order).lower() == "asc" else "DESC"
     cursor.execute(
         f"""
         {all_traces_sql}
         SELECT * FROM all_traces a
         WHERE {where_sql}
-        ORDER BY a.sort_epoch DESC, a.trace_id DESC
+        ORDER BY a.sort_epoch {order_keyword}, a.trace_id {order_keyword}
         LIMIT ? OFFSET ?
         """,
         query_params + [limit, offset],
@@ -2233,8 +2319,8 @@ def _list_trace_page(
     calls_by_trace: Dict[str, List[Dict[str, Any]]] = {}
     reporting_calls_by_trace: Dict[str, List[Dict[str, Any]]] = {}
     if page_trace_ids:
-        page_ids = set(page_trace_ids)
-        range_calls = _fetch_model_calls(
+        range_calls = _fetch_model_calls_for_trace_ids(
+            page_trace_ids,
             effective_start,
             effective_end,
             model_id=model_id,
@@ -2242,18 +2328,18 @@ def _list_trace_page(
         )
         for raw_call in range_calls:
             item_trace_id = raw_call.get("trace_id")
-            if item_trace_id in page_ids:
-                calls_by_trace.setdefault(item_trace_id, []).append(raw_call)
-        reporting_range_calls = _fetch_reporting_model_calls(
+            calls_by_trace.setdefault(item_trace_id, []).append(raw_call)
+        reporting_range_calls = _fetch_model_calls_for_trace_ids(
+            page_trace_ids,
             effective_start,
             effective_end,
             model_id=model_id,
             stage=stage,
+            include_unassignable_attempts=True,
         )
         for raw_call in reporting_range_calls:
             item_trace_id = raw_call.get("trace_id")
-            if item_trace_id in page_ids:
-                reporting_calls_by_trace.setdefault(item_trace_id, []).append(raw_call)
+            reporting_calls_by_trace.setdefault(item_trace_id, []).append(raw_call)
 
     agg_rows: Dict[str, Dict[str, Any]] = {}
     for item_trace_id in page_trace_ids:
@@ -2337,149 +2423,127 @@ def _list_trace_page(
             "unknown_cost_calls": int(summary.get("unavailable_calls") or 0),
         }
 
-    results = []
+    summary_events = _fetch_trace_summary_events(page_trace_ids)
+    results: List[Dict[str, Any]] = []
     for row in trace_rows:
         trace = dict(row)
-        agg = agg_rows.get(trace["trace_id"], {})
-        model_ids = list(agg.get("model_ids") or [])
+        item_trace_id = str(trace["trace_id"])
+        agg = agg_rows.get(item_trace_id, {})
+        item_data_quality = agg.get("data_quality") or _data_quality_summary([])
         call_count = int(agg.get("call_count") or 0)
         provider_attempt_count = int(agg.get("provider_attempt_count") or 0)
-        item_data_quality = agg.get("data_quality") or _data_quality_summary([])
-        provider_actual_calls = int(agg.get("provider_actual_calls") or 0)
-        provider_actual_priced_calls = int(
-            agg.get("provider_actual_priced_calls") or 0
+        events = summary_events.get(item_trace_id, [])
+        router_event = next(
+            (item for item in events if item.get("span_name") == "router"), {}
         )
+        final_event = next(
+            (
+                item
+                for item in reversed(events)
+                if item.get("span_name") == "final_response"
+            ),
+            {},
+        )
+        lane = (router_event.get("metadata") or {}).get("lane")
+        total_latency_ms = _optional_int(final_event.get("latency_ms"))
+        if total_latency_ms is None:
+            created_epoch = _reporting_epoch(trace.get("created_at"))
+            updated_epoch = _reporting_epoch(trace.get("updated_at"))
+            if created_epoch is not None and updated_epoch is not None:
+                total_latency_ms = max(
+                    0, int(round((updated_epoch - created_epoch) * 1000))
+                )
+
+        provider_actual_calls = int(agg.get("provider_actual_calls") or 0)
         estimated_calls = int(agg.get("estimated_calls") or 0)
-        estimated_priced_calls = int(agg.get("estimated_priced_calls") or 0)
         unknown_cost_calls = int(agg.get("unknown_cost_calls") or 0)
-
-        if not model_ids:
-            model_summary = "尚无模型调用记录"
-        elif len(model_ids) == 1:
-            model_summary = _model_display_name(model_ids[0])
+        quality_normal = item_data_quality["data_quality_status"] == "normal"
+        token_complete = bool(agg.get("token_complete")) and quality_normal
+        cost_complete = bool(
+            agg.get("provider_actual_cost_complete")
+            and quality_normal
+            and not estimated_calls
+        )
+        if provider_attempt_count == 0:
+            cost_status = "not_applicable"
+        elif not quality_normal:
+            cost_status = item_data_quality["data_quality_status"]
+        elif cost_complete:
+            cost_status = "provider_actual"
+        elif unknown_cost_calls or provider_actual_calls:
+            cost_status = "partial_unavailable"
         else:
-            model_summary = " + ".join(_model_display_name(item) for item in model_ids)
+            cost_status = "estimated"
 
-        trace.update({
-            "models": model_ids,
-            "model_summary": model_summary,
-            "total_tokens": agg.get("total_tokens") if call_count else None,
-            "input_cache_hit_tokens": (
-                agg.get("input_cache_hit_tokens") if call_count else None
-            ),
-            "input_cache_miss_tokens": (
-                agg.get("input_cache_miss_tokens") if call_count else None
-            ),
-            "output_tokens": agg.get("output_tokens") if call_count else None,
-            "reasoning_tokens": (
-                agg.get("reasoning_tokens") if call_count else None
-            ),
-            "reasoning_known_calls": int(
-                agg.get("reasoning_known_calls") or 0
-            ),
-            "reasoning_unavailable_calls": int(
-                agg.get("reasoning_unavailable_calls") or 0
-            ),
-            "estimated_cost_cny": agg.get("estimated_cost_cny"),
-            "provider_actual_cost_cny": agg.get("provider_actual_cost_cny"),
-            "platform_price_snapshot_direct_cost_cny": agg.get(
-                "platform_price_snapshot_direct_cost_cny"
-            ),
-            "known_partial_cost_cny": agg.get(
-                "known_partial_provider_actual_cost_cny"
-            ),
-            "cost_complete": bool(agg.get("cost_complete")),
-            "local_estimated_cost_cny": agg.get("local_estimated_cost_cny"),
-            "provider_actual_calls": provider_actual_calls,
-            "provider_actual_priced_calls": provider_actual_priced_calls,
-            "estimated_calls": estimated_calls,
-            "estimated_priced_calls": estimated_priced_calls,
-            "unavailable_calls": unknown_cost_calls,
-            "model_call_count": call_count,
-            "provider_request_count": call_count,
-            "provider_attempt_count": provider_attempt_count,
-            "unconfirmed_provider_attempt_count": int(
-                agg.get("unconfirmed_provider_attempt_count") or 0
-            ),
-            "data_quality_status": item_data_quality["data_quality_status"],
-            "anomaly_attempt_count": item_data_quality["anomaly_attempt_count"],
-            "anomaly_attempts": item_data_quality["anomaly_attempts"],
-            "unresolved_reconciliation_count": item_data_quality[
-                "unresolved_reconciliation_count"
-            ],
-            "invalid_timestamp_count": item_data_quality[
-                "invalid_timestamp_count"
-            ],
-            "reasoning_is_output_subset": item_data_quality[
-                "reasoning_is_output_subset"
-            ],
-            "logical_model_record_count": int(
-                agg.get("logical_record_count") or 0
-            ),
-            "cost_status": (
-                "not_applicable" if provider_attempt_count == 0
-                else item_data_quality["data_quality_status"]
-                if item_data_quality["data_quality_status"] != "normal"
-                else "partial_unavailable" if unknown_cost_calls
-                else "provider_actual" if provider_actual_calls and not estimated_calls
-                else "estimated" if estimated_calls and not provider_actual_calls
-                else "mixed"
-            ),
-            "price_missing": int(
-                item_data_quality.get("provider_actual_price_missing_count")
-                or 0
-            ) > 0,
-            "cost_unavailable": unknown_cost_calls > 0,
-            "no_model_calls": provider_attempt_count == 0,
-            **_trace_operation_metadata(
-                trace, list(agg.get("provider_attempt_records") or [])
-            ),
-        })
-        results.append(trace)
+        results.append(
+            {
+                "trace_id": item_trace_id,
+                "created_at": trace.get("created_at"),
+                "question_summary": trace.get("question_summary") or None,
+                "lane": lane,
+                "agent_id": trace.get("agent_id"),
+                "agent_name": trace.get("agent_name"),
+                "result": trace.get("status"),
+                "run_type": trace.get("run_type"),
+                "provider_request_count": call_count,
+                "total_tokens": agg.get("total_tokens") if token_complete else None,
+                "total_cost_cny": (
+                    agg.get("platform_price_snapshot_direct_cost_cny")
+                    if cost_complete
+                    else None
+                ),
+                "known_partial_cost_cny": (
+                    agg.get("known_partial_provider_actual_cost_cny")
+                    if not cost_complete
+                    else None
+                ),
+                "cost_status": cost_status,
+                "total_latency_ms": total_latency_ms,
+            }
+        )
 
     pages = max(1, (total + limit - 1) // limit)
     page = (offset // limit) + 1
-    scoped_normal_calls = _fetch_model_calls(
-        effective_start,
-        effective_end,
-        model_id=model_id,
-        stage=stage,
-        trace_id=trace_id,
-    )
-    scoped_reporting_calls = _fetch_reporting_model_calls(
-        effective_start,
-        effective_end,
-        model_id=model_id,
-        stage=stage,
-        trace_id=trace_id,
-    )
-    if any([session_id, intent, agent]):
-        scoped_normal_calls = [
-            call
-            for call in scoped_normal_calls
-            if str(call.get("trace_id") or "") in matching_trace_ids
-        ]
-        scoped_reporting_calls = [
-            call
-            for call in scoped_reporting_calls
-            if str(call.get("trace_id") or "") in matching_trace_ids
-        ]
-    scoped_expected_provider_count = int(
-        _aggregate_model_calls(scoped_normal_calls)["calls"]
-    )
-    trace_data_quality = _data_quality_summary(scoped_reporting_calls)
-    scope_consistent = (
-        scoped_provider_request_count == scoped_expected_provider_count
-    )
+    page_reporting_calls = [
+        call for calls in reporting_calls_by_trace.values() for call in calls
+    ]
+    trace_data_quality = _data_quality_summary(page_reporting_calls)
+    scope_consistent: Optional[bool] = None
+    if include_scope_reconciliation:
+        scoped_normal_calls = _fetch_model_calls(
+            effective_start,
+            effective_end,
+            model_id=model_id,
+            stage=stage,
+            trace_id=trace_id,
+        )
+        scoped_reporting_calls = _fetch_reporting_model_calls(
+            effective_start,
+            effective_end,
+            model_id=model_id,
+            stage=stage,
+            trace_id=trace_id,
+        )
+        scoped_expected_provider_count = int(
+            _aggregate_model_calls(scoped_normal_calls)["calls"]
+        )
+        trace_data_quality = _data_quality_summary(scoped_reporting_calls)
+        scope_consistent = (
+            scoped_provider_request_count == scoped_expected_provider_count
+        )
     return _json_safe_evidence({
         "traces": results,
         "total": total,
         "trace_group_count": total,
         "provider_request_count": scoped_provider_request_count,
         "scope_consistent": scope_consistent,
-        "statistics_status": _statistics_status(
-            scope_consistent=scope_consistent,
-            data_quality_status=trace_data_quality["data_quality_status"],
+        "statistics_status": (
+            _statistics_status(
+                scope_consistent=bool(scope_consistent),
+                data_quality_status=trace_data_quality["data_quality_status"],
+            )
+            if scope_consistent is not None
+            else "summary_page"
         ),
         "data_quality_status": trace_data_quality["data_quality_status"],
         "data_quality": trace_data_quality,
@@ -2488,12 +2552,7 @@ def _list_trace_page(
         "unresolved_reconciliation_count": trace_data_quality[
             "unresolved_reconciliation_count"
         ],
-        "unassigned_timestamp_attempts": [
-            item
-            for item in trace_data_quality["anomaly_attempts"]
-            if "invalid_timestamp_range_unassignable"
-            in item.get("issue_codes", [])
-        ],
+        "page_data_quality_status": trace_data_quality["data_quality_status"],
         "count_semantics": {
             "trace_group_count": "unique_trace_groups",
             "provider_request_count": "included_outbound_provider_attempts",
@@ -2516,6 +2575,7 @@ def _list_trace_page(
             "agent": agent,
             "model_id": model_id,
             "stage": stage,
+            "sort_order": order_keyword.lower(),
         },
     })
 
@@ -2536,8 +2596,9 @@ async def traces(
     ),
     limit: int = Query(20, ge=1, le=100),
     offset: int = Query(0, ge=0),
+    sort_order: str = Query("desc", pattern="^(asc|desc)$"),
 ):
-    """List one server-paginated page of chat, model-only, and no-model traces."""
+    """List compact Trace summaries; detail and diagnostics are separate reads."""
     try:
         return _list_trace_page(
             session_id=session_id,
@@ -2551,6 +2612,7 @@ async def traces(
             range_key=range_key,
             limit=limit,
             offset=offset,
+            sort_order=sort_order,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -3557,8 +3619,344 @@ def _single_trace_recommendation(chain: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
-@router.get("/traces/{trace_id}")
-async def trace_detail(trace_id: str):
+def _provider_request_projection(call: Dict[str, Any]) -> Dict[str, Any]:
+    """Public request row: accounting evidence without prompts or responses."""
+    tokens = call.get("provider_token_accounting") or {}
+    return {
+        "stage": call.get("stage"),
+        "stage_name": _stage_display_name(call.get("stage")),
+        "requested_model": call.get("requested_model"),
+        "provider_actual_model": call.get("provider_actual_model"),
+        "thinking_enabled": call.get("thinking_enabled"),
+        "model_selection_reason": call.get("model_selection_reason"),
+        "cache_hit_input_tokens": tokens.get("cache_hit_input_tokens"),
+        "cache_miss_input_tokens": tokens.get("cache_miss_input_tokens"),
+        "input_tokens": tokens.get("input_tokens"),
+        "output_tokens": tokens.get("output_tokens"),
+        "reasoning_tokens": tokens.get("reasoning_tokens"),
+        "total_tokens": tokens.get("total_tokens"),
+        "reasoning_is_output_subset": tokens.get(
+            "reasoning_is_output_subset"
+        ),
+        "total_equation_valid": tokens.get("total_equation_valid"),
+        "price_snapshot_cost_cny": call.get("calculated_direct_cost"),
+        "cost_source": call.get("cost_source"),
+        "price_snapshot_effective_date": call.get("effective_date"),
+        "latency_ms": call.get("latency_ms"),
+        "status": call.get("status"),
+        "usage_status": call.get("usage_status"),
+        "provider_request_sequence": call.get("provider_request_sequence"),
+    }
+
+
+def _metadata_int(metadata: Dict[str, Any], *keys: str) -> Optional[int]:
+    for key in keys:
+        parsed = _optional_int(metadata.get(key))
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _trace_cost_quality_control(
+    events: List[Dict[str, Any]],
+    model_calls: List[Dict[str, Any]],
+    mcp_calls: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Build the single Trace-scoped cost/quality card from persisted facts."""
+    event_by_span: Dict[str, List[Dict[str, Any]]] = {}
+    for event in events:
+        event_by_span.setdefault(str(event.get("span_name") or ""), []).append(event)
+
+    router_event = (event_by_span.get("router") or [{}])[-1]
+    router_meta = router_event.get("metadata") or {}
+    frozen_event = (event_by_span.get("agent_frozen") or [{}])[-1]
+    frozen_meta = frozen_event.get("metadata") or {}
+    retrieval_event = (
+        event_by_span.get("retrieval")
+        or event_by_span.get("rag_retrieval")
+        or [{}]
+    )[-1]
+    retrieval_meta = retrieval_event.get("metadata") or {}
+    final_event = (event_by_span.get("final_response") or [{}])[-1]
+    final_meta = final_event.get("metadata") or {}
+    capability_event = (event_by_span.get("capability_decision") or [{}])[-1]
+    capability_meta = capability_event.get("metadata") or {}
+
+    stages = [str(call.get("stage") or "") for call in model_calls]
+    automatic_retries = _metadata_int(
+        final_meta, "automatic_retry_count", "automatic_retries"
+    )
+    if automatic_retries is None:
+        automatic_retries = _metadata_int(
+            frozen_meta, "automatic_retry_count", "automatic_retries"
+        )
+    vertical_request_count = stages.count("vertical_agent")
+    skill_events = [
+        event
+        for event in events
+        if str(event.get("span_name") or "").startswith("skill.")
+    ]
+    activated_skill_ids = final_meta.get("activated_skill_ids")
+    used_skill_count = (
+        len(activated_skill_ids)
+        if isinstance(activated_skill_ids, list)
+        else len(skill_events)
+    )
+    bound_skill_ids = frozen_meta.get("bound_skill_ids")
+    bound_skill_count = _metadata_int(frozen_meta, "bound_skill_count")
+    if not isinstance(bound_skill_ids, list):
+        bound_skill_ids = final_meta.get("bound_skill_ids")
+    if bound_skill_count is None:
+        bound_skill_count = _metadata_int(final_meta, "bound_skill_count")
+    if bound_skill_count is None and isinstance(bound_skill_ids, list):
+        bound_skill_count = len(bound_skill_ids)
+
+    evidence_rows = retrieval_meta.get("evidence")
+    loaded_chunks = (
+        len(evidence_rows)
+        if isinstance(evidence_rows, list)
+        else _metadata_int(retrieval_meta, "loaded_chunk_count", "evidence_count")
+    )
+    filter_summary = retrieval_meta.get("filter_summary")
+    if not isinstance(filter_summary, dict):
+        filter_summary = {}
+    rag_candidate_count = _metadata_int(
+        retrieval_meta, "candidate_count", "raw_candidate_count"
+    )
+    if rag_candidate_count is None:
+        rag_candidate_count = _metadata_int(
+            filter_summary, "candidate_count", "raw_candidate_count"
+        )
+
+    tool_result_characters = sum(
+        len(str(item.get("result_summary") or item.get("error_summary") or ""))
+        for item in mcp_calls
+    )
+    tool_schema_exposed_count = _metadata_int(
+        frozen_meta,
+        "tool_schema_exposed_count",
+        "bound_tool_count",
+    )
+    if tool_schema_exposed_count is None:
+        tool_schema_exposed_count = _metadata_int(
+            capability_meta, "tool_schema_exposed_count", "bound_tool_count"
+        )
+    if tool_schema_exposed_count is None:
+        tool_schema_exposed_count = _metadata_int(
+            final_meta, "tool_schema_exposed_count"
+        )
+    actual_tool_count = _metadata_int(final_meta, "tool_actual_call_count")
+    if actual_tool_count is None:
+        actual_tool_count = len(mcp_calls)
+    recorded_tool_result_characters = _metadata_int(
+        final_meta,
+        "tool_result_character_count",
+        "tool_result_characters",
+    )
+    if recorded_tool_result_characters is None:
+        recorded_tool_result_characters = tool_result_characters
+
+    citation_violations = final_meta.get("citation_violations")
+    if isinstance(citation_violations, list):
+        citation_validation = "valid" if not citation_violations else "invalid"
+    else:
+        citation_validation = "historical_trace_not_recorded"
+    answer_status = final_meta.get("answer_status")
+    if not answer_status:
+        evidence_decision = final_meta.get("evidence_decision")
+        answer_status = evidence_decision or "historical_trace_not_recorded"
+    proposal_event = next(
+        (
+            item
+            for item in reversed(events)
+            if str(item.get("span_name") or "")
+            in {"work_order.proposal_request", "work_order_workflow"}
+        ),
+        None,
+    )
+    proposal_status = (
+        (proposal_event.get("metadata") or {}).get("proposal_status")
+        or (proposal_event.get("metadata") or {}).get("status")
+        if proposal_event
+        else None
+    )
+
+    return {
+        "provider_input_tokens_are_authoritative": True,
+        "call_reduction": {
+            "router_requests": stages.count("router"),
+            "agent_requests": vertical_request_count,
+            "tool_follow_up_requests": (
+                max(0, vertical_request_count - 1 - automatic_retries)
+                if automatic_retries is not None
+                else None
+            ),
+            "selector_requests": stages.count("agent_selector"),
+            "resolver_requests": sum("resolver" in stage for stage in stages),
+            "second_agent_requests": _metadata_int(
+                final_meta, "second_agent_request_count"
+            ),
+            "automatic_retries": automatic_retries,
+        },
+        "context_loading": {
+            "router_session_message_count": _metadata_int(
+                router_meta, "visible_message_count", "session_message_count"
+            ),
+            "router_minimal_agent_card_count": _metadata_int(
+                router_meta, "candidate_count", "minimal_agent_card_count"
+            ),
+            "skill_bound_count": bound_skill_count,
+            "skill_used_count": used_skill_count,
+            "rag_candidate_count": rag_candidate_count,
+            "rag_loaded_chunk_count": loaded_chunks,
+            "rag_loaded_characters": _metadata_int(
+                retrieval_meta,
+                "loaded_character_count",
+                "loaded_characters",
+                "context_characters",
+            ),
+            "tool_schema_exposed_count": tool_schema_exposed_count,
+            "tool_actual_call_count": actual_tool_count,
+            "tool_result_characters": recorded_tool_result_characters,
+            "non_selected_agent_capabilities_loaded": frozen_meta.get(
+                "non_selected_agent_capabilities_loaded"
+            )
+            if "non_selected_agent_capabilities_loaded" in frozen_meta
+            else final_meta.get("non_selected_agent_capabilities_loaded"),
+        },
+        "quality_evidence": {
+            "answer_status": answer_status,
+            "rag_evidence_count": loaded_chunks,
+            "citation_validation": citation_validation,
+            "tool_statuses": [
+                {
+                    "server": item.get("server_name"),
+                    "tool": item.get("tool_name"),
+                    "status": item.get("status"),
+                }
+                for item in mcp_calls
+            ],
+            "proposal_status": proposal_status or "not_applicable",
+            "human_evaluation": "尚未评价",
+        },
+        "model_selection": [
+            {
+                "stage": call.get("stage"),
+                "requested_model": call.get("requested_model"),
+                "provider_actual_model": call.get("provider_actual_model"),
+                "thinking_enabled": call.get("thinking_enabled"),
+                "reason": call.get("model_selection_reason"),
+            }
+            for call in model_calls
+        ],
+    }
+
+
+def _trace_detail_compact(trace_id: str) -> Dict[str, Any]:
+    trace = get_chat_trace(trace_id)
+    if not trace:
+        conn = _get_conn()
+        _register_reporting_sql(conn)
+        cursor = conn.cursor()
+        cursor.execute(
+            """SELECT * FROM model_calls
+               WHERE trace_id = ?
+               ORDER BY yiai_time_epoch(created_at) DESC, id DESC
+               LIMIT 1""",
+            (trace_id,),
+        )
+        row = cursor.fetchone()
+        conn.close()
+        if not row:
+            raise HTTPException(status_code=404, detail="Trace not found")
+        trace = {
+            "trace_id": trace_id,
+            "session_id": None,
+            "user_message": None,
+            "status": row["status"],
+            "created_at": row["created_at"],
+            "updated_at": row["finished_at"] or row["created_at"],
+            "intent": None,
+            "agent_name": None,
+            "agent_id": None,
+            "version_snapshot": None,
+        }
+
+    raw_calls = _fetch_reporting_model_calls(None, None, trace_id=trace_id)
+    provider_raw_calls = [
+        call
+        for call in raw_calls
+        if _provider_aggregate_decision(call)["record_kind"] == "provider_attempt"
+    ]
+    model_calls = [
+        _enrich_model_call(call, trace.get("session_id"))
+        for call in provider_raw_calls
+    ]
+    events = _trace_event_provider_projection(
+        list_trace_events(trace_id), model_calls
+    )
+    mcp_calls = get_mcp_call_audits_for_trace(trace_id)
+    router_event = next(
+        (item for item in events if item.get("span_name") == "router"), {}
+    )
+    final_event = next(
+        (
+            item
+            for item in reversed(events)
+            if item.get("span_name") == "final_response"
+        ),
+        {},
+    )
+    router_meta = router_event.get("metadata") or {}
+    final_meta = final_event.get("metadata") or {}
+    cost_explanation = _trace_cost_explanation(model_calls)
+    cost_summary = _cost_summary(model_calls)
+    return _json_safe_evidence(
+        {
+            "trace": {
+                "trace_id": trace_id,
+                "created_at": trace.get("created_at"),
+                "updated_at": trace.get("updated_at"),
+                "question": trace.get("user_message"),
+                "lane": router_meta.get("lane"),
+                "agent_id": trace.get("agent_id"),
+                "agent_name": trace.get("agent_name"),
+                "status": trace.get("status"),
+                "snapshot_hash": trace.get("version_snapshot"),
+            },
+            "result_summary": {
+                "answer_status": final_meta.get("answer_status")
+                or final_meta.get("evidence_decision")
+                or "historical_trace_not_recorded",
+                "answer_excerpt": final_event.get("output_summary"),
+            },
+            "execution_chain": [
+                {
+                    "span_name": event.get("span_name"),
+                    "status": event.get("status"),
+                    "latency_ms": event.get("latency_ms"),
+                    "provider_called": event.get("provider_called"),
+                    "provider_token_note": event.get("provider_token_note"),
+                }
+                for event in events
+            ],
+            "provider_requests": [
+                _provider_request_projection(call) for call in model_calls
+            ],
+            "provider_summary": cost_summary,
+            "cost_explanation": {
+                "summary": cost_explanation.get("summary"),
+                "cost_scope": cost_explanation.get("cost_scope"),
+            },
+            "cost_quality_control": _trace_cost_quality_control(
+                events, model_calls, mcp_calls
+            ),
+            "advanced_available": True,
+        }
+    )
+
+
+def _trace_detail_full(trace_id: str) -> Dict[str, Any]:
     """Return a single trace with model calls, MCP audits, and messages.
 
     Each model call includes token-level explainability, price snapshot,
@@ -3765,6 +4163,20 @@ async def trace_detail(trace_id: str):
             model_calls, context_breakdown
         ),
     })
+
+
+@router.get("/traces/{trace_id}/advanced")
+async def trace_advanced_diagnostics(trace_id: str):
+    """Load complete diagnostic evidence only after an explicit UI expansion."""
+    payload = _trace_detail_full(trace_id)
+    payload["evidence_ledger"] = get_evidence_ledger(trace_id)
+    return _json_safe_evidence(payload)
+
+
+@router.get("/traces/{trace_id}")
+async def trace_detail(trace_id: str):
+    """Return one lightweight Trace detail without raw evidence payloads."""
+    return _trace_detail_compact(trace_id)
 
 
 # -----------------------------------------------------------------------------

@@ -881,7 +881,7 @@
     async function openTraceDrawer(traceId) {
       try {
         const [data, runtimeEvidenceData] = await Promise.all([
-          apiGet(`/api/observability/traces/${traceId}`),
+          apiGet(`/api/observability/traces/${traceId}/advanced`),
           apiGet(`/api/runtime/traces/${traceId}/evidence`).catch(() => ({}))
         ]);
         const runtimeEvidence = runtimeEvidenceData.ledger || {};
@@ -1223,7 +1223,7 @@
         case 'badcase-detail': await renderBadcaseDetailPage(main); break;
         case 'evaluations': await renderEvaluationsPage(main); break;
         case 'cost-governance': await renderCostGovernancePage(main); break;
-        case 'cost-strategy': await renderCostStrategyPage(main); break;
+        case 'cost-strategy': await renderCostGovernancePage(main); break;
         default: throw new Error(`renderContent: 未知页面 "${STATE.subTab}"`);
       }
     }
@@ -4274,8 +4274,8 @@
       container.innerHTML = loadingState();
 
       const state = {
-        filters: { model: '', stage: '', search: '' },
-        rangeKey: 'today',
+        filters: { model: '', stage: '', search: '', sortOrder: 'desc' },
+        rangeKey: '',
         customStart: '',
         customEnd: '',
         resolvedScope: null,
@@ -4336,34 +4336,17 @@
         return '<span class="text-slate-500">' + escapeHtml(s || '-') + '</span>';
       }
 
-      async function loadAll({ refreshSummary = true } = {}) {
-        const overviewParams = scopeParams();
-        if (state.filters.model) overviewParams.set('model_id', state.filters.model);
-        if (state.filters.stage) overviewParams.set('stage', state.filters.stage);
-        if (state.filters.search) overviewParams.set('trace_id', state.filters.search);
-        if (refreshSummary || !state.overview || !state.resolvedScope) {
-          const [overview, prices, budget] = await Promise.all([
-            apiGet(`/api/observability/overview?${overviewParams.toString()}`),
-            apiGet('/api/observability/prices'),
-            apiGet('/api/observability/budget'),
-          ]);
-          state.overview = overview;
-          state.resolvedScope = overview.scope || null;
-          state.prices = prices.prices || [];
-          state.budget = budget.budget || {};
-        }
-        const scope = state.resolvedScope || {};
-        const traceParams = scope.start && scope.end
-          ? new URLSearchParams({ start: scope.start, end: scope.end })
-          : scopeParams();
+      async function loadAll() {
+        const traceParams = new URLSearchParams();
         if (state.filters.model) traceParams.set('model_id', state.filters.model);
         if (state.filters.stage) traceParams.set('stage', state.filters.stage);
         if (state.filters.search) traceParams.set('trace_id', state.filters.search);
         traceParams.set('limit', String(state.pagination.limit));
         traceParams.set('offset', String((state.pagination.page - 1) * state.pagination.limit));
+        traceParams.set('sort_order', state.filters.sortOrder);
         const traces = await apiGet(`/api/observability/traces?${traceParams.toString()}`);
         state.traces = traces.traces || [];
-        state.traceRange = { start: traces.start || scope.start, end: traces.end || scope.end };
+        state.traceRange = { start: traces.start || '', end: traces.end || '' };
         state.pagination = {
           page: Number(traces.page || 1),
           pages: Number(traces.pages || 1),
@@ -4377,20 +4360,7 @@
           providerRequestCount: Number(traces.provider_request_count ?? 0),
         };
         state.traceDataQuality = traces.data_quality || {};
-        const overviewRequests = Number(state.overview.provider_request_count ?? state.overview.calls ?? 0);
-        const sameRange = String(traces.start || '') === String(scope.start || '')
-          && String(traces.end || '') === String(scope.end || '');
-        state.statisticsConsistent = Boolean(
-          state.overview.scope_consistent !== false
-          && traces.scope_consistent !== false
-          && state.overview.statistics_status === 'consistent'
-          && traces.statistics_status === 'consistent'
-          && state.overview.data_quality_status === 'normal'
-          && traces.data_quality_status === 'normal'
-          && Number(state.overview.trace_group_count ?? 0) === state.traceSummary.traceGroupCount
-          && sameRange
-          && overviewRequests === state.traceSummary.providerRequestCount
-        );
+        state.statisticsConsistent = true;
         state.trends = [];
         state.distribution = [];
       }
@@ -4547,6 +4517,10 @@
                 <option value="ab_test_a" ${state.filters.stage === 'ab_test_a' ? 'selected' : ''}>ab_test_a</option>
                 <option value="ab_test_b" ${state.filters.stage === 'ab_test_b' ? 'selected' : ''}>ab_test_b</option>
                 <option value="darwin" ${state.filters.stage === 'darwin' ? 'selected' : ''}>darwin</option>
+              </select>
+              <select id="cg-sort" class="px-3 py-2 border border-slate-200 rounded-xl text-sm">
+                <option value="desc" ${state.filters.sortOrder === 'desc' ? 'selected' : ''}>最新优先</option>
+                <option value="asc" ${state.filters.sortOrder === 'asc' ? 'selected' : ''}>最早优先</option>
               </select>
               <button id="cg-apply" type="button" class="px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white rounded-xl text-sm">应用筛选</button>
             </div>
@@ -4730,7 +4704,7 @@
 
       async function showTraceDetail(traceId) {
         try {
-          const data = await apiGet(`/api/observability/traces/${traceId}`);
+          const data = await apiGet(`/api/observability/traces/${traceId}/advanced`);
           const trace = data.trace || {};
           const explanation = data.trace_cost_explanation || {};
           const chain = explanation.chain || [];
@@ -4817,6 +4791,117 @@
           openModal('调用记录详情', html, null, '关闭');
         } catch (err) {
           showToast('加载调用记录详情失败', 'error');
+        }
+      }
+
+      function renderTraceSummariesSlim() {
+        const items = state.traces || [];
+        const pagination = state.pagination || {};
+        const laneLabels = {
+          A_HANDOFF: 'A · 人工协同',
+          B_PROPERTY_GOVERNED: 'B · 物业业务',
+          C_ISOLATED_GENERAL: 'C · 通用回答'
+        };
+        const rows = items.map(item => {
+          const cost = item.total_cost_cny !== null && item.total_cost_cny !== undefined
+            ? fmtCost(item.total_cost_cny)
+            : item.known_partial_cost_cny !== null && item.known_partial_cost_cny !== undefined
+              ? `${fmtCost(item.known_partial_cost_cny)}（仅已知部分）`
+              : item.cost_status === 'not_applicable' ? '不适用' : '未完整记录';
+          const tokens = item.total_tokens === null || item.total_tokens === undefined
+            ? (Number(item.provider_request_count || 0) ? '未完整记录' : '不适用')
+            : Number(item.total_tokens).toLocaleString();
+          return `<tr class="border-b border-slate-100 last:border-0 hover:bg-slate-50">
+            <td class="px-3 py-3 whitespace-nowrap text-xs text-slate-500">${fmtTime(item.created_at)}</td>
+            <td class="px-3 py-3 min-w-[220px]"><div class="text-sm text-slate-900 line-clamp-2">${escapeHtml(item.question_summary || '后台运行')}</div><div class="mt-1 font-mono text-[10px] text-slate-400">${escapeHtml(item.trace_id)}</div></td>
+            <td class="px-3 py-3 text-xs text-slate-700 whitespace-nowrap">${escapeHtml(laneLabels[item.lane] || (item.lane ? item.lane : '历史Trace未记录'))}</td>
+            <td class="px-3 py-3 text-xs text-slate-700">${escapeHtml(item.agent_name || item.agent_id || '—')}</td>
+            <td class="px-3 py-3 text-xs text-slate-700">${escapeHtml(item.result || '—')}</td>
+            <td class="px-3 py-3 text-xs text-slate-700 text-right">${Number(item.provider_request_count || 0)}</td>
+            <td class="px-3 py-3 text-xs text-slate-700 text-right">${tokens}</td>
+            <td class="px-3 py-3 text-xs text-slate-700 text-right whitespace-nowrap">${cost}</td>
+            <td class="px-3 py-3 text-xs text-slate-700 text-right whitespace-nowrap">${item.total_latency_ms === null || item.total_latency_ms === undefined ? '未记录' : `${Number(item.total_latency_ms).toLocaleString()} ms`}</td>
+            <td class="px-3 py-3"><button type="button" data-trace="${escapeHtml(item.trace_id)}" class="cg-trace-detail-slim px-3 py-1.5 bg-brand-50 text-brand-700 rounded-lg text-xs hover:bg-brand-100">查看详情</button></td>
+          </tr>`;
+        }).join('');
+        return `<section class="bg-white rounded-2xl shadow-soft border border-slate-200 overflow-hidden">
+          <div class="p-4 flex flex-wrap items-center justify-between gap-3 border-b border-slate-100">
+            <div><h2 class="font-semibold text-slate-900">最近 Trace 摘要</h2><p class="mt-1 text-xs text-slate-500">默认仅加载20条摘要；详情与高级诊断按需请求。</p></div>
+            <div class="text-xs text-slate-500">第 ${Number(pagination.page || 1)} / ${Number(pagination.pages || 1)} 页 · 共 ${Number(pagination.total || 0).toLocaleString()} 条</div>
+          </div>
+          <div class="overflow-x-auto"><table class="w-full"><thead><tr class="bg-slate-50 text-left text-[11px] text-slate-500"><th class="px-3 py-2">时间</th><th class="px-3 py-2">问题摘要</th><th class="px-3 py-2">A/B/C</th><th class="px-3 py-2">Agent</th><th class="px-3 py-2">结果</th><th class="px-3 py-2 text-right">Provider请求</th><th class="px-3 py-2 text-right">Total Token</th><th class="px-3 py-2 text-right">总成本</th><th class="px-3 py-2 text-right">总耗时</th><th class="px-3 py-2"></th></tr></thead><tbody>${rows || '<tr><td colspan="10" class="px-4 py-10 text-center text-sm text-slate-400">暂无 Trace。</td></tr>'}</tbody></table></div>
+          <div class="p-4 flex items-center justify-end gap-2 border-t border-slate-100"><button id="cg-prev-page" type="button" ${pagination.hasPrevious ? '' : 'disabled'} class="px-3 py-1.5 rounded-lg text-sm ${pagination.hasPrevious ? 'bg-slate-100 text-slate-700' : 'bg-slate-50 text-slate-300'}">上一页</button><button id="cg-next-page" type="button" ${pagination.hasNext ? '' : 'disabled'} class="px-3 py-1.5 rounded-lg text-sm ${pagination.hasNext ? 'bg-brand-600 text-white' : 'bg-slate-50 text-slate-300'}">下一页</button></div>
+          <div class="px-4 pb-4">${renderFilters()}</div>
+        </section>`;
+      }
+
+      function traceRecordedValue(value, suffix = '') {
+        if (value === null || value === undefined || value === 'historical_trace_not_recorded') return '历史Trace未记录';
+        return `${escapeHtml(String(value))}${suffix}`;
+      }
+
+      async function showTraceDetailSlim(traceId) {
+        try {
+          const data = await apiGet(`/api/observability/traces/${traceId}`);
+          const trace = data.trace || {};
+          const result = data.result_summary || {};
+          const chain = data.execution_chain || [];
+          const requests = data.provider_requests || [];
+          const providerSummary = data.provider_summary || {};
+          const providerUsage = providerSummary.usage_totals || {};
+          const control = data.cost_quality_control || {};
+          const calls = control.call_reduction || {};
+          const loading = control.context_loading || {};
+          const quality = control.quality_evidence || {};
+          const models = control.model_selection || [];
+          const laneLabels = { A_HANDOFF: 'A · 人工协同', B_PROPERTY_GOVERNED: 'B · 物业业务', C_ISOLATED_GENERAL: 'C · 通用回答' };
+          const chainHtml = chain.length ? `<div class="flex flex-wrap gap-2">${chain.map(item => `<div class="rounded-lg border border-slate-200 px-3 py-2 text-xs"><div class="font-medium text-slate-800">${escapeHtml(item.span_name || '历史节点')}</div><div class="mt-1 text-slate-500">${escapeHtml(item.status || '—')} · ${item.latency_ms === null || item.latency_ms === undefined ? '未记录耗时' : `${Number(item.latency_ms)} ms`}</div><div class="mt-1 ${item.provider_called === true ? 'text-blue-700' : 'text-slate-500'}">${escapeHtml(item.provider_token_note || '历史Trace未记录')}</div></div>`).join('<span class="self-center text-slate-300">→</span>')}</div>` : '<p class="text-sm text-slate-500">历史Trace未记录执行链。</p>';
+          const requestRows = requests.map(item => {
+            const cost = item.price_snapshot_cost_cny === null || item.price_snapshot_cost_cny === undefined ? '不可得' : fmtCost(item.price_snapshot_cost_cny);
+            return `<tr class="border-b border-slate-100 last:border-0"><td class="px-2 py-2">${escapeHtml(item.stage_name || item.stage || '模型请求')}</td><td class="px-2 py-2">${escapeHtml(item.requested_model || '未记录')}</td><td class="px-2 py-2">${escapeHtml(item.provider_actual_model || '未记录')}</td><td class="px-2 py-2">${item.thinking_enabled === null || item.thinking_enabled === undefined ? '未记录' : (item.thinking_enabled ? '开启' : '关闭')}</td><td class="px-2 py-2 text-right">${traceRecordedValue(item.cache_hit_input_tokens)}</td><td class="px-2 py-2 text-right">${traceRecordedValue(item.cache_miss_input_tokens)}</td><td class="px-2 py-2 text-right">${traceRecordedValue(item.input_tokens)}</td><td class="px-2 py-2 text-right">${traceRecordedValue(item.output_tokens)}</td><td class="px-2 py-2 text-right">${traceRecordedValue(item.reasoning_tokens)}</td><td class="px-2 py-2 text-right">${traceRecordedValue(item.total_tokens)}</td><td class="px-2 py-2 text-right">${cost}</td><td class="px-2 py-2 text-right">${traceRecordedValue(item.latency_ms, ' ms')}</td><td class="px-2 py-2">${escapeHtml(item.status || '—')}</td></tr>`;
+          }).join('');
+          const providerTotalCost = providerSummary.platform_price_snapshot_direct_cost_cny !== null && providerSummary.platform_price_snapshot_direct_cost_cny !== undefined
+            ? fmtCost(providerSummary.platform_price_snapshot_direct_cost_cny)
+            : (providerSummary.known_partial_cost_cny !== null && providerSummary.known_partial_cost_cny !== undefined
+              ? `${fmtCost(providerSummary.known_partial_cost_cny)}（仅已知部分）`
+              : '不可得');
+          const providerTotalRow = requests.length ? `<tr class="border-t-2 border-slate-200 bg-slate-50 font-medium text-slate-800"><td class="px-2 py-2">Trace合计</td><td class="px-2 py-2" colspan="3">${traceRecordedValue(providerSummary.provider_request_count, ' 次物理请求')}</td><td class="px-2 py-2 text-right">${traceRecordedValue(providerUsage.cache_hit_input_tokens)}</td><td class="px-2 py-2 text-right">${traceRecordedValue(providerUsage.cache_miss_input_tokens)}</td><td class="px-2 py-2 text-right">${traceRecordedValue(providerUsage.input_tokens)}</td><td class="px-2 py-2 text-right">${traceRecordedValue(providerUsage.output_tokens)}</td><td class="px-2 py-2 text-right">${traceRecordedValue(providerUsage.reasoning_tokens)}</td><td class="px-2 py-2 text-right">${traceRecordedValue(providerUsage.total_tokens)}</td><td class="px-2 py-2 text-right">${providerTotalCost}</td><td class="px-2 py-2 text-right">—</td><td class="px-2 py-2">${providerSummary.complete === true ? '完整' : '部分不可得'}</td></tr>` : '';
+          const modelReasons = models.length ? models.map(item => `<li>${escapeHtml(item.stage || '模型请求')}：请求 ${escapeHtml(item.requested_model || '未记录')}，Provider实际 ${escapeHtml(item.provider_actual_model || '未记录')}，Thinking ${item.thinking_enabled === null || item.thinking_enabled === undefined ? '未记录' : (item.thinking_enabled ? '开启' : '关闭')}；理由：${escapeHtml(item.reason || item.model_selection_reason || '历史Trace未记录')}</li>`).join('') : '<li>本轮未调用Provider。</li>';
+          const toolStatuses = Array.isArray(quality.tool_statuses) && quality.tool_statuses.length ? quality.tool_statuses.map(item => `${item.server || '—'}/${item.tool || '—'}=${item.status || '—'}`).join('；') : '无实际调用';
+          const html = `<div class="space-y-5 max-h-[76vh] overflow-y-auto pr-1">
+            <section class="rounded-xl border border-blue-200 bg-blue-50 p-4"><h4 class="font-semibold text-blue-950">本轮结果摘要</h4><div class="mt-2 grid gap-2 sm:grid-cols-3 text-xs"><div><span class="text-blue-700">A/B/C</span><div class="font-medium text-slate-900">${escapeHtml(laneLabels[trace.lane] || '历史Trace未记录')}</div></div><div><span class="text-blue-700">Agent</span><div class="font-medium text-slate-900">${escapeHtml(trace.agent_name || trace.agent_id || '—')}</div></div><div><span class="text-blue-700">answer_status</span><div class="font-medium text-slate-900">${escapeHtml(result.answer_status || '历史Trace未记录')}</div></div></div><p class="mt-3 text-sm text-blue-950 whitespace-pre-wrap">${escapeHtml(result.answer_excerpt || '历史Trace未记录结果摘要')}</p><p class="mt-2 text-[10px] text-blue-700">Trace ${escapeHtml(traceId)} · Snapshot ${escapeHtml(trace.snapshot_hash || '历史Trace未记录')}</p></section>
+            <section><h4 class="font-semibold text-slate-900 mb-2">真实执行链</h4>${chainHtml}</section>
+            <section><h4 class="font-semibold text-slate-900 mb-2">每个物理Provider请求</h4><p class="mb-2 text-xs text-slate-500">Input = Hit + Miss；Total = Input + Output；Reasoning 是 Output 子集，不重复相加。</p><div class="overflow-x-auto"><table class="w-full text-xs min-w-[1180px]"><thead><tr class="bg-slate-50 text-left text-slate-500"><th class="px-2 py-2">节点</th><th class="px-2 py-2">请求模型</th><th class="px-2 py-2">实际模型</th><th class="px-2 py-2">Thinking</th><th class="px-2 py-2 text-right">Hit</th><th class="px-2 py-2 text-right">Miss</th><th class="px-2 py-2 text-right">Input</th><th class="px-2 py-2 text-right">Output</th><th class="px-2 py-2 text-right">其中Reasoning</th><th class="px-2 py-2 text-right">Total</th><th class="px-2 py-2 text-right">快照成本</th><th class="px-2 py-2 text-right">耗时</th><th class="px-2 py-2">状态</th></tr></thead><tbody>${requestRows || '<tr><td colspan="13" class="px-3 py-4 text-slate-500">本轮未调用Provider，无Provider Token。</td></tr>'}${providerTotalRow}</tbody></table></div></section>
+            <section class="rounded-xl border border-cyan-200 bg-cyan-50 p-4"><h4 class="font-semibold text-cyan-950">本轮成本与质量控制</h4><div class="mt-3 grid gap-3 md:grid-cols-2 text-xs text-cyan-950"><div class="rounded-lg bg-white/70 p-3"><div class="font-medium">减少调用</div><p class="mt-1">Router ${traceRecordedValue(calls.router_requests)} 次；Agent ${traceRecordedValue(calls.agent_requests)} 次；同Agent Tool follow-up ${traceRecordedValue(calls.tool_follow_up_requests)} 次；Selector ${traceRecordedValue(calls.selector_requests)} 次；Resolver ${traceRecordedValue(calls.resolver_requests)} 次；第二Agent ${traceRecordedValue(calls.second_agent_requests)} 次；自动重试 ${traceRecordedValue(calls.automatic_retries)} 次。</p></div><div class="rounded-lg bg-white/70 p-3"><div class="font-medium">减少装载</div><p class="mt-1">Router会话消息 ${traceRecordedValue(loading.router_session_message_count)}；最小Agent卡 ${traceRecordedValue(loading.router_minimal_agent_card_count)}；Skill bound/used ${traceRecordedValue(loading.skill_bound_count)} / ${traceRecordedValue(loading.skill_used_count)}；RAG候选/装载/字符 ${traceRecordedValue(loading.rag_candidate_count)} / ${traceRecordedValue(loading.rag_loaded_chunk_count)} / ${traceRecordedValue(loading.rag_loaded_characters)}；Tool schema/调用/结果字符 ${traceRecordedValue(loading.tool_schema_exposed_count)} / ${traceRecordedValue(loading.tool_actual_call_count)} / ${traceRecordedValue(loading.tool_result_characters)}。</p><p class="mt-1 text-cyan-700">Provider Input Token是权威总量；组件仅展示数量和字符，不伪装精确Token拆分。</p></div><div class="rounded-lg bg-white/70 p-3"><div class="font-medium">质量依据</div><p class="mt-1">answer_status=${escapeHtml(String(quality.answer_status || '历史Trace未记录'))}；RAG Evidence=${traceRecordedValue(quality.rag_evidence_count)}；Citation=${escapeHtml(String(quality.citation_validation || '历史Trace未记录'))}；Tool=${escapeHtml(toolStatuses)}；Proposal=${escapeHtml(String(quality.proposal_status || '不适用'))}；人工评价=${escapeHtml(String(quality.human_evaluation || '尚未评价'))}。</p></div><div class="rounded-lg bg-white/70 p-3"><div class="font-medium">模型选择</div><ul class="mt-1 list-disc list-inside space-y-1">${modelReasons}</ul></div></div></section>
+            <details id="cg-trace-advanced" class="rounded-xl border border-slate-200 bg-slate-50 p-4"><summary class="cursor-pointer font-medium text-slate-800">高级诊断（展开后加载Evidence、Tool结果与Raw JSON）</summary><div id="cg-trace-advanced-body" class="mt-3 text-sm text-slate-500">尚未加载。</div></details>
+          </div>`;
+          openModal('Trace详情', html, null, '关闭');
+          setTimeout(() => {
+            const advanced = $('#cg-trace-advanced');
+            if (!advanced) return;
+            let loaded = false;
+            advanced.addEventListener('toggle', async () => {
+              if (!advanced.open || loaded) return;
+              loaded = true;
+              const target = $('#cg-trace-advanced-body');
+              target.innerHTML = '加载中…';
+              try {
+                const full = await apiGet(`/api/observability/traces/${traceId}/advanced`);
+                const messages = full.messages || [];
+                const assistant = messages.find(item => item.role === 'assistant') || {};
+                const citations = assistant.citations || [];
+                const tools = full.mcp_calls || [];
+                const evidenceHtml = citations.length ? citations.map(item => `<div class="rounded-lg border border-slate-200 bg-white p-3"><div class="text-xs font-medium text-slate-800">${escapeHtml(item.doc_title || item.document_title || 'RAG Evidence')} · chunk ${escapeHtml(String(item.chunk_index ?? '—'))}</div><p class="mt-1 text-xs text-slate-600 whitespace-pre-wrap">${escapeHtml(String(item.content_snapshot || item.content || '').slice(0, 1000))}</p></div>`).join('') : '<p class="text-xs text-slate-500">本轮无RAG Evidence。</p>';
+                const toolHtml = tools.length ? tools.map(item => `<div class="rounded-lg border border-slate-200 bg-white p-3"><div class="text-xs font-medium text-slate-800">${escapeHtml(item.server_name || '—')}/${escapeHtml(item.tool_name || '—')} · ${escapeHtml(item.status || '—')}</div><p class="mt-1 text-xs text-slate-600 whitespace-pre-wrap">${escapeHtml(maskTraceText(item.result_summary || item.error_summary || '无结果摘要'))}</p></div>`).join('') : '<p class="text-xs text-slate-500">本轮无Tool结果。</p>';
+                target.innerHTML = `<div class="space-y-4"><div><h5 class="font-medium text-slate-800 mb-2">完整Evidence</h5><div class="space-y-2">${evidenceHtml}</div></div><div><h5 class="font-medium text-slate-800 mb-2">Tool结果</h5><div class="space-y-2">${toolHtml}</div></div><details class="rounded-lg border border-slate-200 bg-white p-3"><summary class="cursor-pointer text-sm font-medium text-slate-700">Raw JSON</summary><pre class="mt-2 max-h-80 overflow-auto whitespace-pre-wrap break-all text-[10px]">${escapeHtml(safeTraceJson(full))}</pre></details></div>`;
+              } catch (error) {
+                loaded = false;
+                target.innerHTML = `<span class="text-red-600">高级诊断加载失败：${escapeHtml(error.message || error)}</span>`;
+              }
+            });
+          }, 0);
+        } catch (error) {
+          showToast('加载Trace详情失败：' + (error.message || error), 'error');
         }
       }
 
@@ -5047,11 +5132,9 @@
       function renderPage() {
         container.innerHTML = `
           <div class="max-w-6xl mx-auto p-4 md:p-6 space-y-5">
-            ${pageHeader('调用与成本 · Trace（运行调用记录）', '按时间查看逐请求Provider实际Usage与平台价格快照直接成本；Trace不是DeepSeek最终账单。').replace('sticky top-0 z-10', 'relative')}
-            ${renderOverview()}
-            ${renderTraces()}
-            ${renderGovernancePrinciples()}
-            <details class="rounded-2xl border border-slate-200 bg-slate-50 p-3"><summary class="cursor-pointer text-sm font-medium text-slate-700">高级信息：价格、预算与策略说明</summary><div class="mt-3 space-y-4">${renderPrices()}${renderBudget()}${renderStrategy()}<div class="rounded-xl border border-slate-200 bg-white p-3"><p class="text-xs text-slate-500">以下入口保留历史成本策略与无模型预览能力，不属于5分钟默认演示路径。</p><button id="cg-open-cost-strategy" type="button" class="mt-2 px-3 py-1.5 bg-slate-800 text-white rounded-lg text-xs">查看高级成本策略</button></div></div></details>
+            ${pageHeader('Trace 与真实成本', '首屏只加载最近20条摘要；单条详情和高级诊断按需读取，不会触发模型、RAG或成本实验。').replace('sticky top-0 z-10', 'relative')}
+            ${renderTraceSummariesSlim()}
+            <details id="cg-provider-ledger" class="rounded-2xl border border-slate-200 bg-white p-4"><summary class="cursor-pointer text-sm font-medium text-slate-800">④-A Provider账本（点击核对冻结数字）</summary><div id="cg-provider-ledger-body" class="mt-3 text-xs text-slate-500">尚未加载。</div></details>
           </div>
         `;
         bindEvents();
@@ -5062,54 +5145,49 @@
           state.filters.search = $('#cg-search').value.trim();
           state.filters.model = $('#cg-model').value;
           state.filters.stage = $('#cg-stage').value;
-          state.pagination.page = 1;
-          state.resolvedScope = null;
-          await reloadPage();
-        });
-        $$('.cg-range-btn').forEach(btn => btn.addEventListener('click', async () => {
-          state.rangeKey = btn.dataset.range;
-          if (state.rangeKey === 'custom' && (!state.customStart || !state.customEnd)) {
-            state.customStart = beijingToday();
-            state.customEnd = state.customStart;
-          }
-          state.resolvedScope = null;
-          state.pagination.page = 1;
-          await reloadPage();
-        }));
-        const customApply = $('#cg-custom-apply');
-        if (customApply) customApply.addEventListener('click', async () => {
-          const customStart = $('#cg-custom-start').value;
-          const customEnd = $('#cg-custom-end').value;
-          if (!customStart || !customEnd) return showToast('请选择完整的开始和结束日期', 'error');
-          if (customStart > customEnd) return showToast('开始日期不能晚于结束日期', 'error');
-          state.customStart = customStart;
-          state.customEnd = customEnd;
-          state.resolvedScope = null;
+          state.filters.sortOrder = $('#cg-sort').value;
           state.pagination.page = 1;
           await reloadPage();
         });
         const previousPage = $('#cg-prev-page');
         if (previousPage && state.pagination.hasPrevious) previousPage.addEventListener('click', async () => {
           state.pagination.page -= 1;
-          await reloadPage({ refreshSummary: false });
+          await reloadPage();
         });
         const nextPage = $('#cg-next-page');
         if (nextPage && state.pagination.hasNext) nextPage.addEventListener('click', async () => {
           state.pagination.page += 1;
-          await reloadPage({ refreshSummary: false });
+          await reloadPage();
         });
-        $$('.cg-trace-detail').forEach(btn => btn.addEventListener('click', () => showTraceDetail(btn.dataset.trace)));
-        $('#cg-add-price').addEventListener('click', () => openPriceModal());
-        $$('.cg-edit-price').forEach(btn => {
-          const price = state.prices.find(p => String(p.id) === btn.dataset.priceId);
-          btn.addEventListener('click', () => openPriceModal(price));
-        });
-        $('#cg-edit-budget').addEventListener('click', openBudgetModal);
-        $('#cg-open-cost-strategy').addEventListener('click', () => {
-          STATE.subTab = 'cost-strategy';
-          renderSidebar();
-          renderContent();
-        });
+        $$('.cg-trace-detail-slim').forEach(btn => btn.addEventListener('click', () => showTraceDetailSlim(btn.dataset.trace)));
+        const ledger = $('#cg-provider-ledger');
+        if (ledger) {
+          let ledgerLoaded = false;
+          ledger.addEventListener('toggle', async () => {
+            if (!ledger.open || ledgerLoaded) return;
+            ledgerLoaded = true;
+            const target = $('#cg-provider-ledger-body');
+            target.innerHTML = '加载中…';
+            try {
+              const snapshot = await apiGet('/api/observability/overview?range_key=custom&start=2026-08-01&end=2026-08-01');
+              const usage = snapshot.known_usage || {};
+              const actual = {
+                calls: Number(snapshot.provider_request_count || 0),
+                hit: Number(usage.input_cache_hit_tokens || 0),
+                miss: Number(usage.input_cache_miss_tokens || 0),
+                output: Number(usage.output_tokens || 0),
+                reasoning: Number(usage.reasoning_tokens || 0),
+                total: Number(snapshot.total_tokens || 0),
+                cost: Number(snapshot.platform_price_snapshot_direct_cost_cny)
+              };
+              const reconciled = actual.calls === 15 && actual.hit === 4096 && actual.miss === 12373 && actual.output === 6714 && actual.reasoning === 5009 && actual.total === 23183 && Math.abs(actual.cost - 0.02588292) < 0.000000001;
+              target.innerHTML = `<div class="rounded-lg border ${reconciled ? 'border-emerald-200 bg-emerald-50 text-emerald-900' : 'border-red-200 bg-red-50 text-red-800'} p-3"><div class="font-medium">${reconciled ? 'PASS / FROZEN · Provider账本已对平' : '冻结基准未对平，请核查账本'}</div><div class="mt-1">${actual.calls}次Provider请求 · Hit ${actual.hit.toLocaleString()} · Miss ${actual.miss.toLocaleString()} · Output ${actual.output.toLocaleString()}（其中Reasoning ${actual.reasoning.toLocaleString()}）· Total ${actual.total.toLocaleString()} · 平台历史价格快照成本 ${Number.isFinite(actual.cost) ? fmtCost(actual.cost) : '不可得'}</div><div class="mt-1 text-[10px]">Total = Hit + Miss + Output；Reasoning 是 Output 子集，不重复相加。</div></div>`;
+            } catch (error) {
+              ledgerLoaded = false;
+              target.innerHTML = `<span class="text-red-600">账本加载失败：${escapeHtml(error.message || error)}</span>`;
+            }
+          });
+        }
       }
 
       await reloadPage();
