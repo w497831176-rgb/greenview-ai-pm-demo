@@ -13,6 +13,7 @@ from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 
 from app.runtime.agent_factory import (
     build_agent_from_snapshot,
+    resolve_model_used_skills,
     router_agent_cards,
     vertical_agent_cards,
 )
@@ -150,6 +151,14 @@ class InternalControlPayloadLeakError(RuntimeError):
     """A control-plane JSON payload reached the user-answer boundary."""
 
 
+class RouterContractInvalidError(RuntimeError):
+    """The sole Router returned an invalid structured decision."""
+
+
+class AgentContractInvalidError(RuntimeError):
+    """The frozen B/C Agent returned an invalid structured envelope."""
+
+
 def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, default=str)
 
@@ -199,21 +208,70 @@ def _decision(status: str, reason: str, **details: Any) -> Dict[str, Any]:
 
 
 def _extract_tool_calls(value: Any) -> List[Dict[str, Any]]:
+    def field(raw: Any, name: str) -> Any:
+        return raw.get(name) if isinstance(raw, dict) else getattr(raw, name, None)
+
+    def arguments_from(raw: Any) -> Dict[str, Any]:
+        nested = field(raw, "function")
+        arguments = (
+            field(raw, "tool_args")
+            or field(raw, "arguments")
+            or field(raw, "args")
+            or (field(nested, "arguments") if nested is not None else None)
+            or {}
+        )
+        if hasattr(arguments, "model_dump"):
+            arguments = arguments.model_dump()
+        if isinstance(arguments, str):
+            try:
+                parsed = json.loads(arguments)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                parsed = None
+            arguments = parsed if isinstance(parsed, dict) else {"value": arguments}
+        elif not isinstance(arguments, dict):
+            arguments = {"value": str(arguments)}
+        return arguments
+
     calls: List[Dict[str, Any]] = []
     candidate = getattr(value, "run_response", None) or value
     raw_calls = getattr(candidate, "tool_calls", None) or getattr(candidate, "tools", None) or []
     for raw in raw_calls:
-        if isinstance(raw, dict):
-            name = raw.get("tool_name") or raw.get("name") or raw.get("tool") or ""
-            arguments = raw.get("arguments") or raw.get("args") or {}
+        nested = field(raw, "function")
+        name = (
+            field(raw, "tool_name")
+            or field(raw, "name")
+            or field(raw, "tool")
+            or (field(nested, "name") if nested is not None else None)
+            or ""
+        )
+        error = field(raw, "tool_call_error") or field(raw, "error")
+        status_value = field(raw, "status")
+        if hasattr(status_value, "value"):
+            status_value = status_value.value
+        raw_status = str(status_value or "").strip().lower().rsplit(".", 1)[-1]
+        if error or raw_status in {"failed", "error", "cancelled", "canceled"}:
+            status = "failed"
+        elif raw_status in {"success", "completed", "complete"} or not raw_status:
+            status = "success"
         else:
-            name = getattr(raw, "tool", None) or getattr(raw, "name", None) or ""
-            arguments = getattr(raw, "arguments", None) or getattr(raw, "args", None) or {}
-        if hasattr(arguments, "model_dump"):
-            arguments = arguments.model_dump()
-        elif not isinstance(arguments, dict):
-            arguments = {"value": str(arguments)}
-        item = {"tool_name": str(name), "arguments": arguments}
+            status = raw_status
+        result = field(raw, "result")
+        item = {
+            "tool_name": str(name),
+            "arguments": arguments_from(raw),
+            "status": status,
+        }
+        tool_call_id = (
+            field(raw, "tool_call_id")
+            or field(raw, "call_id")
+            or field(raw, "id")
+        )
+        if tool_call_id:
+            item["tool_call_id"] = str(tool_call_id)
+        if error:
+            item["error_summary"] = str(error)
+        if result is not None:
+            item["result_summary"] = str(result)[:500]
         if item not in calls:
             calls.append(item)
     return calls
@@ -348,6 +406,32 @@ def _render_visible_history_context(
     return "\n".join(lines)
 
 
+def _build_retrieval_queries(history: List[Dict[str, str]]) -> List[str]:
+    """Build generic current-plus-context query segments without history dilution.
+
+    Router still receives every visible message with its timestamp. Retrieval
+    deliberately searches the current user bubble and each prior user context
+    as separate semantic segments. Assistant output is not treated as source
+    evidence, and unrelated values in one old bubble cannot veto another
+    segment's valid evidence.
+    """
+
+    user_messages = [
+        str(item.get("content") or "").strip()
+        for item in history
+        if item.get("role") == "user" and str(item.get("content") or "").strip()
+    ]
+    if not user_messages:
+        raise ValueError("retrieval requires visible user context")
+    current = user_messages[-1]
+    queries = [current]
+    for prior in reversed(user_messages[:-1]):
+        contextual = f"{prior}\n{current}"
+        if contextual not in queries:
+            queries.append(contextual)
+    return queries
+
+
 def _is_internal_control_payload(text: str) -> bool:
     """Reject a whole response that is Router/Lane control JSON, not user prose."""
 
@@ -377,16 +461,11 @@ def _is_internal_control_payload(text: str) -> bool:
 
 
 def _parse_agent_turn_result(raw: str) -> AgentTurnResult:
-    """Parse the selected Agent's optional strict envelope.
-
-    Plain prose is a read-only answer. JSON that attempts any structured
-    runtime field must validate completely; it is never interpreted
-    semantically or repaired.
-    """
+    """Parse one whole strict envelope; never repair or pass through prose."""
 
     text = str(raw or "").strip()
     if not text:
-        raise ValueError("selected Agent returned an empty answer")
+        raise AgentContractInvalidError("selected Agent returned an empty answer")
     structured_text = text
     lines = structured_text.splitlines()
     if (
@@ -395,25 +474,80 @@ def _parse_agent_turn_result(raw: str) -> AgentTurnResult:
         and lines[-1].strip() == "```"
     ):
         structured_text = "\n".join(lines[1:-1]).strip()
-    if not (
-        structured_text.startswith("{") and structured_text.endswith("}")
-    ):
-        return AgentTurnResult(answer=text)
+    if not (structured_text.startswith("{") and structured_text.endswith("}")):
+        raise AgentContractInvalidError(
+            "selected Agent response was not one complete JSON object"
+        )
     try:
         payload = json.loads(structured_text)
-    except json.JSONDecodeError:
-        return AgentTurnResult(answer=text)
+    except json.JSONDecodeError as exc:
+        raise AgentContractInvalidError(
+            "selected Agent response was not valid JSON"
+        ) from exc
     if not isinstance(payload, dict):
-        return AgentTurnResult(answer=text)
-    structured_keys = {
-        "answer",
-        "answer_status",
-        "citation_evidence_ids",
-        "proposal_request",
-    }
-    if not structured_keys.intersection(payload):
-        return AgentTurnResult(answer=text)
-    return AgentTurnResult.model_validate(payload)
+        raise AgentContractInvalidError("selected Agent envelope must be an object")
+    try:
+        return AgentTurnResult.model_validate(payload)
+    except Exception as exc:
+        raise AgentContractInvalidError(
+            f"selected Agent envelope schema invalid: {type(exc).__name__}"
+        ) from exc
+
+
+def _validate_agent_capability_usage(
+    agent_turn: AgentTurnResult,
+    *,
+    activated_skills: List[Any],
+    evidence: Any,
+    mcp_invocations: List[Any],
+    tool_calls: List[Dict[str, Any]],
+) -> None:
+    """Fail closed when the Agent's usage declaration differs from runtime facts."""
+
+    declared = agent_turn.capability_usage
+    actual_skill_ids = sorted({int(item.skill_id) for item in activated_skills})
+    declared_skill_ids = sorted({int(item) for item in declared.skill_ids})
+    if declared_skill_ids != actual_skill_ids:
+        raise AgentContractInvalidError(
+            "capability_usage.skill_ids did not match native Skill calls"
+        )
+
+    evidence_ids = set(evidence.by_id())
+    declared_citations = set(agent_turn.citations)
+    declared_rag_ids = set(declared.rag_evidence_ids)
+    if not declared_citations.issubset(evidence_ids):
+        raise AgentContractInvalidError(
+            "Agent citation ID was outside this turn's RAG EvidenceSet"
+        )
+    if declared_rag_ids != declared_citations:
+        raise AgentContractInvalidError(
+            "capability_usage.rag_evidence_ids did not match citations"
+        )
+
+    actual_mcp_names = sorted(
+        {str(item.tool_name) for item in mcp_invocations if item.tool_name}
+    )
+    declared_mcp_names = sorted({str(item) for item in declared.mcp_calls})
+    if declared_mcp_names != actual_mcp_names:
+        raise AgentContractInvalidError(
+            "capability_usage.mcp_calls did not match runtime MCP calls"
+        )
+
+    mcp_names = set(actual_mcp_names)
+    actual_tool_names = sorted(
+        {
+            str(call.get("tool_name") or "")
+            for call in tool_calls
+            if call.get("tool_name")
+            and str(call.get("tool_name")) != "get_skill_instructions"
+            and str(call.get("tool_name")) not in mcp_names
+        }
+    )
+    declared_tool_names = sorted({str(item) for item in declared.tool_calls})
+    if declared_tool_names != actual_tool_names:
+        raise AgentContractInvalidError(
+            "capability_usage.tool_calls did not match runtime Tool calls"
+        )
 
 
 def _lane_explanation(decision: LaneDecision) -> str:
@@ -497,73 +631,6 @@ def _requires_rag_citation(
         and int(linked_skill_evidence_count or 0) == 0
         and int(successful_tool_evidence_count or 0) == 0
         and answer_contract.response_mode == ResponseMode.GROUNDED_ANSWER
-    )
-
-
-def _effective_lane_decision(
-    decision: LaneDecision,
-    *,
-    handoff_status: str = "none",
-    handoff_reason_code: str = "",
-    handoff_queue: str = "",
-) -> Tuple[LaneDecision, Optional[str]]:
-    """Enforce the product invariant before Lane SSE or evidence persistence.
-
-    The Router remains the only semantic classifier. This function consumes
-    only its structured result (plus an already-persisted Handoff state); it
-    never inspects user text. The optional return value preserves the Router's
-    reported lane for audit when normalization was required.
-    """
-
-    active_handoff = str(handoff_status or "none") in {
-        "requested",
-        "active",
-        "waiting_user",
-    }
-    persisted_safety = active_handoff and (
-        str(handoff_reason_code or "").strip() == "safety_risk"
-        or str(handoff_queue or "").strip() == "emergency"
-    )
-    user_requested = (
-        str(decision.business_intent or "").strip()
-        == "user_requested_handoff"
-    )
-    if decision.lane == RuntimeLane.HANDOFF:
-        if persisted_safety and user_requested:
-            return (
-                LaneDecision(
-                    lane=RuntimeLane.HANDOFF,
-                    business_intent="safety_risk",
-                    reason="会话已有现实安全风险人工协同，本轮继续由紧急队列处理。",
-                    decision_source=decision.decision_source,
-                ),
-                decision.lane.value,
-            )
-        return decision, None
-    if not (user_requested or active_handoff):
-        return decision, None
-    effective_intent = (
-        "safety_risk" if persisted_safety else "user_requested_handoff"
-    )
-    return (
-        LaneDecision(
-            lane=RuntimeLane.HANDOFF,
-            business_intent=effective_intent,
-            reason=(
-                (
-                    "会话已有现实安全风险人工协同，本轮继续由紧急队列处理。"
-                    if persisted_safety
-                    else "会话已有普通人工协同，本轮继续由工作人员处理。"
-                )
-                if active_handoff and not user_requested
-                else (
-                    decision.reason
-                    or "本轮已确认需要由工作人员接手。"
-                )
-            ),
-            decision_source=decision.decision_source,
-        ),
-        decision.lane.value,
     )
 
 
@@ -784,7 +851,7 @@ def _thinking_for_snapshot(snapshot_config: Dict[str, Any], model_id: str) -> bo
 
 
 def _results_from_snapshot(
-    query: str,
+    query: Any,
     live_results: List[Dict[str, Any]],
     knowledge_versions: Dict[int, Dict[str, Any]],
     allowed_document_ids: set[int],
@@ -793,6 +860,14 @@ def _results_from_snapshot(
     context_token_budget: int = 1800,
 ) -> Tuple[List[Dict[str, Any]], bool]:
     import rag_retrieval
+
+    queries = [
+        str(item).strip()
+        for item in (query if isinstance(query, list) else [query])
+        if str(item or "").strip()
+    ]
+    if not queries:
+        raise ValueError("snapshot evidence validation requires a query")
 
     published_chunks: Dict[Tuple[int, int], Dict[str, Any]] = {}
     for doc_id in allowed_document_ids:
@@ -912,14 +987,24 @@ def _results_from_snapshot(
             document.get("title") or "",
         ):
             continue
-        query_values = rag_retrieval._required_evidence_values(query)
-        if query_values and not query_values.issubset(
-            rag_retrieval._critical_values(content)
-        ):
+        accepted_scores: List[Tuple[float, int]] = []
+        content_values = rag_retrieval._critical_values(content)
+        for query_index, query_segment in enumerate(queries):
+            query_values = rag_retrieval._required_evidence_values(query_segment)
+            if query_values and not query_values.issubset(content_values):
+                continue
+            segment_score = rag_retrieval._context_relevance_score(
+                query_segment,
+                content,
+            )
+            if segment_score >= context_threshold:
+                accepted_scores.append((segment_score, query_index))
+        if not accepted_scores:
             continue
-        context_score = rag_retrieval._context_relevance_score(query, content)
-        if context_score < context_threshold:
-            continue
+        context_score, matched_query_index = max(
+            accepted_scores,
+            key=lambda item: (item[0], -item[1]),
+        )
         fallback.append(
             {
                 "doc_id": doc_id,
@@ -934,6 +1019,7 @@ def _results_from_snapshot(
                 "evidence_status": "accepted",
                 "evidence_reason": "accepted_snapshot_lexical",
                 "retrieval_sources": ["runtime_release_snapshot_lexical"],
+                "matched_query_index": matched_query_index,
             }
         )
     fallback.sort(key=lambda item: float(item.get("context_score") or 0), reverse=True)
@@ -1082,15 +1168,27 @@ class RuntimeCoordinator:
                 "provider_failure"
                 if isinstance(exc, ProviderFailureError)
                 else (
-                    "internal_control_payload_leak"
-                    if isinstance(exc, InternalControlPayloadLeakError)
-                    else "runtime_failure"
+                    "router_contract_invalid"
+                    if isinstance(exc, RouterContractInvalidError)
+                    else (
+                        "agent_contract_invalid"
+                        if isinstance(
+                            exc,
+                            (AgentContractInvalidError, InternalControlPayloadLeakError),
+                        )
+                        else "runtime_failure"
+                    )
                 )
             )
             public_error = (
                 PROVIDER_FAILURE_PUBLIC_MESSAGE
                 if failure_code == "provider_failure"
-                else RUNTIME_FAILURE_PUBLIC_MESSAGE
+                else (
+                    "本次回答未通过运行合同校验，已透明停止，请稍后重试。"
+                    if failure_code
+                    in {"router_contract_invalid", "agent_contract_invalid"}
+                    else RUNTIME_FAILURE_PUBLIC_MESSAGE
+                )
             )
             state.status = RunStatus.FAILED
             state.next_step = None
@@ -1242,7 +1340,7 @@ class RuntimeCoordinator:
         if result.get("decision") is None:
             if provider_status != "success":
                 raise ProviderFailureError("unified Router Provider call failed")
-            raise RuntimeError(
+            raise RouterContractInvalidError(
                 "unified Router contract invalid: "
                 + str(result.get("validation_error") or "schema validation failed")
             )
@@ -1322,6 +1420,10 @@ class RuntimeCoordinator:
                 "candidate_fields": ["agent_id", "name", "description", "scope"],
                 "candidate_count": len(cards),
                 "visible_message_count": len(visible_messages),
+                "physical_request_count": len(attempts),
+                "automatic_retry_count": 0,
+                "selector_request_count": 0,
+                "resolver_request_count": 0,
                 "answer_contract": state.answer_contract.model_dump(mode="json"),
             },
         )
@@ -1437,34 +1539,10 @@ class RuntimeCoordinator:
                 raise RuntimeError("semantic LaneDecision schema validation failed")
             reported_decision = result["decision"]
 
-        current_session = get_chat_session(session_id) or {}
-        effective_decision, normalized_from_lane = _effective_lane_decision(
-            reported_decision,
-            handoff_status=str(
-                current_session.get("handoff_status") or "none"
-            ),
-            handoff_reason_code=str(
-                current_session.get("handoff_reason_code") or ""
-            ),
-            handoff_queue=str(current_session.get("handoff_queue") or ""),
-        )
-        state.lane_decision = effective_decision
-        if normalized_from_lane:
-            ledger.append(
-                "system_observations",
-                {
-                    "type": "effective_lane_invariant",
-                    "router_reported_lane": normalized_from_lane,
-                    "router_reported_business_intent": reported_decision.business_intent,
-                    "effective_lane": RuntimeLane.HANDOFF.value,
-                    "business_intent": state.lane_decision.business_intent,
-                    "reason_code": (
-                        "safety_risk"
-                        if state.lane_decision.business_intent == "safety_risk"
-                        else "user_requested"
-                    ),
-                },
-            )
+        # The one Router result is final for this bubble. Persisted Handoff
+        # fields remain historical state and must never rewrite a new A/B/C
+        # decision or recreate legacy ordinary/safety/emergency subtypes.
+        state.lane_decision = reported_decision
 
         if self._is_new_work_order_start_authorized(state.lane_decision):
             state.path = RuntimePath.CONTROLLED_ACTION
@@ -1686,7 +1764,7 @@ class RuntimeCoordinator:
         ledger: EvidenceLedger,
         started: float,
     ) -> AsyncIterator[str]:
-        """Execute either A-lane Handoff subtype from one immutable contract."""
+        """Execute the one product-level A Handoff and short-circuit all capabilities."""
 
         if state.lane_decision is None or state.answer_contract is None:
             raise RuntimeError("A handoff started without contracts")
@@ -2707,6 +2785,8 @@ class RuntimeCoordinator:
         visible_history = _visible_chat_history(
             session_id,
         )
+        retrieval_queries = _build_retrieval_queries(visible_history)
+        retrieval_query = retrieval_queries[0]
         all_cards = vertical_agent_cards(snapshot.config)
         cards = _lane_candidates(all_cards, state.lane_decision.lane)
         if not cards:
@@ -2753,6 +2833,9 @@ class RuntimeCoordinator:
                 "selection_source": "unified_router",
                 "snapshot_id": snapshot.snapshot_id,
                 "immutable_for_turn": True,
+                "second_agent_request_count": 0,
+                "automatic_retry_count": 0,
+                "non_selected_agent_capabilities_loaded": False,
             },
         )
         yield _sse(
@@ -2817,15 +2900,80 @@ class RuntimeCoordinator:
             try:
                 import rag_retrieval
 
-                retrieval = await asyncio.to_thread(
-                    rag_retrieval.advanced_search,
-                    message,
-                    snapshot.config.get("retrieval_policy") or {},
-                    allowed_document_ids=sorted(allowed_doc_ids),
+                search_parts = await asyncio.gather(
+                    *(
+                        asyncio.to_thread(
+                            rag_retrieval.advanced_search,
+                            query_segment,
+                            snapshot.config.get("retrieval_policy") or {},
+                            allowed_document_ids=sorted(allowed_doc_ids),
+                        )
+                        for query_segment in retrieval_queries
+                    ),
+                    return_exceptions=True,
                 )
-                results = list((retrieval or {}).get("results") or [])
+                successful_parts = [
+                    item for item in search_parts if isinstance(item, dict)
+                ]
+                failed_parts = [
+                    item for item in search_parts if isinstance(item, BaseException)
+                ]
+                if not successful_parts:
+                    raise RuntimeError(
+                        str(failed_parts[0])
+                        if failed_parts
+                        else "contextual retrieval returned no result envelope"
+                    )
+                merged_results: Dict[Tuple[Any, Any], Dict[str, Any]] = {}
+                for query_index, part in enumerate(search_parts):
+                    if not isinstance(part, dict):
+                        continue
+                    for raw_result in list(part.get("results") or []):
+                        item = dict(raw_result)
+                        key = (
+                            item.get("doc_id", item.get("document_id")),
+                            item.get("chunk_index"),
+                        )
+                        item["context_query_indexes"] = [query_index]
+                        current = merged_results.get(key)
+                        if current is None:
+                            merged_results[key] = item
+                            continue
+                        indexes = sorted(
+                            set(current.get("context_query_indexes") or [])
+                            | {query_index}
+                        )
+                        if float(item.get("score") or 0.0) > float(
+                            current.get("score") or 0.0
+                        ):
+                            item["context_query_indexes"] = indexes
+                            merged_results[key] = item
+                        else:
+                            current["context_query_indexes"] = indexes
+                results = sorted(
+                    merged_results.values(),
+                    key=lambda item: (
+                        -float(item.get("score") or 0.0),
+                        min(item.get("context_query_indexes") or [0]),
+                    ),
+                )
+                first_part = successful_parts[0]
+                retrieval = {
+                    "results": results,
+                    "query_count": len(retrieval_queries),
+                    "failed_query_count": len(failed_parts),
+                    "filter_summary": {"candidate_count": len(results)},
+                    "evidence_policy": first_part.get("evidence_policy"),
+                }
+                if failed_parts:
+                    ledger.violation(
+                        "live_retrieval_failed",
+                        "one or more contextual retrieval segments failed",
+                        failed_query_count=len(failed_parts),
+                        query_count=len(retrieval_queries),
+                    )
                 results, used_snapshot_fallback = _results_from_snapshot(
-                    message,
+                    retrieval_queries,
                     results,
                     knowledge_versions,
                     allowed_doc_ids,
@@ -2849,11 +2997,15 @@ class RuntimeCoordinator:
                 retrieval_status = (
                     "completed_snapshot_fallback"
                     if used_snapshot_fallback
-                    else "completed"
+                    else (
+                        "completed_partial_failure"
+                        if failed_parts
+                        else "completed"
+                    )
                 )
             except Exception as exc:
                 results, _ = _results_from_snapshot(
-                    message,
+                    retrieval_queries,
                     [],
                     knowledge_versions,
                     allowed_doc_ids,
@@ -2883,7 +3035,7 @@ class RuntimeCoordinator:
                     snapshot_fallback_count=len(results),
                 )
         evidence = build_evidence_set(
-            message,
+            retrieval_query,
             results,
             knowledge_versions=knowledge_versions,
             allowed_document_ids=allowed_doc_ids,
@@ -2924,9 +3076,21 @@ class RuntimeCoordinator:
                 ],
                 "retrieval_status": retrieval_status,
                 "snapshot_fallback": used_snapshot_fallback,
+                "candidate_count": int(
+                    ((retrieval or {}).get("filter_summary") or {}).get(
+                        "candidate_count"
+                    )
+                    or len((retrieval or {}).get("results") or [])
+                ),
+                "loaded_chunk_count": len(evidence.items),
+                "loaded_character_count": sum(
+                    len(item.content_snapshot) for item in evidence.items
+                ),
                 "evidence_policy": (retrieval or {}).get("evidence_policy"),
                 "filter_summary": (retrieval or {}).get("filter_summary"),
                 "direct_knowledge_required": direct_knowledge_required,
+                "query_message_count": len(visible_history),
+                "query_segment_count": len(retrieval_queries),
                 "decision_reason": (
                     "structured_realtime_query"
                     if structured_realtime_query
@@ -3006,18 +3170,12 @@ class RuntimeCoordinator:
                 and state.answer_contract.skill_policy == "selected"
             ),
         )
-        state.activated_skills = build.activated_skills
-        for call in build.skill_tool_calls:
-            record_trace_event(
-                trace_id,
-                f"skill.{call['skill_id']}.get_skill_instructions",
-                "success",
-                output_summary=(
-                    f"loaded Skill {call['skill_id']} "
-                    f"version={call['skill_version']}"
-                ),
-                metadata=call,
-            )
+        state.activated_skills = []
+        bound_skill_ids = [item.skill_id for item in build.bound_skills]
+        tool_schema_count = sum(
+            len(getattr(toolkit, "allowed_function_names", set()) or set())
+            for toolkit in model_native_toolkits
+        )
         successful_tool_evidence = [
             invocation
             for invocation in invocations
@@ -3052,19 +3210,10 @@ class RuntimeCoordinator:
                 ),
             ),
             "skill": _decision(
-                "skipped" if not build.activated_skills else "selected",
-                (
-                    "structured_realtime_query"
-                    if structured_realtime_query
-                    else (
-                        "matched_intent"
-                        if build.activated_skills
-                        else "no_match"
-                    )
-                ),
-                skill_ids=[
-                    item.skill_id for item in build.activated_skills
-                ],
+                "skipped",
+                "awaiting_same_agent_native_use",
+                bound_skill_ids=bound_skill_ids,
+                used_skill_ids=[],
             ),
             "rag": _decision(
                 (
@@ -3089,16 +3238,10 @@ class RuntimeCoordinator:
                 evidence_decision=knowledge_gate["evidence_decision"],
             ),
             "tool": _decision(
-                "selected" if read_tool_plans else "skipped",
-                (
-                    "exact_workorder_lookup"
-                    if structured_realtime_query
-                    else ("matched_intent" if read_tool_plans else "not_required")
-                ),
-                tools=[
-                    f"{plan.server_name}/{plan.tool_name}"
-                    for plan in read_tool_plans
-                ],
+                "skipped",
+                "awaiting_same_agent_native_use",
+                exposed_schema_count=tool_schema_count,
+                tools=[],
             ),
             "handoff": _decision(
                 "skipped",
@@ -3113,10 +3256,11 @@ class RuntimeCoordinator:
         state.capability_decision = CapabilityDecision(
             selected_agent_id=selected,
             skill={
-                "status": "selected" if build.activated_skills else "skipped",
-                "reason_code": "matched_intent" if build.activated_skills else "no_match",
+                "status": "skipped",
+                "reason_code": "awaiting_same_agent_native_use",
                 "details": {
-                    "skill_ids": [item.skill_id for item in build.activated_skills]
+                    "bound_skill_ids": bound_skill_ids,
+                    "used_skill_ids": [],
                 },
             },
             rag={
@@ -3140,17 +3284,11 @@ class RuntimeCoordinator:
                 },
             },
             tool={
-                "status": "selected" if read_tool_plans else "skipped",
-                "reason_code": (
-                    "exact_workorder_lookup"
-                    if structured_realtime_query
-                    else ("matched_intent" if read_tool_plans else "not_required")
-                ),
+                "status": "skipped",
+                "reason_code": "awaiting_same_agent_native_use",
                 "details": {
-                    "tools": [
-                        f"{plan.server_name}/{plan.tool_name}"
-                        for plan in read_tool_plans
-                    ]
+                    "exposed_schema_count": tool_schema_count,
+                    "tools": [],
                 },
             },
             write={"status": "not_required", "reason_code": "consultation_path"},
@@ -3163,27 +3301,6 @@ class RuntimeCoordinator:
                 ),
             },
         )
-        ledger.append(
-            "evaluation_results",
-            {
-                "case": "capability_decision",
-                "passed": True,
-                "decision_summary": decision_summary,
-            },
-        )
-        record_trace_event(
-            trace_id,
-            "capability_decision",
-            "success",
-            output_summary=(
-                f"agent={selected}; "
-                f"skill={decision_summary['skill']['status']}; "
-                f"rag={decision_summary['rag']['status']}; "
-                f"tool={decision_summary['tool']['status']}; "
-                "handoff=skipped"
-            ),
-            metadata={"decision_summary": decision_summary},
-        )
         state.next_step = "answer"
         # Evidence availability is an Agent answer concern, never authority to
         # switch Agent, skip C, or replace a selected Agent's answer.
@@ -3194,9 +3311,9 @@ class RuntimeCoordinator:
                 "evidence_gate",
                 "success",
                 output_summary=(
-                    "no matching isolated Agent; vertical model skipped"
+                    "no matching isolated Agent; frozen Agent will report its boundary"
                     if out_of_scope_without_agent
-                    else "knowledge evidence insufficient; vertical model skipped"
+                    else "knowledge evidence insufficient; frozen Agent will report answer_status"
                 ),
                 metadata={
                     "direct_knowledge_required": direct_knowledge_required,
@@ -3348,7 +3465,7 @@ class RuntimeCoordinator:
                     "lane": state.lane_decision.lane.value,
                 },
             )
-            raise InternalControlPayloadLeakError(
+            raise AgentContractInvalidError(
                 "business Agent returned an internal control payload"
             )
         model_native_invocations = []
@@ -3421,20 +3538,167 @@ class RuntimeCoordinator:
                 f"model Provider returned failure text: {provider_failure_reason}"
             )
 
-        loaded_skill_tool = any(
-            call.get("tool_name") == "get_skill_instructions" for call in tool_calls
+        (
+            used_skills,
+            used_skill_tool_calls,
+            used_skill_evidence_sources,
+        ) = resolve_model_used_skills(
+            build,
+            tool_calls,
         )
-        if build.activated_skills and not loaded_skill_tool:
-            ledger.violation(
-                "skill_selected_not_loaded",
-                "Skill trigger matched, but Agno get_skill_instructions was not observed.",
-                selected_skill_ids=[
-                    item.skill_id for item in build.activated_skills
-                ],
+        build.activated_skills = used_skills
+        build.skill_tool_calls = used_skill_tool_calls
+        build.skill_evidence_sources = used_skill_evidence_sources
+        state.activated_skills = used_skills
+        for call in used_skill_tool_calls:
+            call_status = str(call.get("status") or "success")
+            record_trace_event(
+                trace_id,
+                f"skill.{call['skill_id']}.get_skill_instructions",
+                call_status,
+                output_summary=(
+                    f"Skill {call['skill_id']} version={call['skill_version']} "
+                    f"status={call_status}"
+                ),
+                metadata=call,
             )
+            if call_status != "success":
+                state.tool_invocations.append(
+                    ToolInvocation(
+                        server_name="skill_runtime",
+                        tool_name="get_skill_instructions",
+                        effect=ToolEffect.READ,
+                        arguments=dict(call.get("arguments") or {}),
+                        planner_source="model_native",
+                        match_reason="selected_agent_bound_skill",
+                        transport_status="failed",
+                        invocation_status="failed",
+                        business_status="failed",
+                        error_summary=str(
+                            call.get("error_summary") or "Skill execution failed"
+                        ),
+                    )
+                )
+        record_trace_event(
+            trace_id,
+            "skill_usage",
+            "success",
+            output_summary=(
+                f"bound={len(build.bound_skills)}; used={len(used_skills)}"
+            ),
+            metadata={
+                "bound_skill_ids": [item.skill_id for item in build.bound_skills],
+                "used_skill_ids": [item.skill_id for item in used_skills],
+                "failed_skill_ids": [
+                    int(call["skill_id"])
+                    for call in used_skill_tool_calls
+                    if str(call.get("status") or "success") != "success"
+                ],
+            },
+        )
 
         agent_turn = _parse_agent_turn_result(full_content)
+        _validate_agent_capability_usage(
+            agent_turn,
+            activated_skills=used_skills,
+            evidence=evidence,
+            mcp_invocations=model_native_invocations,
+            tool_calls=tool_calls,
+        )
         full_content = agent_turn.answer
+        declared_usage = agent_turn.capability_usage
+        actual_mcp_names = sorted({item.tool_name for item in model_native_invocations})
+        actual_tool_names = sorted(set(declared_usage.tool_calls))
+        previous_capability = state.capability_decision
+        if previous_capability is not None:
+            state.capability_decision = CapabilityDecision(
+                selected_agent_id=selected,
+                skill={
+                    "status": "selected" if used_skills else "skipped",
+                    "reason_code": (
+                        "same_agent_native_use" if used_skills else "not_used"
+                    ),
+                    "details": {
+                        "bound_skill_ids": [
+                            item.skill_id for item in build.bound_skills
+                        ],
+                        "used_skill_ids": [item.skill_id for item in used_skills],
+                    },
+                },
+                rag={
+                    "status": "selected" if agent_turn.citations else "skipped",
+                    "reason_code": (
+                        "cited_rag_evidence"
+                        if agent_turn.citations
+                        else "not_used_in_answer"
+                    ),
+                    "details": {
+                        "candidate_evidence_count": len(evidence.items),
+                        "used_evidence_ids": list(agent_turn.citations),
+                    },
+                },
+                tool={
+                    "status": (
+                        "selected"
+                        if actual_mcp_names or actual_tool_names
+                        else "skipped"
+                    ),
+                    "reason_code": (
+                        "same_agent_native_use"
+                        if actual_mcp_names or actual_tool_names
+                        else "not_used"
+                    ),
+                    "details": {
+                        "exposed_schema_count": tool_schema_count,
+                        "mcp_calls": actual_mcp_names,
+                        "tool_calls": actual_tool_names,
+                    },
+                },
+                write=previous_capability.write,
+                handoff=previous_capability.handoff,
+            )
+        decision_summary["skill"] = _decision(
+            "selected" if used_skills else "skipped",
+            "same_agent_native_use" if used_skills else "not_used",
+            bound_skill_ids=[item.skill_id for item in build.bound_skills],
+            used_skill_ids=[item.skill_id for item in used_skills],
+        )
+        decision_summary["tool"] = _decision(
+            "selected" if actual_mcp_names or actual_tool_names else "skipped",
+            (
+                "same_agent_native_use"
+                if actual_mcp_names or actual_tool_names
+                else "not_used"
+            ),
+            exposed_schema_count=tool_schema_count,
+            mcp_calls=actual_mcp_names,
+            tool_calls=actual_tool_names,
+        )
+        ledger.append(
+            "evaluation_results",
+            {
+                "case": "capability_usage",
+                "passed": True,
+                "decision_summary": decision_summary,
+            },
+        )
+        record_trace_event(
+            trace_id,
+            "capability_decision",
+            "success",
+            output_summary=(
+                f"frozen_agent={selected}; "
+                f"skill_bound={len(build.bound_skills)}; "
+                f"skill_used={len(used_skills)}; "
+                f"rag_used={len(agent_turn.citations)}; "
+                f"mcp_used={len(actual_mcp_names)}; "
+                f"tool_used={len(actual_tool_names)}"
+            ),
+            metadata={
+                "passive_execution_record": True,
+                "decision_summary": decision_summary,
+            },
+        )
         proposal_result: Optional[Dict[str, Any]] = None
         if agent_turn.proposal_request is not None:
             if state.lane_decision.lane != RuntimeLane.PROPERTY_GOVERNED:
@@ -3471,6 +3735,7 @@ class RuntimeCoordinator:
                     "status": proposal_result.get("action"),
                     "phase": proposal_result.get("action"),
                     "proposal_id": proposal_id,
+                    "session_id": session_id,
                     "proposal_status": proposal_result.get("proposal_status"),
                     "missing_fields": proposal_result.get("missing_field_keys") or [],
                     "invocation_mode": "selected_b_agent_structured_request",
@@ -3511,7 +3776,7 @@ class RuntimeCoordinator:
         rendered, citations, citation_violations = render_rag_citations(
             full_content,
             evidence,
-            declared_evidence_ids=agent_turn.citation_evidence_ids,
+            declared_evidence_ids=agent_turn.citations,
         )
         linked_skill_evidence = build_skill_evidence(
             full_content,
@@ -3615,7 +3880,7 @@ class RuntimeCoordinator:
                     or bool(citations)
                     or bool(linked_skill_evidence)
                     or agent_turn.answer_status
-                    in {"insufficient_evidence", "capability_unavailable"}
+                    in {"insufficient_evidence", "insufficient_capability"}
                 ),
                 "required": direct_knowledge_required,
                 "evidence_count": len(evidence.items),
@@ -3626,8 +3891,8 @@ class RuntimeCoordinator:
                 "decision": (
                     "rejected_insufficient"
                     if agent_turn.answer_status == "insufficient_evidence"
-                    else "rejected_capability_unavailable"
-                    if agent_turn.answer_status == "capability_unavailable"
+                    else "rejected_insufficient_capability"
+                    if agent_turn.answer_status == "insufficient_capability"
                     else "answered_with_evidence"
                 ),
             },
@@ -3651,6 +3916,10 @@ class RuntimeCoordinator:
                 "activated_skill_ids": [
                     item.skill_id for item in state.activated_skills
                 ],
+                "bound_skill_ids": [item.skill_id for item in build.bound_skills],
+                "used_skill_ids": [
+                    item.skill_id for item in state.activated_skills
+                ],
                 "skill_evidence": ledger.contract.skill_evidence,
                 "evidence_ids": [item.evidence_id for item in evidence.items],
                 "citation_evidence_ids": [
@@ -3659,16 +3928,29 @@ class RuntimeCoordinator:
                 "mcp_invocation_ids": [
                     item.invocation_id for item in state.tool_invocations
                 ],
+                "tool_schema_exposed_count": tool_schema_count,
+                "tool_actual_call_count": len(model_native_invocations)
+                + len(actual_tool_names),
+                "tool_result_character_count": sum(
+                    len(str(item.result_summary or ""))
+                    for item in model_native_invocations
+                ),
                 "decision_summary": decision_summary,
                 "evidence_decision": (
                     "rejected_insufficient"
                     if agent_turn.answer_status == "insufficient_evidence"
-                    else "rejected_capability_unavailable"
-                    if agent_turn.answer_status == "capability_unavailable"
+                    else "rejected_insufficient_capability"
+                    if agent_turn.answer_status == "insufficient_capability"
                     else "answered_with_evidence"
                 ),
                 "citation_violations": citation_violations,
+                "answer_status": agent_turn.answer_status,
                 "model_invoked": model_invoked,
+                "second_agent_request_count": 0,
+                "automatic_retry_count": 0,
+                "selector_request_count": 0,
+                "resolver_request_count": 0,
+                "non_selected_agent_capabilities_loaded": False,
                 "domain_scope": domain_scope,
                 "lane_decision": state.lane_decision.model_dump(mode="json"),
                 "answer_contract": state.answer_contract.model_dump(mode="json"),

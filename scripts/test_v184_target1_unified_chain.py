@@ -34,6 +34,7 @@ init_db()
 import agents.router as router_module  # noqa: E402
 import app.runtime.api as runtime_api_module  # noqa: E402
 import app.runtime.coordinator as coordinator_module  # noqa: E402
+import app.runtime.mcp_executor as mcp_executor_module  # noqa: E402
 from app.runtime.action_gateway import ActionGateway  # noqa: E402
 from app.runtime.agent_factory import AgentBuild, router_agent_cards  # noqa: E402
 from app.runtime.citation_renderer import build_evidence_set, render_rag_citations  # noqa: E402
@@ -45,8 +46,14 @@ from app.runtime.contracts import (  # noqa: E402
     ToolEffect,
     ToolPolicy,
 )
-from app.runtime.coordinator import RuntimeCoordinator, _results_from_snapshot  # noqa: E402
-from app.runtime.mcp_executor import invoke_confirmed_write  # noqa: E402
+from app.runtime.coordinator import (
+    RuntimeCoordinator,
+    _results_from_snapshot,
+)  # noqa: E402
+from app.runtime.mcp_executor import (
+    build_model_native_read_tools,
+    invoke_confirmed_write,
+)  # noqa: E402
 from app.runtime.release_compiler import validate_release_graph  # noqa: E402
 from app.runtime.tool_gateway import ToolGateway  # noqa: E402
 from app.work_order_workflow import (  # noqa: E402
@@ -61,6 +68,10 @@ ROUTER_INPUTS: List[Dict[str, Any]] = []
 BUILD_CALLS: List[str] = []
 ROUTER_DECISIONS: Dict[str, LaneDecision] = {}
 AGENT_TURN_OVERRIDES: Dict[str, str] = {}
+AGENT_TOOL_CALL_OVERRIDES: Dict[str, List[Any]] = {}
+BOUND_SKILL_OVERRIDES: Dict[str, List[int]] = {}
+SNAPSHOT_CONFIG_OVERRIDES: Dict[str, Dict[str, Any]] = {}
+BOUND_DOC_OVERRIDES: Dict[str, List[int]] = {}
 
 
 def patch(target: Any, name: str, value: Any) -> None:
@@ -101,7 +112,7 @@ def snapshot(session_id: str) -> RunConfigSnapshot:
             "domain_scope": "property",
             "enabled": True,
             "skill_ids": [],
-            "knowledge_doc_ids": [],
+            "knowledge_doc_ids": BOUND_DOC_OVERRIDES.get(session_id, []),
             "mcp_server_names": [],
         },
         {
@@ -116,29 +127,31 @@ def snapshot(session_id: str) -> RunConfigSnapshot:
             "mcp_server_names": [],
         },
     ]
+    config = {
+        "agents": agents,
+        "skills": [],
+        "knowledge": [],
+        "mcp_servers": [],
+        "price_snapshots": [],
+        "retrieval_policy": {"top_k": 5, "context_token_budget": 1800},
+        "model_policy": {
+            "version": "test",
+            "default": {
+                "model_id": "deepseek-v4-flash",
+                "provider": "fake",
+                "model_params": {"use_thinking": False},
+            },
+            "available": [],
+        },
+    }
+    config.update(SNAPSHOT_CONFIG_OVERRIDES.get(session_id, {}))
     return RunConfigSnapshot(
         snapshot_id=f"snap-{session_id}",
         release_id="rr-test-target1",
         snapshot_hash="hash-test-target1",
         session_id=session_id,
         created_at="2026-08-09T00:00:00+08:00",
-        config={
-            "agents": agents,
-            "skills": [],
-            "knowledge": [],
-            "mcp_servers": [],
-            "price_snapshots": [],
-            "retrieval_policy": {"top_k": 5, "context_token_budget": 1800},
-            "model_policy": {
-                "version": "test",
-                "default": {
-                    "model_id": "deepseek-v4-flash",
-                    "provider": "fake",
-                    "model_params": {"use_thinking": False},
-                },
-                "available": [],
-            },
-        },
+        config=config,
     )
 
 
@@ -160,11 +173,17 @@ async def fake_route_session_once(**kwargs: Any) -> Dict[str, Any]:
 
 
 class FakeAgent:
-    def __init__(self, answer: str):
+    def __init__(self, answer: str, tool_calls: List[Any] | None = None):
         self.answer = answer
+        self.tool_calls = list(tool_calls or [])
 
     async def arun(self, *_args: Any, **_kwargs: Any):
-        yield SimpleNamespace(content=self.answer, event="RunContent", metrics={})
+        yield SimpleNamespace(
+            content=self.answer,
+            event="RunContent",
+            metrics={},
+            tool_calls=self.tool_calls,
+        )
 
 
 def fake_build(
@@ -174,26 +193,68 @@ def fake_build(
     **_kwargs: Any,
 ) -> AgentBuild:
     BUILD_CALLS.append(agent_id)
+    tool_calls = AGENT_TOOL_CALL_OVERRIDES.get(message, [])
+    normalized_tool_calls = coordinator_module._extract_tool_calls(
+        SimpleNamespace(tool_calls=tool_calls)
+    )
+    used_skill_ids = sorted(
+        {
+            int(str((call.get("arguments") or {}).get("skill_name") or "").split("-", 1)[1])
+            for call in normalized_tool_calls
+            if call.get("tool_name") == "get_skill_instructions"
+            and call.get("status") == "success"
+            and str((call.get("arguments") or {}).get("skill_name") or "").startswith("skill-")
+        }
+    )
     answer = AGENT_TURN_OVERRIDES.get(
         message,
         json.dumps(
             {
                 "answer": f"answer:{message}",
                 "answer_status": "answered",
-                "citation_evidence_ids": [],
+                "citations": [],
                 "proposal_request": None,
+                "capability_usage": {
+                    "skill_ids": used_skill_ids,
+                    "rag_evidence_ids": [],
+                    "mcp_calls": [],
+                    "tool_calls": [],
+                },
             },
             ensure_ascii=False,
         ),
     )
     config = next(item for item in snap.config["agents"] if item["agent_id"] == agent_id)
+    bound_ids = BOUND_SKILL_OVERRIDES.get(message, [])
+    bound_skills = [
+        SkillActivation(
+            skill_id=skill_id,
+            version="v-symbolic",
+            content_hash=f"hash-{skill_id}",
+            name=f"skill-{skill_id}",
+            match_reason="published binding",
+        )
+        for skill_id in bound_ids
+    ]
     return AgentBuild(
-        agent=FakeAgent(answer),
+        agent=FakeAgent(answer, tool_calls),
         agent_config=config,
         activated_skills=[],
         skill_decisions=[],
         skill_tool_calls=[],
         skill_evidence_sources=[],
+        bound_skills=bound_skills,
+        bound_skill_evidence_sources=[
+            {
+                "skill_id": skill_id,
+                "name": f"skill-{skill_id}",
+                "version": "v-symbolic",
+                "snapshot_id": snap.snapshot_id,
+                "content_hash": f"hash-{skill_id}",
+                "content_snapshot": f"content-{skill_id}",
+            }
+            for skill_id in bound_ids
+        ],
     )
 
 
@@ -257,6 +318,24 @@ def test_full_history_and_a_short_circuit() -> None:
     stages = [item["span_name"] for item in list_trace_events(done["trace_id"])]
     assert "agent_selector" not in stages and "agent_frozen" not in stages
 
+    followup = "u-followup-after-handoff"
+    ROUTER_DECISIONS[followup] = LaneDecision(
+        lane=RuntimeLane.PROPERTY_GOVERNED,
+        selected_agent_id="b_agent",
+        reason="choose-b-agent",
+    )
+    before_followup_builds = len(BUILD_CALLS)
+    followup_events = asyncio.run(consume(followup, session_id))
+    assert BUILD_CALLS[before_followup_builds:] == ["b_agent"]
+    followup_done = next(
+        item["data"] for item in followup_events if item["event"] == "done"
+    )
+    assert followup_done["current_agent_id"] == "b_agent"
+    route = next(
+        item["data"] for item in followup_events if item["event"] == "route"
+    )
+    assert route["lane"] == RuntimeLane.PROPERTY_GOVERNED.value
+
 
 def test_b_and_c_freeze_one_agent_without_fallback() -> None:
     for lane, selected, message in (
@@ -277,6 +356,186 @@ def test_b_and_c_freeze_one_agent_without_fallback() -> None:
         assert stages.count("router") == 1
         assert stages.count("agent_frozen") == 1
         assert "agent_selector" not in stages
+
+
+def test_strict_agent_envelope_fails_transparently_without_fallback() -> None:
+    for index, raw in enumerate(
+        (
+            "symbolic plain prose",
+            "symbolic prose\n```json\n{}\n```",
+        )
+    ):
+        message = f"symbol-invalid-envelope-{index}"
+        session_id = f"session-invalid-envelope-{index}"
+        ROUTER_DECISIONS[message] = LaneDecision(
+            lane=RuntimeLane.PROPERTY_GOVERNED,
+            selected_agent_id="b_agent",
+            reason="choose-b-agent",
+        )
+        AGENT_TURN_OVERRIDES[message] = raw
+        before = len(BUILD_CALLS)
+        events = asyncio.run(consume(message, session_id))
+        assert BUILD_CALLS[before:] == ["b_agent"]
+        assert not [item for item in events if item["event"] == "final"]
+        error = next(item["data"] for item in events if item["event"] == "error")
+        done = next(item["data"] for item in events if item["event"] == "done")
+        assert error["error_code"] == done["error_code"] == "agent_contract_invalid"
+        stages = [item["span_name"] for item in list_trace_events(done["trace_id"])]
+        assert stages.count("agent_frozen") == 1 and "agent_selector" not in stages
+
+
+def test_skill_bound_and_native_used_zero_partial_all() -> None:
+    for suffix, used_ids in (("zero", []), ("partial", [11]), ("all", [11, 12])):
+        message = f"symbol-skill-{suffix}"
+        session_id = f"session-skill-{suffix}"
+        ROUTER_DECISIONS[message] = LaneDecision(
+            lane=RuntimeLane.PROPERTY_GOVERNED,
+            selected_agent_id="b_agent",
+            reason="choose-b-agent",
+        )
+        BOUND_SKILL_OVERRIDES[message] = [11, 12]
+        AGENT_TOOL_CALL_OVERRIDES[message] = (
+            [
+                SimpleNamespace(
+                    tool_name="get_skill_instructions",
+                    tool_args=json.dumps({"skill_name": "skill-11"}),
+                    tool_call_id="call-symbolic-11",
+                    status="completed",
+                    result="loaded",
+                )
+            ]
+            if suffix == "partial"
+            else [
+                {
+                    "tool_name": "get_skill_instructions",
+                    "arguments": {"skill_name": f"skill-{skill_id}"},
+                    "status": "success",
+                }
+                for skill_id in used_ids
+            ]
+        )
+        events = asyncio.run(consume(message, session_id))
+        done = next(item["data"] for item in events if item["event"] == "done")
+        assert [item["skill_id"] for item in done["activated_skills"]] == used_ids
+        usage_event = next(
+            item
+            for item in list_trace_events(done["trace_id"])
+            if item["span_name"] == "skill_usage"
+        )
+        assert usage_event["metadata"]["bound_skill_ids"] == [11, 12]
+        assert usage_event["metadata"]["used_skill_ids"] == used_ids
+
+    failed_message = "symbol-skill-failed"
+    ROUTER_DECISIONS[failed_message] = LaneDecision(
+        lane=RuntimeLane.PROPERTY_GOVERNED,
+        selected_agent_id="b_agent",
+        reason="choose-b-agent",
+    )
+    BOUND_SKILL_OVERRIDES[failed_message] = [11]
+    AGENT_TOOL_CALL_OVERRIDES[failed_message] = [
+        SimpleNamespace(
+            tool_name="get_skill_instructions",
+            tool_args={"skill_name": "skill-11"},
+            status="failed",
+            tool_call_error="symbolic skill failure",
+        )
+    ]
+    failed_events = asyncio.run(consume(failed_message, "session-skill-failed"))
+    failed_done = next(
+        item["data"] for item in failed_events if item["event"] == "done"
+    )
+    assert failed_done["activated_skills"] == []
+    failed_trace = next(
+        item
+        for item in list_trace_events(failed_done["trace_id"])
+        if item["span_name"] == "skill.11.get_skill_instructions"
+    )
+    assert failed_trace["status"] == "failed"
+
+
+def test_public_stream_retrieval_uses_segmented_visible_context() -> None:
+    import rag_retrieval
+
+    session_id = "session-contextual-retrieval"
+    prior_user = "symbol-prior-user"
+    prior_answer = "symbol-prior-answer"
+    current = "symbol-follow-up"
+    save_chat_message(session_id=session_id, role="user", content=prior_user, status="success")
+    save_chat_message(session_id=session_id, role="assistant", content=prior_answer, status="success")
+    ROUTER_DECISIONS[current] = LaneDecision(
+        lane=RuntimeLane.PROPERTY_GOVERNED,
+        selected_agent_id="b_agent",
+        reason="choose-b-agent",
+    )
+    chunk_content = "symbolic-document-chunk"
+    BOUND_DOC_OVERRIDES[session_id] = [71]
+    SNAPSHOT_CONFIG_OVERRIDES[session_id] = {
+        "knowledge": [
+            {
+                "knowledge_doc_id": 71,
+                "title": "symbolic-document",
+                "document_version": "v-symbolic",
+                "document_hash": "document-hash",
+                "chunk_count": 1,
+                "chunk_snapshots": [
+                    {
+                        "chunk_index": 0,
+                        "content": chunk_content,
+                        "chunk_hash": coordinator_module.content_hash(chunk_content),
+                    }
+                ],
+            }
+        ]
+    }
+    captured_queries: List[str] = []
+    original_search = rag_retrieval.advanced_search
+
+    def fake_search(query: str, *_args: Any, **_kwargs: Any) -> Dict[str, Any]:
+        captured_queries.append(query)
+        return {
+            "results": [
+                {
+                    "doc_id": 71,
+                    "chunk_index": 0,
+                    "content": chunk_content,
+                    "score": 1.0,
+                }
+            ]
+        }
+
+    rag_retrieval.advanced_search = fake_search
+    try:
+        events = asyncio.run(consume(current, session_id))
+    finally:
+        rag_retrieval.advanced_search = original_search
+    done = next(item["data"] for item in events if item["event"] == "done")
+    assert done["status"] == "complete"
+    assert captured_queries == [current, f"{prior_user}\n{current}"]
+    assert all(prior_answer not in query for query in captured_queries)
+    assert all('"timestamp"' not in query for query in captured_queries)
+    retrieval_event = next(
+        item
+        for item in list_trace_events(done["trace_id"])
+        if item["span_name"] == "retrieval"
+    )
+    assert retrieval_event["metadata"]["query_message_count"] == 3
+    assert retrieval_event["metadata"]["query_segment_count"] == 2
+
+    snapshot_results, used_fallback = _results_from_snapshot(
+        [
+            "symbol-follow-up",
+            "unrelated-99日\nsymbol-follow-up",
+            "symbolic-document\nsymbol-follow-up",
+        ],
+        [],
+        {71: SNAPSHOT_CONFIG_OVERRIDES[session_id]["knowledge"][0]},
+        {71},
+        5,
+        0.2,
+        1800,
+    )
+    assert used_fallback is True
+    assert [(item["doc_id"], item["chunk_index"]) for item in snapshot_results] == [(71, 0)]
 
 
 def test_router_reason_cannot_create_write() -> None:
@@ -353,8 +612,14 @@ def test_fenced_structured_agent_request_creates_pending_proposal_only() -> None
             {
                 "answer": "symbolic pending confirmation",
                 "answer_status": "answered",
-                "citation_evidence_ids": [],
+                "citations": [],
                 "proposal_request": work_order_payload("fenced"),
+                "capability_usage": {
+                    "skill_ids": [],
+                    "rag_evidence_ids": [],
+                    "mcp_calls": [],
+                    "tool_calls": [],
+                },
             },
             ensure_ascii=False,
         )
@@ -369,6 +634,7 @@ def test_fenced_structured_agent_request_creates_pending_proposal_only() -> None
         item for item in done["tool_calls"] if item.get("tool_name") == "action_gateway"
     )
     proposal_id = action_call["proposal_id"]
+    assert action_call["session_id"] == session_id
     assert action_call["proposal_status"] == "pending_confirmation"
     assert get_action_proposal(proposal_id)["status"] == "pending_confirmation"
     assert scalar(
@@ -516,6 +782,58 @@ def test_rag_citation_snapshot_and_mcp_boundaries() -> None:
     except PermissionError:
         pass
 
+    class FakeGovernedToolkit:
+        def __init__(self, *_args: Any, **kwargs: Any):
+            self.server_name = kwargs["server_name"]
+            self.allowed_function_names = set(kwargs["allowed_function_names"])
+
+    original_toolkit = mcp_executor_module.GovernedMCPTools
+    mcp_executor_module.GovernedMCPTools = FakeGovernedToolkit
+    try:
+        toolkits = build_model_native_read_tools(
+            {
+                "agents": [
+                    {
+                        "agent_id": "b_agent",
+                        "enabled": True,
+                        "mcp_server_names": ["bound-read-server"],
+                    }
+                ],
+                "mcp_servers": [
+                    {
+                        "name": "bound-read-server",
+                        "enabled": True,
+                        "command": "symbolic-command",
+                        "args": [],
+                        "tools": [
+                            {
+                                "name": "symbolic-read",
+                                "tool_metadata": {
+                                    "execution_mode": "auto_preinvoke"
+                                },
+                                "policy": {
+                                    "server_name": "bound-read-server",
+                                    "tool_name": "symbolic-read",
+                                    "effect": "read",
+                                    "risk_level": "L0",
+                                    "allowed_paths": ["consultation"],
+                                    "requires_confirmation": False,
+                                    "enabled": True,
+                                    "policy_reason": "symbolic",
+                                },
+                            }
+                        ],
+                    }
+                ],
+            },
+            "b_agent",
+            "symbolic-message",
+        )
+    finally:
+        mcp_executor_module.GovernedMCPTools = original_toolkit
+    assert len(toolkits) == 1
+    assert toolkits[0].allowed_function_names == {"symbolic-read"}
+
 
 def test_static_contracts() -> None:
     __import__("app.runtime.legacy_chat")
@@ -541,8 +859,11 @@ def test_static_contracts() -> None:
     assert "plan_tools(" not in coordinator_source.split("async def _stream_consultation", 1)[1]
     assert "必须按AgentTurnResult返回结构化proposal_request" in coordinator_source
     mcp_source = (root / "app/runtime/mcp_executor.py").read_text(encoding="utf-8")
-    assert '== "model_native"' in mcp_source
+    assert '== "model_native"' not in mcp_source
     assert "确认创建" in frontend_source and "work-order-proposal/decision" in frontend_source
+    assert 'onclick="decideWorkOrderProposal' not in frontend_source
+    assert "data-proposal-session" in frontend_source
+    assert "session_id: sessionId" in frontend_source
     assert "await sendChatMessage('请安排工作人员接手本次对话')" in frontend_source
 
 
@@ -592,6 +913,9 @@ def main() -> None:
         tests = (
             test_full_history_and_a_short_circuit,
             test_b_and_c_freeze_one_agent_without_fallback,
+            test_strict_agent_envelope_fails_transparently_without_fallback,
+            test_skill_bound_and_native_used_zero_partial_all,
+            test_public_stream_retrieval_uses_segmented_visible_context,
             test_router_reason_cannot_create_write,
             test_badcase_capture_failure_cannot_suppress_terminal_events,
             test_fenced_structured_agent_request_creates_pending_proposal_only,

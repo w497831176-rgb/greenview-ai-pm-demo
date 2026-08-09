@@ -139,7 +139,7 @@ def create_unified_abc_router(*, model: Any) -> Agent:
             "You are the only routing decision in this request.",
             "Read the complete timestamped conversation in order. The final item is the current bubble; do not privilege or summarize it separately.",
             "Return exactly one JSON object with only lane, selected_agent_id, and reason.",
-            "A_HANDOFF means ordinary human handoff. Its selected_agent_id must be null.",
+            "A_HANDOFF means the user explicitly asks for a real human or reports an immediate real-world personal/property safety risk. Its selected_agent_id must be null.",
             "B_PROPERTY_GOVERNED means a property-service request. Select exactly one candidate whose scope is property.",
             "C_ISOLATED_GENERAL is the complete complement of A and B. Select exactly one candidate whose scope is isolated_general.",
             "Use only candidate agent_id, name, description, and scope. Do not infer or request bindings, instructions, Skills, RAG, MCP, Tools, results, or capability counts.",

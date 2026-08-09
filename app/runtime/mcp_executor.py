@@ -453,17 +453,13 @@ def build_model_native_read_tools(
             str(tool.get("name") or ""): tool
             for tool in server.get("tools") or []
         }
+        # Historical execution_mode values described the retired pre-invoke
+        # chain. Every bound READ tool that passes ToolGateway is now exposed
+        # to the same frozen Agent's native tool loop; none is pre-called.
         allowed = [
             tool_name
             for tool_name in policy_allowed
             if tool_name in tool_definitions
-            and str(
-                (tool_definitions[tool_name].get("tool_metadata") or {}).get(
-                    "execution_mode"
-                )
-                or "model_native"
-            )
-            == "model_native"
         ]
         if not allowed or not server.get("command"):
             continue

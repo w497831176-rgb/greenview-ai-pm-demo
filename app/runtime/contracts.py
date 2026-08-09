@@ -159,19 +159,25 @@ class WorkOrderProposalRequest(ImmutableModel):
     appointment_time: Optional[str] = Field(default=None, max_length=160)
 
 
-class AgentTurnResult(ImmutableModel):
-    """Optional strict envelope for a selected Agent's answer and side effects.
+class AgentCapabilityUsage(ImmutableModel):
+    """Agent-declared usage, cross-checked against this turn's runtime facts."""
 
-    Plain prose remains a valid read-only answer. A business write, however,
-    is reachable only through ``proposal_request`` in this envelope.
-    """
+    skill_ids: List[int]
+    rag_evidence_ids: List[str]
+    mcp_calls: List[str]
+    tool_calls: List[str]
+
+
+class AgentTurnResult(ImmutableModel):
+    """Strict envelope returned by the one already-frozen B/C Agent."""
 
     answer: str = Field(min_length=1)
     answer_status: Literal[
-        "answered", "insufficient_evidence", "capability_unavailable"
-    ] = "answered"
-    citation_evidence_ids: List[str] = Field(default_factory=list)
-    proposal_request: Optional[WorkOrderProposalRequest] = None
+        "answered", "insufficient_evidence", "insufficient_capability"
+    ]
+    citations: List[str]
+    proposal_request: Optional[WorkOrderProposalRequest]
+    capability_usage: AgentCapabilityUsage
 
 
 class AnswerContract(ImmutableModel):

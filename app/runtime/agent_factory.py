@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-import json
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional
 
 from agno.agent import Agent, AgentFactory
 from agno.factory import RequestContext
@@ -12,7 +11,6 @@ from agno.factory import RequestContext
 from app.runtime.contracts import RunConfigSnapshot, SkillActivation
 from app.runtime.skill_projector import project_skills
 from app.settings import MODEL_ID, agent_db, build_model
-from app.skill_runtime import select_skills
 
 try:
     from agno.skills import LocalSkills, Skills
@@ -29,72 +27,66 @@ class AgentBuild:
     skill_decisions: List[Dict[str, Any]]
     skill_tool_calls: List[Dict[str, Any]]
     skill_evidence_sources: List[Dict[str, Any]]
+    bound_skills: List[SkillActivation] = field(default_factory=list)
+    bound_skill_evidence_sources: List[Dict[str, Any]] = field(default_factory=list)
 
 
-def _preload_skill_instructions(
-    skills: Any,
-    activations: List[SkillActivation],
-) -> Tuple[List[str], List[Dict[str, Any]]]:
-    """Load selected Agno Skills deterministically before the model call.
+def resolve_model_used_skills(
+    build: AgentBuild,
+    tool_calls: List[Dict[str, Any]],
+) -> tuple[List[SkillActivation], List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Resolve actual Skill use from the frozen Agent's native tool calls.
 
-    Trigger selection belongs to the runtime control plane. Relying on the
-    model to optionally call ``get_skill_instructions`` made an otherwise
-    valid Skill disappear from real runs. We still use Agno's own Skill access
-    tool, but invoke it as a governed pre-invocation and preserve the evidence.
+    Bound Skills are only a progressive-discovery candidate set. A Skill is
+    considered used only when this same Agent called get_skill_instructions
+    for its published package in this physical model run.
     """
 
-    if skills is None or not activations:
-        return [], []
-    access_tool = next(
-        (
-            tool
-            for tool in skills.get_tools()
-            if getattr(tool, "name", "") == "get_skill_instructions"
-        ),
-        None,
-    )
-    if access_tool is None or not getattr(access_tool, "entrypoint", None):
-        raise RuntimeError("Agno get_skill_instructions tool is unavailable")
-
-    contexts: List[str] = []
-    calls: List[Dict[str, Any]] = []
-    for activation in activations:
-        skill_name = f"skill-{activation.skill_id}"
-        raw = access_tool.entrypoint(skill_name)
-        payload = json.loads(raw) if isinstance(raw, str) else dict(raw or {})
-        if payload.get("error"):
-            raise RuntimeError(
-                f"failed to load published Skill {activation.skill_id}: "
-                f"{payload['error']}"
-            )
-        contexts.append(
-            "\n".join(
-                [
-                    f"[已加载动态 Skill：{activation.name}]",
-                    str(payload.get("instructions") or ""),
-                ]
-            )
+    bound_by_id = {item.skill_id: item for item in build.bound_skills}
+    evidence_by_id = {
+        int(item["skill_id"]): item
+        for item in build.bound_skill_evidence_sources
+        if item.get("skill_id") is not None
+    }
+    used_ids: List[int] = []
+    observed_calls: List[Dict[str, Any]] = []
+    for call in tool_calls:
+        if str(call.get("tool_name") or "") != "get_skill_instructions":
+            continue
+        arguments = call.get("arguments") or {}
+        skill_name = str(
+            arguments.get("skill_name")
+            or arguments.get("name")
+            or ""
         )
-        calls.append(
+        if not skill_name.startswith("skill-"):
+            continue
+        try:
+            skill_id = int(skill_name.removeprefix("skill-"))
+        except ValueError:
+            continue
+        activation = bound_by_id.get(skill_id)
+        if activation is None:
+            raise PermissionError(
+                f"selected Agent attempted to load unbound Skill: {skill_id}"
+            )
+        observed_calls.append(
             {
-                "tool_name": "get_skill_instructions",
-                "arguments": {"skill_name": skill_name},
-                "status": "success",
-                "invocation_mode": "policy_preinvoke",
-                "skill_id": activation.skill_id,
+                **call,
+                "status": str(call.get("status") or "success"),
+                "invocation_mode": "model_native",
+                "skill_id": skill_id,
                 "skill_version": activation.version,
                 "skill_content_hash": activation.content_hash,
             }
         )
-    return contexts, calls
-
-
-def _skills_exposed_to_model(
-    skills: Any,
-    preload_calls: List[Dict[str, Any]],
-) -> Any:
-    """Hide a Skill tool after the same Skill was deterministically preloaded."""
-    return None if preload_calls else skills
+        if str(call.get("status") or "success") != "success":
+            continue
+        if skill_id not in used_ids:
+            used_ids.append(skill_id)
+    activations = [bound_by_id[item] for item in used_ids]
+    sources = [evidence_by_id[item] for item in used_ids if item in evidence_by_id]
+    return activations, observed_calls, sources
 
 
 def _find_agent(config: Dict[str, Any], agent_id: str) -> Dict[str, Any]:
@@ -272,56 +264,55 @@ def build_agent_from_snapshot(
         if enable_skills
         else []
     )
-    # Reuse the deterministic runtime selector.  Adapt the compiled field names
-    # to its legacy-compatible input contract.
-    selector_candidates = [
-        {
-            "id": item["skill_id"],
-            "name": item.get("name"),
-            "description": item.get("description"),
-            "instructions": item.get("instructions_fallback"),
-            "enabled": item.get("enabled"),
-            "trigger_condition": item.get("trigger_condition"),
-            "skill_metadata": item.get("metadata") or {},
-        }
-        for item in candidates
-    ]
-    selected_legacy, decisions = select_skills(selector_candidates, message)
-    selected_ids = {int(item["skill_id"]) for item in selected_legacy}
-    selected = [item for item in candidates if int(item["skill_id"]) in selected_ids]
-    reasons = {
-        int(item["skill_id"]): str(item.get("match_reason") or item.get("outcome") or "trigger matched")
-        for item in decisions
-        if item.get("selected")
-    }
-    skills_root, activations = project_skills(
+    # Binding is the authority boundary, not proof of use. Project every Skill
+    # bound to this frozen Agent as a progressive-discovery candidate and let
+    # the same Agent decide whether to call get_skill_instructions. No keyword,
+    # bigram, Resolver, pre-invocation, or extra Provider request participates.
+    skills_root, bound_activations = project_skills(
         snapshot.release_id,
-        selected,
-        match_reasons=reasons,
+        candidates,
     )
     agno_skills = None
     if skills_root and Skills is not None and LocalSkills is not None:
         agno_skills = Skills(loaders=[LocalSkills(str(skills_root))])
-    skill_contexts, skill_tool_calls = _preload_skill_instructions(
-        agno_skills,
-        activations,
-    )
-    model_skills = _skills_exposed_to_model(agno_skills, skill_tool_calls)
+    decisions = [
+        {
+            "skill_id": item.skill_id,
+            "bound": True,
+            "used": False,
+            "reason": "available_to_frozen_agent",
+        }
+        for item in bound_activations
+    ]
+    bound_evidence_sources = [
+        {
+            "skill_id": int(item["skill_id"]),
+            "name": str(item.get("name") or f"Skill {item['skill_id']}"),
+            "version": str(item.get("version") or ""),
+            "snapshot_id": snapshot.snapshot_id,
+            "content_hash": str(item.get("content_hash") or ""),
+            "content_snapshot": str(item.get("instructions_fallback") or ""),
+        }
+        for item in candidates
+    ]
 
     instructions = [
         str(agent_config.get("instructions") or ""),
-        "你只能使用本次已发布快照装配的能力。",
-        "若运行时已加载业务 Skill，请直接依据已加载的 Skill 原文回答，不要重复调用 Skill 工具。",
-        "不得自行创建、更新、删除业务数据；写操作只能描述为待确认 Proposal。",
-        "只有后端 ActionReceipt.status=committed 且包含真实 resource_id 时，才能声称操作成功。",
+        "You may use only capabilities bound to this Agent in the pinned RuntimeRelease snapshot.",
+        "Bound Skills are candidates, not preloaded instructions. Call get_skill_instructions only for Skills relevant to this turn; zero, some, or all bound Skills may be used.",
+        "Never create, update, or delete business data directly. A write request can only be expressed as a pending proposal_request.",
+        "Claim write success only when the backend supplies a committed ActionReceipt with a real resource_id.",
     ]
     instructions.extend(
         [
-            "A normal answer may be plain text. If you need to expose structured runtime status, return one JSON object with only answer, answer_status, citation_evidence_ids, and proposal_request.",
-            "answer_status must be answered, insufficient_evidence, or capability_unavailable. Never request another Agent or another routing decision.",
-            "citation_evidence_ids may contain only RAG evidence IDs supplied in this turn. Skill, MCP, Tool, model output, and configuration are never citations.",
+            "Return exactly one JSON object and no prose, markdown fence, schema explanation, or control-plane fields.",
+            "The object must contain exactly: answer, answer_status, citations, proposal_request, capability_usage.",
+            "answer_status must be answered, insufficient_evidence, or insufficient_capability. Never request another Agent or routing decision.",
+            "citations is a list of RAG evidence IDs supplied in this turn. Skill, MCP, Tool, model output, and configuration are never citations.",
+            "capability_usage must contain skill_ids, rag_evidence_ids, mcp_calls, and tool_calls. Report only capabilities actually used in this run; use empty lists when none were used.",
+            "For Skill use, report the numeric id from a get_skill_instructions package named skill-<id>. For MCP and Tool use, report the exact function names you actually called.",
             "Only a selected property Agent may request work-order creation. It must use proposal_request with room_id, issue_type, issue_desc, urgency, contact_name, contact_phone, and appointment_time. Do not encode a write request in prose.",
-            "If work-order fields are missing, include the known values in proposal_request and ask for the missing values in answer. If no work-order state is requested, proposal_request must be null.",
+            "If work-order fields are missing, include known values in proposal_request and ask for the missing values in answer. If no work-order state is requested, proposal_request must be null.",
         ]
     )
     if (agent_config.get("domain_scope") or "property") == "isolated_general":
@@ -336,7 +327,6 @@ def build_agent_from_snapshot(
         instructions.append(
             "你处于物业业务域：价格、时效、责任、服务是否存在等受控事实必须来自本轮合法Skill、RAG、成功Tool或Receipt证据。"
         )
-    instructions.extend(skill_contexts)
     if evidence_prompt:
         instructions.append(evidence_prompt)
     snapshot_default_model = (
@@ -372,7 +362,7 @@ def build_agent_from_snapshot(
         db=agent_db,
         instructions=instructions,
         tools=list(tools or []),
-        skills=model_skills,
+        skills=agno_skills,
         markdown=True,
         # The coordinator injects only successful user-visible chat_messages.
         # Agno stage history may contain Router control JSON and must stay off.
@@ -382,20 +372,12 @@ def build_agent_from_snapshot(
     return AgentBuild(
         agent=agent,
         agent_config=agent_config,
-        activated_skills=activations,
+        activated_skills=[],
         skill_decisions=decisions,
-        skill_tool_calls=skill_tool_calls,
-        skill_evidence_sources=[
-            {
-                "skill_id": int(item["skill_id"]),
-                "name": str(item.get("name") or f"Skill {item['skill_id']}"),
-                "version": str(item.get("version") or ""),
-                "snapshot_id": snapshot.snapshot_id,
-                "content_hash": str(item.get("content_hash") or ""),
-                "content_snapshot": str(item.get("instructions_fallback") or ""),
-            }
-            for item in selected
-        ],
+        skill_tool_calls=[],
+        skill_evidence_sources=[],
+        bound_skills=bound_activations,
+        bound_skill_evidence_sources=bound_evidence_sources,
     )
 
 

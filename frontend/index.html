@@ -606,6 +606,7 @@
       const receiptId = call && call.receipt_id ? String(call.receipt_id) : '';
       const resourceId = call && (call.resource_id || call.work_order_id) ? String(call.resource_id || call.work_order_id) : '';
       const proposalId = call && call.proposal_id ? String(call.proposal_id) : ((call && call.arguments && call.arguments.proposal_id) ? String(call.arguments.proposal_id) : '');
+      const proposalSessionId = call && call.session_id ? String(call.session_id) : ((call && call.arguments && call.arguments.session_id) ? String(call.arguments.session_id) : '');
       const isVerifiedCommit = status === 'committed' && Boolean(receiptId && resourceId);
       const displayedStatus = status === 'committed' && !isVerifiedCommit ? '提交凭证不完整，不能确认创建成功' : controlledWriteStatusLabel(status);
       const style = controlledWriteStatusStyle(status, isVerifiedCommit);
@@ -617,33 +618,36 @@
           <div>已启用幂等保护</div>
           ${proposalId ? `<details class="mt-1"><summary class="cursor-pointer">查看提议编号</summary><div class="font-mono mt-1">${escapeHtml(proposalId)}</div></details>` : ''}
         </div>` : '';
-      const decisionButtons = status === 'awaiting_confirmation' && proposalId ? `
+      const decisionButtons = status === 'awaiting_confirmation' && proposalId && proposalSessionId ? `
         <div class="mt-3 flex flex-wrap gap-2">
-          <button type="button" data-proposal-id="${escapeHtml(proposalId)}" onclick="decideWorkOrderProposal(this.dataset.proposalId, 'confirm', this)" class="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-medium">确认创建</button>
-          <button type="button" data-proposal-id="${escapeHtml(proposalId)}" onclick="decideWorkOrderProposal(this.dataset.proposalId, 'cancel', this)" class="px-3 py-1.5 rounded-lg bg-white hover:bg-slate-50 border border-slate-300 text-slate-700 text-xs font-medium">取消</button>
-        </div>` : '';
-      return `<div data-work-order-proposal="${escapeHtml(proposalId)}" class="w-full border rounded-xl p-3 ${style}">
+          <button type="button" data-proposal-decision="confirm" class="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-medium">确认创建</button>
+          <button type="button" data-proposal-decision="cancel" class="px-3 py-1.5 rounded-lg bg-white hover:bg-slate-50 border border-slate-300 text-slate-700 text-xs font-medium">取消</button>
+        </div>
+        <div data-proposal-feedback class="mt-2 text-xs" aria-live="polite"></div>` : '';
+      return `<div data-work-order-proposal="${escapeHtml(proposalId)}" data-proposal-session="${escapeHtml(proposalSessionId)}" class="w-full border rounded-xl p-3 ${style}">
         <div class="flex flex-wrap items-center justify-between gap-2">
           <div class="font-medium text-sm">受控业务写入：创建维修工单</div>
           <span class="text-xs font-medium">${escapeHtml(displayedStatus)}</span>
         </div>
         <div class="mt-1 text-xs opacity-80">执行通道：应用规则工作流 → ActionGateway → 内部工单服务</div>
-        <div class="mt-1 text-xs opacity-80">本次非MCP写入 · 本次未调用模型</div>
+        <div class="mt-1 text-xs opacity-80">本次非MCP写入 · 点击确认/取消本身不再调用模型</div>
         ${receiptEvidence}
         ${decisionButtons}
       </div>`;
     }
 
-    async function decideWorkOrderProposal(proposalId, decision, button) {
-      if (!proposalId || !['confirm', 'cancel'].includes(decision)) return;
+    async function decideWorkOrderProposal(sessionId, proposalId, decision, button) {
+      if (!sessionId || !proposalId || !['confirm', 'cancel'].includes(decision)) return;
       const card = button ? button.closest('[data-work-order-proposal]') : null;
+      const feedback = card ? card.querySelector('[data-proposal-feedback]') : null;
       if (card) card.querySelectorAll('button').forEach(item => { item.disabled = true; });
+      if (feedback) feedback.textContent = decision === 'confirm' ? '正在确认创建…' : '正在取消…';
       try {
         const res = await fetch(`${API_BASE}/api/chat/work-order-proposal/decision`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            session_id: STATE.chatSessionId,
+            session_id: sessionId,
             proposal_id: proposalId,
             decision
           })
@@ -656,6 +660,7 @@
             action_type: 'work_order.create',
             status: payload.action,
             proposal_id: proposalId,
+            session_id: sessionId,
             receipt_id: payload.receipt_id,
             resource_id: payload.resource_id,
             work_order_id: payload.work_order_id
@@ -665,9 +670,23 @@
         showToast(payload.reply || '操作完成', 'success');
       } catch (err) {
         if (card) card.querySelectorAll('button').forEach(item => { item.disabled = false; });
+        if (feedback) feedback.textContent = err.message || '工单决定提交失败';
         showToast(err.message || '工单决定提交失败', 'error');
       }
     }
+
+    document.addEventListener('click', event => {
+      const button = event.target.closest('[data-proposal-decision]');
+      if (!button) return;
+      const card = button.closest('[data-work-order-proposal]');
+      if (!card) return;
+      decideWorkOrderProposal(
+        card.dataset.proposalSession || '',
+        card.dataset.workOrderProposal || '',
+        button.dataset.proposalDecision || '',
+        button
+      );
+    });
 
     function liveToolStatusText(toolCalls) {
       const calls = toolCalls || [];
