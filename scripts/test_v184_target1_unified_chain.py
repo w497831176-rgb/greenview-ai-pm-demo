@@ -32,6 +32,7 @@ from db.property_db import (  # noqa: E402
 init_db()
 
 import agents.router as router_module  # noqa: E402
+import app.runtime.api as runtime_api_module  # noqa: E402
 import app.runtime.coordinator as coordinator_module  # noqa: E402
 from app.runtime.action_gateway import ActionGateway  # noqa: E402
 from app.runtime.agent_factory import AgentBuild, router_agent_cards  # noqa: E402
@@ -459,6 +460,46 @@ def test_static_contracts() -> None:
     assert "await sendChatMessage('请安排工作人员接手本次对话')" in frontend_source
 
 
+def test_retired_extension_control_path() -> None:
+    request = runtime_api_module.ExtensionAcceptanceRequest(
+        session_id="retired-extension",
+        query="symbolic-query",
+        expected_agent_id="b_agent",
+    )
+    snapshot_calls = 0
+    original_resolver = runtime_api_module.resolve_snapshot
+
+    def forbidden_snapshot(*_args: Any, **_kwargs: Any) -> Any:
+        nonlocal snapshot_calls
+        snapshot_calls += 1
+        raise AssertionError("retired endpoint resolved a runtime snapshot")
+
+    runtime_api_module.resolve_snapshot = forbidden_snapshot
+    try:
+        try:
+            asyncio.run(runtime_api_module.extension_acceptance(request))
+        except Exception as exc:
+            assert getattr(exc, "status_code", None) == 410
+            detail = getattr(exc, "detail", {})
+            assert detail.get("code") == "extension_acceptance_retired"
+        else:
+            raise AssertionError("retired extension endpoint did not fail closed")
+    finally:
+        runtime_api_module.resolve_snapshot = original_resolver
+    assert snapshot_calls == 0
+
+    root = Path(__file__).resolve().parents[1]
+    api_source = (root / "app/runtime/api.py").read_text(encoding="utf-8")
+    retired_source = api_source.split(
+        "async def extension_acceptance", 1
+    )[1].split('@router.post("/acceptance/trace")', 1)[0]
+    assert "_capability_fallback" not in retired_source
+    assert "plan_tools" not in retired_source
+    frontend_source = (root / "frontend/index.html").read_text(encoding="utf-8")
+    assert "/api/runtime/acceptance/extension" not in frontend_source
+    assert "runtime-extension-accept-btn" not in frontend_source
+
+
 def main() -> None:
     install_runtime_fakes()
     try:
@@ -469,6 +510,7 @@ def main() -> None:
             test_structured_work_order_state_machine,
             test_rag_citation_snapshot_and_mcp_boundaries,
             test_static_contracts,
+            test_retired_extension_control_path,
         )
         for test in tests:
             test()
