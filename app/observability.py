@@ -2652,7 +2652,9 @@ def _enrich_model_call(call: Dict[str, Any], session_id: Optional[str]) -> Dict[
     decision = _provider_reporting_decision(enriched)
 
     enriched["requested_model"] = (
-        usage_norm.get("requested_model") or model_id
+        usage_norm.get("requested_model")
+        or call.get("requested_model")
+        or model_id
     )
     provider_actual_model_candidates = _provider_actual_model_candidates(
         enriched
@@ -2667,8 +2669,17 @@ def _enrich_model_call(call: Dict[str, Any], session_id: Optional[str]) -> Dict[
     enriched["provider_actual_model_candidate_count"] = len(
         provider_actual_model_candidates
     )
-    enriched["thinking_enabled"] = _first_present(
+    thinking_evidence = _first_present(
         usage_norm, "thinking", "thinking_enabled"
+    )
+    if thinking_evidence is None:
+        thinking_evidence = call.get("thinking_enabled")
+    enriched["thinking_enabled"] = _optional_bool(thinking_evidence)
+    model_selection_reason = call.get("model_selection_reason")
+    enriched["model_selection_reason"] = (
+        str(model_selection_reason).strip()
+        if isinstance(model_selection_reason, str) and model_selection_reason.strip()
+        else None
     )
     enriched["stream"] = _optional_bool(
         _first_present(usage_norm, "stream", "streaming")
@@ -2712,15 +2723,74 @@ def _enrich_model_call(call: Dict[str, Any], session_id: Optional[str]) -> Dict[
     output = _token_value(enriched, "output_tokens")
     reasoning = _token_value(enriched, "reasoning_tokens")
     total = _token_value(enriched, "total_tokens")
+    parsed_hit = _optional_int(hit)
+    parsed_miss = _optional_int(miss)
+    parsed_output = _optional_int(output)
+    parsed_reasoning = _optional_int(reasoning)
+    parsed_total = _optional_int(total)
+    provider_actual = _token_source(enriched) == "provider_actual"
+    input_tokens = (
+        parsed_hit + parsed_miss
+        if provider_actual
+        and parsed_hit is not None
+        and parsed_miss is not None
+        and parsed_hit >= 0
+        and parsed_miss >= 0
+        else None
+    )
+    total_equation_valid = (
+        parsed_total == input_tokens + parsed_output
+        if input_tokens is not None
+        and parsed_output is not None
+        and parsed_total is not None
+        and parsed_output >= 0
+        and parsed_total >= 0
+        else None
+    )
+    reasoning_is_output_subset = (
+        0 <= parsed_reasoning <= parsed_output
+        if parsed_reasoning is not None
+        and parsed_output is not None
+        and parsed_output >= 0
+        else None
+    )
     enriched["provider_usage"] = {
         "cache_hit_input_tokens": hit,
         "cache_miss_input_tokens": miss,
         "input_cache_hit_tokens": hit,
         "input_cache_miss_tokens": miss,
+        "input_tokens": input_tokens,
         "output_tokens": output,
         "reasoning_tokens": reasoning,
         "total_tokens": total,
     }
+    enriched["provider_token_accounting"] = {
+        "source": "provider_actual" if provider_actual else "not_collected",
+        "cache_hit_input_tokens": parsed_hit if provider_actual else None,
+        "cache_miss_input_tokens": parsed_miss if provider_actual else None,
+        "input_tokens": input_tokens,
+        "input_formula": "cache_hit_input_tokens + cache_miss_input_tokens",
+        "output_tokens": parsed_output if provider_actual else None,
+        "reasoning_tokens": parsed_reasoning if provider_actual else None,
+        "reasoning_relationship": "subset_of_output",
+        "reasoning_is_output_subset": reasoning_is_output_subset,
+        "total_tokens": parsed_total if provider_actual else None,
+        "total_formula": "input_tokens + output_tokens",
+        "total_equation_valid": total_equation_valid,
+    }
+    enriched["provider_identity_evidence"] = {
+        "requested_model": enriched.get("requested_model"),
+        "requested_model_collected": bool(enriched.get("requested_model")),
+        "provider_actual_model": provider_actual_model,
+        "provider_actual_model_collected": bool(provider_actual_model),
+        "thinking_enabled": enriched.get("thinking_enabled"),
+        "thinking_collected": enriched.get("thinking_enabled") is not None,
+        "model_selection_reason": enriched.get("model_selection_reason"),
+        "model_selection_reason_collected": bool(
+            enriched.get("model_selection_reason")
+        ),
+    }
+    enriched["provider_called"] = True
     enriched["reasoning_tokens"] = reasoning
     enriched["total_tokens"] = total
     enriched["provider_usage_raw"] = usage_norm.get("provider_usage_raw")
@@ -2934,6 +3004,11 @@ def _cost_summary(calls: List[Dict[str, Any]]) -> Dict[str, Any]:
     known_token_calls = 0
     unknown_token_calls = 0
     total_tokens = 0
+    cache_hit_input_tokens = 0
+    cache_miss_input_tokens = 0
+    output_tokens = 0
+    reasoning_tokens = 0
+    reasoning_known_calls = 0
     for call in provider_calls:
         model_id = _provider_model(call)
         item = by_model.setdefault(
@@ -2957,6 +3032,21 @@ def _cost_summary(calls: List[Dict[str, Any]]) -> Dict[str, Any]:
             item["known_token_calls"] += 1
             total_tokens += int(token_value)
             item["tokens"] += int(token_value)
+            cache_hit_input_tokens += int(
+                _token_value(
+                    call, "cache_hit_input_tokens", "input_cache_hit_tokens"
+                )
+            )
+            cache_miss_input_tokens += int(
+                _token_value(
+                    call, "cache_miss_input_tokens", "input_cache_miss_tokens"
+                )
+            )
+            output_tokens += int(_token_value(call, "output_tokens"))
+            reasoning_value = _optional_int(_token_value(call, "reasoning_tokens"))
+            if reasoning_value is not None:
+                reasoning_tokens += reasoning_value
+                reasoning_known_calls += 1
         else:
             unknown_token_calls += 1
             item["unknown_token_calls"] += 1
@@ -2980,6 +3070,15 @@ def _cost_summary(calls: List[Dict[str, Any]]) -> Dict[str, Any]:
         and unknown_token_calls == 0
         and quality["data_quality_status"] == "normal"
     )
+    token_totals_complete = bool(provider_calls) and unknown_token_calls == 0
+    input_tokens = cache_hit_input_tokens + cache_miss_input_tokens
+    token_relationship_valid = (
+        input_tokens + output_tokens == total_tokens
+        and quality["reasoning_violation_calls"] == 0
+        and not any(_provider_usage_inconsistency(item)[0] for item in provider_calls)
+        if token_totals_complete
+        else None
+    )
     return {
         "calls": len(provider_calls),
         "provider_request_count": len(provider_calls),
@@ -2987,6 +3086,25 @@ def _cost_summary(calls: List[Dict[str, Any]]) -> Dict[str, Any]:
         "total_tokens": total_tokens if known_token_calls else None,
         "known_token_calls": known_token_calls,
         "unknown_token_calls": unknown_token_calls,
+        "usage_totals": {
+            "cache_hit_input_tokens": (
+                cache_hit_input_tokens if token_totals_complete else None
+            ),
+            "cache_miss_input_tokens": (
+                cache_miss_input_tokens if token_totals_complete else None
+            ),
+            "input_tokens": input_tokens if token_totals_complete else None,
+            "output_tokens": output_tokens if token_totals_complete else None,
+            "reasoning_tokens": (
+                reasoning_tokens
+                if token_totals_complete
+                and reasoning_known_calls == len(provider_calls)
+                else None
+            ),
+            "total_tokens": total_tokens if token_totals_complete else None,
+            "complete": token_totals_complete,
+            "token_relationship_valid": token_relationship_valid,
+        },
         "known_cost_cny": round(known_cost_cny, 8) if known_cost_calls else None,
         "platform_price_snapshot_direct_cost_cny": (
             round(known_cost_cny, 8)
@@ -3016,6 +3134,127 @@ def _stage_display_name(stage: Optional[str]) -> str:
         "darwin": "Darwin/AI专家",
         "retest": "Badcase复测（逻辑聚合）",
     }.get(stage) or (stage or "模型调用")
+
+
+_KNOWN_NON_PROVIDER_SPANS = {
+    "agent_frozen",
+    "capability_decision",
+    "retrieval",
+    "rag_retrieval",
+    "citation_validation",
+    "action_gateway",
+    "work_order_workflow",
+    "work_order.proposal_request",
+    "handoff_state",
+    "a_handoff",
+}
+
+
+def _trace_event_provider_projection(
+    events: List[Dict[str, Any]], model_calls: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """Annotate spans from persisted execution evidence without guessing history."""
+
+    attempted_provider_stages = {
+        str(item.get("stage") or "") for item in model_calls
+    }
+    confirmed_provider_stages = {
+        str(item.get("stage") or "")
+        for item in model_calls
+        if (item.get("reconciliation") or {}).get("provider_request_sent") is True
+    }
+    projected: List[Dict[str, Any]] = []
+    for event in events:
+        item = dict(event)
+        span = str(item.get("span_name") or "")
+        if span in confirmed_provider_stages:
+            item["provider_called"] = True
+            item["provider_token_note"] = (
+                "该节点调用了Provider；Token与成本按物理请求逐次展示。"
+            )
+        elif span in attempted_provider_stages:
+            item["provider_called"] = None
+            item["provider_token_note"] = (
+                "该节点存在Provider尝试记录，但出站调用未确认。"
+            )
+        elif (
+            span in _KNOWN_NON_PROVIDER_SPANS
+            or span.startswith("rag.")
+            or span.startswith("skill.")
+            or span.startswith("mcp.")
+            or span.startswith("tool.")
+            or span.startswith("work_order.")
+        ):
+            item["provider_called"] = False
+            item["provider_token_note"] = "未调用Provider，无Provider Token。"
+        else:
+            item["provider_called"] = None
+            item["provider_token_note"] = "该历史节点未采集Provider调用归属。"
+        projected.append(item)
+    return projected
+
+
+def _trace_efficiency_notes(
+    model_calls: List[Dict[str, Any]], context_breakdown: Dict[str, Any]
+) -> List[Dict[str, Any]]:
+    """Return at most three read-only, evidence-labelled savings notes."""
+
+    confirmed_calls = [
+        item
+        for item in model_calls
+        if (item.get("reconciliation") or {}).get("included_in_provider_summary")
+        is True
+        or item.get("included_in_provider_summary") is True
+    ]
+    stages = [str(item.get("stage") or "unknown") for item in confirmed_calls]
+    selector_count = sum(stage == "agent_selector" for stage in stages)
+    context_values = {
+        key: _optional_int(context_breakdown.get(key))
+        for key in (
+            "system_prompt_tokens",
+            "history_tokens",
+            "skill_tokens",
+            "rag_tokens",
+            "tool_result_tokens",
+            "user_message_tokens",
+        )
+    }
+    measured_context = {
+        key: value for key, value in context_values.items() if value is not None
+    }
+    return [
+        {
+            "evidence_level": "measured",
+            "title": "减少物理调用次数",
+            "action": "Router一次完成分类与选Agent；冻结后不回溯，确认按钮不再调用模型。",
+            "cost_result": (
+                f"本Trace实测Provider请求{len(confirmed_calls)}次；"
+                f"agent_selector请求{selector_count}次。"
+            ),
+            "quality_boundary": "不省略唯一Router，也不把逻辑节点伪装成Provider请求。",
+        },
+        {
+            "evidence_level": "measured" if measured_context else "not_collected",
+            "title": "按选定Agent装配上下文",
+            "action": "Router只看最小Agent卡；垂直Agent只装配自身绑定，Skill按需激活。",
+            "cost_result": (
+                "本Trace上下文分项："
+                + ", ".join(
+                    f"{key}={value}" for key, value in measured_context.items()
+                )
+                if measured_context
+                else "本Trace未采集上下文分项Token，不推断节省数值。"
+            ),
+            "quality_boundary": "绑定不等于全部加载；未绑定能力不得进入上下文。",
+        },
+        {
+            "evidence_level": "expected",
+            "title": "只注入相关RAG与必要相邻分片",
+            "action": "在统一预算内补同文档相邻上下文，不装载整库。",
+            "cost_result": "预期减少无关装载Token；没有实测金额时不换算节省费用。",
+            "quality_boundary": "完整带时间戳会话仍保留，不通过截断历史换取节省。",
+        },
+    ]
 
 
 def _trace_cost_explanation(calls: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -3410,7 +3649,9 @@ async def trace_detail(trace_id: str):
     session_model_calls = [
         _enrich_model_call(c, session_id) for c in session_provider_raw_calls
     ]
-    trace_events = list_trace_events(trace_id)
+    trace_events = _trace_event_provider_projection(
+        list_trace_events(trace_id), model_calls
+    )
     evaluation_run = get_evaluation_run_by_trace_id(trace_id)
 
     # Summarize context composition from the vertical model call if available.
@@ -3520,6 +3761,9 @@ async def trace_detail(trace_id: str):
         "trace_cost_summary": _cost_summary(model_calls),
         "session_cost_summary": _cost_summary(session_model_calls),
         "trace_cost_explanation": _trace_cost_explanation(model_calls),
+        "trace_efficiency_notes": _trace_efficiency_notes(
+            model_calls, context_breakdown
+        ),
     })
 
 
