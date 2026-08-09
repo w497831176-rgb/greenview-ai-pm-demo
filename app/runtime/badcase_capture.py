@@ -8,7 +8,6 @@ import unicodedata
 from enum import Enum
 from typing import Any, Dict, Optional
 
-from app.badcase_schema import is_terminal_status
 from app.runtime.contracts import RunEvidenceLedger
 from db.property_db import (
     add_badcase_action,
@@ -25,6 +24,7 @@ AUTO_SOURCES = {
     "runtime_failure",
     "provider_failure",
     "agent_insufficient_evidence",
+    "agent_insufficient_capability",
     "agent_capability_unavailable",
 }
 
@@ -32,20 +32,25 @@ AUTO_SOURCES = {
 class BadcaseTriggerCode(str, Enum):
     """Closed runtime facts that may create an active suspected Badcase."""
 
+    ROUTER_CONTRACT_INVALID = "router_contract_invalid"
+    AGENT_CONTRACT_INVALID = "agent_contract_invalid"
     RUNTIME_FAILED = "runtime_failed"
-    CONTRACT_INVALID = "contract_invalid"
     CAPABILITY_FAILED = "capability_failed"
     CITATION_INVALID = "citation_invalid"
-    ACTION_FAILED = "action_failed"
     INSUFFICIENT_EVIDENCE = "insufficient_evidence"
-    CAPABILITY_UNAVAILABLE = "capability_unavailable"
+    INSUFFICIENT_CAPABILITY = "insufficient_capability"
 
 
 _RUNTIME_FAILURE_CODES = {
     "provider_failure",
     "runtime_failure",
 }
-_CONTRACT_INVALID_CODES = {
+_ROUTER_CONTRACT_INVALID_CODES = {
+    "router_contract_invalid",
+}
+_AGENT_CONTRACT_INVALID_CODES = {
+    "agent_contract_invalid",
+    "contract_invalid",
     "internal_control_payload_leak",
 }
 _CAPABILITY_FAILURE_CODES = {
@@ -74,7 +79,10 @@ _ACTION_FAILURE_CODES = {
 _FAILED_ACTION_STATUSES = {"error", "failed"}
 _AGENT_ANSWER_STATUS_TRIGGERS = {
     "insufficient_evidence": BadcaseTriggerCode.INSUFFICIENT_EVIDENCE,
-    "capability_unavailable": BadcaseTriggerCode.CAPABILITY_UNAVAILABLE,
+    "insufficient_capability": BadcaseTriggerCode.INSUFFICIENT_CAPABILITY,
+    # Backward-compatible runtime alias; the persisted closed trigger is the
+    # product term above rather than a second lifecycle category.
+    "capability_unavailable": BadcaseTriggerCode.INSUFFICIENT_CAPABILITY,
 }
 _KNOWN_AGENT_ANSWER_STATUSES = {"answered", *_AGENT_ANSWER_STATUS_TRIGGERS}
 
@@ -235,7 +243,12 @@ def runtime_badcase_decision(
     failed_evaluations = _fixed_evaluation_failures(ledger, legacy_mode=legacy_mode)
     failed_actions = _failed_actions(ledger)
     runtime_violations = _violations_for_codes(ledger, _RUNTIME_FAILURE_CODES)
-    contract_violations = _violations_for_codes(ledger, _CONTRACT_INVALID_CODES)
+    router_contract_violations = _violations_for_codes(
+        ledger, _ROUTER_CONTRACT_INVALID_CODES
+    )
+    agent_contract_violations = _violations_for_codes(
+        ledger, _AGENT_CONTRACT_INVALID_CODES
+    )
     capability_violations = _violations_for_codes(
         ledger, _CAPABILITY_FAILURE_CODES
     )
@@ -248,7 +261,7 @@ def runtime_badcase_decision(
     )
 
     base = {
-        "capture_version": 3,
+        "capture_version": 4,
         "contract_violations": violations,
         "failed_evaluations": failed_evaluations,
         "failed_tools": failed_tools,
@@ -257,6 +270,43 @@ def runtime_badcase_decision(
         "release_id": _release_id(ledger),
         "affects_final_user": not bool(context.get("renderer_intercepted")),
     }
+
+    normalized_runtime_error_type = str(runtime_error_type or "").strip().lower()
+    if (
+        normalized_runtime_error_type in _ROUTER_CONTRACT_INVALID_CODES
+        or router_contract_violations
+    ):
+        return _formal_decision(
+            base,
+            trigger_code=BadcaseTriggerCode.ROUTER_CONTRACT_INVALID,
+            source="runtime_contract",
+            category="routing",
+            root_cause_domain="routing",
+            reason="Router structured result failed contract validation",
+            component=(
+                _violation_component("router", router_contract_violations)
+                if router_contract_violations
+                else "router:contract"
+            ),
+        )
+
+    if (
+        normalized_runtime_error_type in _AGENT_CONTRACT_INVALID_CODES
+        or agent_contract_violations
+    ):
+        return _formal_decision(
+            base,
+            trigger_code=BadcaseTriggerCode.AGENT_CONTRACT_INVALID,
+            source="runtime_contract",
+            category="response_quality",
+            root_cause_domain="model_instruction",
+            reason="Selected Agent structured result failed contract validation",
+            component=(
+                _violation_component("agent", agent_contract_violations)
+                if agent_contract_violations
+                else f"agent:{_selected_agent_id(ledger)}"
+            ),
+        )
 
     if runtime_error or runtime_violations:
         provider_failure = runtime_error_type == "provider_failure" or any(
@@ -292,7 +342,7 @@ def runtime_badcase_decision(
         ]
         return _formal_decision(
             base,
-            trigger_code=BadcaseTriggerCode.ACTION_FAILED,
+            trigger_code=BadcaseTriggerCode.RUNTIME_FAILED,
             source="runtime_contract",
             category="other",
             root_cause_domain="authority_safety",
@@ -321,25 +371,20 @@ def runtime_badcase_decision(
         )
 
     if failed_tools:
-        required_failure = legacy_mode or any(
-            item.get("required") is True or item.get("affects_final_user") is True
-            for item in failed_tools
+        return _formal_decision(
+            base,
+            trigger_code=BadcaseTriggerCode.CAPABILITY_FAILED,
+            source="tool_failure",
+            category="mcp_capability",
+            root_cause_domain="tool_mcp",
+            reason="本轮实际能力调用出现结构化失败",
+            component=_component_list(
+                *(
+                    f"tool:{item.get('server_name') or 'local'}/{item.get('tool_name') or 'unknown'}"
+                    for item in failed_tools
+                )
+            ),
         )
-        if required_failure:
-            return _formal_decision(
-                base,
-                trigger_code=BadcaseTriggerCode.CAPABILITY_FAILED,
-                source="tool_failure",
-                category="mcp_capability",
-                root_cause_domain="tool_mcp",
-                reason="必要能力调用失败，用户未获得正常结果",
-                component=_component_list(
-                    *(
-                        f"tool:{item.get('server_name') or 'local'}/{item.get('tool_name') or 'unknown'}"
-                        for item in failed_tools
-                    )
-                ),
-            )
 
     if capability_violations:
         return _formal_decision(
@@ -350,35 +395,6 @@ def runtime_badcase_decision(
             root_cause_domain="unknown",
             reason="已选能力出现结构化执行失败",
             component=_violation_component("capability", capability_violations),
-        )
-
-    if contract_violations or failed_evaluations:
-        evaluation_components = [
-            "evaluation:{case}:{assertion}".format(
-                case=item.get("evaluation_case_id")
-                or item.get("evaluation_run_id")
-                or "unknown",
-                assertion=item.get("assertion_id") or "fixed",
-            )
-            for item in failed_evaluations
-        ]
-        return _formal_decision(
-            base,
-            trigger_code=BadcaseTriggerCode.CONTRACT_INVALID,
-            source="evaluation" if failed_evaluations else "runtime_contract",
-            category="response_quality" if failed_evaluations else "other",
-            root_cause_domain="unknown",
-            reason=(
-                "固定评估断言未通过"
-                if failed_evaluations
-                else "封闭运行合同校验失败"
-            ),
-            component=_component_list(
-                _violation_component("contract", contract_violations)
-                if contract_violations
-                else None,
-                *evaluation_components,
-            ),
         )
 
     agent_trigger = _AGENT_ANSWER_STATUS_TRIGGERS.get(
@@ -392,7 +408,7 @@ def runtime_badcase_decision(
             source=(
                 "agent_insufficient_evidence"
                 if insufficient
-                else "agent_capability_unavailable"
+                else "agent_insufficient_capability"
             ),
             category="knowledge_gap" if insufficient else "mcp_capability",
             root_cause_domain="knowledge_rag" if insufficient else "unknown",
@@ -408,32 +424,26 @@ def runtime_badcase_decision(
         normalized_answer_status is not None
         and normalized_answer_status not in _KNOWN_AGENT_ANSWER_STATUSES
     ):
-        return {
-            **base,
-            "disposition": "system_observation",
-            "trigger_code": None,
-            "source": "runtime_contract",
-            "category": "other",
-            "suggested_root_cause_domain": "unknown",
-            "reason": "Agent返回未知answer_status，未进入活跃Badcase",
-            "component": f"agent:{_selected_agent_id(ledger)}",
-        }
+        return _formal_decision(
+            base,
+            trigger_code=BadcaseTriggerCode.AGENT_CONTRACT_INVALID,
+            source="runtime_contract",
+            category="response_quality",
+            root_cause_domain="model_instruction",
+            reason="Selected Agent returned an invalid answer_status",
+            component=f"agent:{_selected_agent_id(ledger)}",
+        )
 
-    if failed_tools:
+    if failed_evaluations:
         return {
             **base,
             "disposition": "system_observation",
             "trigger_code": None,
-            "source": "tool_failure",
-            "category": "mcp_capability",
-            "suggested_root_cause_domain": "tool_mcp",
-            "reason": "非必要工具异常但最终业务结果正常",
-            "component": _component_list(
-                *(
-                    f"tool:{item.get('server_name') or 'local'}/{item.get('tool_name') or 'unknown'}"
-                    for item in failed_tools
-                )
-            ),
+            "source": "evaluation",
+            "category": "response_quality",
+            "suggested_root_cause_domain": "unknown",
+            "reason": "Evaluation differences require an operator decision",
+            "component": "evaluation",
         }
 
     if violations:
@@ -569,11 +579,48 @@ def capture_runtime_badcase(
 
     existing_cases = list_badcases()
     for existing in existing_cases:
+        try:
+            existing_context = json.loads(existing.get("context_json") or "{}")
+        except Exception:
+            existing_context = {}
         if (
             str(existing.get("trace_id") or "") == ledger.trace_id
             and str(existing.get("source") or "") in AUTO_SOURCES
+            and str(existing_context.get("trigger_code") or "")
+            == str(decision.get("trigger_code") or "")
         ):
-            return existing
+            occurrence_count = max(
+                1, int(existing_context.get("occurrence_count") or 1)
+            ) + 1
+            existing_context.update(
+                {
+                    "capture_version": 4,
+                    "occurrence_count": occurrence_count,
+                    "last_occurrence_trace_id": ledger.trace_id,
+                }
+            )
+            updated = update_badcase(
+                int(existing["id"]),
+                context_json=json.dumps(
+                    existing_context, ensure_ascii=False, default=str
+                ),
+            )
+            add_badcase_action(
+                badcase_id=int(existing["id"]),
+                action_type="auto-duplicate-occurrence",
+                action_detail=json.dumps(
+                    {
+                        "trace_id": ledger.trace_id,
+                        "trigger_code": decision.get("trigger_code"),
+                        "occurrence_count": occurrence_count,
+                    },
+                    ensure_ascii=False,
+                ),
+                status_before=str(existing.get("status") or "pending"),
+                status_after=str(existing.get("status") or "pending"),
+                created_by="runtime",
+            )
+            return updated or existing
 
     release_id = _release_id(ledger)
     problem_fingerprint = _problem_fingerprint(original_query)
@@ -582,64 +629,6 @@ def capture_runtime_badcase(
         release_id=release_id,
         problem_fingerprint=problem_fingerprint,
     )
-    active_matches = []
-    for existing in existing_cases:
-        try:
-            context = json.loads(existing.get("context_json") or "{}")
-        except Exception:
-            context = {}
-        if (
-            context.get("capture_version") == 3
-            and context.get("issue_fingerprint") == fingerprint
-            and not is_terminal_status(str(existing.get("status") or "pending"))
-        ):
-            active_matches.append((existing, context))
-    if active_matches:
-        existing, context = max(
-            active_matches,
-            key=lambda item: int(item[0].get("id") or 0),
-        )
-        occurrence_trace_ids = [
-            str(value)
-            for value in context.get("occurrence_trace_ids") or []
-            if str(value)
-        ]
-        if ledger.trace_id in occurrence_trace_ids:
-            return existing
-        occurrence_trace_ids.append(ledger.trace_id)
-        occurrence_count = max(1, int(context.get("occurrence_count") or 1)) + 1
-        context.update(
-            {
-                "occurrence_count": occurrence_count,
-                "occurrence_trace_ids": occurrence_trace_ids,
-                "last_occurrence_trace_id": ledger.trace_id,
-            }
-        )
-        updated = update_badcase(
-            int(existing["id"]),
-            context_json=json.dumps(context, ensure_ascii=False, default=str),
-        )
-        add_badcase_action(
-            badcase_id=int(existing["id"]),
-            action_type="auto-duplicate-occurrence",
-            action_detail=json.dumps(
-                {
-                    "trace_id": ledger.trace_id,
-                    "issue_fingerprint": fingerprint,
-                    "trigger_code": decision.get("trigger_code"),
-                    "component": decision.get("component"),
-                    "release_id": release_id,
-                    "problem_fingerprint": problem_fingerprint,
-                    "occurrence_count": occurrence_count,
-                },
-                ensure_ascii=False,
-            ),
-            status_before=str(existing.get("status") or "pending"),
-            status_after=str(existing.get("status") or "pending"),
-            created_by="runtime",
-        )
-        return updated or existing
-
     evidence = {
         "trace_id": ledger.trace_id,
         "config_snapshot": ledger.config_snapshot,
@@ -648,7 +637,7 @@ def capture_runtime_badcase(
         **decision,
     }
     context = {
-        "capture_version": 3,
+        "capture_version": 4,
         "issue_fingerprint": fingerprint,
         "problem_fingerprint": problem_fingerprint,
         "occurrence_count": 1,
@@ -689,7 +678,7 @@ def capture_runtime_badcase(
     )
     add_badcase_action(
         badcase_id=int(case["id"]),
-        action_type="auto-capture-v3",
+        action_type="auto-capture-v4",
         action_detail=json.dumps(evidence, ensure_ascii=False, default=str),
         status_before="pending",
         status_after="pending",

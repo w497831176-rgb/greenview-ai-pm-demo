@@ -1,10 +1,10 @@
 """Evaluation / Golden Set API for YIAI物业 V1.6.
 
 This module deliberately evaluates the *product path*, not an isolated model
-completion.  A case can assert route, Skill, Tool/MCP, RAG evidence, handoff
-and hard business prohibitions.  A real model call happens only when an
-operator explicitly runs one active case; creating, editing and reviewing a
-case is free of model calls.
+completion.  A case records expected lane, Agent, capability modes, handoff
+and one operator rubric.  Structural differences are computed automatically;
+PASS/FAIL remains an operator decision.  A real model call happens only when
+an operator explicitly runs one active case.
 """
 
 import json
@@ -127,6 +127,24 @@ def _validate_case_payload(payload: Dict[str, Any]) -> None:
         raise HTTPException(status_code=400, detail="case_key must be 1-80 characters")
     rubric = payload.get("rubric")
     if isinstance(rubric, dict):
+        expected_lane = rubric.get("expected_lane")
+        if expected_lane is not None and str(expected_lane).upper() not in {"A", "B", "C"}:
+            raise HTTPException(status_code=400, detail=f"invalid expected_lane: {expected_lane}")
+        capability_expectations = rubric.get("capability_expectations")
+        if capability_expectations is not None:
+            if not isinstance(capability_expectations, dict):
+                raise HTTPException(status_code=400, detail="capability_expectations must be an object")
+            unknown = set(capability_expectations) - {"skill", "rag", "mcp", "tool"}
+            invalid_modes = {
+                str(value)
+                for value in capability_expectations.values()
+                if str(value).lower() not in {"must", "forbid", "ignore"}
+            }
+            if unknown or invalid_modes:
+                raise HTTPException(
+                    status_code=400,
+                    detail="capability expectations only allow skill/rag/mcp/tool with must/forbid/ignore",
+                )
         assertions = rubric.get("deterministic_assertions")
         if isinstance(assertions, dict) and "expected_runtime_status" in assertions:
             expected_status = assertions.get("expected_runtime_status")
@@ -252,6 +270,47 @@ def _expected_runtime_status(case: Dict[str, Any]) -> Any:
     return assertions.get("expected_runtime_status", "complete")
 
 
+def _actual_lane(done: Dict[str, Any]) -> str:
+    """Read the runtime's structured lane without re-interpreting user prose."""
+
+    lane_decision = done.get("lane_decision") or {}
+    raw = str(
+        (lane_decision.get("lane") if isinstance(lane_decision, dict) else None)
+        or done.get("lane")
+        or done.get("route_intent")
+        or ""
+    ).strip()
+    return {
+        "A_HANDOFF": "A",
+        "B_PROPERTY_GOVERNED": "B",
+        "C_ISOLATED_GENERAL": "C",
+    }.get(raw, raw if raw in {"A", "B", "C"} else "")
+
+
+def _capability_rule(
+    capability: str,
+    mode: str,
+    actual_items: Any,
+) -> Dict[str, Any]:
+    normalized_mode = str(mode or "ignore").strip().lower()
+    if normalized_mode not in {"must", "forbid", "ignore"}:
+        normalized_mode = "ignore"
+    present = bool(actual_items)
+    if normalized_mode == "ignore":
+        status = "not_configured"
+    elif normalized_mode == "must":
+        status = "pass" if present else "fail"
+    else:
+        status = "pass" if not present else "fail"
+    return _rule(
+        f"capability_{capability}",
+        f"{capability.upper()} capability",
+        normalized_mode,
+        {"used": present, "evidence": actual_items},
+        status,
+    )
+
+
 def evaluate_runtime_evidence(case: Dict[str, Any], answer: str, done: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], str]:
     """Run deterministic checks and leave qualitative judgement to humans.
 
@@ -264,8 +323,6 @@ def evaluate_runtime_evidence(case: Dict[str, Any], answer: str, done: Dict[str,
     skills = _normalize_skill_names(done)
     tools = _normalize_tool_names(done)
     citations = _normalize_citation_titles(done)
-    answer_lower = (answer or "").lower()
-
     rubric = case.get("rubric") or {}
     assertions = (
         rubric.get("deterministic_assertions") or {}
@@ -285,6 +342,23 @@ def evaluate_runtime_evidence(case: Dict[str, Any], answer: str, done: Dict[str,
             if actual_runtime_status != expected_runtime_status else ""
         ),
     ))
+
+    expected_lane = str(
+        rubric.get("expected_lane") if isinstance(rubric, dict) else ""
+    ).strip().upper()
+    actual_lane = _actual_lane(done)
+    if expected_lane in {"A", "B", "C"}:
+        checks.append(_rule(
+            "lane",
+            "A/B/C lane",
+            expected_lane,
+            actual_lane,
+            "pass" if actual_lane == expected_lane else "fail",
+        ))
+    else:
+        checks.append(_rule(
+            "lane", "A/B/C lane", "not configured", actual_lane, "not_configured"
+        ))
 
     controlled_evidence = done.get("controlled_action_evidence") or {}
     if actual_runtime_status == "paused":
@@ -393,19 +467,32 @@ def evaluate_runtime_evidence(case: Dict[str, Any], answer: str, done: Dict[str,
     else:
         checks.append(_rule("citations", "RAG 证据引用", "未配置", citations, "not_configured"))
 
-    required_terms = _text_list(case.get("required_terms"))
-    if required_terms:
-        missing = [item for item in required_terms if item.lower() not in answer_lower]
-        checks.append(_rule("required_terms", "必须表达", required_terms, answer[:800], "pass" if not missing else "fail", note=("未出现：" + "、".join(missing)) if missing else ""))
-    else:
-        checks.append(_rule("required_terms", "必须表达", "未配置", "-", "not_configured"))
-
-    forbidden_terms = _text_list(case.get("forbidden_terms"))
-    if forbidden_terms:
-        found = [item for item in forbidden_terms if item.lower() in answer_lower]
-        checks.append(_rule("forbidden_terms", "禁止表达", forbidden_terms, answer[:800], "fail" if found else "pass", note=("出现：" + "、".join(found)) if found else ""))
-    else:
-        checks.append(_rule("forbidden_terms", "禁止表达", "未配置", "-", "not_configured"))
+    # Answer wording is intentionally not scored with required/forbidden terms.
+    # Product quality remains an operator judgement against operator_rubric.
+    capability_expectations = (
+        rubric.get("capability_expectations") or {}
+        if isinstance(rubric, dict)
+        else {}
+    )
+    if not isinstance(capability_expectations, dict):
+        capability_expectations = {}
+    retrieval_evidence = done.get("retrieval_evidence") or (
+        (done.get("evidence_ledger") or {}).get("retrieval_evidence")
+        if isinstance(done.get("evidence_ledger"), dict)
+        else []
+    )
+    capability_actual = {
+        "skill": skills,
+        "rag": done.get("citations") or retrieval_evidence or [],
+        "mcp": done.get("mcp_calls") or [],
+        "tool": done.get("tool_calls") or [],
+    }
+    for capability in ("skill", "rag", "mcp", "tool"):
+        checks.append(_capability_rule(
+            capability,
+            capability_expectations.get(capability, "ignore"),
+            capability_actual[capability],
+        ))
 
     expected_handoff = case.get("expected_handoff")
     if expected_handoff is not None:
@@ -429,27 +516,6 @@ def evaluate_runtime_evidence(case: Dict[str, Any], answer: str, done: Dict[str,
                 actual_value,
                 "pass" if passed else "fail",
             ))
-
-    citation_terms = _text_list(assertions.get("citation_required_terms"))
-    if citation_terms:
-        citation_text = "\n".join(
-            " ".join(str(item.get(key) or "") for key in ("doc_title", "content_snapshot", "content"))
-            for item in (done.get("citations") or [])
-            if isinstance(item, dict)
-        ).lower()
-        missing = [term for term in citation_terms if term.lower() not in citation_text]
-        checks.append(_rule(
-            "citation_support", "引用内容支持关键事实", citation_terms,
-            citation_text[:1200], "pass" if not missing else "fail",
-            note=("引用中缺少：" + "、".join(missing)) if missing else "",
-        ))
-
-    if assertions.get("require_knowledge_insufficient"):
-        passed = "当前知识依据不足" in (answer or "")
-        checks.append(_rule(
-            "knowledge_insufficient", "无依据时安全拒答", "当前知识依据不足",
-            answer[:800], "pass" if passed else "fail",
-        ))
 
     side_effects = done.get("side_effects") or {}
     if assertions.get("forbid_business_side_effects"):
@@ -524,10 +590,9 @@ def evaluate_runtime_evidence(case: Dict[str, Any], answer: str, done: Dict[str,
             note="此失败由验收用例显式注入，不代表真实能力故障。",
         ))
 
-    hard_fail = any(item["hard"] and item["status"] == "fail" for item in checks)
-    needs_manual = _manual_rubric_required(case)
-    status = "failed" if hard_fail else "needs_manual_review" if needs_manual else "passed"
-    return checks, status
+    # Structural differences are evidence, not the final quality verdict.
+    # Only an operator review may turn a completed run into PASS or FAIL.
+    return checks, "needs_manual_review"
 
 
 class RuntimeExecutionError(RuntimeError):
@@ -876,6 +941,8 @@ def _enrich_runtime_evidence(
 
 def _evaluation_evidence(done: Dict[str, Any]) -> Dict[str, Any]:
     return {
+        "lane_decision": done.get("lane_decision") or {},
+        "lane": _actual_lane(done),
         "route_intent": done.get("route_intent"),
         "route_reason": done.get("route_reason"),
         "current_agent": done.get("current_agent"),
@@ -883,7 +950,9 @@ def _evaluation_evidence(done: Dict[str, Any]) -> Dict[str, Any]:
         "activated_skills": _normalize_skill_names(done),
         "tool_names": _normalize_tool_names(done),
         "mcp_calls": done.get("mcp_calls") or [],
+        "tool_calls": done.get("tool_calls") or [],
         "citations": done.get("citations") or [],
+        "answer_status": done.get("answer_status"),
         "handoff": bool(done.get("handoff")),
         "handoff_state": done.get("handoff_state"),
         "handoff_reason": done.get("handoff_reason"),
@@ -904,7 +973,7 @@ def _evaluation_evidence(done: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _ensure_badcase_for_run(run_id: int) -> Dict[str, Any]:
-    """Idempotently persist one source=evaluation Badcase for a failed run."""
+    """Persist one operator-requested suspected Badcase for a reviewed failure."""
     run = get_evaluation_run(run_id)
     if not run:
         raise HTTPException(status_code=404, detail="evaluation run not found")
@@ -916,7 +985,7 @@ def _ensure_badcase_for_run(run_id: int) -> Dict[str, Any]:
         update_evaluation_run(run_id, badcase_id=existing["id"])
         return existing
     if run.get("status") not in {"failed", "error"}:
-        raise HTTPException(status_code=409, detail="仅失败运行可自动沉淀为 Badcase")
+        raise HTTPException(status_code=409, detail="Only a failed run may be manually linked to a suspected Badcase")
     case = get_evaluation_case(int(run["evaluation_case_id"]))
     if not case:
         raise HTTPException(status_code=404, detail="evaluation case not found")
@@ -930,10 +999,10 @@ def _ensure_badcase_for_run(run_id: int) -> Dict[str, Any]:
         "skills": case.get("expected_skills"),
         "tools": case.get("expected_tools"),
         "citation_docs": case.get("expected_citation_docs"),
-        "required_terms": case.get("required_terms"),
-        "forbidden_terms": case.get("forbidden_terms"),
         "handoff": case.get("expected_handoff"),
-        "deterministic_assertions": (case.get("rubric") or {}).get("deterministic_assertions") or {},
+        "expected_lane": (case.get("rubric") or {}).get("expected_lane"),
+        "capability_expectations": (case.get("rubric") or {}).get("capability_expectations") or {},
+        "operator_rubric": (case.get("rubric") or {}).get("operator_rubric") or "",
     }
     controlled = bool((case.get("rubric") or {}).get("controlled_failure_canary"))
     marker = "【受控故障注入】" if controlled else ""
@@ -996,7 +1065,6 @@ def _link_evaluation_retest(
     run_id = int(run["id"])
     update_evaluation_run(run_id, badcase_id=int(badcase["id"]))
     run = get_evaluation_run(run_id) or run
-    passed = run.get("status") == "passed"
     trace_id = str(run.get("trace_id") or "").strip()
     trace = get_chat_trace(trace_id) if trace_id else None
     session_id = str(run.get("session_id") or "").strip()
@@ -1006,13 +1074,10 @@ def _link_evaluation_retest(
         and session_id
         and trace.get("session_id") == session_id
     )
-    retest_complete = bool(
-        passed
-        and str(run.get("answer") or "").strip()
-        and trace_complete
-    )
     before_status = str(badcase.get("status") or "verifying")
-    after_status = before_status if retest_complete else "fixing"
+    # A retest records evidence only.  It cannot advance or regress the
+    # Badcase lifecycle before an operator records the final judgement.
+    after_status = before_status
     retest_at = now_cn()
     baseline_run_id = badcase.get("linked_evaluation_run_id")
     baseline_trace_id = badcase.get("trace_id")
@@ -1021,7 +1086,7 @@ def _link_evaluation_retest(
         "evaluation_case_id": case.get("id"),
         "evaluation_case_key": case.get("case_key"),
         "evaluation_run_id": run_id,
-        "run_status": "complete" if retest_complete else "failed",
+        "run_status": "awaiting_human_review",
         "evaluation_run_status": run.get("status"),
         "trace_id": trace_id,
         "retest_started_at": retest_started_at,
@@ -1167,14 +1232,14 @@ async def run_case(case_id: int, request: EvaluationRunRequest = EvaluationRunRe
         )
         badcase = (
             _link_evaluation_retest(linked_badcase, case, run, retest_started_at)
-            if linked_badcase else _ensure_badcase_for_run(run["id"])
+            if linked_badcase else None
         )
         return {
             "case": case,
             "run": get_evaluation_run(run["id"]),
             "rule_results": checks,
             "badcase": badcase,
-            "message": "运行失败；已保存真实失败并自动关联 Evaluation Badcase，未伪造成 PASS。",
+            "message": "运行失败；已保存真实失败。需要人工评审后再点击创建疑似 Badcase。",
         }
     except Exception as exc:
         checks = [_rule(
@@ -1190,14 +1255,14 @@ async def run_case(case_id: int, request: EvaluationRunRequest = EvaluationRunRe
         )
         badcase = (
             _link_evaluation_retest(linked_badcase, case, run, retest_started_at)
-            if linked_badcase else _ensure_badcase_for_run(run["id"])
+            if linked_badcase else None
         )
         return {
             "case": case,
             "run": get_evaluation_run(run["id"]),
             "rule_results": checks,
             "badcase": badcase,
-            "message": "运行失败；已保留可见错误并自动关联 Evaluation Badcase。",
+            "message": "运行失败；已保留可见错误，未自动创建 Badcase。",
         }
 
     trace_id = done.get("trace_id")
@@ -1236,7 +1301,7 @@ async def run_case(case_id: int, request: EvaluationRunRequest = EvaluationRunRe
             linked_badcase, case, run, retest_started_at
         )
     else:
-        badcase = _ensure_badcase_for_run(run["id"]) if run_status == "failed" else None
+        badcase = None
     if badcase:
         run = get_evaluation_run(run["id"]) or run
     return {
@@ -1245,7 +1310,7 @@ async def run_case(case_id: int, request: EvaluationRunRequest = EvaluationRunRe
         "rule_results": checks,
         "badcase": badcase,
         "budget": budget_gate,
-        "message": "硬规则结果已生成；涉及业务可用性、语气和复杂 SOP 的 Rubric 仍需人工审核。",
+        "message": "结构差异已生成；最终 PASS / FAIL 必须由人工审核。",
     }
 
 
@@ -1262,17 +1327,14 @@ async def review_run(run_id: int, request: EvaluationReviewRequest):
         operator_judgement="passed" if request.passed else "failed",
         operator_note=request.note.strip(),
     )
-    if not request.passed:
-        _ensure_badcase_for_run(run_id)
-        updated = get_evaluation_run(run_id)
     return {"run": updated}
 
 
 @router.post("/runs/{run_id}/create-badcase")
 async def create_badcase_from_run(run_id: int):
-    """Backward-compatible idempotent access to the automatic S6 link."""
+    """Explicit operator action to link one failed run to a suspected Badcase."""
     badcase = _ensure_badcase_for_run(run_id)
     return {
         "badcase": badcase,
-        "message": "该失败评估已关联唯一的 Trace 证据 Badcase。",
+        "message": "已按人工操作创建或复用唯一的疑似 Badcase。",
     }

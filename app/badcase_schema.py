@@ -77,16 +77,16 @@ STATUS_LABELS = {
 }
 
 USER_STATUS_LABELS = {
-    "pending": "待审核",
+    "pending": "待处理",
     "classified": "处理中",
     "investigating": "处理中",
     "fixing": "处理中",
     "verifying": "待验证",
     "released": "待验证",
-    "closed": "已结束",
-    "rejected": "已结束",
-    "duplicate": "已结束",
-    "accepted_limitation": "已结束",
+    "closed": "已关闭",
+    "rejected": "已关闭",
+    "duplicate": "已关闭",
+    "accepted_limitation": "已关闭",
 }
 
 USER_STATUS_GROUPS = {
@@ -117,18 +117,20 @@ ACTION_LABELS = {
     "system-observation": "转为系统观察",
     "auto-capture-v2": "系统自动发现",
     "auto-capture-v3": "系统结构化发现",
+    "auto-capture-v4": "系统结构化疑似发现",
     "auto-duplicate-occurrence": "关联重复发现",
+    "ai-suggestion": "AI 处理建议",
 }
 
 # Canonical state machine transitions.
 # Each key is the source status; the value is the set of statuses reachable
 # through normal lifecycle actions (excluding the admin-only transition fallback).
 STATUS_TRANSITIONS: Dict[str, Set[str]] = {
-    "pending": {"classified", "rejected", "duplicate", "accepted_limitation"},
-    "classified": {"investigating", "fixing", "rejected", "duplicate", "accepted_limitation"},
-    "investigating": {"fixing", "rejected", "duplicate", "accepted_limitation"},
+    "pending": {"classified", "fixing", "rejected", "duplicate", "accepted_limitation"},
+    "classified": {"investigating", "fixing", "verifying", "rejected", "duplicate", "accepted_limitation"},
+    "investigating": {"fixing", "verifying", "rejected", "duplicate", "accepted_limitation"},
     "fixing": {"verifying", "rejected"},
-    "verifying": {"released", "fixing", "rejected"},
+    "verifying": {"released", "closed", "fixing", "rejected"},
     "released": {"closed", "fixing"},
     "closed": set(),
     "rejected": set(),
@@ -139,7 +141,7 @@ STATUS_TRANSITIONS: Dict[str, Set[str]] = {
 # Actions exposed to operators in the UI, mapped to the status they require.
 ACTION_STATUS_REQUIREMENTS: Dict[str, Set[str]] = {
     "classify": {"pending"},
-    "darwin-fix": {"classified", "investigating"},
+    "darwin-fix": {"classified", "investigating", "fixing"},
     "extract-knowledge": {"classified"},  # knowledge-gap repair draft
     "edit-draft": {"fixing"},
     "review-draft": {"fixing"},
@@ -366,7 +368,7 @@ def _format_action(action: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def user_status_label(status: str) -> str:
-    return USER_STATUS_LABELS.get(status, "待审核")
+    return USER_STATUS_LABELS.get(status, "待处理")
 
 
 def _action_by_type(actions: List[Dict[str, Any]], action_type: str) -> Optional[Dict[str, Any]]:
@@ -501,16 +503,16 @@ def _enrich_badcase(badcase: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any
     enriched["source"] = enriched.get("source") or "auto"
     source = enriched.get("source")
     if source == "manual":
-        enriched["source_label"] = "人工反馈"
+        enriched["source_label"] = "人工新增"
     elif source == "user_feedback":
         enriched["source_label"] = "用户反馈"
     elif source == "evaluation":
-        enriched["source_label"] = "评估失败"
+        enriched["source_label"] = "人工评测"
     elif source in {"mcp_failure", "tool_failure"}:
         enriched["source_label"] = "工具监测"
     elif source == "agent_insufficient_evidence":
         enriched["source_label"] = "Agent自报：依据不足"
-    elif source == "agent_capability_unavailable":
+    elif source in {"agent_insufficient_capability", "agent_capability_unavailable"}:
         enriched["source_label"] = "Agent自报：能力不可用"
     elif source == "handoff":
         enriched["source_label"] = "人工协同复盘"

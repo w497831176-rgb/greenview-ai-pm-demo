@@ -611,11 +611,13 @@ async def get_badcase(case_id: int):
 
 @router.post("")
 async def create_badcase(request: BadcaseCreate):
-    """Create a new badcase."""
+    """Create an operator-reported suspected Badcase in the review queue."""
     if request.category not in VALID_CATEGORIES:
         request.category = "other"
-    if request.status not in VALID_STATUSES:
-        request.status = "pending"
+    # This public endpoint is the manual-entry path.  Neither callers nor AI
+    # may skip the human review queue by supplying a later lifecycle status.
+    request.status = "pending"
+    request.source = "manual"
     case = db_create_badcase(
         title=request.title,
         description=request.description,
@@ -764,9 +766,18 @@ async def classify_badcase(case_id: int, request: ClassifyRequest = ClassifyRequ
             logger.exception("AI classification failed")
             status = "failed"
             error_summary = f"{type(e).__name__}: provider operation failed"
+            raise HTTPException(
+                status_code=502,
+                detail="AI suggestion failed; Badcase status was not changed",
+            ) from e
 
-        category = parsed.get("suggested_category", parsed.get("category", "other"))
-        reason = parsed.get("root_cause_hypothesis", parsed.get("reason", "自动分类失败，归入 other"))
+        category = parsed.get("suggested_category", parsed.get("category"))
+        reason = parsed.get("root_cause_hypothesis", parsed.get("reason"))
+        if category not in (VALID_CATEGORIES - {"pending"}) or not str(reason or "").strip():
+            raise HTTPException(
+                status_code=502,
+                detail="AI suggestion returned an invalid structure; Badcase status was not changed",
+            )
         repair_path = parsed.get("repair_path_suggestion", repair_path_for_category(category))
         priority = parsed.get("priority", "medium")
         if category not in VALID_CATEGORIES:
@@ -781,13 +792,43 @@ async def classify_badcase(case_id: int, request: ClassifyRequest = ClassifyRequ
         reason = request.reason
         repair_path = repair_path_for_category(category)
         priority = "medium"
-        if category not in VALID_CATEGORIES:
+        if category not in (VALID_CATEGORIES - {"pending"}):
             raise HTTPException(status_code=400, detail=f"invalid category: {category}")
         root_cause_domain = request.root_cause_domain or "unknown"
         if root_cause_domain not in ROOT_CAUSE_DOMAINS:
             raise HTTPException(status_code=400, detail=f"invalid root_cause_domain: {root_cause_domain}")
 
-    new_status = "classified"
+    if request.auto:
+        suggestion = {
+            "category": category,
+            "reason": reason,
+            "repair_path_suggestion": repair_path,
+            "priority": priority,
+            "root_cause_domain": root_cause_domain,
+            "classify_trace_id": classify_trace_id,
+        }
+        _record_action(
+            case_id,
+            "ai-suggestion",
+            suggestion,
+            case["status"],
+            case["status"],
+            "ai_flash",
+        )
+        return {
+            "badcase": _enrich_badcase(_load_case(case_id)),
+            "suggestion": suggestion,
+            "suggested_category": category,
+            "root_cause_hypothesis": reason,
+            "repair_path_suggestion": repair_path,
+            "priority": priority,
+            "root_cause_domain": root_cause_domain,
+            "status_changed": False,
+        }
+
+    # Only an explicit operator decision adopts the category and enters the
+    # processing group.  Historical internal states remain readable.
+    new_status = "fixing"
     updated = db_update_badcase(
         case_id,
         category=category,
@@ -825,7 +866,13 @@ async def classify_badcase(case_id: int, request: ClassifyRequest = ClassifyRequ
 
 @router.post("/{case_id}/extract-knowledge")
 async def extract_knowledge(case_id: int, request: ExtractKnowledgeRequest = ExtractKnowledgeRequest()):
-    """Extract a knowledge draft from a badcase (knowledge_gap only)."""
+    """Retired AI draft path; historical drafts remain readable."""
+    raise HTTPException(
+        status_code=410,
+        detail="AI draft creation is retired; request a suggestion and let an operator act manually",
+    )
+
+    # Kept below only for historical source compatibility; unreachable by API.
     case = _load_case(case_id)
     _require_case_status(case, "extract-knowledge", {"classified"})
     if case.get("category") not in ("knowledge_gap", "pending"):
@@ -1433,12 +1480,12 @@ def _cost_evidence_for_call(
 
 @router.post("/{case_id}/darwin-fix")
 async def darwin_fix(case_id: int, request: DarwinFixRequest = DarwinFixRequest()):
-    """Run Darwin deep analysis on a classified badcase and generate structured fix drafts."""
+    """Generate an operator-reviewed Darwin suggestion without lifecycle changes."""
     case = db_get_badcase(case_id)
     if not case:
         raise HTTPException(status_code=404, detail="not found")
-    if case["status"] not in {"classified", "investigating"}:
-        raise HTTPException(status_code=400, detail=f"Darwin analysis requires status=classified/investigating, got {case['status']}")
+    if case["status"] not in {"classified", "investigating", "fixing"}:
+        raise HTTPException(status_code=400, detail=f"Darwin suggestion requires a processing status, got {case['status']}")
 
     context = case.get("context_json") or ""
     if isinstance(context, str) and context:
@@ -1554,18 +1601,22 @@ async def darwin_fix(case_id: int, request: DarwinFixRequest = DarwinFixRequest(
         raise HTTPException(status_code=502, detail="Darwin Provider call failed")
 
     analysis_obj = _extract_json(analysis_text) or {}
-    if not analysis_obj and status == "success":
-        analysis_obj = {
-            "phenomenon_impact": "Darwin 返回无法解析",
-            "root_cause_hypothesis": "Darwin 返回无法解析",
-            "evidence_uncertainties": "无法评估",
-            "repair_path_suggestion": repair_path_for_category(case.get("category", "other")),
-            "recommended_category": case.get("category", "other"),
-            "suggested_actions": ["检查 Darwin 输出格式"],
-            "expected_impact": "无法评估",
-            "risks": "无法评估",
-            "drafts": [],
-        }
+    if not analysis_obj:
+        persist_darwin_operation(
+            trace_id=darwin_trace_id,
+            badcase_id=case_id,
+            model_call=model_call,
+            operation_status="failed",
+            started_at=operation_started_at,
+            completed_at=now_cn(),
+            status_before=case["status"],
+            status_after=case["status"],
+            error_summary="Darwin returned an invalid structured suggestion",
+        )
+        raise HTTPException(
+            status_code=502,
+            detail="Darwin returned an invalid structured suggestion; Badcase status was not changed",
+        )
 
     # Ensure required keys exist.
     analysis_obj.setdefault("phenomenon_impact", "")
@@ -1596,6 +1647,55 @@ async def darwin_fix(case_id: int, request: DarwinFixRequest = DarwinFixRequest(
     # Keep a backward-compatible root_cause alias for downstream consumers.
     analysis_obj.setdefault("root_cause", analysis_obj["root_cause_hypothesis"])
 
+    before = case["status"]
+    updated = db_update_badcase(
+        case_id,
+        darwin_analysis=json.dumps(analysis_obj, ensure_ascii=False),
+        darwin_trace_id=darwin_trace_id,
+    )
+    _record_action(
+        case_id,
+        "ai-suggestion",
+        {
+            "suggestion_type": "darwin",
+            "model_id": model_id,
+            "darwin_trace_id": darwin_trace_id,
+            "analysis_keys": list(analysis_obj.keys()),
+        },
+        before,
+        before,
+        "ai_expert",
+    )
+    persist_darwin_operation(
+        trace_id=darwin_trace_id,
+        badcase_id=case_id,
+        model_call=model_call,
+        operation_status="complete",
+        started_at=operation_started_at,
+        completed_at=now_cn(),
+        drafts=[],
+        status_before=before,
+        status_after=before,
+    )
+    return {
+        "badcase": _enrich_badcase(updated),
+        "analysis": analysis_obj,
+        "drafts": [],
+        "status_changed": False,
+        "model_id": model_id,
+        "darwin_skill_found": bool(darwin),
+        "darwin_trace_id": darwin_trace_id,
+        "usage_source": model_call.get("usage_source") if model_call else "unavailable",
+        "total_tokens": model_call.get("total_tokens") if model_call else None,
+        "estimated_cost_cny": model_call.get("estimated_cost_cny") if model_call else None,
+        "calculated_direct_cost": model_call.get("estimated_cost_cny") if model_call else None,
+        "cost_source": model_call.get("cost_source") if model_call else None,
+        "cost_disclaimer": "platform_price_snapshot_not_provider_final_bill",
+    }
+
+    # Legacy draft generation is deliberately unreachable. Historical draft
+    # records and endpoints remain readable, but AI analysis no longer creates
+    # or applies any repair object.
     created_drafts: List[Dict[str, Any]] = []
     for draft in analysis_obj.get("drafts", []) or []:
         draft_type = draft.get("type")
@@ -1759,14 +1859,20 @@ async def switch_model_retry(case_id: int, request: SwitchModelRetryRequest = Sw
     )
 
     before = case["status"]
-    new_status = "fixing" if before in ("pending", "classified") else before
-    updated = db_update_badcase(
+    _record_action(
         case_id,
-        status=new_status,
-        fix_plan=f"model retry with {model_id}",
+        "ai-suggestion",
+        {"suggestion_type": "model-retry", "model_id": model_id, "response": retry_text},
+        before,
+        before,
+        "ai",
     )
-    _record_action(case_id, "switch-model-retry", {"model_id": model_id, "response": retry_text}, before, new_status)
-    return {"badcase": _enrich_badcase(updated), "model_id": model_id, "retry_response": retry_text}
+    return {
+        "badcase": _enrich_badcase(_load_case(case_id)),
+        "model_id": model_id,
+        "retry_response": retry_text,
+        "status_changed": False,
+    }
 
 
 @router.post("/{case_id}/verify")
@@ -2390,11 +2496,16 @@ async def check_tools_badcase(case_id: int):
     )
 
     before = case["status"]
-    new_status = "fixing" if before in ("pending", "classified") else before
-    updated = db_update_badcase(
+    _record_action(
         case_id,
-        status=new_status,
-        fix_plan="tool configuration check: " + analysis[:200],
+        "ai-suggestion",
+        {"suggestion_type": "tool-check", "analysis": analysis},
+        before,
+        before,
+        "ai",
     )
-    _record_action(case_id, "check-tools", {"analysis": analysis}, before, new_status)
-    return {"badcase": _enrich_badcase(updated), "analysis": analysis}
+    return {
+        "badcase": _enrich_badcase(_load_case(case_id)),
+        "analysis": analysis,
+        "status_changed": False,
+    }
