@@ -159,7 +159,7 @@ def create_semantic_lane_router(*, model: Any) -> Agent:
         db=agent_db,
         instructions=[
             "You are the sole production Router. In exactly one model response, classify the complete ordered conversation into one lane, select the vertical Agent when required, and explain the choice in natural language.",
-            "A_HANDOFF means the request must immediately enter unified human collaboration. For A, selected_agent_id must be null.",
+            "A_SAFETY_HANDOFF means the request must immediately enter human collaboration. For A, selected_agent_id must be null.",
             "B_PROPERTY_GOVERNED means a property-service request. For B, select exactly one candidate whose scope is property.",
             "C_ISOLATED_GENERAL is the complete complement of A and B. For C, select exactly one candidate whose scope is isolated_general.",
             "Use only each candidate's agent_id, name, description, and scope. Do not infer or request instructions, bindings, Skills, RAG, Knowledge, MCP, Tools, capability counts, or execution results.",
@@ -266,7 +266,7 @@ async def _classify_lane_decision_legacy(
         "visible_conversation": history,
         "current_user_message": message,
         "decision_schema": {
-            "lane": "A_HANDOFF | B_PROPERTY_GOVERNED | C_ISOLATED_GENERAL",
+            "lane": "A_SAFETY_HANDOFF | B_PROPERTY_GOVERNED | C_ISOLATED_GENERAL",
             "business_intent": "A类使用user_requested_handoff或safety_risk；B类明确启动维修工单创建流程使用work_order_create；其他类写简短业务意图",
             "reason": "简短中文理由",
         },
@@ -337,7 +337,7 @@ async def classify_lane_decision(
             "messages": ordered_messages,
             "agent_candidates": minimal_cards,
             "decision_schema": {
-                "lane": "A_HANDOFF | B_PROPERTY_GOVERNED | C_ISOLATED_GENERAL",
+                "lane": "A_SAFETY_HANDOFF | B_PROPERTY_GOVERNED | C_ISOLATED_GENERAL",
                 "selected_agent_id": "null for A; one candidate technical id for B/C",
                 "reason": "natural-language selection reason",
             },
@@ -460,8 +460,8 @@ async def select_lane_agent(
         "validation_error": None,
         "candidate_count": len(catalog),
     }
-    if lane == RuntimeLane.HANDOFF or not catalog:
-        base["selection_source"] = "not_required" if lane == RuntimeLane.HANDOFF else "no_candidate"
+    if lane == RuntimeLane.SAFETY_HANDOFF or not catalog:
+        base["selection_source"] = "not_required" if lane == RuntimeLane.SAFETY_HANDOFF else "no_candidate"
         return base
     if len(catalog) == 1:
         base.update(

@@ -970,11 +970,17 @@
         const summaryText = maskTraceText([`Trace ID：${traceId}`, `Release：${config.release_id || '-'}`, `Snapshot：${config.snapshot_id || '-'}`, `当前 Agent：${currentAgent} (${currentAgentId})`, `激活 Skill：${skills.join('、') || '无'}`, `Provider 请求：${providerRequestCount} 次`, `逻辑/历史记录：${logicalModelRecords.length} 条（不计Provider汇总）`, `MCP 调用：${mcpCalls.length} 次`, `受控写入：${isControlledWorkOrderTrace ? '创建维修工单（ActionGateway）' : '无'}`, `回答实际引用：${usedCitations.map(c => `《${c.doc_title}》分片${c.chunk_index}`).join('、') || '无'}`, `契约违规：${violations.length}`, `链路事件：${traceEvents.map(e => spanLabels[e.span_name] || e.span_name).join(' → ') || '历史 Trace 无 span 记录'}`].join('\n'));
         const controlledWriteConfirmed = Boolean(controlledReceipt && controlledReceipt.status === 'committed' && controlledReceipt.receipt_id && controlledReceipt.resource_id);
         const controlledWriteSummaryHtml = isControlledWorkOrderTrace ? `<div class="rounded-xl border ${controlledWriteConfirmed ? 'border-emerald-200 bg-emerald-50' : 'border-amber-200 bg-amber-50'} p-3 text-sm"><div class="font-medium text-slate-900">受控业务写入</div><div class="mt-1 text-xs text-slate-700">本轮通过 ActionGateway（受控业务写入网关）执行维修工单操作；${controlledWriteConfirmed ? '正式回执证明写入成功。' : '当前证据不足以证明写入成功。'}</div><div class="mt-1 text-xs text-slate-600">它不是 MCP/Tool 调用；业主确认也不等同于人工接管。</div></div>` : '';
-        const laneLabels = { A_HANDOFF: 'A路：人工协同', A_SAFETY_HANDOFF: 'A路：人工协同（历史）', B_PROPERTY_GOVERNED: 'B路：物业受控回答', C_ISOLATED_GENERAL: 'C路：隔离通用回答', CLARIFY: '需澄清' };
-        const modeLabels = { human_handoff: '人工协同', emergency_handoff: '人工协同（历史）', clarify_only: '仅澄清', grounded_answer: '依据回答', realtime_read: '实时读取', controlled_write: '受控写入', safe_general: '安全通用回答', safe_refusal: '安全拒绝' };
-        const isHandoffLane = ['A_HANDOFF', 'A_SAFETY_HANDOFF'].includes(laneDecision.lane);
-        const laneReasonText = isHandoffLane
-          ? `本轮进入统一人工协同${laneDecision.reason ? `；${laneDecision.reason}` : ''}`
+        const laneLabels = { A_SAFETY_HANDOFF: 'A路：人工协同', B_PROPERTY_GOVERNED: 'B路：物业受控回答', C_ISOLATED_GENERAL: 'C路：隔离通用回答', CLARIFY: '需澄清' };
+        const modeLabels = { human_handoff: '普通人工协同', emergency_handoff: '紧急人工协同', clarify_only: '仅澄清', grounded_answer: '依据回答', realtime_read: '实时读取', controlled_write: '受控写入', safe_general: '安全通用回答', safe_refusal: '安全拒绝' };
+        const latestHandoff = handoffEvents.length ? handoffEvents[handoffEvents.length - 1] : {};
+        const handoffReasonCode = latestHandoff.reason_code || (laneDecision.lane === 'A_SAFETY_HANDOFF' ? laneDecision.business_intent : '');
+        const handoffReasonLabels = {
+          user_requested: '业主主动要求人工协同',
+          user_requested_handoff: '业主主动要求人工协同',
+          safety_risk: 'AI识别现实安全风险并发起人工协同'
+        };
+        const laneReasonText = handoffReasonLabels[handoffReasonCode]
+          ? `${handoffReasonLabels[handoffReasonCode]}（${handoffReasonCode}）${laneDecision.reason ? `；${laneDecision.reason}` : ''}`
           : (laneDecision.reason || laneDecision.explanation || '历史记录未采集结构化原因');
         const capabilityLabel = (name, value) => {
           return `${name}${traceCapabilityStatusLabel(value)}（${(value || {}).reason_code || '无运行证据'}）`;
@@ -1441,10 +1447,25 @@
           showToast('已经处于转人工状态，请等待工作人员回复', 'success');
           return;
         }
-        if (STATE.chatStreaming) return;
-        // “转人工”也是一个可见聊天气泡：先经过唯一 Router，再由 A 路
-        // 自动创建统一 Handoff；前端不再直接写入 Handoff 状态。
-        await sendChatMessage('请安排工作人员接手本次会话。');
+        if (!confirm('确定要转接人工服务吗？')) return;
+        try {
+          const res = await fetch(`${API_BASE}/api/chat/handoff`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ session_id: STATE.chatSessionId, reason: '业主主动点击转人工按钮' })
+          });
+          if (!res.ok) throw new Error(await res.text() || '请求失败');
+          const payload = await res.json();
+          const handoffState = payload.handoff_state || (payload.session || {}).handoff_status || 'requested';
+          STATE.chatHandoff = ['requested', 'active', 'waiting_user'].includes(handoffState);
+          updateHandoffBanner(handoffState);
+          appendSystemMessage(payload.message || '已发起人工协同：等待工作人员领取。');
+          showToast(payload.message || '已发起人工协同', 'success');
+          await loadChatSessions();
+          refreshSidebar();
+        } catch (err) {
+          showToast('转人工失败，请重试', 'error');
+        }
       });
 
       $('#chat-refresh-btn').addEventListener('click', async () => {
@@ -5100,6 +5121,22 @@
                 <textarea id="runtime-composite-cases" class="mt-3 w-full border rounded-lg p-2 font-mono text-[10px]" rows="4" placeholder='可选：粘贴多个 TraceAcceptanceRequest 的 JSON 数组'></textarea>
                 <button id="runtime-composite-accept-btn" class="mt-2 px-3 py-1.5 bg-slate-800 text-white rounded-lg text-xs">生成父 Acceptance Run</button>
               </details>
+              <details class="bg-white rounded-2xl border border-cyan-200 p-5">
+                <summary class="font-semibold text-slate-900 cursor-pointer">目标 2：验收新增能力包</summary>
+                <p class="text-xs text-slate-500 mt-2">新增并绑定 Agent / Skill / MCP / RAG，发布后填写一个全新 session_id 和固定问题。</p>
+                <div class="grid md:grid-cols-2 gap-2 mt-3">
+                  <input id="runtime-ext-session" class="border rounded-lg px-3 py-2 text-sm font-mono" placeholder="全新 Session ID">
+                  <input id="runtime-ext-agent" class="border rounded-lg px-3 py-2 text-sm" placeholder="预期 Agent ID">
+                  <textarea id="runtime-ext-query" class="md:col-span-2 border rounded-lg px-3 py-2 text-sm" rows="3" placeholder="固定自然语言问题，不写 Agent/Server/Tool 内部名"></textarea>
+                  <input id="runtime-ext-skills" class="border rounded-lg px-3 py-2 text-sm" placeholder="Skill ID，逗号分隔">
+                  <input id="runtime-ext-docs" class="border rounded-lg px-3 py-2 text-sm" placeholder="RAG 文档 ID，逗号分隔">
+                  <input id="runtime-ext-mcp" class="md:col-span-2 border rounded-lg px-3 py-2 text-sm" placeholder="预期 server:tool，逗号分隔">
+                  <input id="runtime-ext-baseline-session" class="border rounded-lg px-3 py-2 text-sm font-mono" placeholder="发布前旧 Session ID（可空）">
+                  <input id="runtime-ext-baseline-hash" class="border rounded-lg px-3 py-2 text-sm font-mono" placeholder="旧 Snapshot Hash（可空）">
+                </div>
+                <label class="block mt-2 text-xs"><input id="runtime-ext-retrieval" type="checkbox"> 同时运行 scoped RAG（不调用大模型）</label>
+                <button id="runtime-extension-accept-btn" class="mt-3 px-4 py-2 bg-cyan-600 text-white rounded-xl text-sm">验收新增能力包</button>
+              </details>
               <div class="bg-white rounded-2xl border border-slate-200 p-5">
                 <h3 class="font-semibold text-slate-900 mb-3">固定验收矩阵（${cases.length}）</h3>
                 <div class="grid md:grid-cols-2 gap-2">
@@ -5158,6 +5195,26 @@
               });
               openDrawer('Trace 验收结果', renderAcceptance(result));
             } catch (err) { showToast('Trace 验收失败：' + (err.message || err), 'error'); }
+          });
+          $('#runtime-extension-accept-btn').addEventListener('click', async () => {
+            const query = $('#runtime-ext-query').value.trim();
+            const agentId = $('#runtime-ext-agent').value.trim();
+            if (!query || !agentId) return showToast('请填写固定问题和预期 Agent', 'error');
+            try {
+              const result = await apiPost('/api/runtime/acceptance/extension', {
+                case_key: 'EXT-OFFDOMAIN-01',
+                session_id: $('#runtime-ext-session').value.trim() || `ext-${Date.now()}`,
+                query,
+                expected_agent_id: agentId,
+                expected_skill_ids: parseIds($('#runtime-ext-skills').value),
+                expected_mcp_tools: parseCsv($('#runtime-ext-mcp').value),
+                expected_knowledge_doc_ids: parseIds($('#runtime-ext-docs').value),
+                run_scoped_retrieval: $('#runtime-ext-retrieval').checked,
+                baseline_session_id: $('#runtime-ext-baseline-session').value.trim() || null,
+                expected_baseline_snapshot_hash: $('#runtime-ext-baseline-hash').value.trim() || null
+              });
+              openDrawer('新增能力包验收结果', renderAcceptance(result));
+            } catch (err) { showToast('新增能力包验收失败：' + (err.message || err), 'error'); }
           });
           $('#runtime-composite-accept-btn').addEventListener('click', async () => {
             try {

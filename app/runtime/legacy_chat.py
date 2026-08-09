@@ -45,11 +45,6 @@ from db.property_db import (
 
 router = APIRouter(prefix="/api/chat", tags=["chat"])
 
-_RETIRED_HANDOFF_ENTRY = {
-    "code": "chat_router_required",
-    "message": "Handoff can only be created by sending a chat bubble through the single Router.",
-}
-
 
 def _latest_ai_evidence(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Extract the last AI turn's verifiable evidence for a staff handoff."""
@@ -467,18 +462,41 @@ async def chat_feedback(request: FeedbackRequest):
 
 @router.post("/handoff")
 async def chat_handoff(request: HandoffRequest):
-    """Retired write shortcut; every new owner bubble must enter the Router."""
-
-    del request
-    raise HTTPException(status_code=410, detail=_RETIRED_HANDOFF_ENTRY)
+    """Owner-facing explicit transfer request with an inspectable context package."""
+    reason = (request.reason or "业主主动请求人工服务").strip()
+    before = get_chat_session(request.session_id) or {}
+    before_status = str(before.get("handoff_status") or "none")
+    policy = {
+        **evaluate_handoff_policy("", explicit_reason=reason),
+        "reason_code": "user_requested",
+        "matched_signals": ["explicit_handoff_button"],
+    }
+    session = _request_handoff_with_context(request.session_id, policy, actor="owner")
+    handoff_state = str(session.get("handoff_status") or "requested")
+    message = (
+        "工作人员已领取，当前正在人工协同处理中。"
+        if handoff_state == "active"
+        else "已发起人工协同：等待工作人员领取。"
+        if handoff_state == "requested"
+        and before_status in {"none", "cancelled", "closed", "resolved"}
+        else "人工协同已在等待领取。"
+        if handoff_state == "requested"
+        else f"人工协同当前状态：{handoff_state}。"
+    )
+    return {
+        "status": "ok",
+        "session": session,
+        "handoff_state": handoff_state,
+        "message": message,
+        "policy": policy,
+        "package_available": True,
+    }
 
 
 @router.post("/handoff-policy")
 async def chat_handoff_policy(request: HandoffPolicyDiagnosticRequest):
-    """Retired pre-Router classifier; no policy may bypass the chat chain."""
-
-    del request
-    raise HTTPException(status_code=410, detail=_RETIRED_HANDOFF_ENTRY)
+    """Explain the deterministic collaboration boundary without calling a model."""
+    return {"policy": evaluate_handoff_policy(request.message, mcp_calls=request.mcp_calls)}
 
 
 @router.get("/handoffs")

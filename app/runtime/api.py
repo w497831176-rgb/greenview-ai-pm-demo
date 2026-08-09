@@ -10,6 +10,8 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
+from app.runtime.agent_factory import vertical_agent_cards
+from app.runtime.contracts import RuntimePath, ToolEffect
 from app.runtime.release_compiler import (
     diff_runtime_configs,
     preview_runtime_release,
@@ -18,6 +20,9 @@ from app.runtime.release_compiler import (
 )
 from app.runtime.acceptance import ACCEPTANCE_CASES
 from app.runtime.snapshot_resolver import resolve_snapshot
+from app.runtime.tool_planner import plan_tools
+from app.skill_runtime import select_skills
+from agents.router import _capability_fallback
 from db.property_db import (
     count_runtime_releases,
     get_agent_by_agent_id,
@@ -66,6 +71,21 @@ class RetrievalCostPreviewRequest(BaseModel):
     query: str = Field(min_length=1)
     agent_id: str
     top_k: int = Field(ge=1, le=10)
+
+
+class ExtensionAcceptanceRequest(BaseModel):
+    """No-model proof for a newly published, off-domain capability package."""
+
+    case_key: str = "EXT-OFFDOMAIN-01"
+    session_id: str
+    query: str = Field(min_length=1)
+    expected_agent_id: str
+    expected_skill_ids: List[int] = Field(default_factory=list)
+    expected_mcp_tools: List[str] = Field(default_factory=list)
+    expected_knowledge_doc_ids: List[int] = Field(default_factory=list)
+    run_scoped_retrieval: bool = False
+    baseline_session_id: Optional[str] = None
+    expected_baseline_snapshot_hash: Optional[str] = None
 
 
 class TraceAcceptanceRequest(BaseModel):
@@ -540,21 +560,260 @@ def _acceptance_assertion(
 
 
 @router.post("/acceptance/extension")
-async def extension_acceptance():
-    """Retired legacy acceptance path.
+async def extension_acceptance(request: ExtensionAcceptanceRequest):
+    """Exercise Router/Skill/ToolPlan/RAG scope from one immutable snapshot.
 
-    Trusted capabilities are admitted by code review and exercised only by
-    real RuntimeCoordinator traces. This endpoint must never run a fallback
-    router, planner, capability simulation, or write proposal.
+    This endpoint never calls an LLM and never invokes an MCP write.  Optional
+    retrieval uses the local embedding/index pipeline inside the Agent-bound
+    document scope.
     """
 
-    raise HTTPException(
-        status_code=410,
-        detail=(
-            "legacy extension acceptance is retired; use trusted catalog "
-            "validation, RuntimeRelease Diff, and real Trace acceptance"
-        ),
+    snapshot = resolve_snapshot(request.session_id)
+    baseline_snapshot = (
+        resolve_snapshot(request.baseline_session_id)
+        if request.baseline_session_id
+        else None
     )
+    cards = vertical_agent_cards(snapshot.config)
+    routed_agent_id, route_reason, route_scores = _capability_fallback(
+        request.query,
+        cards,
+    )
+    agent = next(
+        (
+            item
+            for item in snapshot.config.get("agents") or []
+            if item.get("agent_id") == request.expected_agent_id
+            and item.get("enabled")
+            and item.get("category") not in {"router", "orchestration"}
+        ),
+        None,
+    )
+    assertions: List[Dict[str, Any]] = [
+        _acceptance_assertion(
+            "dynamic_router",
+            routed_agent_id == request.expected_agent_id,
+            request.expected_agent_id,
+            routed_agent_id,
+            route_reason,
+        ),
+        _acceptance_assertion(
+            "agent_in_snapshot",
+            bool(agent),
+            request.expected_agent_id,
+            agent.get("agent_id") if agent else None,
+        ),
+    ]
+    if baseline_snapshot:
+        baseline_agent_ids = {
+            str(item.get("agent_id"))
+            for item in baseline_snapshot.config.get("agents") or []
+        }
+        assertions.append(
+            _acceptance_assertion(
+                "old_session_does_not_hot_load_new_agent",
+                request.expected_agent_id not in baseline_agent_ids
+                and baseline_snapshot.snapshot_hash != snapshot.snapshot_hash,
+                {
+                    "new_agent_absent": request.expected_agent_id,
+                    "different_snapshot": True,
+                },
+                {
+                    "baseline_snapshot_hash": baseline_snapshot.snapshot_hash,
+                    "new_snapshot_hash": snapshot.snapshot_hash,
+                    "baseline_agent_present": (
+                        request.expected_agent_id in baseline_agent_ids
+                    ),
+                },
+            )
+        )
+        if request.expected_baseline_snapshot_hash:
+            assertions.append(
+                _acceptance_assertion(
+                    "old_session_snapshot_hash_unchanged",
+                    baseline_snapshot.snapshot_hash
+                    == request.expected_baseline_snapshot_hash,
+                    request.expected_baseline_snapshot_hash,
+                    baseline_snapshot.snapshot_hash,
+                )
+            )
+    selected_skill_ids: List[int] = []
+    read_plans = []
+    write_plans = []
+    retrieval_evidence: List[Dict[str, Any]] = []
+    retrieval_scope: Optional[Dict[str, Any]] = None
+    if agent:
+        skills_by_id = {
+            int(item["skill_id"]): item
+            for item in snapshot.config.get("skills") or []
+        }
+        skill_candidates = [
+            {
+                "id": item["skill_id"],
+                "name": item.get("name"),
+                "description": item.get("description"),
+                "instructions": item.get("instructions_fallback"),
+                "enabled": item.get("enabled"),
+                "trigger_condition": item.get("trigger_condition"),
+                "skill_metadata": item.get("metadata") or {},
+            }
+            for skill_id in agent.get("skill_ids") or []
+            for item in [skills_by_id.get(int(skill_id))]
+            if item and item.get("enabled")
+        ]
+        selected_skills, _ = select_skills(skill_candidates, request.query)
+        selected_skill_ids = [
+            int(item["skill_id"]) for item in selected_skills
+        ]
+        read_plans = plan_tools(
+            snapshot.config,
+            request.expected_agent_id,
+            request.query,
+            RuntimePath.CONSULTATION,
+            effects=[ToolEffect.READ],
+        )
+        write_plans = plan_tools(
+            snapshot.config,
+            request.expected_agent_id,
+            request.query,
+            RuntimePath.CONTROLLED_ACTION,
+            effects=[ToolEffect.CREATE, ToolEffect.UPDATE],
+            execution_modes=["proposal"],
+        )
+        assertions.extend(
+            [
+                _acceptance_assertion(
+                    "skill_runtime_selection",
+                    set(request.expected_skill_ids).issubset(
+                        set(selected_skill_ids)
+                    ),
+                    request.expected_skill_ids,
+                    selected_skill_ids,
+                ),
+                _acceptance_assertion(
+                    "mcp_binding",
+                    {
+                        key.split(":", 1)[0]
+                        for key in request.expected_mcp_tools
+                    }.issubset(set(agent.get("mcp_server_names") or [])),
+                    request.expected_mcp_tools,
+                    agent.get("mcp_server_names") or [],
+                ),
+                _acceptance_assertion(
+                    "rag_binding",
+                    set(request.expected_knowledge_doc_ids).issubset(
+                        set(agent.get("knowledge_doc_ids") or [])
+                    ),
+                    request.expected_knowledge_doc_ids,
+                    agent.get("knowledge_doc_ids") or [],
+                ),
+            ]
+        )
+    planned_keys = {
+        f"{item.server_name}:{item.tool_name}"
+        for item in [*read_plans, *write_plans]
+    }
+    assertions.append(
+        _acceptance_assertion(
+            "configuration_driven_tool_plan",
+            set(request.expected_mcp_tools).issubset(planned_keys),
+            request.expected_mcp_tools,
+            sorted(planned_keys),
+        )
+    )
+    if agent and request.run_scoped_retrieval:
+        allowed_document_ids = sorted(
+            {int(item) for item in agent.get("knowledge_doc_ids") or []}
+        )
+        try:
+            import rag_retrieval
+
+            retrieval = await asyncio.to_thread(
+                rag_retrieval.advanced_search,
+                request.query,
+                snapshot.config.get("retrieval_policy") or {},
+                allowed_document_ids=allowed_document_ids,
+            )
+            retrieval_evidence = list((retrieval or {}).get("results") or [])
+            retrieval_scope = (retrieval or {}).get("scope")
+            actual_document_ids = {
+                int(item.get("doc_id", item.get("document_id")))
+                for item in retrieval_evidence
+                if item.get("doc_id", item.get("document_id")) is not None
+            }
+            assertions.append(
+                _acceptance_assertion(
+                    "rag_scope_before_top_k",
+                    actual_document_ids.issubset(set(allowed_document_ids))
+                    and (retrieval_scope or {}).get("mode") == "agent_bound",
+                    allowed_document_ids,
+                    {
+                        "retrieved_document_ids": sorted(actual_document_ids),
+                        "scope": retrieval_scope,
+                    },
+                )
+            )
+        except Exception as exc:
+            assertions.append(
+                _acceptance_assertion(
+                    "rag_scope_before_top_k",
+                    False,
+                    request.expected_knowledge_doc_ids,
+                    type(exc).__name__,
+                    str(exc)[:300],
+                )
+            )
+    passed = bool(assertions) and all(item["passed"] for item in assertions)
+    result = {
+        "case_key": request.case_key,
+        "passed": passed,
+        "release_id": snapshot.release_id,
+        "snapshot_id": snapshot.snapshot_id,
+        "snapshot_hash": snapshot.snapshot_hash,
+        "snapshot_diff": (
+            {
+                "baseline_session_id": request.baseline_session_id,
+                "baseline_release_id": baseline_snapshot.release_id,
+                "baseline_snapshot_id": baseline_snapshot.snapshot_id,
+                "baseline_snapshot_hash": baseline_snapshot.snapshot_hash,
+                "new_session_id": request.session_id,
+                "new_release_id": snapshot.release_id,
+                "new_snapshot_id": snapshot.snapshot_id,
+                "new_snapshot_hash": snapshot.snapshot_hash,
+            }
+            if baseline_snapshot
+            else None
+        ),
+        "route": {
+            "selected_agent_id": routed_agent_id,
+            "reason": route_reason,
+            "scores": route_scores,
+        },
+        "selected_skill_ids": selected_skill_ids,
+        "tool_plans": [
+            item.model_dump(mode="json") for item in [*read_plans, *write_plans]
+        ],
+        "retrieval_scope": retrieval_scope,
+        "retrieval_evidence": retrieval_evidence,
+        "assertions": assertions,
+        "model_called": False,
+        "mcp_invoked": False,
+        "writes_business_data": False,
+    }
+    saved = save_runtime_acceptance_run(
+        acceptance_run_id=f"accept_{uuid.uuid4().hex}",
+        case_key=request.case_key,
+        release_id=snapshot.release_id,
+        status="passed" if passed else "failed",
+        evidence=result,
+        cleanup={
+            "required": True,
+            "strategy": "rollback_test_release_and_remove_test_configuration",
+        },
+    )
+    result["acceptance_run_id"] = saved.get("acceptance_run_id")
+    return result
+
 
 @router.post("/acceptance/trace")
 async def trace_acceptance(request: TraceAcceptanceRequest):

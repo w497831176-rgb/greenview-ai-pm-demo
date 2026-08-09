@@ -287,7 +287,7 @@ def _claims_business_success(text: str) -> bool:
 def _lane_candidates(
     cards: List[Dict[str, Any]], lane: RuntimeLane
 ) -> List[Dict[str, Any]]:
-    if lane == RuntimeLane.HANDOFF:
+    if lane == RuntimeLane.SAFETY_HANDOFF:
         return []
     scope = "property" if lane == RuntimeLane.PROPERTY_GOVERNED else "isolated_general"
     return [card for card in cards if _agent_domain_scope(card) == scope]
@@ -367,7 +367,7 @@ def _parse_agent_envelope(raw: Any) -> AgentResponseEnvelope:
 
 def _lane_explanation(decision: LaneDecision) -> str:
     labels = {
-        RuntimeLane.HANDOFF: "人工协同",
+        RuntimeLane.SAFETY_HANDOFF: "人工协同",
         RuntimeLane.PROPERTY_GOVERNED: "物业受控回答",
         RuntimeLane.ISOLATED_GENERAL: "隔离通用回答",
     }
@@ -479,11 +479,11 @@ def _effective_lane_decision(
         str(decision.business_intent or "").strip()
         == "user_requested_handoff"
     )
-    if decision.lane == RuntimeLane.HANDOFF:
+    if decision.lane == RuntimeLane.SAFETY_HANDOFF:
         if persisted_safety and user_requested:
             return (
                 LaneDecision(
-                    lane=RuntimeLane.HANDOFF,
+                    lane=RuntimeLane.SAFETY_HANDOFF,
                     business_intent="safety_risk",
                     reason="会话已有现实安全风险人工协同，本轮继续由紧急队列处理。",
                     decision_source=decision.decision_source,
@@ -498,7 +498,7 @@ def _effective_lane_decision(
     )
     return (
         LaneDecision(
-            lane=RuntimeLane.HANDOFF,
+            lane=RuntimeLane.SAFETY_HANDOFF,
             business_intent=effective_intent,
             reason=(
                 (
@@ -521,7 +521,7 @@ def _effective_lane_decision(
 def _handoff_contract_for(
     decision: LaneDecision,
 ) -> HandoffExecutionContract:
-    if decision.lane != RuntimeLane.HANDOFF:
+    if decision.lane != RuntimeLane.SAFETY_HANDOFF:
         raise ValueError("Handoff execution contract requires effective A lane")
     return HandoffExecutionContract(
         kind=HandoffKind.USER_REQUESTED,
@@ -543,7 +543,7 @@ def _answer_contract_for(
         "unverified_execution_success",
         "internal_control_payload",
     ]
-    if decision.lane == RuntimeLane.HANDOFF:
+    if decision.lane == RuntimeLane.SAFETY_HANDOFF:
         return AnswerContract(
             response_mode=ResponseMode.HUMAN_HANDOFF,
             evidence_required=False,
@@ -962,7 +962,7 @@ class RuntimeCoordinator:
                 },
             )
 
-            if state.lane_decision.lane == RuntimeLane.HANDOFF:
+            if state.lane_decision.lane == RuntimeLane.SAFETY_HANDOFF:
                 async for event in self._stream_unified_handoff(
                     message, session_id, trace_id, snapshot, state, ledger, started
                 ):
@@ -1223,7 +1223,7 @@ class RuntimeCoordinator:
         decision = result["decision"]
         state.lane_decision = decision
         selected_id = str(decision.selected_agent_id or "").strip()
-        if decision.lane == RuntimeLane.HANDOFF:
+        if decision.lane == RuntimeLane.SAFETY_HANDOFF:
             state.selected_agent = None
         else:
             expected_scope = (
@@ -1545,7 +1545,7 @@ class RuntimeCoordinator:
             content=reply,
             token_count=0,
             round_token_count=router_tokens,
-            route_intent=RuntimeLane.HANDOFF.value,
+            route_intent=RuntimeLane.SAFETY_HANDOFF.value,
             route_reason=state.lane_decision.reason,
             current_agent="人工协同控制器",
             current_agent_id="human_copilot",
@@ -1555,7 +1555,7 @@ class RuntimeCoordinator:
         )
         update_chat_trace(
             trace_id,
-            intent=RuntimeLane.HANDOFF.value,
+            intent=RuntimeLane.SAFETY_HANDOFF.value,
             agent_name="人工协同控制器",
             agent_id="human_copilot",
             status="complete",
@@ -1619,7 +1619,7 @@ class RuntimeCoordinator:
 
         if state.lane_decision is None or state.answer_contract is None:
             raise RuntimeError("selected Agent path started without Router contracts")
-        if state.lane_decision.lane == RuntimeLane.HANDOFF:
+        if state.lane_decision.lane == RuntimeLane.SAFETY_HANDOFF:
             raise RuntimeError("A lane cannot enter selected Agent execution")
         if not state.selected_agent:
             raise RouterContractError("B/C lane has no frozen selected Agent")
