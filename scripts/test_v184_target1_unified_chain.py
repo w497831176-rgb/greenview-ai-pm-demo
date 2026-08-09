@@ -188,11 +188,13 @@ class FakeAgent:
     def get_last_run_output(self, *, session_id: str) -> Any:
         assert "::vertical::" in session_id
         try:
-            content: Any = AgentTurnResult.model_validate_json(self.answer)
+            parsed = AgentTurnResult.model_validate_json(self.answer)
+            content: Any = parsed.model_dump(exclude_none=True)
         except Exception:
             content = self.answer
         return SimpleNamespace(
             content=content,
+            messages=[SimpleNamespace(role="assistant", content=self.answer)],
             tools=self.tool_calls,
             metrics={},
         )

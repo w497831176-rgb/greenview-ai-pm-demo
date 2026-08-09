@@ -296,7 +296,32 @@ async def _completed_agent_run_output(agent: Any, session_id: str) -> Any:
 
 
 def _completed_agent_run_content(run_output: Any) -> str:
-    """Serialize a completed RunOutput without leaking Pydantic repr syntax."""
+    """Return the exact final assistant payload from one completed RunOutput."""
+
+    def serialize(value: Any) -> str:
+        model_dumper = getattr(value, "model_dump_json", None)
+        if callable(model_dumper):
+            return str(model_dumper(exclude_none=False))
+        if isinstance(value, (dict, list)):
+            return _json(value)
+        return str(value or "")
+
+    # Agno can normalize ``RunOutput.content`` through a Pydantic dump that
+    # omits explicit nulls.  The last non-empty assistant message preserves
+    # the Provider's exact final JSON, including required nullable fields.
+    for message in reversed(list(getattr(run_output, "messages", None) or [])):
+        role = (
+            message.get("role")
+            if isinstance(message, dict)
+            else getattr(message, "role", None)
+        )
+        content = (
+            message.get("content")
+            if isinstance(message, dict)
+            else getattr(message, "content", None)
+        )
+        if str(role or "").lower() == "assistant" and content:
+            return serialize(content)
 
     content_getter = getattr(run_output, "get_content_as_string", None)
     if callable(content_getter):
@@ -304,13 +329,7 @@ def _completed_agent_run_content(run_output: Any) -> str:
             return str(content_getter(exclude_none=False) or "")
         except TypeError:
             return str(content_getter() or "")
-    content = getattr(run_output, "content", None)
-    model_dumper = getattr(content, "model_dump_json", None)
-    if callable(model_dumper):
-        return str(model_dumper(exclude_none=False))
-    if isinstance(content, (dict, list)):
-        return _json(content)
-    return str(content or "")
+    return serialize(getattr(run_output, "content", None))
 
 
 def _metrics_dict(value: Any) -> Dict[str, Optional[int]]:
