@@ -220,6 +220,13 @@ def fake_build(
             and str((call.get("arguments") or {}).get("skill_name") or "").startswith("skill-")
         }
     )
+    reported_tool_names = sorted(
+        {
+            str(call.get("tool_name") or "")
+            for call in normalized_tool_calls
+            if call.get("tool_name")
+        }
+    )
     answer = AGENT_TURN_OVERRIDES.get(
         message,
         json.dumps(
@@ -232,7 +239,7 @@ def fake_build(
                     "skill_ids": used_skill_ids,
                     "rag_evidence_ids": [],
                     "mcp_calls": [],
-                    "tool_calls": [],
+                    "tool_calls": reported_tool_names,
                 },
             },
             ensure_ascii=False,

@@ -594,7 +594,6 @@ def _validate_agent_capability_usage(
             str(call.get("tool_name") or "")
             for call in tool_calls
             if call.get("tool_name")
-            and str(call.get("tool_name")) != "get_skill_instructions"
             and str(call.get("tool_name")) not in mcp_names
         }
     )

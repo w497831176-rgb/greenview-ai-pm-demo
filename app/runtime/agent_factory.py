@@ -310,7 +310,7 @@ def build_agent_from_snapshot(
             "answer_status must be answered, insufficient_evidence, or insufficient_capability. Never request another Agent or routing decision.",
             "citations is a list of RAG evidence IDs supplied in this turn. Skill, MCP, Tool, model output, and configuration are never citations.",
             "capability_usage must contain skill_ids, rag_evidence_ids, mcp_calls, and tool_calls. Report only capabilities actually used in this run; use empty lists when none were used.",
-            "For Skill use, report the numeric id from a get_skill_instructions package named skill-<id>. For MCP and Tool use, report the exact function names you actually called.",
+            "For Skill use, report the numeric id from a successfully loaded get_skill_instructions package named skill-<id>. tool_calls must list every non-MCP model-native function actually called, including Skill helper functions; mcp_calls lists MCP functions separately.",
             "Only a selected property Agent may request work-order creation. It must use proposal_request with room_id, issue_type, issue_desc, urgency, contact_name, contact_phone, and appointment_time. Do not encode a write request in prose.",
             "If work-order fields are missing, include known values in proposal_request and ask for the missing values in answer. If no work-order state is requested, proposal_request must be null.",
         ]
