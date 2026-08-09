@@ -133,7 +133,7 @@ def _install_symbolic_catalog_fixtures() -> tuple[int, int]:
             "effect": "read",
             "effect_source": "operator_declared",
             "risk_level": "L1",
-            "execution_mode": "model_native",
+            "execution_mode": "auto_preinvoke",
             "natural_language_intents": [],
             "trigger_keywords": [],
             "trigger_mode": "any",
@@ -396,9 +396,10 @@ def test_bind_publish_unbind_publish_and_session_pinning() -> None:
     )
 
     bound_assembly = _assemble_capabilities(session_after_bind)
-    assert [
-        item.skill_id for item in bound_assembly["build"].activated_skills
-    ] == [skill_id]
+    assert bound_assembly["build"].activated_skills == []
+    assert [item.skill_id for item in bound_assembly["build"].bound_skills] == [
+        skill_id
+    ]
     assert [
         int(item.document_id) for item in bound_assembly["evidence"].items
     ] == [document_id]
@@ -421,9 +422,9 @@ def test_bind_publish_unbind_publish_and_session_pinning() -> None:
         bound_assembly,
         "bound",
     )
-    assert [item["skill_id"] for item in bound_trace["ledger"]["activated_skills"]] == [
-        skill_id
-    ]
+    # Binding exposes a candidate to the frozen Agent. It is not a real use
+    # until that Agent calls get_skill_instructions in a model run.
+    assert bound_trace["ledger"]["activated_skills"] == []
     assert [
         int(item["document_id"])
         for item in bound_trace["ledger"]["retrieval_evidence"]
@@ -479,6 +480,7 @@ def test_bind_publish_unbind_publish_and_session_pinning() -> None:
 
     unbound_assembly = _assemble_capabilities(session_after_unbind)
     assert unbound_assembly["build"].activated_skills == []
+    assert unbound_assembly["build"].bound_skills == []
     assert unbound_assembly["build"].skill_tool_calls == []
     assert unbound_assembly["evidence"].items == []
     assert unbound_assembly["toolkits"] == []
@@ -528,11 +530,23 @@ def test_bind_publish_unbind_publish_and_session_pinning() -> None:
     assert _catalog_counts() == catalog_counts
 
 
+def test_current_release_parent_diff_ui_contract() -> None:
+    frontend = (REPO_ROOT / "frontend/index.html").read_text(encoding="utf-8")
+    assert 'id="runtime-current-parent-diff"' in frontend
+    assert "与上一版本比较" in frontend
+    assert (
+        "/api/runtime/releases/${encodeURIComponent(current.release_id)}/diff?include_details=true"
+        in frontend
+    )
+
+
 def main() -> None:
     try:
         init_db()
         test_bind_publish_unbind_publish_and_session_pinning()
         print("PASS test_bind_publish_unbind_publish_and_session_pinning")
+        test_current_release_parent_diff_ui_contract()
+        print("PASS test_current_release_parent_diff_ui_contract")
     finally:
         TEMP_DIR.cleanup()
     print("Target 2 hot-binding lifecycle contracts passed without model calls.")
