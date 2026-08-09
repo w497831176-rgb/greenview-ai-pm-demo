@@ -638,7 +638,6 @@ def test_c_without_capabilities_completes_one_frozen_agent_run() -> None:
     build_calls: List[str] = []
     tool_build_calls: List[str] = []
     vertical_calls: List[Dict[str, Any]] = []
-    build_inputs: List[Dict[str, Any]] = []
     forbidden_hits: List[str] = []
     vertical_payload = {
         "value": AgentResponseEnvelope(answer="answer_c_dynamic_01").model_dump_json()
@@ -674,7 +673,6 @@ def test_c_without_capabilities_completes_one_frozen_agent_run() -> None:
 
     def build_agent(_snapshot_value: Any, agent_id: str, *_args: Any, **_kwargs: Any) -> Any:
         build_calls.append(agent_id)
-        build_inputs.append(dict(_kwargs))
         return SimpleNamespace(
             agent=FakeVerticalAgent(),
             activated_skills=[],
@@ -747,15 +745,6 @@ def test_c_without_capabilities_completes_one_frozen_agent_run() -> None:
     assert build_calls == ["agent_c_01", "agent_c_01"]
     assert tool_build_calls == ["agent_c_01", "agent_c_01"]
     assert len(vertical_calls) == 2
-    assert len(build_inputs) == 2
-    for item in build_inputs:
-        evidence_prompt = str(item.get("evidence_prompt") or "")
-        prompt_payload = json.loads(evidence_prompt)
-        evidence_contract = str(prompt_payload["evidence_contract"])
-        assert "optional enhancements" in evidence_contract
-        assert "never use missing evidence alone as a refusal reason" in evidence_contract
-        assert prompt_payload["domain_scope"] == "isolated_general"
-        assert "work_order_state" not in prompt_payload
     assert forbidden_hits == []
     done = [item["data"] for item in events if item["event"] == "done"][-1]
     assert done["status"] == "completed"
@@ -771,44 +760,6 @@ def test_c_without_capabilities_completes_one_frozen_agent_run() -> None:
         and item.get("provider_request_id") == "request_c_dynamic_01"
         for item in failed_ledger["ledger"]["model_calls"]
     )
-
-
-def test_c_final_instruction_overrides_optional_context_refusal() -> None:
-    captured: Dict[str, Any] = {}
-
-    class FakeAgent:
-        def __init__(self, **kwargs: Any):
-            captured.update(kwargs)
-
-    with ExitStack() as stack:
-        stack.enter_context(_patch(agent_factory_module, "Agent", FakeAgent))
-        stack.enter_context(
-            _patch(agent_factory_module, "build_model", lambda *_args, **_kwargs: object())
-        )
-        snapshot = _snapshot_c_without_capabilities("session_c_prompt_01")
-        selected = next(
-            item
-            for item in snapshot.config["agents"]
-            if item["agent_id"] == "agent_c_01"
-        )
-        selected["instructions"] = "symbolic_conflicting_property_only_persona_01"
-        built = agent_factory_module.build_agent_from_snapshot(
-            snapshot,
-            "agent_c_01",
-            "msg_c_prompt_01",
-            evidence_prompt="optional_context_01",
-        )
-
-    assert built.agent is not None
-    instructions = captured["instructions"]
-    assert instructions[0] == "symbolic_conflicting_property_only_persona_01"
-    assert "你只能使用本次已发布快照装配的能力。" not in instructions
-    assert instructions[-2] == "optional_context_01"
-    assert "Final C-lane authority" in instructions[-1]
-    assert "never prerequisites for answering" in instructions[-1]
-    assert "do not claim that you only handle property matters" in instructions[-1]
-    assert "overrides any conflicting property-only persona text" in instructions[-1]
-    assert "proposal_request and confirmation_request must remain null" in instructions[-1]
 
 
 def test_b_bindings_and_reference_allowlist() -> None:
@@ -1277,7 +1228,6 @@ TESTS = (
     test_a_unified_handoff_short_circuits,
     test_selected_agent_is_frozen_on_b_and_c_failure,
     test_c_without_capabilities_completes_one_frozen_agent_run,
-    test_c_final_instruction_overrides_optional_context_refusal,
     test_b_bindings_and_reference_allowlist,
     test_c_optional_bindings_and_property_isolation,
     test_router_write_text_cannot_open_workflow,

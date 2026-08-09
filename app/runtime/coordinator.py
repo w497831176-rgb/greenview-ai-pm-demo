@@ -1765,25 +1765,16 @@ class RuntimeCoordinator:
                 ),
             }
 
-        evidence_contract = (
-            "citation_ids may contain only exact IDs from this list; an empty list is "
-            "valid; decide your own B-lane refusal when property support is insufficient"
-            if domain_scope == "property"
-            else (
-                "citation_ids may contain only exact IDs from this list; an empty list "
-                "is valid. C-lane Skill, RAG, MCP, and Tool results are optional "
-                "enhancements: answer the non-property request normally when none is "
-                "available, and never use missing evidence alone as a refusal reason"
-            )
+        evidence_prompt = _json(
+            {
+                "evidence_contract": (
+                    "citation_ids may contain only exact IDs from this list; "
+                    "an empty list is valid; decide your own refusal when support is insufficient"
+                ),
+                "rag_evidence": [item.model_dump(mode="json") for item in evidence.items],
+                "work_order_state": workflow_context,
+            }
         )
-        evidence_payload: Dict[str, Any] = {
-            "domain_scope": domain_scope,
-            "evidence_contract": evidence_contract,
-            "rag_evidence": [item.model_dump(mode="json") for item in evidence.items],
-        }
-        if domain_scope == "property":
-            evidence_payload["work_order_state"] = workflow_context
-        evidence_prompt = _json(evidence_payload)
         model_native_toolkits = build_model_native_read_tools(
             snapshot.config,
             selected,

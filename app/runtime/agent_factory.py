@@ -441,18 +441,11 @@ def build_agent_from_snapshot(
 
     instructions = [
         str(agent_config.get("instructions") or ""),
+        "你只能使用本次已发布快照装配的能力。",
         "若运行时已加载业务 Skill，请直接依据已加载的 Skill 原文回答，不要重复调用 Skill 工具。",
         "不得自行创建、更新、删除业务数据；写操作只能描述为待确认 Proposal。",
         "只有后端 ActionReceipt.status=committed 且包含真实 resource_id 时，才能声称操作成功。",
     ]
-    instructions.append(
-        "你只能使用本次已发布快照装配的能力。"
-        if domain_scope == "property"
-        else (
-            "回答非物业通用问题时可以直接使用基础模型知识；本Agent在当前Snapshot中"
-            "真实绑定的Skill、RAG、MCP和Tool只作为可选增强。"
-        )
-    )
     instructions.extend(
         [
             "Your final response must be exactly one JSON object. Do not emit Markdown fences, a preface, a suffix, or any text outside the object.",
@@ -465,7 +458,7 @@ def build_agent_from_snapshot(
         instructions.extend(
             [
                 "你处于非物业隔离域：不得把通用回答表述为物业官方结论。",
-                "若使用增强能力，只能加载或调用本Agent在当前Snapshot中真实绑定的非物业Skill、RAG和只读Tool；不得访问物业能力或ActionGateway。",
+                "只能使用本Agent在当前Snapshot中真实绑定的Skill、RAG和只读Tool；不得调用物业ActionGateway。",
                 "没有实时Tool时不得确认当前天气、价格、名额等实时事实；医疗、法律、金融或暴力风险只给保守边界和求助建议。",
             ]
         )
@@ -487,22 +480,6 @@ def build_agent_from_snapshot(
     instructions.extend(skill_contexts)
     if evidence_prompt:
         instructions.append(evidence_prompt)
-    if domain_scope == "isolated_general":
-        # Keep the product-level C contract as the final authority after the
-        # selected Agent's own Skill/RAG context.  Those optional enhancements
-        # may narrow factual claims, but they must never turn a general Agent
-        # back into a property-only assistant or make missing evidence a reply
-        # precondition.
-        instructions.append(
-            "Final C-lane authority: answer the user's non-property request directly "
-            "using your general model knowledge and any selected Agent bindings that "
-            "are genuinely relevant. Skill, RAG, MCP, and Tool results are optional "
-            "enhancements, never prerequisites for answering. Do not refuse merely "
-            "because no enhancement or citation is available, and do not claim that "
-            "you only handle property matters. This structured domain_scope overrides "
-            "any conflicting property-only persona text. proposal_request and "
-            "confirmation_request must remain null."
-        )
     snapshot_default_model = (
         (config.get("model_policy") or {}).get("default") or {}
     ).get("model_id")
