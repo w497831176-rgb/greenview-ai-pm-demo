@@ -3263,6 +3263,16 @@ class RuntimeCoordinator:
             selected,
             message,
             tools=model_native_toolkits,
+            mcp_tool_names=sorted(
+                {
+                    str(tool_name)
+                    for toolkit in model_native_toolkits
+                    for tool_name in (
+                        getattr(toolkit, "allowed_function_names", set()) or set()
+                    )
+                    if str(tool_name).strip()
+                }
+            ),
             evidence_prompt=evidence_prompt + mcp_context + answer_boundary,
             enable_skills=(
                 not structured_realtime_query

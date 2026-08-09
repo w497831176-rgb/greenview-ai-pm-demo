@@ -33,10 +33,15 @@ init_db()
 
 import agents.router as router_module  # noqa: E402
 import app.runtime.api as runtime_api_module  # noqa: E402
+import app.runtime.agent_factory as agent_factory_module  # noqa: E402
 import app.runtime.coordinator as coordinator_module  # noqa: E402
 import app.runtime.mcp_executor as mcp_executor_module  # noqa: E402
 from app.runtime.action_gateway import ActionGateway  # noqa: E402
-from app.runtime.agent_factory import AgentBuild, router_agent_cards  # noqa: E402
+from app.runtime.agent_factory import (  # noqa: E402
+    AgentBuild,
+    build_agent_from_snapshot,
+    router_agent_cards,
+)
 from app.runtime.citation_renderer import build_evidence_set, render_rag_citations  # noqa: E402
 from app.runtime.contracts import (  # noqa: E402
     AgentTurnResult,
@@ -894,6 +899,83 @@ def test_rag_citation_snapshot_and_mcp_boundaries() -> None:
         mcp_executor_module.GovernedMCPTools = original_toolkit
     assert len(toolkits) == 1
     assert toolkits[0].allowed_function_names == {"symbolic-read"}
+
+    captured_agent: Dict[str, Any] = {}
+
+    class FakeAgentConstructor:
+        def __init__(self, **kwargs: Any):
+            captured_agent.update(kwargs)
+
+    original_agent = agent_factory_module.Agent
+    original_build_model = agent_factory_module.build_model
+    agent_factory_module.Agent = FakeAgentConstructor
+    agent_factory_module.build_model = lambda *_args, **_kwargs: object()
+    try:
+        build_agent_from_snapshot(
+            snapshot("mcp-contract"),
+            "b_agent",
+            "symbolic-message",
+            mcp_tool_names=["symbolic-read"],
+        )
+    finally:
+        agent_factory_module.Agent = original_agent
+        agent_factory_module.build_model = original_build_model
+    instructions = "\n".join(captured_agent["instructions"])
+    assert "symbolic-read" in instructions
+    assert "capability_usage.mcp_calls" in instructions
+    assert "never in capability_usage.tool_calls" in instructions
+
+    actual_mcp_invocations = [SimpleNamespace(tool_name="symbolic-read")]
+    actual_native_calls = [
+        {"tool_name": "symbolic-read"},
+        {"tool_name": "symbolic-local-tool"},
+    ]
+    correctly_declared = AgentTurnResult.model_validate(
+        {
+            "answer": "symbolic-answer",
+            "answer_status": "answered",
+            "citations": [],
+            "proposal_request": None,
+            "capability_usage": {
+                "skill_ids": [],
+                "rag_evidence_ids": [],
+                "mcp_calls": ["symbolic-read"],
+                "tool_calls": ["symbolic-local-tool"],
+            },
+        }
+    )
+    coordinator_module._validate_agent_capability_usage(
+        correctly_declared,
+        activated_skills=[],
+        evidence=evidence,
+        mcp_invocations=actual_mcp_invocations,
+        tool_calls=actual_native_calls,
+    )
+    wrongly_declared = AgentTurnResult.model_validate(
+        {
+            "answer": "symbolic-answer",
+            "answer_status": "answered",
+            "citations": [],
+            "proposal_request": None,
+            "capability_usage": {
+                "skill_ids": [],
+                "rag_evidence_ids": [],
+                "mcp_calls": [],
+                "tool_calls": ["symbolic-read", "symbolic-local-tool"],
+            },
+        }
+    )
+    try:
+        coordinator_module._validate_agent_capability_usage(
+            wrongly_declared,
+            activated_skills=[],
+            evidence=evidence,
+            mcp_invocations=actual_mcp_invocations,
+            tool_calls=actual_native_calls,
+        )
+        raise AssertionError("MCP usage misfiled as an ordinary Tool was accepted")
+    except coordinator_module.AgentContractInvalidError:
+        pass
 
 
 def test_static_contracts() -> None:

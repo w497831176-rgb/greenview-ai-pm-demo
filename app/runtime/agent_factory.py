@@ -247,6 +247,7 @@ def build_agent_from_snapshot(
     agent_id: str,
     message: str,
     tools: Optional[List[Any]] = None,
+    mcp_tool_names: Optional[List[str]] = None,
     evidence_prompt: str = "",
     enable_skills: bool = True,
 ) -> AgentBuild:
@@ -316,6 +317,17 @@ def build_agent_from_snapshot(
             "If work-order fields are missing, include known values in proposal_request and ask for the missing values in answer. If no work-order state is requested, proposal_request must be null.",
         ]
     )
+    available_mcp_tool_names = sorted(
+        {str(name) for name in (mcp_tool_names or []) if str(name).strip()}
+    )
+    if available_mcp_tool_names:
+        instructions.append(
+            "The following model-native function names are MCP tools in this frozen "
+            "Agent run: "
+            + ", ".join(available_mcp_tool_names)
+            + ". If you actually call one, list its exact function name in "
+            "capability_usage.mcp_calls and never in capability_usage.tool_calls."
+        )
     if (agent_config.get("domain_scope") or "property") == "isolated_general":
         instructions.extend(
             [
