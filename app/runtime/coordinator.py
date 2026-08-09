@@ -3767,29 +3767,62 @@ class RuntimeCoordinator:
             mcp_calls=mcp_payload or None,
             usage_source=vertical_usage_source,
         )
-        auto_badcase = capture_runtime_badcase(
-            ledger=ledger.contract,
-            original_query=message,
-            ai_response=rendered,
-            source_message_id=saved.get("id"),
-            agent_answer_status=agent_turn.answer_status,
-            delivery_context={
-                "normal_completed": True,
-                "renderer_intercepted": knowledge_grounding_failed,
-            },
-        )
-        if ledger.contract.system_observations:
-            ledger.persist("complete")
-        if auto_badcase:
-            ledger.append(
-                "badcase_links",
-                {
-                    "badcase_id": auto_badcase.get("id"),
-                    "source": auto_badcase.get("source"),
-                    "trigger": "runtime_evidence",
+        auto_badcase = None
+        try:
+            auto_badcase = capture_runtime_badcase(
+                ledger=ledger.contract,
+                original_query=message,
+                ai_response=rendered,
+                source_message_id=saved.get("id"),
+                agent_answer_status=agent_turn.answer_status,
+                delivery_context={
+                    "normal_completed": True,
+                    "renderer_intercepted": knowledge_grounding_failed,
                 },
             )
-            ledger.persist("complete")
+            if ledger.contract.system_observations:
+                ledger.persist("complete")
+            if auto_badcase:
+                ledger.append(
+                    "badcase_links",
+                    {
+                        "badcase_id": auto_badcase.get("id"),
+                        "source": auto_badcase.get("source"),
+                        "trigger": "runtime_evidence",
+                    },
+                )
+                ledger.persist("complete")
+        except Exception as exc:
+            # The governed answer and its Trace are already complete.  A
+            # secondary Badcase persistence failure is a structured runtime
+            # observation, never authority to suppress that successful answer.
+            ledger.append(
+                "system_observations",
+                {
+                    "code": "badcase_capture_failed",
+                    "component": "badcase_capture",
+                    "error_type": type(exc).__name__,
+                    "delivery_status": "preserved",
+                },
+            )
+            try:
+                ledger.persist("complete")
+            except Exception:
+                pass
+            try:
+                record_trace_event(
+                    trace_id,
+                    "badcase_capture",
+                    "failed",
+                    latency_ms=int((time.time() - started) * 1000),
+                    output_summary="Badcase capture failed after successful answer",
+                    metadata={
+                        "error_type": type(exc).__name__,
+                        "delivery_status": "preserved",
+                    },
+                )
+            except Exception:
+                pass
 
         # Replace provisional stream text with the citation-validated answer.
         # This preserves one authoritative EvidenceSet for final text,

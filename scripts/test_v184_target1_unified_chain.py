@@ -289,6 +289,40 @@ def test_router_reason_cannot_create_write() -> None:
     assert scalar("SELECT COUNT(*) FROM action_proposals") == before_proposals
 
 
+def test_badcase_capture_failure_cannot_suppress_terminal_events() -> None:
+    message = "symbol-badcase-capture-boundary"
+    session_id = "session-badcase-capture-boundary"
+    ROUTER_DECISIONS[message] = LaneDecision(
+        lane=RuntimeLane.PROPERTY_GOVERNED,
+        selected_agent_id="b_agent",
+        reason="choose-b-agent",
+    )
+    original_capture = coordinator_module.capture_runtime_badcase
+
+    def failed_capture(**_kwargs: Any) -> None:
+        raise RuntimeError("symbolic capture failure")
+
+    coordinator_module.capture_runtime_badcase = failed_capture
+    try:
+        events = asyncio.run(consume(message, session_id))
+    finally:
+        coordinator_module.capture_runtime_badcase = original_capture
+
+    assert [item["event"] for item in events].count("final") == 1
+    done_events = [item["data"] for item in events if item["event"] == "done"]
+    assert len(done_events) == 1 and done_events[0]["status"] == "complete"
+    trace_id = done_events[0]["trace_id"]
+    stored = get_evidence_ledger(trace_id)
+    observations = (stored or {}).get("ledger", {}).get("system_observations") or []
+    assert any(
+        item.get("code") == "badcase_capture_failed"
+        and item.get("delivery_status") == "preserved"
+        for item in observations
+    )
+    stages = [item["span_name"] for item in list_trace_events(trace_id)]
+    assert "badcase_capture" in stages
+
+
 def work_order_payload(suffix: str) -> Dict[str, str]:
     return {
         "room_id": f"room-{suffix}",
@@ -512,6 +546,7 @@ def main() -> None:
             test_full_history_and_a_short_circuit,
             test_b_and_c_freeze_one_agent_without_fallback,
             test_router_reason_cannot_create_write,
+            test_badcase_capture_failure_cannot_suppress_terminal_events,
             test_structured_work_order_state_machine,
             test_rag_citation_snapshot_and_mcp_boundaries,
             test_static_contracts,
