@@ -773,6 +773,46 @@ def test_rag_citation_snapshot_and_mcp_boundaries() -> None:
     assert len(citations) == 1 and citations[0].evidence_type == "rag_document_chunk"
     assert [item["code"] for item in violations] == ["invalid_evidence_id"]
 
+    hybrid_chunks = [
+        {
+            "chunk_index": index,
+            "content": "symbol-current" if index == 7 else f"symbol-{index}",
+            "chunk_hash": coordinator_module.content_hash(
+                "symbol-current" if index == 7 else f"symbol-{index}"
+            ),
+        }
+        for index in range(10)
+    ]
+    hybrid_knowledge = {
+        8: {
+            "knowledge_doc_id": 8,
+            "title": "symbol-doc",
+            "document_version": "v1",
+            "document_hash": "symbol-hash",
+            "chunk_count": 10,
+            "chunk_snapshots": hybrid_chunks,
+        }
+    }
+    hybrid, used_snapshot_hybrid = _results_from_snapshot(
+        "symbol-current",
+        [
+            {
+                "doc_id": 8,
+                "chunk_index": 0,
+                "content": "symbol-0",
+                "score": 1.0,
+            }
+        ],
+        hybrid_knowledge,
+        {8},
+        3,
+        0.2,
+        500,
+    )
+    hybrid_indexes = [int(item["chunk_index"]) for item in hybrid]
+    assert used_snapshot_hybrid is True
+    assert 7 in hybrid_indexes and 6 in hybrid_indexes and 8 in hybrid_indexes
+
     bad_policy = ToolPolicy(
         server_name="mcp",
         tool_name="write",

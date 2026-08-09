@@ -1029,10 +1029,7 @@ def _results_from_snapshot(
             ),
         )
 
-    if verified:
-        return with_adjacent_context(verified), False
-
-    fallback: List[Dict[str, Any]] = []
+    snapshot_ranked: List[Dict[str, Any]] = []
     for (doc_id, chunk_index), snapshot_chunk in published_chunks.items():
         document = snapshot_chunk["document"]
         content = str(snapshot_chunk.get("content") or "")
@@ -1051,7 +1048,7 @@ def _results_from_snapshot(
                 query_segment,
                 content,
             )
-            if segment_score >= context_threshold:
+            if segment_score > 0:
                 accepted_scores.append((segment_score, query_index))
         if not accepted_scores:
             continue
@@ -1059,7 +1056,7 @@ def _results_from_snapshot(
             accepted_scores,
             key=lambda item: (item[0], -item[1]),
         )
-        fallback.append(
+        snapshot_ranked.append(
             {
                 "doc_id": doc_id,
                 "doc_title": document.get("title") or "",
@@ -1076,8 +1073,56 @@ def _results_from_snapshot(
                 "matched_query_index": matched_query_index,
             }
         )
-    fallback.sort(key=lambda item: float(item.get("context_score") or 0), reverse=True)
-    return with_adjacent_context(fallback), True
+    snapshot_ranked.sort(
+        key=lambda item: float(item.get("context_score") or 0),
+        reverse=True,
+    )
+    best_snapshot_score = float(
+        (snapshot_ranked[0].get("context_score") if snapshot_ranked else 0) or 0
+    )
+    snapshot_candidates = [
+        item
+        for item in snapshot_ranked
+        if best_snapshot_score > 0
+        and (
+            float(item.get("context_score") or 0) >= context_threshold
+            or float(item.get("context_score") or 0) / best_snapshot_score
+            >= context_threshold
+        )
+    ][: max(1, int(top_k)) * 2]
+
+    # Fuse live semantic/hybrid ranks with immutable-snapshot lexical ranks.
+    # A weak live hit must not suppress a stronger same-release snapshot
+    # candidate; reciprocal ranks avoid comparing provider-specific score
+    # scales.  No domain term, document id, or question pattern is involved.
+    fused: Dict[Tuple[int, int], Dict[str, Any]] = {}
+    fused_scores: Dict[Tuple[int, int], float] = {}
+    live_keys: set[Tuple[int, int]] = set()
+    for source, items in (
+        ("live", verified),
+        ("snapshot", snapshot_candidates),
+    ):
+        for rank, item in enumerate(items):
+            key = (int(item["doc_id"]), int(item.get("chunk_index") or 0))
+            if source == "live":
+                live_keys.add(key)
+                fused[key] = item
+            elif key not in fused:
+                fused[key] = item
+            fused_scores[key] = fused_scores.get(key, 0.0) + 1.0 / (rank + 1)
+    seeds = sorted(
+        fused.values(),
+        key=lambda item: (
+            -fused_scores[(int(item["doc_id"]), int(item.get("chunk_index") or 0))],
+            int(item["doc_id"]),
+            int(item.get("chunk_index") or 0),
+        ),
+    )[: max(1, int(top_k))]
+    used_snapshot_hybrid = any(
+        (int(item["doc_id"]), int(item.get("chunk_index") or 0)) not in live_keys
+        for item in seeds
+    )
+    return with_adjacent_context(seeds), used_snapshot_hybrid
 
 
 class RuntimeCoordinator:
