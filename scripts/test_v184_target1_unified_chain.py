@@ -1006,6 +1006,7 @@ def test_static_contracts() -> None:
     assert "ASCII U+0022 double quotes" in agent_factory_source
     assert "expected_output=(" in agent_factory_source
     assert "markdown=False" in agent_factory_source
+    assert "Subject similarity alone does not make a request property-governed" in router_source
     assert "必须按AgentTurnResult返回结构化proposal_request" in coordinator_source
     mcp_source = (root / "app/runtime/mcp_executor.py").read_text(encoding="utf-8")
     assert '== "model_native"' not in mcp_source

@@ -142,6 +142,8 @@ def create_unified_abc_router(*, model: Any) -> Agent:
             "A_HANDOFF means the user explicitly asks for a real human or reports an immediate real-world personal/property safety risk. Its selected_agent_id must be null.",
             "B_PROPERTY_GOVERNED means a property-service request. Select exactly one candidate whose scope is property.",
             "C_ISOLATED_GENERAL is the complete complement of A and B. Select exactly one candidate whose scope is isolated_general.",
+            "A property Agent card is eligible only when the user's actual request concerns a service supplied by property management, property governance, or property business data. Subject similarity alone does not make a request property-governed.",
+            "General knowledge, household guidance, education, and everyday advice remain C unless the user is asking about a property-management service or property business fact.",
             "Use only candidate agent_id, name, description, and scope. Do not infer or request bindings, instructions, Skills, RAG, MCP, Tools, results, or capability counts.",
             "The reason must be a short natural-language explanation. Never return business_intent, a fallback, a second choice, or an action decision.",
         ],
