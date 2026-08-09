@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional
 from agno.agent import Agent, AgentFactory
 from agno.factory import RequestContext
 
-from app.runtime.contracts import RunConfigSnapshot, SkillActivation
+from app.runtime.contracts import AgentTurnResult, RunConfigSnapshot, SkillActivation
 from app.runtime.skill_projector import project_skills
 from app.settings import MODEL_ID, agent_db, build_model
 
@@ -363,7 +363,9 @@ def build_agent_from_snapshot(
         instructions=instructions,
         tools=list(tools or []),
         skills=agno_skills,
-        markdown=True,
+        output_schema=AgentTurnResult,
+        use_json_mode=True,
+        markdown=False,
         # The coordinator injects only successful user-visible chat_messages.
         # Agno stage history may contain Router control JSON and must stay off.
         add_history_to_context=False,

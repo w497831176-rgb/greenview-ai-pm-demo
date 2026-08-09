@@ -277,6 +277,42 @@ def _extract_tool_calls(value: Any) -> List[Dict[str, Any]]:
     return calls
 
 
+async def _completed_agent_run_output(agent: Any, session_id: str) -> Any:
+    """Load the completed output for this exact frozen-Agent run, if stored.
+
+    Agno's streaming events do not consistently carry the final structured
+    content or the accumulated ToolExecution list.  The completed RunOutput is
+    the authoritative artifact of the same run; reading it does not invoke a
+    Provider or introduce another Agent decision.
+    """
+
+    async_getter = getattr(agent, "aget_last_run_output", None)
+    if callable(async_getter):
+        return await async_getter(session_id=session_id)
+    sync_getter = getattr(agent, "get_last_run_output", None)
+    if callable(sync_getter):
+        return await asyncio.to_thread(sync_getter, session_id=session_id)
+    return None
+
+
+def _completed_agent_run_content(run_output: Any) -> str:
+    """Serialize a completed RunOutput without leaking Pydantic repr syntax."""
+
+    content_getter = getattr(run_output, "get_content_as_string", None)
+    if callable(content_getter):
+        try:
+            return str(content_getter(exclude_none=False) or "")
+        except TypeError:
+            return str(content_getter() or "")
+    content = getattr(run_output, "content", None)
+    model_dumper = getattr(content, "model_dump_json", None)
+    if callable(model_dumper):
+        return str(model_dumper(exclude_none=False))
+    if isinstance(content, (dict, list)):
+        return _json(content)
+    return str(content or "")
+
+
 def _metrics_dict(value: Any) -> Dict[str, Optional[int]]:
     metrics = getattr(value, "metrics", None)
     if not metrics:
@@ -3398,12 +3434,13 @@ class RuntimeCoordinator:
             if model_invoked
             else nullcontext(None)
         )
+        vertical_session_id = f"{session_id}::vertical::{selected}::{trace_id}"
         with accounting_context as provider_scope:
             response_stream = (
                 build.agent.arun(
                     contextual_message,
                     user_id=user_id,
-                    session_id=f"{session_id}::vertical::{selected}::{trace_id}",
+                    session_id=vertical_session_id,
                     stream=True,
                     stream_events=True,
                 )
@@ -3444,6 +3481,26 @@ class RuntimeCoordinator:
                         },
                     )
                     last_progress_at = time.time()
+
+        completed_run_output = await _completed_agent_run_output(
+            build.agent,
+            vertical_session_id,
+        )
+        if completed_run_output is not None:
+            completed_content = _completed_agent_run_content(completed_run_output)
+            if completed_content:
+                full_content = str(completed_content)
+                provisional_buffer = full_content
+            for call in _extract_tool_calls(completed_run_output):
+                if call not in tool_calls:
+                    tool_calls.append(call)
+            completed_metrics = _metrics_dict(completed_run_output)
+            if completed_metrics:
+                final_metrics.update(completed_metrics)
+            merge_non_null(
+                final_provider_evidence,
+                provider_evidence_from_run(completed_run_output),
+            )
 
         provider_requests = list(provider_scope.attempts) if provider_scope else []
 

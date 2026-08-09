@@ -39,6 +39,7 @@ from app.runtime.action_gateway import ActionGateway  # noqa: E402
 from app.runtime.agent_factory import AgentBuild, router_agent_cards  # noqa: E402
 from app.runtime.citation_renderer import build_evidence_set, render_rag_citations  # noqa: E402
 from app.runtime.contracts import (  # noqa: E402
+    AgentTurnResult,
     LaneDecision,
     RunConfigSnapshot,
     RuntimeLane,
@@ -182,7 +183,18 @@ class FakeAgent:
             content=self.answer,
             event="RunContent",
             metrics={},
-            tool_calls=self.tool_calls,
+        )
+
+    def get_last_run_output(self, *, session_id: str) -> Any:
+        assert "::vertical::" in session_id
+        try:
+            content: Any = AgentTurnResult.model_validate_json(self.answer)
+        except Exception:
+            content = self.answer
+        return SimpleNamespace(
+            content=content,
+            tools=self.tool_calls,
+            metrics={},
         )
 
 
@@ -849,6 +861,7 @@ def test_static_contracts() -> None:
         raise AssertionError("Router candidate scope must fail closed")
     root = Path(__file__).resolve().parents[1]
     coordinator_source = (root / "app/runtime/coordinator.py").read_text(encoding="utf-8")
+    agent_factory_source = (root / "app/runtime/agent_factory.py").read_text(encoding="utf-8")
     router_source = (root / "agents/router.py").read_text(encoding="utf-8")
     frontend_source = (root / "frontend/index.html").read_text(encoding="utf-8")
     assert RuntimeLane.HANDOFF.value == "A_HANDOFF"
@@ -857,6 +870,9 @@ def test_static_contracts() -> None:
     assert "A_SAFETY_HANDOFF" not in frontend_source
     assert "await self._select_agent_after_lane(" not in coordinator_source.split("async def _stream_consultation", 1)[1]
     assert "plan_tools(" not in coordinator_source.split("async def _stream_consultation", 1)[1]
+    assert "output_schema=AgentTurnResult" in agent_factory_source
+    assert "use_json_mode=True" in agent_factory_source
+    assert "markdown=False" in agent_factory_source
     assert "必须按AgentTurnResult返回结构化proposal_request" in coordinator_source
     mcp_source = (root / "app/runtime/mcp_executor.py").read_text(encoding="utf-8")
     assert '== "model_native"' not in mcp_source
