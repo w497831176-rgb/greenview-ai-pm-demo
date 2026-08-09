@@ -73,14 +73,14 @@ check("01 provider failure is formal", runtime_badcase_decision(ledger(), runtim
 tool_fail = {"server_name": "workorder", "tool_name": "get", "invocation_status": "failed", "transport_status": "failed", "business_status": "failed", "required": True}
 check("02 required tool failure is formal", decide(ledger(tool_invocations=[tool_fail]))["disposition"] == "formal_badcase")
 check("03 unsupported final value is formal", decide(ledger(contract_violations=violation("ungrounded_critical_value")))["disposition"] == "formal_badcase")
-check("04 wrong capability selection is formal", decide(ledger(contract_violations=violation("tool_selection_wrong")))["disposition"] == "formal_badcase")
+check("04 registered capability failure is formal", decide(ledger(contract_violations=violation("skill_selected_not_loaded")))["disposition"] == "formal_badcase")
 check("05 risky action is formal", decide(ledger(contract_violations=violation("false_success_without_receipt")))["disposition"] == "formal_badcase")
 fixed_eval = {"evaluation_run_id": 9, "assertion_id": "agent", "passed": False, "status": "failed"}
 check("06 fixed evaluation failure is formal", decide(ledger(evaluation_results=[fixed_eval]))["disposition"] == "formal_badcase")
 
 # Observation/ignore boundary.
-check("07 safe rejection is observation", runtime_badcase_decision(ledger(contract_violations=violation("ungrounded_critical_value")), delivery_context={"safe_rejection": True})["disposition"] == "system_observation")
-check("08 renderer interception is observation", runtime_badcase_decision(ledger(contract_violations=violation("citation_claim_mismatch")), delivery_context={"renderer_intercepted": True})["disposition"] == "system_observation")
+check("07 answer wording flag cannot suppress structured citation failure", runtime_badcase_decision(ledger(contract_violations=violation("ungrounded_critical_value")), delivery_context={"safe_rejection": True})["disposition"] == "formal_badcase")
+check("08 renderer interception is structured citation failure", runtime_badcase_decision(ledger(contract_violations=violation("citation_claim_mismatch")), delivery_context={"renderer_intercepted": True})["disposition"] == "formal_badcase")
 check("09 healthy skip creates nothing", decide(ledger())["disposition"] == "none")
 empty_tool = {"invocation_status": "success", "transport_status": "success", "business_status": "not_found"}
 check("10 normal not-found creates nothing", decide(ledger(tool_invocations=[empty_tool]))["disposition"] == "none")

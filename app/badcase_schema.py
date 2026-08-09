@@ -116,6 +116,7 @@ ACTION_LABELS = {
     "mark-auto-false-positive": "确认自动误抓",
     "system-observation": "转为系统观察",
     "auto-capture-v2": "系统自动发现",
+    "auto-capture-v3": "系统结构化发现",
     "auto-duplicate-occurrence": "关联重复发现",
 }
 
@@ -507,6 +508,10 @@ def _enrich_badcase(badcase: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any
         enriched["source_label"] = "评估失败"
     elif source in {"mcp_failure", "tool_failure"}:
         enriched["source_label"] = "工具监测"
+    elif source == "agent_insufficient_evidence":
+        enriched["source_label"] = "Agent自报：依据不足"
+    elif source == "agent_capability_unavailable":
+        enriched["source_label"] = "Agent自报：能力不可用"
     elif source == "handoff":
         enriched["source_label"] = "人工协同复盘"
     else:

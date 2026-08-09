@@ -3604,7 +3604,8 @@ class RuntimeCoordinator:
                     not direct_knowledge_required
                     or bool(citations)
                     or bool(linked_skill_evidence)
-                    or rendered.startswith("当前知识依据不足")
+                    or agent_turn.answer_status
+                    in {"insufficient_evidence", "capability_unavailable"}
                 ),
                 "required": direct_knowledge_required,
                 "evidence_count": len(evidence.items),
@@ -3614,7 +3615,9 @@ class RuntimeCoordinator:
                 "model_invoked": model_invoked,
                 "decision": (
                     "rejected_insufficient"
-                    if rendered.startswith("当前知识依据不足")
+                    if agent_turn.answer_status == "insufficient_evidence"
+                    else "rejected_capability_unavailable"
+                    if agent_turn.answer_status == "capability_unavailable"
                     else "answered_with_evidence"
                 ),
             },
@@ -3649,7 +3652,9 @@ class RuntimeCoordinator:
                 "decision_summary": decision_summary,
                 "evidence_decision": (
                     "rejected_insufficient"
-                    if rendered.startswith("当前知识依据不足")
+                    if agent_turn.answer_status == "insufficient_evidence"
+                    else "rejected_capability_unavailable"
+                    if agent_turn.answer_status == "capability_unavailable"
                     else "answered_with_evidence"
                 ),
                 "citation_violations": citation_violations,
@@ -3767,9 +3772,9 @@ class RuntimeCoordinator:
             original_query=message,
             ai_response=rendered,
             source_message_id=saved.get("id"),
+            agent_answer_status=agent_turn.answer_status,
             delivery_context={
                 "normal_completed": True,
-                "safe_rejection": rendered.startswith("当前知识依据不足"),
                 "renderer_intercepted": knowledge_grounding_failed,
             },
         )
