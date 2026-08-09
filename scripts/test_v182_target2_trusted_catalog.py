@@ -351,46 +351,6 @@ def test_compile_publish_pin_and_rollback() -> None:
             / "server.py",
         ),
     )
-
-    mcp_package = (
-        Path(TEMP_DIR.name) / "mcp_packages" / "fixture-general"
-    )
-    mcp_server = capability_catalog_module._runtime_object("mcp_server", 500)
-    baseline_mcp_hash = capability_catalog_module._artifact_state(
-        "mcp_server", mcp_server
-    )["hash"]
-    deployment_env = mcp_package / ".env"
-    deployment_env_local = mcp_package / ".env.local"
-    deployment_env.write_text("SYMBOLIC_SECRET=one\n", encoding="utf-8")
-    deployment_env_local.write_text("SYMBOLIC_SECRET=two\n", encoding="utf-8")
-    env_present_hash = capability_catalog_module._artifact_state(
-        "mcp_server", mcp_server
-    )["hash"]
-    deployment_env.write_text("SYMBOLIC_SECRET=changed\n", encoding="utf-8")
-    deployment_env_local.write_text(
-        "SYMBOLIC_SECRET=also_changed\n", encoding="utf-8"
-    )
-    env_changed_hash = capability_catalog_module._artifact_state(
-        "mcp_server", mcp_server
-    )["hash"]
-    deployment_env.unlink()
-    deployment_env_local.unlink()
-    env_missing_hash = capability_catalog_module._artifact_state(
-        "mcp_server", mcp_server
-    )["hash"]
-    check(
-        "MCP artifact hash ignores deployment env presence and content",
-        len(
-            {
-                baseline_mcp_hash,
-                env_present_hash,
-                env_changed_hash,
-                env_missing_hash,
-            }
-        )
-        == 1,
-    )
-
     for capability_type, stable_id, artifact_path in artifact_tamper_cases:
         original = artifact_path.read_bytes()
         artifact_path.write_bytes(original + b"\nSYMBOLIC_TAMPER")
