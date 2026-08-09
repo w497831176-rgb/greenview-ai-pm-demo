@@ -7,46 +7,16 @@ import json
 import os
 import shlex
 import time
-import uuid
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from app.runtime.contracts import RuntimePath, ToolEffect, ToolInvocation, ToolPlan
 from app.runtime.tool_gateway import ToolGateway
-from app.runtime.tool_planner import plan_tools
+from app.runtime.tool_planner import plan_tools, validate_arguments
 
 try:
     from agno.tools.mcp import MCPTools
 except Exception:  # pragma: no cover
     MCPTools = None  # type: ignore
-
-
-SAFE_SUBPROCESS_ENV_KEYS = {
-    "PATH",
-    "PYTHONPATH",
-    "LANG",
-    "LC_ALL",
-    "TZ",
-    "SYSTEMROOT",
-    "WINDIR",
-    "PATHEXT",
-    "TEMP",
-    "TMP",
-}
-
-
-def _server_subprocess_env(server: Dict[str, Any]) -> Dict[str, str]:
-    """Project only process basics plus the selected server's declared keys."""
-
-    declared = {
-        str(key).strip()
-        for key in (server.get("env_keys") or [])
-        if str(key).strip()
-    }
-    return {
-        key: os.environ[key]
-        for key in SAFE_SUBPROCESS_ENV_KEYS | declared
-        if key in os.environ
-    }
 
 
 if MCPTools is not None:
@@ -87,7 +57,6 @@ if MCPTools is not None:
                 if not isinstance(arguments, dict):
                     arguments = {"value": str(arguments)}
                 started = time.time()
-                invocation_id = f"tool_{uuid.uuid4().hex}"
                 try:
                     if asyncio.iscoroutinefunction(original):
                         result = await original(*args, **kwargs)
@@ -99,7 +68,6 @@ if MCPTools is not None:
                     )
                     self.recorded_invocations.append(
                         ToolInvocation(
-                            invocation_id=invocation_id,
                             server_name=self.server_name,
                             tool_name=function_name,
                             effect=ToolEffect.READ,
@@ -112,14 +80,10 @@ if MCPTools is not None:
                             result_summary=result_summary,
                         )
                     )
-                    return {
-                        "citation_id": invocation_id,
-                        "result": result,
-                    }
+                    return result
                 except Exception as exc:
                     self.recorded_invocations.append(
                         ToolInvocation(
-                            invocation_id=invocation_id,
                             server_name=self.server_name,
                             tool_name=function_name,
                             effect=ToolEffect.READ,
@@ -305,7 +269,14 @@ async def preinvoke_read_tools(
         try:
             toolkit = MCPTools(
                 command=full_command,
-                env=_server_subprocess_env(server),
+                env={
+                    **dict(os.environ),
+                    **{
+                        key: os.environ[key]
+                        for key in (server.get("env_keys") or [])
+                        if key in os.environ
+                    },
+                },
                 name=server_name,
                 transport="stdio",
                 timeout_seconds=15,
@@ -452,18 +423,31 @@ def build_model_native_read_tools(
     excluded_servers: Optional[Set[str]] = None,
     excluded_tools: Optional[Set[Tuple[str, str]]] = None,
 ) -> List[Any]:
-    """Expose every published read tool bound to the selected Agent.
+    """Build only message-matched model-native tools for Agno's tool loop.
 
-    ``message`` remains only for call-site compatibility. It is deliberately
-    not a planner input: tool visibility is determined solely by the immutable
-    Agent binding, structured isolation validation and published read policy.
+    A published binding makes a tool eligible; it does not mean every request
+    should start that MCP server.  Matching the immutable Tool metadata before
+    Agent construction both preserves the control-plane contract and prevents
+    unrelated route-only prompts from being coupled to external tool startup.
     """
 
     if GovernedMCPTools is None:
         return []
-    del message
     excluded = set(excluded_servers or set())
     excluded_tool_keys = set(excluded_tools or set())
+    planned_tool_keys = {
+        (plan.server_name, plan.tool_name)
+        for plan in plan_tools(
+            snapshot_config,
+            agent_id,
+            message,
+            RuntimePath.CONSULTATION,
+            effects=[ToolEffect.READ],
+            execution_modes=["model_native"],
+        )
+    }
+    if not planned_tool_keys:
+        return []
     gateway = ToolGateway(snapshot_config)
     toolkits: List[Any] = []
     for server in snapshot_config.get("mcp_servers") or []:
@@ -480,7 +464,23 @@ def build_model_native_read_tools(
             )
             if (server_name, tool_name) not in excluded_tool_keys
         ]
-        allowed = policy_allowed
+        tool_definitions = {
+            str(tool.get("name") or ""): tool
+            for tool in server.get("tools") or []
+        }
+        allowed = [
+            tool_name
+            for tool_name in policy_allowed
+            if (
+                (server_name, tool_name) in planned_tool_keys
+                and
+                (
+                    tool_definitions.get(tool_name, {}).get("tool_metadata")
+                    or {}
+                ).get("execution_mode")
+                == "model_native"
+            )
+        ]
         if not allowed or not server.get("command"):
             continue
         result_contracts = {
@@ -499,7 +499,14 @@ def build_model_native_read_tools(
         toolkits.append(
             GovernedMCPTools(
                 command=full_command,
-                env=_server_subprocess_env(server),
+                env={
+                    **dict(os.environ),
+                    **{
+                        key: os.environ[key]
+                        for key in (server.get("env_keys") or [])
+                        if key in os.environ
+                    },
+                },
                 name=server_name,
                 server_name=server_name,
                 allowed_function_names=allowed,
@@ -518,9 +525,127 @@ async def invoke_confirmed_write(
     tool_name: str,
     arguments: Dict[str, Any],
 ) -> Dict[str, Any]:
-    """Reject every MCP write before policy lookup or toolkit construction."""
+    """Invoke one approved create/update MCP tool from its immutable snapshot."""
 
-    del snapshot_config, agent_id, server_name, tool_name, arguments
-    raise PermissionError(
-        "MCP is permanently read-only; confirmed MCP writes are forbidden"
+    if MCPTools is None:
+        raise RuntimeError("Agno MCP toolkit is unavailable")
+    gateway = ToolGateway(snapshot_config)
+    policy = gateway.write_policy(server_name, tool_name, agent_id=agent_id)
+    server = next(
+        (
+            item
+            for item in snapshot_config.get("mcp_servers") or []
+            if item.get("name") == server_name and item.get("enabled")
+        ),
+        None,
     )
+    if not server or not server.get("command"):
+        raise RuntimeError("published MCP server has no executable command")
+    tool = next(
+        (
+            item
+            for item in server.get("tools") or []
+            if item.get("name") == tool_name
+        ),
+        None,
+    )
+    if not tool:
+        raise RuntimeError("published MCP tool is absent from snapshot")
+    schema_errors = validate_arguments(
+        arguments,
+        tool.get("input_schema") or {},
+    )
+    if schema_errors:
+        raise ValueError(
+            "MCP arguments failed published JSON Schema: "
+            + "; ".join(schema_errors)
+        )
+    full_command = shlex.join(
+        [
+            str(server["command"]),
+            *[str(argument) for argument in (server.get("args") or [])],
+        ]
+    )
+    toolkit: Optional[Any] = None
+    try:
+        toolkit = MCPTools(
+            command=full_command,
+            env={
+                **dict(os.environ),
+                **{
+                    key: os.environ[key]
+                    for key in (server.get("env_keys") or [])
+                    if key in os.environ
+                },
+            },
+            name=server_name,
+            transport="stdio",
+            timeout_seconds=15,
+        )
+        await asyncio.wait_for(toolkit.__aenter__(), timeout=8)
+        functions = getattr(toolkit, "functions", None) or {}
+        function = functions.get(tool_name)
+        if function is None or not getattr(function, "entrypoint", None):
+            raise RuntimeError("approved MCP function was not exposed by discovery")
+        started = time.time()
+        result = await asyncio.wait_for(
+            function.entrypoint(**arguments),
+            timeout=12,
+        )
+        business_status, result_summary = _business_status(
+            result,
+            (tool.get("tool_metadata") or {}).get("result_contract") or {},
+        )
+        parsed = _structured_result(result) or {}
+        if business_status != "success":
+            raise RuntimeError(
+                f"MCP business outcome is not successful: {business_status}"
+            )
+        resource_id = ""
+        if isinstance(parsed, dict):
+            for key in (
+                "resource_id",
+                "id",
+                "work_order_id",
+                "order_id",
+                "ticket_id",
+                "booking_id",
+            ):
+                if parsed.get(key):
+                    resource_id = str(parsed[key])
+                    break
+            nested = parsed.get("data") or parsed.get("result")
+            if not resource_id and isinstance(nested, dict):
+                for key in (
+                    "resource_id",
+                    "id",
+                    "work_order_id",
+                    "order_id",
+                    "ticket_id",
+                    "booking_id",
+                ):
+                    if nested.get(key):
+                        resource_id = str(nested[key])
+                        break
+        if not resource_id:
+            raise RuntimeError(
+                "MCP write returned no durable resource id; committed Receipt is forbidden"
+            )
+        return {
+            "resource_type": f"mcp:{server_name}:{tool_name}",
+            "resource_id": resource_id,
+            "server_name": server_name,
+            "tool_name": tool_name,
+            "effect": policy.effect.value,
+            "arguments": arguments,
+            "business_status": business_status,
+            "latency_ms": int((time.time() - started) * 1000),
+            "result_summary": result_summary,
+            "raw_result": parsed,
+        }
+    finally:
+        if toolkit and hasattr(toolkit, "close"):
+            try:
+                await asyncio.wait_for(toolkit.close(), timeout=3)
+            except Exception:
+                pass

@@ -8,7 +8,7 @@ import uuid
 from enum import Enum
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field
 
 
 def canonical_json(value: Any) -> str:
@@ -114,17 +114,6 @@ class ImmutableModel(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
 
-class StrictImmutableModel(ImmutableModel):
-    """No extra fields at externally supplied structured-output boundaries."""
-
-    # ``model_validate`` receives an already decoded JSON object.  Pydantic's
-    # global ``strict=True`` would reject a valid JSON string for a ``str``
-    # Enum when validating that Python object, so exact field sets and the
-    # model validators below provide the strict boundary without that false
-    # negative.
-    model_config = ConfigDict(frozen=True, extra="forbid")
-
-
 class HandoffKind(str, Enum):
     USER_REQUESTED = "user_requested"
     SAFETY_RISK = "safety_risk"
@@ -156,84 +145,6 @@ class LaneDecision(ImmutableModel):
     business_intent: Optional[str] = Field(default=None, max_length=160)
     reason: Optional[str] = Field(default=None, max_length=160)
     decision_source: LaneDecisionSource = LaneDecisionSource.ROUTER_MODEL
-
-
-class RouterDecisionPayload(StrictImmutableModel):
-    """The exact three-field payload returned by the one-call production Router."""
-
-    lane: RuntimeLane
-    selected_agent_id: Optional[str]
-    reason: str = Field(min_length=1, max_length=240)
-
-    @model_validator(mode="after")
-    def validate_lane_agent_shape(self) -> "RouterDecisionPayload":
-        if not self.reason.strip() or self.reason.strip() != self.reason:
-            raise ValueError("reason must be non-empty without surrounding whitespace")
-        selected = str(self.selected_agent_id or "").strip()
-        if self.lane == RuntimeLane.SAFETY_HANDOFF:
-            if self.selected_agent_id is not None:
-                raise ValueError("A lane selected_agent_id must be null")
-            return self
-        if not selected:
-            raise ValueError("B/C lane selected_agent_id must be a non-empty technical id")
-        if selected != self.selected_agent_id:
-            raise ValueError("selected_agent_id must not contain surrounding whitespace")
-        return self
-
-
-class WorkOrderCreateProposalRequest(StrictImmutableModel):
-    """A selected B Agent's structured request to create a pending Proposal."""
-
-    action_type: Literal["work_order.create"]
-    room_id: str = Field(min_length=1, max_length=80)
-    issue_type: str = Field(min_length=1, max_length=80)
-    issue_desc: str = Field(min_length=1, max_length=1000)
-    urgency: str = Field(min_length=1, max_length=40)
-    contact_name: str = Field(min_length=1, max_length=80)
-    contact_phone: str = Field(min_length=1, max_length=80)
-    appointment_time: str = Field(min_length=1, max_length=160)
-
-
-class WorkOrderConfirmationRequest(StrictImmutableModel):
-    """A selected B Agent's structured decision for one persisted Proposal."""
-
-    action_type: Literal["work_order.create"]
-    proposal_id: str = Field(min_length=1, max_length=160)
-    decision: Literal["approve", "reject"]
-
-
-class AgentResponseEnvelope(StrictImmutableModel):
-    """Strict final output contract for a frozen B/C vertical Agent."""
-
-    answer: str = Field(min_length=1)
-    citation_ids: List[str] = Field(default_factory=list)
-    proposal_request: Optional[WorkOrderCreateProposalRequest] = None
-    confirmation_request: Optional[WorkOrderConfirmationRequest] = None
-
-    @model_validator(mode="after")
-    def validate_action_shape(self) -> "AgentResponseEnvelope":
-        if not self.answer.strip():
-            raise ValueError("answer must contain user-visible text")
-        if self.proposal_request is not None and self.confirmation_request is not None:
-            raise ValueError(
-                "proposal_request and confirmation_request are mutually exclusive"
-            )
-        if len(set(self.citation_ids)) != len(self.citation_ids):
-            raise ValueError("citation_ids must be unique")
-        if any(not str(item).strip() or str(item).strip() != item for item in self.citation_ids):
-            raise ValueError("citation_ids must be non-empty ids without surrounding whitespace")
-        return self
-
-    def validate_for_scope(self, scope: str) -> "AgentResponseEnvelope":
-        """Apply the selected Agent's immutable domain boundary after parsing."""
-
-        if scope not in {"property", "isolated_general"}:
-            raise ValueError(f"invalid selected Agent scope: {scope}")
-        if scope == "isolated_general" and (
-            self.proposal_request is not None or self.confirmation_request is not None
-        ):
-            raise ValueError("C Agent must not emit proposal or confirmation requests")
-        return self
 
 
 class AnswerContract(ImmutableModel):
@@ -478,7 +389,7 @@ class RunState(BaseModel):
     session_id: str
     snapshot_id: str
     path: RuntimePath
-    lane_decision: Optional[RouterDecisionPayload] = None
+    lane_decision: Optional[LaneDecision] = None
     answer_contract: Optional[AnswerContract] = None
     route_decision: Optional[RouteDecision] = None
     capability_decision: Optional[CapabilityDecision] = None

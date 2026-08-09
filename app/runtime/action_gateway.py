@@ -17,6 +17,7 @@ from db.property_db import (
     create_work_order,
     get_action_proposal,
     get_action_receipt_by_idempotency_key,
+    get_runtime_release,
     now_cn,
     record_action_approval,
     save_action_receipt,
@@ -24,18 +25,6 @@ from db.property_db import (
 
 
 ActionHandler = Callable[[Dict[str, Any], str], Dict[str, Any]]
-
-
-def _internal_action_type(action_type: Any) -> str:
-    normalized = str(action_type or "").strip()
-    if not normalized:
-        raise ValueError("internal action_type is required")
-    if normalized.lower().startswith("mcp."):
-        raise PermissionError(
-            "MCP is permanently read-only; ActionGateway cannot register, "
-            "propose or execute mcp.* actions"
-        )
-    return normalized
 
 
 class ActionGateway:
@@ -47,7 +36,6 @@ class ActionGateway:
         }
 
     def register(self, action_type: str, handler: ActionHandler) -> None:
-        action_type = _internal_action_type(action_type)
         self._handlers[action_type] = handler
 
     def propose(
@@ -59,11 +47,6 @@ class ActionGateway:
         release_id: Optional[str] = None,
         risk_level: RiskLevel = RiskLevel.L2,
     ) -> ActionProposal:
-        action_type = _internal_action_type(action_type)
-        if action_type not in self._handlers:
-            raise ValueError(
-                f"internal action is not explicitly registered: {action_type}"
-            )
         parameter_hash = content_hash(payload)
         idempotency_key = content_hash(
             {
@@ -106,17 +89,16 @@ class ActionGateway:
         proposal = get_action_proposal(proposal_id)
         if not proposal:
             raise ValueError("action proposal not found")
-        action_type = _internal_action_type(proposal.get("action_type"))
         existing = get_action_receipt_by_idempotency_key(proposal["idempotency_key"])
         if existing:
             return self._receipt_contract(existing)
         if proposal.get("status") != "approved":
             raise PermissionError("action proposal is not approved")
-        handler = self._handlers.get(action_type)
+        handler = self._handlers.get(proposal["action_type"])
         if not handler:
             return self._failed_receipt(
                 proposal,
-                f"no backend action handler registered for {action_type}",
+                f"no backend action handler registered for {proposal['action_type']}",
             )
         try:
             result = handler(proposal["payload"], proposal["session_id"])
@@ -131,13 +113,35 @@ class ActionGateway:
             return self._failed_receipt(proposal, str(exc))
 
     async def execute_async(self, proposal_id: str) -> ActionReceipt:
-        """Execute one explicitly registered internal service action."""
+        """Execute a registered backend action or a published MCP write."""
 
         proposal = get_action_proposal(proposal_id)
         if not proposal:
             raise ValueError("action proposal not found")
-        _internal_action_type(proposal.get("action_type"))
-        return self.execute(proposal_id)
+        existing = get_action_receipt_by_idempotency_key(proposal["idempotency_key"])
+        if existing:
+            return self._receipt_contract(existing)
+        if proposal.get("status") != "approved":
+            raise PermissionError("action proposal is not approved")
+        if not str(proposal.get("action_type") or "").startswith("mcp."):
+            return self.execute(proposal_id)
+        try:
+            release = get_runtime_release(str(proposal.get("release_id") or ""))
+            if not release:
+                raise RuntimeError("proposal RuntimeRelease no longer exists")
+            payload = proposal.get("payload") or {}
+            from app.runtime.mcp_executor import invoke_confirmed_write
+
+            result = await invoke_confirmed_write(
+                snapshot_config=release.get("config") or {},
+                agent_id=str(payload.get("agent_id") or ""),
+                server_name=str(payload.get("server_name") or ""),
+                tool_name=str(payload.get("tool_name") or ""),
+                arguments=payload.get("arguments") or {},
+            )
+            return self._committed_receipt(proposal, result)
+        except Exception as exc:
+            return self._failed_receipt(proposal, str(exc))
 
     def _committed_receipt(
         self,

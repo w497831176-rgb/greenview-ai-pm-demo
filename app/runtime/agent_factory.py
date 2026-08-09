@@ -9,13 +9,10 @@ from typing import Any, Dict, List, Optional, Tuple
 from agno.agent import Agent, AgentFactory
 from agno.factory import RequestContext
 
-from app.runtime.contracts import (
-    AgentResponseEnvelope,
-    RunConfigSnapshot,
-    SkillActivation,
-)
+from app.runtime.contracts import RunConfigSnapshot, SkillActivation
 from app.runtime.skill_projector import project_skills
 from app.settings import MODEL_ID, agent_db, build_model
+from app.skill_runtime import select_skills
 
 try:
     from agno.skills import LocalSkills, Skills
@@ -107,157 +104,6 @@ def _find_agent(config: Dict[str, Any], agent_id: str) -> Dict[str, Any]:
     raise ValueError(f"agent is not enabled in RunConfigSnapshot: {agent_id}")
 
 
-VALID_AGENT_SCOPES = {"property", "isolated_general"}
-BINDING_FIELDS = ("skill_ids", "knowledge_doc_ids", "mcp_server_names")
-
-
-def _strict_agent_scope(agent: Dict[str, Any]) -> str:
-    agent_id = str(agent.get("agent_id") or "").strip() or "<missing>"
-    scope = agent.get("domain_scope")
-    if not isinstance(scope, str) or scope not in VALID_AGENT_SCOPES:
-        raise ValueError(
-            f"enabled Agent has missing or invalid structured domain_scope: "
-            f"{agent_id}/{scope!r}"
-        )
-    return scope
-
-
-def _enabled_vertical_agents(config: Dict[str, Any]) -> List[Dict[str, Any]]:
-    agents: List[Dict[str, Any]] = []
-    seen_ids: set[str] = set()
-    for raw in config.get("agents") or []:
-        if not raw.get("enabled") or raw.get("category") in {"router", "orchestration"}:
-            continue
-        agent_id = str(raw.get("agent_id") or "").strip()
-        if not agent_id:
-            raise ValueError("enabled vertical Agent is missing agent_id")
-        if agent_id in seen_ids:
-            raise ValueError(f"duplicate enabled vertical Agent id: {agent_id}")
-        _strict_agent_scope(raw)
-        seen_ids.add(agent_id)
-        agents.append(raw)
-    return agents
-
-
-def _binding_ids(agent: Dict[str, Any], field: str) -> set[Any]:
-    values = agent.get(field) or []
-    if not isinstance(values, list):
-        raise ValueError(
-            f"Agent binding must be a list: {agent.get('agent_id')}/{field}"
-        )
-    normalized: set[Any] = set()
-    for value in values:
-        try:
-            identity = str(value).strip() if field == "mcp_server_names" else int(value)
-        except (TypeError, ValueError) as exc:
-            raise ValueError(
-                f"Agent binding has an invalid identity: "
-                f"{agent.get('agent_id')}/{field}/{value!r}"
-            ) from exc
-        if identity == "":
-            raise ValueError(
-                f"Agent binding has an empty identity: {agent.get('agent_id')}/{field}"
-            )
-        normalized.add(identity)
-    return normalized
-
-
-def validate_agent_binding_isolation(
-    config: Dict[str, Any],
-    agent_id: str,
-    expected_scope: Optional[str] = None,
-) -> str:
-    """Validate one Agent using only immutable scopes and binding relations.
-
-    A capability shared by enabled property and isolated-general Agents has no
-    unambiguous domain. It is a configuration error; names, descriptions and
-    prompt text are deliberately never consulted as a fallback.
-    """
-
-    if expected_scope is not None and expected_scope not in VALID_AGENT_SCOPES:
-        raise ValueError(f"invalid expected Agent scope: {expected_scope!r}")
-    agents = _enabled_vertical_agents(config)
-    selected = next(
-        (item for item in agents if str(item.get("agent_id")) == str(agent_id)),
-        None,
-    )
-    if selected is None:
-        raise ValueError(f"selected Agent is not an enabled vertical Agent: {agent_id}")
-    selected_scope = _strict_agent_scope(selected)
-    if expected_scope is not None and selected_scope != expected_scope:
-        raise ValueError(
-            f"selected Agent scope mismatch: {agent_id}/{selected_scope}/{expected_scope}"
-        )
-
-    available: Dict[str, set[Any]] = {
-        "skill_ids": {
-            int(item["skill_id"])
-            for item in config.get("skills") or []
-            if item.get("enabled") and item.get("skill_id") is not None
-        },
-        "knowledge_doc_ids": {
-            int(item["knowledge_doc_id"])
-            for item in config.get("knowledge") or []
-            if item.get("knowledge_doc_id") is not None
-        },
-        "mcp_server_names": {
-            str(item.get("name") or "").strip()
-            for item in config.get("mcp_servers") or []
-            if item.get("enabled") and str(item.get("name") or "").strip()
-        },
-    }
-    bindings_by_agent = {
-        str(item["agent_id"]): {
-            field: _binding_ids(item, field) for field in BINDING_FIELDS
-        }
-        for item in agents
-    }
-    for field in BINDING_FIELDS:
-        # Validate the complete enabled Release graph.  A selected Agent must
-        # not be allowed to build merely because an ambiguous cross-domain
-        # binding happens to belong to another enabled Agent.
-        for owner in agents:
-            owner_id = str(owner["agent_id"])
-            missing = bindings_by_agent[owner_id][field] - available[field]
-            if missing:
-                raise ValueError(
-                    f"enabled Agent has unavailable published binding: "
-                    f"{owner_id}/{field}/{sorted(missing, key=str)}"
-                )
-        binding_ids = {
-            binding_id
-            for owner_bindings in bindings_by_agent.values()
-            for binding_id in owner_bindings[field]
-        }
-        for binding_id in binding_ids:
-            owner_scopes = {
-                _strict_agent_scope(owner)
-                for owner in agents
-                if binding_id
-                in bindings_by_agent[str(owner["agent_id"])][field]
-            }
-            if len(owner_scopes) > 1:
-                raise ValueError(
-                    f"cross-domain shared binding is forbidden: "
-                    f"{field}/{binding_id}/{sorted(owner_scopes)}"
-                )
-    return selected_scope
-
-
-def router_agent_cards(config: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Return the exact minimal card surface visible to the production Router."""
-
-    return [
-        {
-            "agent_id": str(agent["agent_id"]),
-            "name": str(agent.get("name") or agent["agent_id"]),
-            "description": str(agent.get("description") or ""),
-            "scope": _strict_agent_scope(agent),
-        }
-        for agent in _enabled_vertical_agents(config)
-    ]
-
-
 def vertical_agent_cards(config: Dict[str, Any]) -> List[Dict[str, Any]]:
     skill_by_id = {
         int(item["skill_id"]): item for item in config.get("skills") or []
@@ -275,7 +121,6 @@ def vertical_agent_cards(config: Dict[str, Any]) -> List[Dict[str, Any]]:
     for agent in config.get("agents") or []:
         if not agent.get("enabled") or agent.get("category") in {"router", "orchestration"}:
             continue
-        domain_scope = _strict_agent_scope(agent)
         bound_skills = [
             skill_by_id[skill_id]
             for skill_id in agent.get("skill_ids") or []
@@ -351,7 +196,7 @@ def vertical_agent_cards(config: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "name": agent.get("name") or agent["agent_id"],
                 "description": agent.get("description") or "",
                 "instructions": agent.get("instructions") or "",
-                "domain_scope": domain_scope,
+                "domain_scope": agent.get("domain_scope") or "property",
                 "enabled": True,
                 "skills": [
                     {
@@ -366,7 +211,7 @@ def vertical_agent_cards(config: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "mcp_tools": list(agent.get("mcp_server_names") or []),
                 "capability_card": {
                     "service_scope": agent.get("description") or "",
-                    "domain_scope": domain_scope,
+                    "domain_scope": agent.get("domain_scope") or "property",
                     "routing_hints": agent.get("instructions") or "",
                     "skills": skill_cards,
                     "mcp_servers": server_cards,
@@ -387,7 +232,6 @@ def build_agent_from_snapshot(
 ) -> AgentBuild:
     config = snapshot.config
     agent_config = _find_agent(config, agent_id)
-    domain_scope = validate_agent_binding_isolation(config, agent_id)
     skills_by_id = {
         int(item["skill_id"]): item for item in config.get("skills") or []
     }
@@ -400,23 +244,25 @@ def build_agent_from_snapshot(
         if enable_skills
         else []
     )
-    # Agent selection already happened in the Router. Every enabled Skill bound
-    # to that one frozen Agent is loaded; message keywords have no authority
-    # over capability construction.
-    selected = list(candidates)
-    decisions = [
+    # Reuse the deterministic runtime selector.  Adapt the compiled field names
+    # to its legacy-compatible input contract.
+    selector_candidates = [
         {
-            "skill_id": int(item["skill_id"]),
-            "selected": True,
-            "outcome": "published_agent_binding",
-            "match_reason": "enabled binding of the frozen selected Agent",
+            "id": item["skill_id"],
+            "name": item.get("name"),
+            "description": item.get("description"),
+            "instructions": item.get("instructions_fallback"),
+            "enabled": item.get("enabled"),
+            "trigger_condition": item.get("trigger_condition"),
+            "skill_metadata": item.get("metadata") or {},
         }
-        for item in selected
+        for item in candidates
     ]
+    selected_legacy, decisions = select_skills(selector_candidates, message)
+    selected_ids = {int(item["skill_id"]) for item in selected_legacy}
+    selected = [item for item in candidates if int(item["skill_id"]) in selected_ids]
     reasons = {
-        int(item["skill_id"]): str(
-            item.get("match_reason") or item.get("outcome") or "published binding"
-        )
+        int(item["skill_id"]): str(item.get("match_reason") or item.get("outcome") or "trigger matched")
         for item in decisions
         if item.get("selected")
     }
@@ -433,11 +279,6 @@ def build_agent_from_snapshot(
         activations,
     )
     model_skills = _skills_exposed_to_model(agno_skills, skill_tool_calls)
-    envelope_schema = json.dumps(
-        AgentResponseEnvelope.model_json_schema(),
-        ensure_ascii=False,
-        separators=(",", ":"),
-    )
 
     instructions = [
         str(agent_config.get("instructions") or ""),
@@ -446,15 +287,7 @@ def build_agent_from_snapshot(
         "不得自行创建、更新、删除业务数据；写操作只能描述为待确认 Proposal。",
         "只有后端 ActionReceipt.status=committed 且包含真实 resource_id 时，才能声称操作成功。",
     ]
-    instructions.extend(
-        [
-            "Your final response must be exactly one JSON object. Do not emit Markdown fences, a preface, a suffix, or any text outside the object.",
-            "The JSON must strictly match AgentResponseEnvelope and must not contain additional fields. citation_ids may contain only identifiers supplied by this run.",
-            "A successful read Tool result exposes its exact citation_id. If the answer relies on that result, copy that citation_id into citation_ids; never invent or transform it.",
-            f"AgentResponseEnvelope JSON Schema: {envelope_schema}",
-        ]
-    )
-    if domain_scope == "isolated_general":
+    if (agent_config.get("domain_scope") or "property") == "isolated_general":
         instructions.extend(
             [
                 "你处于非物业隔离域：不得把通用回答表述为物业官方结论。",
@@ -465,17 +298,6 @@ def build_agent_from_snapshot(
     else:
         instructions.append(
             "你处于物业业务域：价格、时效、责任、服务是否存在等受控事实必须来自本轮合法Skill、RAG、成功Tool或Receipt证据。"
-        )
-    if domain_scope == "isolated_general":
-        instructions.append(
-            "You are a C-lane Agent: proposal_request and confirmation_request must both be null. Answer normally even when no enhancement is available."
-        )
-    else:
-        instructions.extend(
-            [
-                "Only when you decide from the complete conversation to request a work order may proposal_request contain a strict work_order.create request; the backend will not infer write intent from prose.",
-                "Only when you decide from the complete conversation and a persisted pending Proposal to approve or reject it may confirmation_request be non-null. Otherwise both request fields must be null.",
-            ]
         )
     instructions.extend(skill_contexts)
     if evidence_prompt:
@@ -514,7 +336,7 @@ def build_agent_from_snapshot(
         instructions=instructions,
         tools=list(tools or []),
         skills=model_skills,
-        markdown=False,
+        markdown=True,
         # The coordinator injects only successful user-visible chat_messages.
         # Agno stage history may contain Router control JSON and must stay off.
         add_history_to_context=False,
@@ -550,9 +372,7 @@ def build_runtime_agent(ctx: RequestContext) -> Agent:
     raw = ctx.input or {}
     if hasattr(raw, "model_dump"):
         raw = raw.model_dump()
-    agent_id = str(raw.get("agent_id") or "").strip()
-    if not agent_id:
-        raise ValueError("factory_input.agent_id is required; no default Agent is allowed")
+    agent_id = str(raw.get("agent_id") or "customer_service")
     message = str(raw.get("message") or "")
     snapshot = resolve_snapshot(ctx.session_id or f"agentos-{ctx.user_id or 'anonymous'}")
     return build_agent_from_snapshot(snapshot, agent_id, message).agent

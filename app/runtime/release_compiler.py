@@ -79,20 +79,21 @@ def compile_tool_policy(server: Dict[str, Any], tool: Dict[str, Any]) -> ToolPol
             enabled=bool(server.get("enabled")),
             policy_reason="只读工具可在已发布白名单内自动执行。",
         )
-    if effect in {ToolEffect.CREATE, ToolEffect.UPDATE, ToolEffect.DELETE}:
+    if effect in {ToolEffect.CREATE, ToolEffect.UPDATE}:
         return ToolPolicy(
             server_id=server.get("id"),
             server_name=server_name,
             tool_name=tool_name,
             effect=effect,
-            risk_level=RiskLevel.L3,
-            allowed_paths=[],
-            requires_confirmation=False,
-            enabled=False,
-            policy_reason=(
-                "MCP 永久只读：create/update/delete 不进入确认或执行路径；"
-                "业务写入只能使用显式内部服务 Action。"
+            risk_level=(
+                RiskLevel(declared_risk)
+                if declared_risk in {"L2", "L3"}
+                else RiskLevel.L2
             ),
+            allowed_paths=[RuntimePath.CONTROLLED_ACTION, RuntimePath.EXTENSION_ACCEPTANCE],
+            requires_confirmation=True,
+            enabled=bool(server.get("enabled")),
+            policy_reason="写工具只允许生成 Proposal；确认后由 ActionGateway 执行。",
         )
     return ToolPolicy(
         server_id=server.get("id"),
@@ -101,9 +102,13 @@ def compile_tool_policy(server: Dict[str, Any], tool: Dict[str, Any]) -> ToolPol
         effect=effect,
         risk_level=RiskLevel.L3,
         allowed_paths=[],
-        requires_confirmation=False,
+        requires_confirmation=True,
         enabled=False,
-        policy_reason="未分类 MCP 工具默认高风险并拒绝发布到运行时。",
+        policy_reason=(
+            "V1.8 禁用删除/破坏性工具。"
+            if effect == ToolEffect.DELETE
+            else "未分类工具默认高风险并拒绝发布到运行时。"
+        ),
     )
 
 
@@ -252,10 +257,11 @@ def _compile_graph() -> Tuple[Dict[str, Any], List[ToolPolicy]]:
             )
             effective_tool = {**tool, "tool_metadata": runtime_metadata}
             policy = compile_tool_policy(server, effective_tool)
-            if policy.effect != ToolEffect.READ:
-                # Retain the declaration for operator visibility, but remove
-                # every runtime planner/confirmation execution mode.
-                runtime_metadata["execution_mode"] = "disabled"
+            if (
+                "execution_mode" not in (tool.get("tool_metadata") or {})
+                and policy.effect in {ToolEffect.CREATE, ToolEffect.UPDATE}
+            ):
+                runtime_metadata["execution_mode"] = "proposal"
             policies.append(policy)
             compiled_tools.append(
                 {
@@ -902,25 +908,6 @@ def validate_release_graph(graph: Dict[str, Any], policies: List[ToolPolicy]) ->
     for server in servers:
         for tool in server.get("tools") or []:
             metadata = tool.get("tool_metadata") or {}
-            policy = tool.get("policy") or {}
-            effect = str(policy.get("effect") or "unknown")
-            if effect != ToolEffect.READ.value:
-                if server.get("enabled"):
-                    errors.append(
-                        {
-                            "code": "enabled_mcp_tool_must_be_read_only",
-                            "server_name": server.get("name"),
-                            "tool_name": tool.get("name"),
-                            "effect": effect,
-                            "detail": (
-                                "MCP is permanently read-only; configure business "
-                                "writes as explicit internal service Actions."
-                            ),
-                        }
-                    )
-                # Non-read MCP metadata is intentionally not interpreted as a
-                # planner or Proposal contract, even on a disabled server.
-                continue
             metadata_errors = validate_tool_metadata(
                 metadata,
                 tool.get("input_schema") or {},
@@ -932,6 +919,22 @@ def validate_release_graph(graph: Dict[str, Any], policies: List[ToolPolicy]) ->
                         "server_name": server.get("name"),
                         "tool_name": tool.get("name"),
                         "detail": detail,
+                    }
+                )
+            policy = tool.get("policy") or {}
+            effect = str(policy.get("effect") or "unknown")
+            if effect in {"create", "update"} and not (
+                metadata.get("trigger_keywords") or []
+            ):
+                warnings.append(
+                    {
+                        "code": "write_tool_has_no_natural_language_trigger",
+                        "server_name": server.get("name"),
+                        "tool_name": tool.get("name"),
+                        "detail": (
+                            "工具仍保留在发布快照，但自然语言不会自动进入写路径；"
+                            "请在平台配置 trigger_keywords。"
+                        ),
                     }
                 )
 
