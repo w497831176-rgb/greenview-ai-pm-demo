@@ -15,14 +15,12 @@ from fastapi import APIRouter, HTTPException
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from pydantic import BaseModel, Field
-from app.runtime.capability_catalog import (
-    CapabilityCatalogError,
-    assert_trusted_capability,
-    set_trusted_capability_enabled,
-    trusted_capability_ids,
-)
 
-from app.runtime.tool_planner import DEFAULT_RESULT_CONTRACT, validate_tool_metadata
+from app.runtime.tool_planner import (
+    DEFAULT_RESULT_CONTRACT,
+    effective_tool_metadata,
+    validate_tool_metadata,
+)
 from app.runtime.mcp_importer import (
     McpImportError,
     prepare_git_mcp_package,
@@ -45,33 +43,20 @@ from db.property_db import (
 router = APIRouter(prefix="/api/mcp-servers", tags=["mcp-servers"])
 
 
-def _supply_chain_locked(operation: str) -> None:
-    raise HTTPException(
-        status_code=410,
-        detail={
-            "code": "trusted_catalog_supply_chain_locked",
-            "operation": operation,
-            "message": (
-                "MCP 新增、导入、地址修改、Tool 定义/策略修改和重新发现已停用；"
-                "新增能力需经过代码级受控入库，MCP 永久只读。"
-            ),
-        },
-    )
-
-
 def _resolve_server(identifier: str) -> Dict[str, Any]:
-    """Resolve only an exact stable ID or exact trusted display name."""
+    """Resolve an MCP server by integer id or string id (e.g. 'weather')."""
     if identifier.isdigit():
-        try:
-            return assert_trusted_capability("mcp_server", int(identifier))["object"]
-        except CapabilityCatalogError:
-            pass
-    for server_id in trusted_capability_ids("mcp_server"):
-        try:
-            server = assert_trusted_capability("mcp_server", server_id)["object"]
-        except CapabilityCatalogError:
-            continue
-        if str(server.get("name") or "") == identifier:
+        server = db_get_mcp_server(int(identifier))
+        if server:
+            return server
+    # Fall back to matching by string id/name.
+    lowered = identifier.lower()
+    for server in db_list_mcp_servers():
+        if str(server.get("id")) == identifier:
+            return server
+        server_id = str(server.get("server_id", "")).lower()
+        name = str(server.get("name", "")).lower()
+        if server_id == lowered or name == lowered or lowered in name:
             return server
     raise HTTPException(status_code=404, detail="mcp server not found")
 
@@ -166,12 +151,7 @@ def _save_tool_runtime_policy(
 @router.get("")
 async def list_mcp_servers():
     """List all MCP server configurations."""
-    allowed = {int(item) for item in trusted_capability_ids("mcp_server")}
-    servers = [
-        server
-        for server in db_list_mcp_servers()
-        if int(server.get("id") or 0) in allowed
-    ]
+    servers = db_list_mcp_servers()
     return {"mcp_servers": servers, "count": len(servers)}
 
 
@@ -185,9 +165,6 @@ async def get_mcp_server(server_id: str):
 @router.post("")
 async def create_mcp_server(request: McpServerCreate):
     """Create a new MCP server configuration."""
-    del request
-    _supply_chain_locked("mcp_server.create")
-
     server = db_create_mcp_server(
         name=request.name,
         command=request.command,
@@ -207,9 +184,6 @@ async def import_mcp_server_from_git(request: McpGitImportRequest):
     permission and does not affect existing sessions; the operator still
     classifies tools, binds an Agent and publishes a RuntimeRelease.
     """
-
-    del request
-    _supply_chain_locked("mcp_server.import_git")
 
     try:
         prepared = await asyncio.to_thread(
@@ -308,15 +282,30 @@ async def import_mcp_server_from_git(request: McpGitImportRequest):
 @router.put("/{server_id}")
 async def update_mcp_server(server_id: str, request: McpServerUpdate):
     """Update an MCP server configuration."""
-    del server_id, request
-    _supply_chain_locked("mcp_server.implementation.update")
+    server = _resolve_server(server_id)
+    updated = db_update_mcp_server(
+        server_id=server["id"],
+        name=request.name,
+        command=request.command,
+        args=request.args,
+        env=request.env,
+        description=request.description,
+        enabled=request.enabled,
+    )
+    if not updated:
+        raise HTTPException(status_code=404, detail="not found")
+    return {"mcp_server": updated}
 
 
 @router.delete("/{server_id}")
 async def delete_mcp_server(server_id: str):
     """Delete an MCP server configuration."""
-    del server_id
-    _supply_chain_locked("mcp_server.delete")
+    server = _resolve_server(server_id)
+    deleted = db_delete_mcp_server(server["id"])
+    if not deleted:
+        raise HTTPException(status_code=404, detail="not found")
+    delete_mcp_tools_for_server(server["id"])
+    return {"ok": True, "deleted_id": server_id}
 
 
 @router.post("/{server_id}/toggle")
@@ -325,36 +314,21 @@ async def toggle_mcp_server(server_id: str, request: Optional[McpServerToggle] =
     server = _resolve_server(server_id)
     current_enabled = bool(server.get("enabled"))
     target = request.enabled if request else not current_enabled
-    try:
-        set_trusted_capability_enabled("mcp_server", int(server["id"]), target)
-    except CapabilityCatalogError as exc:
-        raise HTTPException(
-            status_code=422,
-            detail={"code": "trusted_catalog_toggle_rejected", "message": str(exc)},
-        ) from exc
-    return {"mcp_server": _resolve_server(str(server["id"]))}
+    updated = toggle_mcp_server_enabled(server["id"], target)
+    return {"mcp_server": updated}
 
 
 @router.get("/{server_id}/tools")
 async def get_mcp_server_tools(server_id: str):
     """List cached tools for an MCP server."""
     server = _resolve_server(server_id)
-    allowed = {int(item) for item in trusted_capability_ids("mcp_tool")}
-    tools = [
-        tool
-        for tool in list_mcp_tools(server_id=server["id"])
-        if int(tool.get("id") or 0) in allowed
-    ]
+    tools = list_mcp_tools(server_id=server["id"])
     for tool in tools:
-        metadata = dict(tool.get("tool_metadata") or {})
-        metadata.update(
-            {
-                "effect": "read",
-                "effect_source": "code_reviewed_manifest",
-                "execution_mode": "model_native",
-            }
+        tool["effective_runtime_metadata"] = effective_tool_metadata(
+            str(server.get("name") or ""),
+            str(tool.get("name") or ""),
+            tool.get("tool_metadata") or {},
         )
-        tool["effective_runtime_metadata"] = metadata
     return {"mcp_server": server, "tools": tools, "count": len(tools)}
 
 
@@ -364,9 +338,6 @@ async def update_mcp_tool_policy(
     tool_id: int,
     request: McpToolPolicyUpdate,
 ):
-    del server_id, tool_id, request
-    _supply_chain_locked("mcp_tool.policy.update")
-
     server = _resolve_server(server_id)
     tool = get_mcp_tool(tool_id)
     if not tool or int(tool.get("server_id") or 0) != int(server["id"]):
@@ -393,9 +364,6 @@ async def update_mcp_tool_runtime_policy(
 ):
     """Save the generic natural-language ToolPlan contract as Draft."""
 
-    del server_id, tool_id, request
-    _supply_chain_locked("mcp_tool.runtime_policy.update")
-
     server = _resolve_server(server_id)
     tool = get_mcp_tool(tool_id)
     if not tool or int(tool.get("server_id") or 0) != int(server["id"]):
@@ -418,9 +386,6 @@ async def update_mcp_tool_runtime_policy(
 @router.post("/{server_id}/discover")
 async def discover_mcp_server_tools(server_id: str):
     """Discover tools from a running MCP server and cache them."""
-    del server_id
-    _supply_chain_locked("mcp_tool.discover")
-
     server = _resolve_server(server_id)
     try:
         discovered = await discover_server_tools(server)
@@ -446,11 +411,6 @@ async def discover_mcp_server_tools(server_id: str):
 
 async def discover_server_tools(server: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Connect to a single MCP server via stdio and cache its tools."""
-    del server
-    raise CapabilityCatalogError(
-        "runtime MCP discovery is disabled; use code-reviewed catalog ingestion"
-    )
-
     command = server.get("command") or "python"
     args = server.get("args") or []
     env = server.get("env") or {}
@@ -515,10 +475,15 @@ async def discover_all_mcp_tools() -> Dict[str, Any]:
 
     Called during application lifespan startup.
     """
-    return {
-        "servers": 0,
-        "tools": 0,
-        "errors": [],
-        "disabled": True,
-        "reason": "trusted_catalog_supply_chain_locked",
-    }
+    summary: Dict[str, Any] = {"servers": 0, "tools": 0, "errors": []}
+    for server in db_list_mcp_servers():
+        if not server.get("enabled"):
+            continue
+        server_id = server["id"]
+        try:
+            discovered = await discover_server_tools(server)
+            summary["servers"] += 1
+            summary["tools"] += len(discovered)
+        except Exception as e:
+            summary["errors"].append({"server_id": server_id, "error": str(e)})
+    return summary

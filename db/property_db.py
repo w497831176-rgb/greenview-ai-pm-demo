@@ -4135,21 +4135,6 @@ def update_skill(
     return get_skill(skill_id)
 
 
-def set_skill_enabled(skill_id: int, enabled: bool) -> Optional[Dict[str, Any]]:
-    """Update only the Draft enable switch without rewriting Skill content."""
-
-    now = now_cn("%Y-%m-%d %H:%M")
-    conn = _get_conn()
-    cursor = conn.cursor()
-    cursor.execute(
-        "UPDATE skills SET enabled = ?, updated_at = ? WHERE id = ?",
-        (1 if enabled else 0, now, skill_id),
-    )
-    conn.commit()
-    conn.close()
-    return get_skill(skill_id)
-
-
 def delete_skill(skill_id: int) -> bool:
     conn = _get_conn()
     cursor = conn.cursor()

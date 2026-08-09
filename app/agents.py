@@ -9,13 +9,6 @@ from typing import Any, Dict, List, Literal, Optional
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
-from app.runtime.capability_catalog import (
-    CapabilityCatalogError,
-    assert_trusted_capability,
-    set_trusted_agent_bindings,
-    set_trusted_capability_enabled,
-    trusted_capability_ids,
-)
 
 from db.property_db import (
     create_agent as db_create_agent,
@@ -35,20 +28,6 @@ from db.property_db import (
 )
 
 router = APIRouter(prefix="/api/agents", tags=["agents"])
-
-
-def _supply_chain_locked(operation: str) -> None:
-    raise HTTPException(
-        status_code=410,
-        detail={
-            "code": "trusted_catalog_supply_chain_locked",
-            "operation": operation,
-            "message": (
-                "新增、删除或修改 Agent 实现已停用；新增能力需经过代码级"
-                "受控入库，目录内既有能力仅支持 Draft 启停与绑定。"
-            ),
-        },
-    )
 
 
 class AgentCreate(BaseModel):
@@ -98,11 +77,10 @@ def _resolve_agent(identifier: str) -> Dict[str, Any]:
     if identifier.isdigit():
         agent = db_get_agent(int(identifier))
         if agent:
-            identifier = str(agent.get("agent_id") or "")
-    try:
-        return assert_trusted_capability("agent", identifier)["object"]
-    except CapabilityCatalogError:
-        pass
+            return agent
+    agent = get_agent_by_agent_id(identifier)
+    if agent:
+        return agent
     raise HTTPException(status_code=404, detail="agent not found")
 
 
@@ -158,15 +136,11 @@ def _serialize_agent(agent: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]
 def _get_router_members() -> List[Dict[str, Any]]:
     """Return enabled vertical agents as router routing candidates."""
     members = []
-    allowed = {str(item) for item in trusted_capability_ids("agent")}
     for a in db_list_agents(category="vertical"):
-        if not a.get("enabled") or str(a.get("agent_id") or "") not in allowed:
+        if not a.get("enabled"):
             continue
         aid = a.get("agent_id")
-        skills = [
-            (db_get_skill(int(skill_id)) or {}).get("name") or str(skill_id)
-            for skill_id in get_agent_skills(aid)
-        ]
+        skills = [db_get_skill(int(s)).get("name") or str(s) for s in get_agent_skills(aid)]
         tools = [t.get("tool_name") for t in get_agent_tools(aid) if t.get("tool_name")]
         members.append({
             "agent_id": aid,
@@ -187,12 +161,7 @@ def _is_router(agent: Dict[str, Any]) -> bool:
 @router.get("")
 async def list_agents(category: Optional[str] = None):
     """List all agents, optionally filtered by category."""
-    allowed = {str(item) for item in trusted_capability_ids("agent")}
-    agents = [
-        agent
-        for agent in db_list_agents(category=category)
-        if str(agent.get("agent_id") or "") in allowed
-    ]
+    agents = db_list_agents(category=category)
     return {"agents": [_serialize_agent(a) for a in agents], "count": len(agents)}
 
 
@@ -206,11 +175,6 @@ async def get_agent(agent_id: str):
 @router.post("")
 async def create_agent(request: AgentCreate):
     """Create a new agent. Only vertical agents can be created."""
-    del request
-    _supply_chain_locked("agent.create")
-
-    # Unreachable legacy implementation retained only to preserve source
-    # history; the production API is fail-closed above.
     agent_id = (request.agent_id or request.name).strip()
     if get_agent_by_agent_id(agent_id):
         raise HTTPException(status_code=409, detail="agent_id already exists")
@@ -262,63 +226,10 @@ async def update_agent(agent_id: str, request: AgentUpdate):
     skill/tool bindings.
     """
     agent = _resolve_agent(agent_id)
-    fields_set = getattr(request, "model_fields_set", getattr(request, "__fields_set__", set()))
-    allowed = {
-        "skill_ids",
-        "knowledge_doc_ids",
-        "tool_names",
-        "available_mcp_tools",
-    }
-    if not fields_set or not set(fields_set).issubset(allowed):
-        _supply_chain_locked("agent.implementation.update")
-    skill_ids = (
-        request.skill_ids
-        if "skill_ids" in fields_set
-        else get_agent_skills(str(agent["agent_id"]))
-    )
-    knowledge_doc_ids = (
-        request.knowledge_doc_ids
-        if "knowledge_doc_ids" in fields_set
-        else get_agent_knowledge_bindings(str(agent["agent_id"]))
-    )
-    if knowledge_doc_ids is None:
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "code": "explicit_knowledge_binding_required",
-                "message": "旧式隐式全量 RAG 绑定不能进入可信目录发布。",
-            },
-        )
-    mcp_names = (
-        request.available_mcp_tools
-        if "available_mcp_tools" in fields_set
-        else (
-            request.tool_names
-            if "tool_names" in fields_set
-            else [
-                str(item.get("tool_name") or "")
-                for item in get_agent_tools(str(agent["agent_id"]))
-                if str(item.get("tool_name") or "")
-            ]
-        )
-    )
-    try:
-        set_trusted_agent_bindings(
-            str(agent["agent_id"]),
-            skill_ids or [],
-            knowledge_doc_ids or [],
-            mcp_server_names=mcp_names or [],
-            system_tool_ids=[],
-        )
-    except CapabilityCatalogError as exc:
-        raise HTTPException(
-            status_code=422,
-            detail={"code": "trusted_catalog_binding_rejected", "message": str(exc)},
-        ) from exc
-    return {"agent": _serialize_agent(_resolve_agent(agent_id))}
-
-    # Unreachable legacy implementation retained for source archaeology.
     is_router = _is_router(agent)
+
+    # Pydantic V2 / V1 compatible way to know which fields were sent.
+    fields_set = getattr(request, "model_fields_set", getattr(request, "__fields_set__", set()))
 
     # 1. Basic scalar fields: keep original if not sent.
     name = request.name if "name" in fields_set else agent.get("name")
@@ -402,24 +313,21 @@ async def update_agent(agent_id: str, request: AgentUpdate):
 @router.delete("/{agent_id}")
 async def delete_agent(agent_id: str):
     """Delete an agent."""
-    del agent_id
-    _supply_chain_locked("agent.delete")
+    agent = _resolve_agent(agent_id)
+    if _is_router(agent):
+        raise HTTPException(status_code=400, detail="router agent cannot be deleted")
+    deleted = db_delete_agent(agent["id"])
+    return {"ok": deleted}
 
 
 @router.post("/{agent_id}/toggle")
 async def toggle_agent(agent_id: str, request: AgentToggleRequest):
     """Enable or disable an agent."""
     agent = _resolve_agent(agent_id)
-    try:
-        set_trusted_capability_enabled(
-            "agent", str(agent["agent_id"]), request.enabled
-        )
-    except CapabilityCatalogError as exc:
-        raise HTTPException(
-            status_code=422,
-            detail={"code": "trusted_catalog_toggle_rejected", "message": str(exc)},
-        ) from exc
-    return {"agent": _serialize_agent(_resolve_agent(agent_id))}
+    if _is_router(agent):
+        raise HTTPException(status_code=400, detail="router agent cannot be disabled")
+    updated = db_update_agent(agent["id"], enabled=request.enabled)
+    return {"agent": _serialize_agent(updated)}
 
 
 @router.patch("/{agent_id}")

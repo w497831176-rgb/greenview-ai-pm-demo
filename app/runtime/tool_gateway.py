@@ -5,7 +5,6 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional
 
 from app.runtime.contracts import RuntimePath, ToolEffect, ToolPolicy
-from app.runtime.capability_catalog import get_trusted_metadata
 
 
 class ToolPolicyError(PermissionError):
@@ -46,49 +45,13 @@ class ToolGateway:
         for server in self.config.get("mcp_servers") or []:
             if server.get("name") not in bound_servers or not server.get("enabled"):
                 continue
-            server_manifest = get_trusted_metadata(
-                "mcp_server", server.get("server_id")
-            )
-            if not server_manifest:
-                raise ToolPolicyError(
-                    f"bound MCP server is absent from trusted catalog: "
-                    f"{server.get('server_id')}"
-                )
-            if server_manifest.get("domain_scope") != agent.get("domain_scope"):
-                raise ToolPolicyError(
-                    f"bound MCP server domain mismatch: {agent_id}/"
-                    f"{server.get('server_id')}"
-                )
             for tool in server.get("tools") or []:
                 policy = ToolPolicy.model_validate(tool.get("policy") or {})
-                if not policy.enabled:
-                    continue
-                tool_manifest = get_trusted_metadata(
-                    "mcp_tool", tool.get("tool_id")
-                )
-                if not tool_manifest:
-                    raise ToolPolicyError(
-                        f"enabled MCP Tool is absent from trusted catalog: "
-                        f"{server.get('server_id')}/{tool.get('tool_id')}"
-                    )
                 if (
-                    int(tool_manifest.get("server_id") or 0)
-                    != int(server.get("server_id") or 0)
-                    or tool_manifest.get("domain_scope")
-                    != agent.get("domain_scope")
-                    or tool_manifest.get("effect") != ToolEffect.READ.value
+                    policy.enabled
+                    and runtime_path in policy.allowed_paths
+                    and policy.effect == ToolEffect.READ
                 ):
-                    raise ToolPolicyError(
-                        f"enabled MCP Tool violates trusted catalog policy: "
-                        f"{server.get('server_id')}/{tool.get('tool_id')}"
-                    )
-                if policy.effect != ToolEffect.READ:
-                    raise ToolPolicyError(
-                        f"published MCP policy is not read-only: "
-                        f"{server.get('server_id')}/{tool.get('tool_id')}/"
-                        f"{policy.effect.value}"
-                    )
-                if runtime_path in policy.allowed_paths:
                     result.append(policy)
         return result
 

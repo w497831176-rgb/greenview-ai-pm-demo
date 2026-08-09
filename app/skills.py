@@ -15,11 +15,6 @@ from typing import Any, Dict, Optional
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
-from app.runtime.capability_catalog import (
-    CapabilityCatalogError,
-    assert_trusted_capability,
-    trusted_capability_ids,
-)
 
 from app.skill_runtime import canonical_metadata, next_patch_version, select_skills, skill_contract
 from db.property_db import (
@@ -37,20 +32,6 @@ import skill_storage
 
 
 router = APIRouter(prefix="/api/skills", tags=["skills"])
-
-
-def _supply_chain_locked(operation: str) -> None:
-    raise HTTPException(
-        status_code=410,
-        detail={
-            "code": "trusted_catalog_supply_chain_locked",
-            "operation": operation,
-            "message": (
-                "Skill 新增、导入、上传、实现编辑、删除及实现级回滚已停用；"
-                "新增能力需经过代码级受控入库。"
-            ),
-        },
-    )
 
 
 class SkillPayload(BaseModel):
@@ -100,10 +81,10 @@ def _serialize_skill(skill: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _get_or_404(skill_id: int) -> Dict[str, Any]:
-    try:
-        return assert_trusted_capability("skill", skill_id)["object"]
-    except CapabilityCatalogError:
+    skill = db_get_skill(skill_id)
+    if not skill:
         raise HTTPException(status_code=404, detail="skill not found")
+    return skill
 
 
 def _persist_current_skill_file(skill: Dict[str, Any]):
@@ -194,14 +175,11 @@ def _evaluate_for_agent(skill: Dict[str, Any], message: str, agent_id: Optional[
 @router.get("/import-git")
 async def import_git_help():
     """Avoid dynamic-route ambiguity; actual import is POST only."""
-    _supply_chain_locked("skill.import_git")
+    return {"message": "请使用 POST /api/skills/import-git 导入 Skill"}
 
 
 @router.post("/import-git")
 async def import_skill_from_git(request: GitImportRequest):
-    del request
-    _supply_chain_locked("skill.import_git")
-
     tmp = None
     try:
         imported = skill_storage.import_from_git(request.git_url)
@@ -234,9 +212,6 @@ async def import_skill_from_zip(
     trigger_condition: str = Form(""),
     enabled: bool = Form(True),
 ):
-    del file, trigger_condition, enabled
-    _supply_chain_locked("skill.import_zip")
-
     tmp = None
     try:
         imported = skill_storage.import_from_zip(await file.read())
@@ -265,20 +240,12 @@ async def import_skill_from_zip(
 
 @router.get("")
 async def list_skills():
-    allowed = {int(item) for item in trusted_capability_ids("skill")}
-    skills = [
-        _serialize_skill(skill)
-        for skill in db_list_skills()
-        if int(skill.get("id") or 0) in allowed
-    ]
+    skills = [_serialize_skill(skill) for skill in db_list_skills()]
     return {"skills": skills, "count": len(skills)}
 
 
 @router.post("")
 async def create_skill(request: SkillCreate):
-    del request
-    _supply_chain_locked("skill.create")
-
     if not request.name.strip():
         raise HTTPException(status_code=400, detail="skill name required")
     metadata = canonical_metadata({"trigger_condition": request.trigger_condition}, request.skill_metadata)
@@ -305,21 +272,21 @@ async def get_skill(skill_id: int):
 
 @router.put("/{skill_id}")
 async def update_skill(skill_id: int, request: SkillUpdate):
-    del skill_id, request
-    _supply_chain_locked("skill.implementation.update")
+    existing = _get_or_404(skill_id)
+    updated = _save_update(existing, request, "平台管理页编辑")
+    return {"skill": _serialize_skill(updated)}
 
 
 @router.delete("/{skill_id}")
 async def delete_skill(skill_id: int):
-    del skill_id
-    _supply_chain_locked("skill.delete")
+    _get_or_404(skill_id)
+    deleted = db_delete_skill(skill_id)
+    skill_storage.delete_skill_dir(skill_id)
+    return {"ok": True, "deleted_id": skill_id, "deleted": deleted}
 
 
 @router.post("/{skill_id}/skill-md")
 async def update_skill_md(skill_id: int, request: SkillMdUpdate):
-    del skill_id, request
-    _supply_chain_locked("skill.implementation.update")
-
     existing = _get_or_404(skill_id)
     metadata = canonical_metadata(existing, request.metadata)
     metadata["version"] = next_patch_version(str(metadata.get("version") or "legacy-1.0.0"))
@@ -349,9 +316,6 @@ async def get_skill_versions(skill_id: int):
 
 @router.post("/{skill_id}/versions/{version}/rollback")
 async def rollback_skill_version(skill_id: int, version: str):
-    del skill_id, version
-    _supply_chain_locked("skill.implementation.rollback")
-
     existing = _get_or_404(skill_id)
     records = list_skill_versions(skill_id)
     record = next((item for item in records if item.get("version") == version), None)
@@ -404,14 +368,19 @@ async def list_skill_files(skill_id: int):
 
 @router.post("/{skill_id}/files")
 async def upload_skill_file(skill_id: int, file: UploadFile = File(...), path: str = Form("")):
-    del skill_id, file, path
-    _supply_chain_locked("skill.file.upload")
+    _get_or_404(skill_id)
+    rel_path = path or file.filename
+    if not rel_path:
+        raise HTTPException(status_code=400, detail="path required")
+    skill_storage.save_skill_file(skill_id, rel_path, await file.read())
+    return {"ok": True, "path": rel_path}
 
 
 @router.delete("/{skill_id}/files/{file_path:path}")
 async def delete_skill_file(skill_id: int, file_path: str):
-    del skill_id, file_path
-    _supply_chain_locked("skill.file.delete")
+    _get_or_404(skill_id)
+    skill_storage.delete_skill_file(skill_id, file_path)
+    return {"ok": True}
 
 
 @router.get("/{skill_id}/export")
@@ -429,9 +398,6 @@ async def export_skill(skill_id: int):
 
 @router.post("/{skill_id}/apply-darwin")
 async def apply_darwin_optimization(skill_id: int, request: ApplyDarwinRequest):
-    del skill_id, request
-    _supply_chain_locked("skill.darwin.apply")
-
     existing = _get_or_404(skill_id)
     payload = SkillUpdate(
         name=existing["name"], description=existing.get("description") or "",

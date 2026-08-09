@@ -14,7 +14,6 @@ from app.runtime.contracts import (
     RunConfigSnapshot,
     SkillActivation,
 )
-from app.runtime.capability_catalog import get_trusted_metadata
 from app.runtime.skill_projector import project_skills
 from app.settings import MODEL_ID, agent_db, build_model
 
@@ -120,16 +119,6 @@ def _strict_agent_scope(agent: Dict[str, Any]) -> str:
             f"enabled Agent has missing or invalid structured domain_scope: "
             f"{agent_id}/{scope!r}"
         )
-    manifest = get_trusted_metadata("agent", agent_id)
-    if not manifest:
-        raise ValueError(
-            f"enabled Agent is absent from trusted catalog: {agent_id}"
-        )
-    if manifest.get("domain_scope") != scope:
-        raise ValueError(
-            f"enabled Agent domain differs from trusted catalog: "
-            f"{agent_id}/{scope}/{manifest.get('domain_scope')}"
-        )
     return scope
 
 
@@ -178,14 +167,11 @@ def validate_agent_binding_isolation(
     agent_id: str,
     expected_scope: Optional[str] = None,
 ) -> str:
-    """Validate one Agent against code-reviewed per-capability domains.
+    """Validate one Agent using only immutable scopes and binding relations.
 
-    RuntimeRelease v27 snapshots predate embedded capability-domain fields, so
-    stable IDs are resolved through the same code-reviewed manifest.  Names,
-    prompts, current Draft bindings and "who else uses it" never define scope.
-    Runtime construction validates only the Router-frozen Agent; unrelated
-    legacy Agents cannot force a fallback or break this turn. New Releases are
-    still validated as a complete graph by ``validate_release_graph``.
+    A capability shared by enabled property and isolated-general Agents has no
+    unambiguous domain. It is a configuration error; names, descriptions and
+    prompt text are deliberately never consulted as a fallback.
     """
 
     if expected_scope is not None and expected_scope not in VALID_AGENT_SCOPES:
@@ -203,74 +189,58 @@ def validate_agent_binding_isolation(
             f"selected Agent scope mismatch: {agent_id}/{selected_scope}/{expected_scope}"
         )
 
-    skill_nodes = {
-        int(item["skill_id"]): item
-        for item in config.get("skills") or []
-        if item.get("enabled") and item.get("skill_id") is not None
-    }
-    knowledge_nodes = {
-        int(item["knowledge_doc_id"]): item
-        for item in config.get("knowledge") or []
-        if item.get("enabled", True) and item.get("knowledge_doc_id") is not None
-    }
-    server_nodes = {
-        str(item.get("name") or "").strip(): item
-        for item in config.get("mcp_servers") or []
-        if item.get("enabled") and str(item.get("name") or "").strip()
-    }
     available: Dict[str, set[Any]] = {
-        "skill_ids": set(skill_nodes),
-        "knowledge_doc_ids": set(knowledge_nodes),
-        "mcp_server_names": set(server_nodes),
+        "skill_ids": {
+            int(item["skill_id"])
+            for item in config.get("skills") or []
+            if item.get("enabled") and item.get("skill_id") is not None
+        },
+        "knowledge_doc_ids": {
+            int(item["knowledge_doc_id"])
+            for item in config.get("knowledge") or []
+            if item.get("knowledge_doc_id") is not None
+        },
+        "mcp_server_names": {
+            str(item.get("name") or "").strip()
+            for item in config.get("mcp_servers") or []
+            if item.get("enabled") and str(item.get("name") or "").strip()
+        },
     }
-    selected_bindings = {
-        field: _binding_ids(selected, field) for field in BINDING_FIELDS
+    bindings_by_agent = {
+        str(item["agent_id"]): {
+            field: _binding_ids(item, field) for field in BINDING_FIELDS
+        }
+        for item in agents
     }
     for field in BINDING_FIELDS:
-        missing = selected_bindings[field] - available[field]
-        if missing:
-            raise ValueError(
-                f"selected Agent has unavailable published binding: "
-                f"{agent_id}/{field}/{sorted(missing, key=str)}"
-            )
-        for binding_id in selected_bindings[field]:
-            if field == "skill_ids":
-                capability_type = "skill"
-                stable_id = int(binding_id)
-                node = skill_nodes.get(stable_id) or {}
-            elif field == "knowledge_doc_ids":
-                capability_type = "knowledge"
-                stable_id = int(binding_id)
-                node = knowledge_nodes.get(stable_id) or {}
-            else:
-                capability_type = "mcp_server"
-                node = server_nodes.get(str(binding_id)) or {}
-                stable_id = node.get("server_id")
-            manifest = get_trusted_metadata(capability_type, stable_id)
-            if not manifest:
+        # Validate the complete enabled Release graph.  A selected Agent must
+        # not be allowed to build merely because an ambiguous cross-domain
+        # binding happens to belong to another enabled Agent.
+        for owner in agents:
+            owner_id = str(owner["agent_id"])
+            missing = bindings_by_agent[owner_id][field] - available[field]
+            if missing:
                 raise ValueError(
-                    f"binding is absent from trusted catalog: "
-                    f"{agent_id}/{field}/{binding_id}"
+                    f"enabled Agent has unavailable published binding: "
+                    f"{owner_id}/{field}/{sorted(missing, key=str)}"
                 )
-            embedded_scope = node.get("domain_scope")
-            if embedded_scope is not None and embedded_scope != manifest.get(
-                "domain_scope"
-            ):
+        binding_ids = {
+            binding_id
+            for owner_bindings in bindings_by_agent.values()
+            for binding_id in owner_bindings[field]
+        }
+        for binding_id in binding_ids:
+            owner_scopes = {
+                _strict_agent_scope(owner)
+                for owner in agents
+                if binding_id
+                in bindings_by_agent[str(owner["agent_id"])][field]
+            }
+            if len(owner_scopes) > 1:
                 raise ValueError(
-                    f"published capability domain differs from trusted catalog: "
-                    f"{field}/{binding_id}/{embedded_scope}/"
-                    f"{manifest.get('domain_scope')}"
+                    f"cross-domain shared binding is forbidden: "
+                    f"{field}/{binding_id}/{sorted(owner_scopes)}"
                 )
-            if manifest.get("domain_scope") != selected_scope:
-                raise ValueError(
-                    f"cross-domain binding is forbidden: {agent_id}/{selected_scope}/"
-                    f"{field}/{binding_id}/{manifest.get('domain_scope')}"
-                )
-    if selected.get("system_tool_ids"):
-        raise ValueError(
-            f"system Tool binding is unavailable: "
-            f"{selected.get('agent_id')}/{selected.get('system_tool_ids')}"
-        )
     return selected_scope
 
 
