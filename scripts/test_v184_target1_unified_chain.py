@@ -943,6 +943,13 @@ def test_rag_citation_snapshot_and_mcp_boundaries() -> None:
         {"tool_name": "symbolic-read"},
         {"tool_name": "symbolic-local-tool"},
     ]
+    ordinary_calls = coordinator_module._tool_calls_without_mcp(
+        actual_native_calls,
+        {"symbolic-read"},
+    )
+    assert [item["tool_name"] for item in ordinary_calls] == [
+        "symbolic-local-tool"
+    ]
     correctly_declared = AgentTurnResult.model_validate(
         {
             "answer": "symbolic-answer",

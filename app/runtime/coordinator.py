@@ -592,9 +592,8 @@ def _validate_agent_capability_usage(
     actual_tool_names = sorted(
         {
             str(call.get("tool_name") or "")
-            for call in tool_calls
+            for call in _tool_calls_without_mcp(tool_calls, mcp_names)
             if call.get("tool_name")
-            and str(call.get("tool_name")) not in mcp_names
         }
     )
     declared_tool_names = sorted({str(item) for item in declared.tool_calls})
@@ -602,6 +601,20 @@ def _validate_agent_capability_usage(
         raise AgentContractInvalidError(
             "capability_usage.tool_calls did not match runtime Tool calls"
         )
+
+
+def _tool_calls_without_mcp(
+    tool_calls: List[Dict[str, Any]],
+    mcp_tool_names: Any,
+) -> List[Dict[str, Any]]:
+    """Project raw native calls into the ordinary Tool channel only."""
+
+    mcp_names = {str(item) for item in (mcp_tool_names or set()) if str(item)}
+    return [
+        dict(call)
+        for call in tool_calls
+        if str(call.get("tool_name") or "") not in mcp_names
+    ]
 
 
 def _lane_explanation(decision: LaneDecision) -> str:
@@ -4186,6 +4199,10 @@ class RuntimeCoordinator:
                 "model_invoked": False,
             }
         )
+        message_tool_calls = _tool_calls_without_mcp(
+            tool_calls,
+            actual_mcp_names,
+        )
         saved = save_chat_message(
             session_id=session_id,
             role="assistant",
@@ -4199,7 +4216,7 @@ class RuntimeCoordinator:
             route_reason=route.reason,
             current_agent=str(state.selected_agent.get("name") or selected),
             current_agent_id=selected,
-            tool_calls=tool_calls or None,
+            tool_calls=message_tool_calls or None,
             model_id=model_id if model_invoked else None,
             thinking_enabled=(
                 _thinking_for_snapshot(snapshot.config, model_id)
