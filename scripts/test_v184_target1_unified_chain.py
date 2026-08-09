@@ -921,6 +921,8 @@ def test_static_contracts() -> None:
     assert "plan_tools(" not in coordinator_source.split("async def _stream_consultation", 1)[1]
     assert "output_schema=AgentTurnResult" in agent_factory_source
     assert "use_json_mode=True" in agent_factory_source
+    assert "ASCII U+0022 double quotes" in agent_factory_source
+    assert "expected_output=(" in agent_factory_source
     assert "markdown=False" in agent_factory_source
     assert "必须按AgentTurnResult返回结构化proposal_request" in coordinator_source
     mcp_source = (root / "app/runtime/mcp_executor.py").read_text(encoding="utf-8")

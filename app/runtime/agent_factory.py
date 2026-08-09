@@ -306,6 +306,7 @@ def build_agent_from_snapshot(
     instructions.extend(
         [
             "Return exactly one JSON object and no prose, markdown fence, schema explanation, or control-plane fields.",
+            "Use ASCII U+0022 double quotes for every JSON key and string delimiter. Typographic quotation marks such as left/right curly quotes are invalid JSON.",
             "The object must contain exactly: answer, answer_status, citations, proposal_request, capability_usage.",
             "answer_status must be answered, insufficient_evidence, or insufficient_capability. Never request another Agent or routing decision.",
             "citations is a list of RAG evidence IDs supplied in this turn. Skill, MCP, Tool, model output, and configuration are never citations.",
@@ -365,6 +366,11 @@ def build_agent_from_snapshot(
         skills=agno_skills,
         output_schema=AgentTurnResult,
         use_json_mode=True,
+        expected_output=(
+            '{"answer":"user-visible answer","answer_status":"answered",'
+            '"citations":[],"proposal_request":null,"capability_usage":'
+            '{"skill_ids":[],"rag_evidence_ids":[],"mcp_calls":[],"tool_calls":[]}}'
+        ),
         markdown=False,
         # The coordinator injects only successful user-visible chat_messages.
         # Agno stage history may contain Router control JSON and must stay off.
