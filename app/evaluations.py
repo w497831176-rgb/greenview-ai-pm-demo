@@ -57,6 +57,39 @@ SOURCES = {"badcase", "sop", "expert", "adversarial", "synthetic"}
 RUNTIME_TERMINAL_STATUSES = {"complete", "paused", "completed"}
 
 
+def _budget_threshold_enabled(value: Any) -> bool:
+    try:
+        return value is not None and float(value) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def _evaluation_budget_gate() -> Dict[str, Any]:
+    """Keep reconciliation attention advisory when no evaluation budget is enabled."""
+    budget_gate = _background_budget_gate("evaluation_run")
+    daily_enabled = _budget_threshold_enabled(
+        budget_gate.get("daily_threshold_cny")
+    )
+    monthly_enabled = _budget_threshold_enabled(
+        budget_gate.get("monthly_threshold_cny")
+    )
+    if (
+        budget_gate.get("allowed") is False
+        and budget_gate.get("reason_code") == "budget_reconciliation_attention"
+        and not daily_enabled
+        and not monthly_enabled
+    ):
+        return {
+            **budget_gate,
+            "allowed": True,
+            "alert_level": "warning",
+            "http_status": None,
+            "detail": None,
+            "warning_code": "budget_reconciliation_attention",
+        }
+    return budget_gate
+
+
 class EvaluationCaseCreate(BaseModel):
     case_key: str
     title: str
@@ -1195,7 +1228,7 @@ async def run_case(case_id: int, request: EvaluationRunRequest = EvaluationRunRe
 
     # Evaluation is an explicit background-quality operation, unlike ordinary
     # owner chat.  Respect a hard budget stop before spending a new model call.
-    budget_gate = _background_budget_gate("evaluation_run")
+    budget_gate = _evaluation_budget_gate()
     if not budget_gate.get("allowed"):
         raise HTTPException(
             status_code=int(budget_gate["http_status"]),

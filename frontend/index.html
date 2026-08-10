@@ -1779,7 +1779,10 @@
       const renderItem = (item) => {
         const citation = item.citation;
         const scoreValue = citation.retrieval_score ?? citation.score;
-        const score = typeof scoreValue === 'number' ? scoreValue.toFixed(3) : '-';
+        const retrievalMode = String(citation.retrieval_mode || '').toLowerCase();
+        const scoreLabel = typeof scoreValue === 'number' && Number.isFinite(scoreValue)
+          ? `相关度 ${scoreValue.toFixed(3)}`
+          : (retrievalMode.includes('adjacent') ? '相邻上下文（未单独评分）' : '相关度未记录');
         const provenance = [
           citation.retrieval_sources?.length ? `召回：${citation.retrieval_sources.join('+')}` : '',
           citation.retrieval_paths?.length ? `路径：${citation.retrieval_paths.join('+')}` : '',
@@ -1793,7 +1796,7 @@
           registerCitationSnapshot(citation);
           click = `class="mt-1 cursor-pointer hover:text-brand-600 hover:underline" onclick="showCitationEvidence('${escapeHtml(citation.evidence_id)}')"`;
         }
-        return `<li ${click}>[${item.index}] 《${title}》${chunkIndex !== '' ? ` · 分片 ${chunkIndex}` : ''}<span class="text-slate-400">（相关度 ${score}）</span>${provenance ? `<span class="block text-[9px] text-slate-400">${escapeHtml(provenance)}</span>` : ''}</li>`;
+        return `<li ${click}>[${item.index}] 《${title}》${chunkIndex !== '' ? ` · 分片 ${chunkIndex}` : ''}<span class="text-slate-400">（${escapeHtml(scoreLabel)}）</span>${provenance ? `<span class="block text-[9px] text-slate-400">${escapeHtml(provenance)}</span>` : ''}</li>`;
       };
       let html = '<div class="ai-message-citations mt-2 pt-2 border-t border-slate-100">';
       if (used.length) html += `<p class="text-[10px] text-slate-400 mb-1">回答中实际引用的证据</p><ol class="text-[10px] text-slate-500 list-decimal list-inside">${used.map(renderItem).join('')}</ol>`;
@@ -3901,6 +3904,17 @@
       const processingStatuses = new Set(['classified', 'investigating', 'fixing']);
       const verifyingStatuses = new Set(['verifying', 'released']);
       const terminalStatuses = new Set(['closed', 'rejected', 'duplicate', 'accepted_limitation']);
+      let darwinSuggestionInFlight = false;
+
+      function hasDisplayableDarwinAdvice(advice) {
+        const category = String(advice?.recommended_category || '').trim();
+        return !!(advice && typeof advice === 'object'
+          && ['knowledge_gap', 'skill_prompt', 'mcp_capability', 'routing', 'response_quality', 'other'].includes(category)
+          && String(advice.root_cause_hypothesis || '').trim()
+          && String(advice.repair_path_suggestion || '').trim()
+          && Array.isArray(advice.suggested_actions)
+          && advice.suggested_actions.some(item => String(item || '').trim()));
+      }
 
       async function mutate(path, body, success) {
         try {
@@ -3921,6 +3935,7 @@
           const suggestions = actions.filter(item => item.action_type === 'ai-suggestion');
           const latestSuggestion = suggestions.length ? (suggestions[suggestions.length - 1].action_detail_parsed || {}) : {};
           const darwinAdvice = bc.darwin_analysis_parsed || {};
+          const hasDarwinAdvice = hasDisplayableDarwinAdvice(darwinAdvice);
           const suggestedCategory = darwinAdvice.recommended_category || latestSuggestion.category || 'other';
           const suggestedRootCause = darwinAdvice.root_cause_hypothesis || latestSuggestion.reason || '';
           const suggestedActions = Array.isArray(darwinAdvice.suggested_actions)
@@ -3933,7 +3948,7 @@
           let controls = '';
           if (status === 'pending') {
             const options = Object.entries(categories).map(([value, label]) => `<option value="${value}" ${suggestedCategory === value ? 'selected' : ''}>${label}</option>`).join('');
-            controls = `<div class="space-y-3"><div class="text-sm font-medium text-slate-900">人工处理</div><div class="grid grid-cols-1 md:grid-cols-2 gap-3"><label class="text-xs text-slate-600">人工分类<select id="badcase-human-category" class="mt-1 w-full px-3 py-2 border border-slate-200 rounded-xl bg-white">${options}</select></label><label class="text-xs text-slate-600">采用依据<input id="badcase-human-reason" value="${escapeHtml(suggestedRootCause)}" placeholder="写明人工判断" class="mt-1 w-full px-3 py-2 border border-slate-200 rounded-xl"></label></div><div class="flex flex-wrap gap-2"><button id="badcase-ai-suggest" class="px-3 py-2 rounded-xl bg-violet-600 text-white text-sm">生成AI处理建议（Darwin · Pro）</button><button id="badcase-adopt" class="px-3 py-2 rounded-xl bg-brand-600 text-white text-sm">采用建议并进入处理</button><button id="badcase-reject" class="px-3 py-2 rounded-xl bg-slate-100 text-slate-700 text-sm">人工驳回并关闭</button></div><p class="text-xs text-slate-500">AI 只生成建议，不改变分类、状态或配置；只有人工按钮会推进状态。</p></div>`;
+            controls = `<div class="space-y-3"><div class="text-sm font-medium text-slate-900">人工处理</div><div class="grid grid-cols-1 md:grid-cols-2 gap-3"><label class="text-xs text-slate-600">人工分类<select id="badcase-human-category" class="mt-1 w-full px-3 py-2 border border-slate-200 rounded-xl bg-white">${options}</select></label><label class="text-xs text-slate-600">采用依据<input id="badcase-human-reason" value="${escapeHtml(suggestedRootCause)}" placeholder="写明人工判断" class="mt-1 w-full px-3 py-2 border border-slate-200 rounded-xl"></label></div><div class="flex flex-wrap gap-2">${hasDarwinAdvice ? '' : '<button id="badcase-ai-suggest" class="px-3 py-2 rounded-xl bg-violet-600 text-white text-sm">生成AI处理建议（Darwin · Pro）</button>'}<button id="badcase-adopt" class="px-3 py-2 rounded-xl bg-brand-600 text-white text-sm">采用建议并进入处理</button><button id="badcase-reject" class="px-3 py-2 rounded-xl bg-slate-100 text-slate-700 text-sm">人工驳回并关闭</button></div><p class="text-xs text-slate-500">AI 只生成建议，不改变分类、状态或配置；只有人工按钮会推进状态。</p></div>`;
           } else if (processingStatuses.has(status)) {
             controls = `<div class="space-y-3"><div class="text-sm font-medium text-slate-900">处理中</div><div class="flex flex-wrap gap-2"><button id="badcase-to-verify" class="px-3 py-2 rounded-xl bg-brand-600 text-white text-sm">人工进入待验证</button><button id="badcase-reject" class="px-3 py-2 rounded-xl bg-slate-100 text-slate-700 text-sm">人工关闭</button></div><p class="text-xs text-slate-500">AI 建议仅供人工参考；状态仍由人工操作推进。</p></div>`;
           } else if (verifyingStatuses.has(status)) {
@@ -3941,7 +3956,7 @@
           } else if (terminalStatuses.has(status)) {
             controls = '<div class="text-sm text-slate-500">该记录已关闭，仅保留历史证据。</div>';
           }
-          const suggestionHtml = Object.keys(darwinAdvice).length ? `<div class="rounded-xl border border-violet-100 bg-violet-50 p-3 space-y-2"><div class="text-xs font-medium text-violet-800">Darwin · Pro 处理建议（待人工决定）</div><div class="text-sm text-violet-950"><span class="font-medium">建议分类：</span>${escapeHtml(categories[suggestedCategory] || suggestedCategory)}</div><div class="text-sm text-violet-950 whitespace-pre-wrap"><span class="font-medium">根因：</span>${escapeHtml(suggestedRootCause || '未提供')}</div><div class="text-sm text-violet-950 whitespace-pre-wrap"><span class="font-medium">处理建议：</span>${escapeHtml(darwinAdvice.repair_path_suggestion || '未提供')}</div>${suggestedActions.length ? `<ul class="list-disc list-inside text-sm text-violet-950">${suggestedActions.map(item => `<li>${escapeHtml(item)}</li>`).join('')}</ul>` : ''}</div>` : (suggestions.length ? `<div class="space-y-2">${suggestions.slice(-3).reverse().map(item => { const detail = item.action_detail_parsed || {}; return `<div class="rounded-xl border border-violet-100 bg-violet-50 p-3"><div class="text-xs font-medium text-violet-800">${escapeHtml(detail.suggestion_type === 'darwin' ? 'Darwin 处理建议' : 'AI 处理建议')}</div><div class="mt-1 text-sm text-violet-950 whitespace-pre-wrap">${escapeHtml(detail.reason || detail.analysis || '建议已生成，请人工查看后决定是否采用')}</div></div>`; }).join('')}</div>` : '<div class="text-sm text-slate-400">尚无 AI 建议</div>');
+          const suggestionHtml = hasDarwinAdvice ? `<div class="rounded-xl border border-violet-100 bg-violet-50 p-3 space-y-2"><div class="text-xs font-medium text-violet-800">Darwin · Pro 处理建议（待人工决定）</div><div class="text-sm text-violet-950"><span class="font-medium">建议分类：</span>${escapeHtml(categories[suggestedCategory] || suggestedCategory)}</div><div class="text-sm text-violet-950 whitespace-pre-wrap"><span class="font-medium">根因：</span>${escapeHtml(suggestedRootCause || '未提供')}</div><div class="text-sm text-violet-950 whitespace-pre-wrap"><span class="font-medium">处理建议：</span>${escapeHtml(darwinAdvice.repair_path_suggestion || '未提供')}</div>${suggestedActions.length ? `<ul class="list-disc list-inside text-sm text-violet-950">${suggestedActions.map(item => `<li>${escapeHtml(item)}</li>`).join('')}</ul>` : ''}</div>` : (suggestions.length ? `<div class="space-y-2">${suggestions.slice(-3).reverse().map(item => { const detail = item.action_detail_parsed || {}; return `<div class="rounded-xl border border-violet-100 bg-violet-50 p-3"><div class="text-xs font-medium text-violet-800">${escapeHtml(detail.suggestion_type === 'darwin' ? 'Darwin 处理建议' : 'AI 处理建议')}</div><div class="mt-1 text-sm text-violet-950 whitespace-pre-wrap">${escapeHtml(detail.reason || detail.analysis || '建议已生成，请人工查看后决定是否采用')}</div></div>`; }).join('')}</div>` : '<div class="text-sm text-slate-400">尚无 AI 建议</div>');
           $('#badcase-detail-content').innerHTML = `<div class="space-y-4"><div class="bg-white border border-slate-200 rounded-2xl p-5"><div class="flex flex-wrap items-start justify-between gap-3"><div><div class="text-xs text-slate-400">疑似 Badcase #${bc.id}</div><h2 class="mt-1 text-xl font-semibold text-slate-900">${escapeHtml(bc.title || '未命名问题')}</h2></div><span class="px-2.5 py-1 rounded-full bg-slate-100 text-slate-700 text-xs">${escapeHtml(bc.user_status_label || '待处理')}</span></div><div class="mt-4 grid grid-cols-1 md:grid-cols-3 gap-3 text-sm"><div class="rounded-xl bg-slate-50 p-3"><div class="text-xs text-slate-500">来源</div><div class="mt-1 text-slate-900">${escapeHtml(bc.source_label || bc.source || '-')}</div></div><div class="rounded-xl bg-slate-50 p-3"><div class="text-xs text-slate-500">为什么被抓</div><div class="mt-1 text-slate-900 whitespace-pre-wrap">${escapeHtml(why)}</div></div><div class="rounded-xl bg-slate-50 p-3"><div class="text-xs text-slate-500">发生次数</div><div class="mt-1 text-slate-900">${occurrenceCount}</div></div></div><div class="mt-3 grid grid-cols-1 md:grid-cols-2 gap-3"><div class="rounded-xl border border-slate-200 p-3"><div class="text-xs text-slate-500">原问题</div><div class="mt-1 text-sm text-slate-800 whitespace-pre-wrap">${escapeHtml(bc.original_query || bc.query || '-')}</div></div><div class="rounded-xl border border-slate-200 p-3"><div class="text-xs text-slate-500">原回答</div><div class="mt-1 text-sm text-slate-800 whitespace-pre-wrap">${escapeHtml(bc.ai_response || '-')}</div></div></div><div class="mt-3 flex flex-wrap gap-3 text-xs">${bc.trace_id ? `<button type="button" data-badcase-trace-id="${escapeHtml(bc.trace_id)}" class="text-brand-600 font-mono hover:underline">原 Trace ${escapeHtml(bc.trace_id)}</button>` : '<span class="text-slate-400">无原 Trace</span>'}${bc.retest_trace_id ? `<button type="button" data-badcase-trace-id="${escapeHtml(bc.retest_trace_id)}" class="text-indigo-600 font-mono hover:underline">复测 Trace ${escapeHtml(bc.retest_trace_id)}</button>` : ''}</div></div><div class="bg-white border border-slate-200 rounded-2xl p-5">${controls}</div><div class="bg-white border border-slate-200 rounded-2xl p-5"><div class="font-medium text-slate-900 mb-3">处理建议</div>${suggestionHtml}</div><details class="bg-white border border-slate-200 rounded-2xl p-4"><summary class="cursor-pointer text-sm font-medium text-slate-700">高级证据与历史动作</summary><pre class="mt-3 text-xs whitespace-pre-wrap overflow-auto max-h-96">${escapeHtml(JSON.stringify({ trigger_code: context.trigger_code, component: context.component, release_id: context.release_id, actions }, null, 2))}</pre></details></div>`;
 
           $('#badcase-detail-content').querySelectorAll('[data-badcase-trace-id]').forEach(button => {
@@ -3949,7 +3964,34 @@
           });
 
           const aiSuggest = $('#badcase-ai-suggest');
-          if (aiSuggest) aiSuggest.addEventListener('click', () => mutate(`/api/badcases/${id}/darwin`, {}, 'Darwin · Pro 建议已生成，状态未改变'));
+          if (aiSuggest) aiSuggest.addEventListener('click', async () => {
+            if (darwinSuggestionInFlight || aiSuggest.disabled) return;
+            darwinSuggestionInFlight = true;
+            aiSuggest.disabled = true;
+            aiSuggest.textContent = '生成中，请稍候（Darwin · Pro）…';
+            try {
+              await apiPost(`/api/badcases/${id}/darwin`, {});
+              showToast('Darwin · Pro 建议已生成，状态未改变');
+              await loadDetail();
+            } catch (err) {
+              try {
+                const latest = await apiGet(`/api/badcases/${id}`);
+                const latestBadcase = latest.badcase || latest;
+                if (hasDisplayableDarwinAdvice(latestBadcase.darwin_analysis_parsed || {})) {
+                  showToast('Darwin · Pro 建议已生成，状态未改变');
+                  await loadDetail();
+                  return;
+                }
+              } catch (_) {
+                // Preserve the original request error when the refresh itself cannot complete.
+              }
+              aiSuggest.disabled = false;
+              aiSuggest.textContent = '生成AI处理建议（Darwin · Pro）';
+              showToast(err.message || '操作失败', 'error');
+            } finally {
+              darwinSuggestionInFlight = false;
+            }
+          });
           const adopt = $('#badcase-adopt');
           if (adopt) adopt.addEventListener('click', () => {
             const reason = $('#badcase-human-reason').value.trim();

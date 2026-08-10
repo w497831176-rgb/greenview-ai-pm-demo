@@ -194,6 +194,21 @@ def _complete_darwin_suggestion(value: Dict[str, Any]) -> bool:
     )
 
 
+def _stored_complete_darwin_suggestion(
+    badcase: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Return an already persisted, displayable Darwin suggestion if valid."""
+    stored = badcase.get("darwin_analysis")
+    if isinstance(stored, str):
+        try:
+            stored = json.loads(stored)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+    if not isinstance(stored, dict) or not _complete_darwin_suggestion(stored):
+        return None
+    return dict(stored)
+
+
 class BadcaseCreate(BaseModel):
     title: str
     description: str = ""
@@ -1538,6 +1553,32 @@ async def darwin_fix(case_id: int, request: DarwinFixRequest = DarwinFixRequest(
         raise HTTPException(status_code=404, detail="not found")
     if case["status"] not in {"pending", "classified", "investigating", "fixing"}:
         raise HTTPException(status_code=400, detail=f"Darwin suggestion is unavailable for status {case['status']}")
+
+    existing_analysis = _stored_complete_darwin_suggestion(case)
+    if existing_analysis is not None:
+        # A saved suggestion is the durable result of this optional Pro action.
+        # Reusing it avoids duplicate provider calls and audit actions when an
+        # operator refreshes or clicks again after a successful response.
+        existing_trace_id = (
+            existing_analysis.get("trace_id") or case.get("darwin_trace_id")
+        )
+        return {
+            "badcase": _enrich_badcase(case),
+            "analysis": existing_analysis,
+            "drafts": [],
+            "status_changed": False,
+            "model_id": existing_analysis.get("model") or "deepseek-v4-pro",
+            "darwin_skill_found": None,
+            "darwin_trace_id": existing_trace_id,
+            "usage_source": "historical",
+            "total_tokens": None,
+            "estimated_cost_cny": existing_analysis.get("calculated_direct_cost"),
+            "calculated_direct_cost": existing_analysis.get("calculated_direct_cost"),
+            "cost_source": existing_analysis.get("cost_source"),
+            "cost_disclaimer": "platform_price_snapshot_not_provider_final_bill",
+            "budget_warning_code": None,
+            "reused": True,
+        }
 
     context = case.get("context_json") or ""
     if isinstance(context, str) and context:
