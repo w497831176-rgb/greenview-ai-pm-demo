@@ -455,8 +455,11 @@ def test_frontend_loads_summary_and_advanced_diagnostics_lazily() -> None:
             "function bindEvents()"
         )
     ]
-    assert load.count("apiGet(") == 1
+    assert load.count("apiGet(") == 2
+    assert "Promise.all" in load
+    assert "/api/observability/usage-summary?" in load
     assert "/api/observability/traces?" in load
+    assert "new URLSearchParams(usageParams.toString())" in load
     assert "state.pagination.limit" in load
     assert "sort_order" in load
     assert "/overview" not in load

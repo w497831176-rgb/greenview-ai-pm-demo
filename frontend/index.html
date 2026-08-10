@@ -4275,7 +4275,7 @@
 
       const state = {
         filters: { model: '', stage: '', search: '', sortOrder: 'desc' },
-        rangeKey: '',
+        rangeKey: 'yesterday',
         customStart: '',
         customEnd: '',
         resolvedScope: null,
@@ -4283,6 +4283,7 @@
         traceSummary: { traceGroupCount: 0, providerRequestCount: 0 },
         traceDataQuality: {},
         statisticsConsistent: null,
+        usageSummary: { rows: [], total: {}, complete: true },
         overview: null,
         traces: [],
         trends: [],
@@ -4304,11 +4305,50 @@
         return `${parts.year}-${parts.month}-${parts.day}`;
       }
 
+      function shiftCalendarDate(dateText, dayOffset) {
+        const [year, month, day] = String(dateText).split('-').map(Number);
+        const shifted = new Date(Date.UTC(year, month - 1, day + dayOffset));
+        return shifted.toISOString().slice(0, 10);
+      }
+
+      function beijingDateOffset(dayOffset) {
+        return shiftCalendarDate(beijingToday(), dayOffset);
+      }
+
+      function beijingWeekStart() {
+        const today = beijingToday();
+        const [year, month, day] = today.split('-').map(Number);
+        const weekday = new Date(Date.UTC(year, month - 1, day)).getUTCDay();
+        return shiftCalendarDate(today, weekday === 0 ? -6 : 1 - weekday);
+      }
+
       function scopeParams() {
-        const params = new URLSearchParams({ range_key: state.rangeKey });
-        if (state.rangeKey === 'custom') {
+        const params = new URLSearchParams();
+        if (state.rangeKey === 'today') {
+          const date = beijingToday();
+          params.set('range_key', 'custom');
+          params.set('start', date);
+          params.set('end', date);
+        } else if (state.rangeKey === 'yesterday' || state.rangeKey === 'day_before_yesterday') {
+          const date = beijingDateOffset(state.rangeKey === 'yesterday' ? -1 : -2);
+          params.set('range_key', 'custom');
+          params.set('start', date);
+          params.set('end', date);
+        } else if (state.rangeKey === 'this_week') {
+          params.set('range_key', 'custom');
+          params.set('start', beijingWeekStart());
+          params.set('end', beijingToday());
+        } else if (state.rangeKey === 'this_month') {
+          const today = beijingToday();
+          params.set('range_key', 'custom');
+          params.set('start', `${today.slice(0, 7)}-01`);
+          params.set('end', today);
+        } else if (state.rangeKey === 'custom') {
+          params.set('range_key', 'custom');
           params.set('start', state.customStart);
           params.set('end', state.customEnd);
+        } else {
+          params.set('range_key', state.rangeKey);
         }
         return params;
       }
@@ -4337,14 +4377,20 @@
       }
 
       async function loadAll() {
-        const traceParams = new URLSearchParams();
+        const usageParams = scopeParams();
+        const traceParams = new URLSearchParams(usageParams.toString());
         if (state.filters.model) traceParams.set('model_id', state.filters.model);
         if (state.filters.stage) traceParams.set('stage', state.filters.stage);
         if (state.filters.search) traceParams.set('trace_id', state.filters.search);
         traceParams.set('limit', String(state.pagination.limit));
         traceParams.set('offset', String((state.pagination.page - 1) * state.pagination.limit));
         traceParams.set('sort_order', state.filters.sortOrder);
-        const traces = await apiGet(`/api/observability/traces?${traceParams.toString()}`);
+        const [usageSummary, traces] = await Promise.all([
+          apiGet(`/api/observability/usage-summary?${usageParams.toString()}`),
+          apiGet(`/api/observability/traces?${traceParams.toString()}`),
+        ]);
+        state.usageSummary = usageSummary || { rows: [], total: {}, complete: false };
+        state.resolvedScope = usageSummary.scope || null;
         state.traces = traces.traces || [];
         state.traceRange = { start: traces.start || '', end: traces.end || '' };
         state.pagination = {
@@ -4360,7 +4406,11 @@
           providerRequestCount: Number(traces.provider_request_count ?? 0),
         };
         state.traceDataQuality = traces.data_quality || {};
-        state.statisticsConsistent = true;
+        state.statisticsConsistent = Boolean(
+          state.resolvedScope
+          && String(state.resolvedScope.start || '') === String(traces.start || '')
+          && String(state.resolvedScope.end || '') === String(traces.end || '')
+        );
         state.trends = [];
         state.distribution = [];
       }
@@ -4794,6 +4844,64 @@
         }
       }
 
+      function renderProviderUsageSummary() {
+        const summary = state.usageSummary || {};
+        const rows = Array.isArray(summary.rows) ? summary.rows : [];
+        const byModel = Object.fromEntries(rows.map(row => [row.actual_model, row]));
+        const emptyRow = (actualModel, label) => ({
+          actual_model: actualModel,
+          model_label: label,
+          provider_request_count: null,
+          cache_hit_input_tokens: null,
+          cache_miss_input_tokens: null,
+          output_tokens: null,
+          total_tokens: null,
+          usage_complete: false,
+        });
+        const displayRows = [
+          byModel['deepseek-v4-flash'] || emptyRow('deepseek-v4-flash', 'Flash'),
+          byModel['deepseek-v4-pro'] || emptyRow('deepseek-v4-pro', 'Pro'),
+          summary.total || emptyRow(null, '合计'),
+        ];
+        const usageValue = (row, field) => row[field] === null || row[field] === undefined
+          ? '不可得'
+          : Number(row[field]).toLocaleString();
+        const tableRows = displayRows.map(row => `
+          <tr class="border-b border-slate-100 last:border-0 ${row.model_label === '合计' ? 'bg-slate-50 font-semibold text-slate-900' : 'text-slate-700'}">
+            <td class="px-3 py-3">${escapeHtml(row.model_label || '—')}</td>
+            <td class="px-3 py-3 text-right">${row.provider_request_count === null || row.provider_request_count === undefined ? '不可得' : Number(row.provider_request_count).toLocaleString()}</td>
+            <td class="px-3 py-3 text-right">${usageValue(row, 'cache_hit_input_tokens')}</td>
+            <td class="px-3 py-3 text-right">${usageValue(row, 'cache_miss_input_tokens')}</td>
+            <td class="px-3 py-3 text-right">${usageValue(row, 'output_tokens')}</td>
+            <td class="px-3 py-3 text-right">${usageValue(row, 'total_tokens')}</td>
+          </tr>`).join('');
+        const ranges = [
+          ['today', '今天'],
+          ['yesterday', '昨天'],
+          ['day_before_yesterday', '前天'],
+          ['this_week', '本周'],
+          ['this_month', '本月'],
+          ['custom', '自定义日期范围'],
+        ];
+        const scope = summary.scope || state.resolvedScope || {};
+        const incompleteCalls = Number(summary.incomplete_provider_request_count || 0);
+        const unclassifiedCalls = Number(summary.unclassified_provider_request_count || 0);
+        const incompleteNote = summary.complete !== true
+          ? `<div class="mt-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">账本汇总不完整：核心Usage不可得 ${incompleteCalls} 次，实际模型不可分类 ${unclassifiedCalls} 次；相关字段显示“不可得”，没有按0填充。</div>`
+          : '';
+        return `
+          <section class="bg-white rounded-2xl shadow-soft border border-slate-200 p-4" aria-labelledby="cg-provider-summary-title">
+            <div class="flex flex-wrap items-start justify-between gap-3">
+              <div><h2 id="cg-provider-summary-title" class="font-semibold text-slate-900">Provider调用统计</h2><p class="mt-1 text-xs text-slate-500">按Provider实际模型统计逐物理请求账本 · ${escapeHtml(scope.start || '—')} 至 ${escapeHtml(scope.end || '—')} · Asia/Shanghai</p></div>
+              <div class="flex flex-wrap gap-2" aria-label="Provider调用统计日期范围">${ranges.map(([key, label]) => `<button type="button" data-provider-range="${key}" class="cg-provider-range px-3 py-1.5 rounded-lg text-sm ${state.rangeKey === key ? 'bg-brand-600 text-white' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'}">${label}</button>`).join('')}</div>
+            </div>
+            ${state.rangeKey === 'custom' ? `<div class="mt-3 flex flex-wrap items-end gap-2"><label class="text-xs text-slate-500">开始日期<input id="cg-provider-custom-start" type="date" value="${escapeHtml(state.customStart)}" class="block mt-1 px-3 py-2 border border-slate-200 rounded-lg text-sm text-slate-700"></label><label class="text-xs text-slate-500">结束日期<input id="cg-provider-custom-end" type="date" value="${escapeHtml(state.customEnd)}" class="block mt-1 px-3 py-2 border border-slate-200 rounded-lg text-sm text-slate-700"></label><button id="cg-provider-custom-apply" type="button" class="px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white rounded-lg text-sm">查询</button></div>` : ''}
+            ${incompleteNote}
+            <div class="mt-4 overflow-x-auto"><table class="w-full text-sm"><thead><tr class="bg-slate-50 text-left text-xs text-slate-500"><th class="px-3 py-2">实际模型</th><th class="px-3 py-2 text-right">调用次数</th><th class="px-3 py-2 text-right">Hit</th><th class="px-3 py-2 text-right">Miss</th><th class="px-3 py-2 text-right">Output</th><th class="px-3 py-2 text-right">Total</th></tr></thead><tbody>${tableRows}</tbody></table></div>
+            <p class="mt-3 text-xs text-slate-500">Reasoning属于Output子集，不重复计入Total。</p>
+          </section>`;
+      }
+
       function renderTraceSummariesSlim() {
         const items = state.traces || [];
         const pagination = state.pagination || {};
@@ -5133,6 +5241,7 @@
         container.innerHTML = `
           <div class="max-w-6xl mx-auto p-4 md:p-6 space-y-5">
             ${pageHeader('Trace 与真实成本', '首屏只加载最近20条摘要；单条详情和高级诊断按需读取，不会触发模型、RAG或成本实验。').replace('sticky top-0 z-10', 'relative')}
+            ${renderProviderUsageSummary()}
             ${renderTraceSummariesSlim()}
             <details id="cg-provider-ledger" class="rounded-2xl border border-slate-200 bg-white p-4"><summary class="cursor-pointer text-sm font-medium text-slate-800">④-A Provider账本（点击核对冻结数字）</summary><div id="cg-provider-ledger-body" class="mt-3 text-xs text-slate-500">尚未加载。</div></details>
           </div>
@@ -5141,6 +5250,37 @@
       }
 
       function bindEvents() {
+        $$('.cg-provider-range').forEach(button => button.addEventListener('click', async () => {
+          const rangeKey = button.dataset.providerRange;
+          state.rangeKey = rangeKey;
+          state.pagination.page = 1;
+          if (rangeKey === 'custom') {
+            const currentStart = String((state.resolvedScope || {}).start || '').slice(0, 10);
+            const currentEnd = String((state.resolvedScope || {}).end || '').slice(0, 10);
+            state.customStart = state.customStart || currentStart || beijingToday();
+            state.customEnd = state.customEnd || currentEnd || beijingToday();
+            renderPage();
+            return;
+          }
+          await reloadPage();
+        }));
+        const customApply = $('#cg-provider-custom-apply');
+        if (customApply) customApply.addEventListener('click', async () => {
+          const start = $('#cg-provider-custom-start').value;
+          const end = $('#cg-provider-custom-end').value;
+          if (!start || !end) {
+            showToast('自定义日期需要同时提供开始日期和结束日期', 'error');
+            return;
+          }
+          if (start > end) {
+            showToast('开始日期不能晚于结束日期', 'error');
+            return;
+          }
+          state.customStart = start;
+          state.customEnd = end;
+          state.pagination.page = 1;
+          await reloadPage();
+        });
         $('#cg-apply').addEventListener('click', async () => {
           state.filters.search = $('#cg-search').value.trim();
           state.filters.model = $('#cg-model').value;

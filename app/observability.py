@@ -1555,6 +1555,164 @@ def _query_period_summary(start: str, end: str) -> Dict[str, Any]:
     return _aggregate_model_calls(_fetch_model_calls(start, end))
 
 
+_USAGE_SUMMARY_MODELS: Tuple[Tuple[str, str], ...] = (
+    ("deepseek-v4-flash", "Flash"),
+    ("deepseek-v4-pro", "Pro"),
+)
+_USAGE_SUMMARY_TOKEN_FIELDS: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
+    (
+        "cache_hit_input_tokens",
+        ("cache_hit_input_tokens", "input_cache_hit_tokens"),
+    ),
+    (
+        "cache_miss_input_tokens",
+        ("cache_miss_input_tokens", "input_cache_miss_tokens"),
+    ),
+    ("output_tokens", ("output_tokens",)),
+    ("total_tokens", ("total_tokens",)),
+)
+
+
+def _empty_usage_summary_accumulator(
+    actual_model: Optional[str], model_label: str
+) -> Dict[str, Any]:
+    return {
+        "actual_model": actual_model,
+        "model_label": model_label,
+        "provider_request_count": 0,
+        "cache_hit_input_tokens": 0,
+        "cache_miss_input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "_missing_field_counts": {
+            field: 0 for field, _aliases in _USAGE_SUMMARY_TOKEN_FIELDS
+        },
+        "_incomplete_request_count": 0,
+    }
+
+
+def _add_usage_summary_call(
+    accumulator: Dict[str, Any], call: Dict[str, Any]
+) -> None:
+    accumulator["provider_request_count"] += 1
+    provider_actual = _token_source(call) == "provider_actual"
+    call_incomplete = not provider_actual
+    usage_inconsistent, _reasons = _provider_usage_inconsistency(call)
+    if usage_inconsistent:
+        call_incomplete = True
+
+    for field, aliases in _USAGE_SUMMARY_TOKEN_FIELDS:
+        value = (
+            _optional_int(_token_value(call, *aliases))
+            if provider_actual
+            else None
+        )
+        if value is None or value < 0:
+            accumulator["_missing_field_counts"][field] += 1
+            call_incomplete = True
+            continue
+        accumulator[field] += value
+
+    if call_incomplete:
+        accumulator["_incomplete_request_count"] += 1
+
+
+def _finalize_usage_summary_accumulator(
+    accumulator: Dict[str, Any]
+) -> Dict[str, Any]:
+    missing_counts = dict(accumulator["_missing_field_counts"])
+    incomplete_request_count = int(accumulator["_incomplete_request_count"])
+    result = {
+        "actual_model": accumulator["actual_model"],
+        "model_label": accumulator["model_label"],
+        "provider_request_count": int(accumulator["provider_request_count"]),
+        "incomplete_provider_request_count": int(
+            incomplete_request_count
+        ),
+        "usage_complete": not any(missing_counts.values())
+        and not incomplete_request_count,
+        "missing_usage_field_counts": missing_counts,
+    }
+    for field, _aliases in _USAGE_SUMMARY_TOKEN_FIELDS:
+        result[field] = (
+            None if incomplete_request_count else int(accumulator[field])
+        )
+    return result
+
+
+def _query_provider_usage_summary(start: str, end: str) -> Dict[str, Any]:
+    """Aggregate only persisted physical Provider requests for one date scope.
+
+    This deliberately avoids the full overview path: no prices, budgets,
+    Trace detail, MCP, Badcase, Evaluation, or global request-ID scan. Token
+    totals come directly from Provider actual Usage; Total is never rebuilt.
+    """
+    range_conditions, params = _time_range_predicates(
+        "model_calls.created_at", start, end
+    )
+    conditions = [*range_conditions, _provider_sql_predicate("model_calls")]
+    conn = _get_conn()
+    _register_reporting_sql(conn)
+    cursor = conn.cursor()
+    cursor.execute(
+        f"""
+        SELECT stage, model_id, status, usage_source, usage_normalized,
+               record_kind, usage_status, created_at,
+               input_tokens, output_tokens, reasoning_tokens, cached_tokens,
+               total_tokens
+        FROM model_calls
+        WHERE {' AND '.join(conditions)}
+        """,
+        params,
+    )
+    calls = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+
+    by_model = {
+        model_id: _empty_usage_summary_accumulator(model_id, label)
+        for model_id, label in _USAGE_SUMMARY_MODELS
+    }
+    total = _empty_usage_summary_accumulator(None, "合计")
+    unclassified_provider_request_count = 0
+
+    for call in calls:
+        _add_usage_summary_call(total, call)
+        candidates = _provider_actual_model_candidates(call)
+        actual_model = candidates[0] if len(candidates) == 1 else None
+        model_accumulator = by_model.get(actual_model or "")
+        if model_accumulator is None:
+            unclassified_provider_request_count += 1
+            continue
+        _add_usage_summary_call(model_accumulator, call)
+
+    rows = [
+        _finalize_usage_summary_accumulator(by_model[model_id])
+        for model_id, _label in _USAGE_SUMMARY_MODELS
+    ]
+    total_row = _finalize_usage_summary_accumulator(total)
+    if unclassified_provider_request_count:
+        total_row["usage_complete"] = False
+        for field, _aliases in _USAGE_SUMMARY_TOKEN_FIELDS:
+            total_row[field] = None
+    complete = bool(
+        total_row["usage_complete"]
+        and not unclassified_provider_request_count
+        and sum(row["provider_request_count"] for row in rows)
+        == total_row["provider_request_count"]
+    )
+    return {
+        "rows": rows,
+        "total": total_row,
+        "complete": complete,
+        "incomplete_provider_request_count": int(
+            total_row["incomplete_provider_request_count"]
+        ),
+        "unclassified_provider_request_count": int(
+            unclassified_provider_request_count
+        ),
+    }
+
+
 def _check_budget(strategy: Optional[str] = None) -> Dict[str, Any]:
     """Fail closed for optional paid background work when cost is unknowable."""
     thresholds: Dict[str, Any] = {}
@@ -1725,6 +1883,24 @@ def _background_budget_gate(strategy: str) -> Dict[str, Any]:
 # -----------------------------------------------------------------------------
 # Overview
 # -----------------------------------------------------------------------------
+
+
+@router.get("/usage-summary")
+async def usage_summary(
+    range_key: str = Query(
+        "yesterday",
+        pattern="^(today|yesterday|last_7_days|this_month|last_month|custom)$",
+    ),
+    start: Optional[str] = Query(None),
+    end: Optional[str] = Query(None),
+):
+    """Return a lightweight, read-only Provider-request Usage summary."""
+    try:
+        scope = _reporting_scope(range_key, start, end)
+        summary = _query_provider_usage_summary(scope["start"], scope["end"])
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return _json_safe_evidence({"scope": scope, **summary})
 
 
 @router.get("/overview")
