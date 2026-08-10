@@ -3833,10 +3833,91 @@ def _metadata_int(metadata: Dict[str, Any], *keys: str) -> Optional[int]:
     return None
 
 
+def _rag_adopted_citation_count(
+    evidence_ledger_record: Optional[Dict[str, Any]],
+) -> Optional[int]:
+    """Count only persisted RAG Citation links; never infer from retrieval."""
+    if not isinstance(evidence_ledger_record, dict):
+        return None
+    ledger = evidence_ledger_record.get("ledger")
+    if not isinstance(ledger, dict) or "citation_links" not in ledger:
+        return None
+    citation_links = ledger.get("citation_links")
+    if not isinstance(citation_links, list):
+        return None
+    if any(
+        not isinstance(item, dict)
+        or not str(item.get("evidence_type") or "").strip()
+        or not str(item.get("evidence_id") or "").strip()
+        for item in citation_links
+    ):
+        return None
+    return sum(
+        1
+        for item in citation_links
+        if item.get("evidence_type") == "rag_document_chunk"
+    )
+
+
+def _business_tool_call_count(
+    capability_metadata: Dict[str, Any],
+    skill_events: List[Dict[str, Any]],
+    mcp_calls: List[Dict[str, Any]],
+) -> Optional[int]:
+    """Count recorded business Tool calls without treating Skill/MCP as Tool."""
+    decision_summary = capability_metadata.get("decision_summary")
+    if isinstance(decision_summary, dict):
+        capability_metadata = decision_summary
+    tool_decision = capability_metadata.get("tool")
+    if not isinstance(tool_decision, dict):
+        return None
+    if "tool_calls" in tool_decision:
+        tool_calls = tool_decision.get("tool_calls")
+    else:
+        details = tool_decision.get("details")
+        if not isinstance(details, dict) or "tool_calls" not in details:
+            return None
+        tool_calls = details.get("tool_calls")
+    if not isinstance(tool_calls, list):
+        return None
+
+    def recorded_tool_name(item: Any) -> str:
+        if isinstance(item, str):
+            return item.strip()
+        if isinstance(item, dict):
+            return str(item.get("tool_name") or "").strip()
+        return ""
+
+    recorded_tool_names = [recorded_tool_name(item) for item in tool_calls]
+    if any(not tool_name for tool_name in recorded_tool_names):
+        return None
+
+    skill_tool_names: set[str] = set()
+    for event in skill_events:
+        tool_name = str((event.get("metadata") or {}).get("tool_name") or "").strip()
+        if not tool_name:
+            return None
+        skill_tool_names.add(tool_name)
+
+    mcp_tool_names: set[str] = set()
+    for call in mcp_calls:
+        tool_name = str(call.get("tool_name") or "").strip()
+        if not tool_name:
+            return None
+        mcp_tool_names.add(tool_name)
+
+    return sum(
+        1
+        for tool_name in recorded_tool_names
+        if tool_name not in skill_tool_names | mcp_tool_names
+    )
+
+
 def _trace_cost_quality_control(
     events: List[Dict[str, Any]],
     model_calls: List[Dict[str, Any]],
     mcp_calls: List[Dict[str, Any]],
+    evidence_ledger_record: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Build the single Trace-scoped cost/quality card from persisted facts."""
     event_by_span: Dict[str, List[Dict[str, Any]]] = {}
@@ -3858,7 +3939,12 @@ def _trace_cost_quality_control(
     capability_event = (event_by_span.get("capability_decision") or [{}])[-1]
     capability_meta = capability_event.get("metadata") or {}
 
-    stages = [str(call.get("stage") or "") for call in model_calls]
+    included_model_calls = [
+        call
+        for call in model_calls
+        if call.get("included_in_provider_summary") is True
+    ]
+    stages = [str(call.get("stage") or "") for call in included_model_calls]
     automatic_retries = _metadata_int(
         final_meta, "automatic_retry_count", "automatic_retries"
     )
@@ -3866,7 +3952,25 @@ def _trace_cost_quality_control(
         automatic_retries = _metadata_int(
             frozen_meta, "automatic_retry_count", "automatic_retries"
         )
+    second_agent_requests = _metadata_int(
+        final_meta, "second_agent_request_count"
+    )
+    if second_agent_requests is None:
+        second_agent_requests = _metadata_int(
+            frozen_meta, "second_agent_request_count"
+        )
     vertical_request_count = stages.count("vertical_agent")
+    selected_agent_request_count = (
+        max(0, vertical_request_count - second_agent_requests)
+        if second_agent_requests is not None
+        else None
+    )
+    other_provider_request_count = max(
+        0,
+        len(included_model_calls)
+        - stages.count("router")
+        - vertical_request_count,
+    )
     skill_events = [
         event
         for event in events
@@ -3931,12 +4035,18 @@ def _trace_cost_quality_control(
     )
     if recorded_tool_result_characters is None:
         recorded_tool_result_characters = tool_result_characters
+    business_tool_call_count = _business_tool_call_count(
+        capability_meta, skill_events, mcp_calls
+    )
 
     citation_violations = final_meta.get("citation_violations")
     if isinstance(citation_violations, list):
         citation_validation = "valid" if not citation_violations else "invalid"
     else:
         citation_validation = "historical_trace_not_recorded"
+    rag_citation_used_count = _rag_adopted_citation_count(
+        evidence_ledger_record
+    )
     answer_status = final_meta.get("answer_status")
     if not answer_status:
         evidence_decision = final_meta.get("evidence_decision")
@@ -3961,18 +4071,23 @@ def _trace_cost_quality_control(
         "provider_input_tokens_are_authoritative": True,
         "call_reduction": {
             "router_requests": stages.count("router"),
-            "agent_requests": vertical_request_count,
+            "agent_requests": selected_agent_request_count,
             "tool_follow_up_requests": (
-                max(0, vertical_request_count - 1 - automatic_retries)
+                max(
+                    0,
+                    selected_agent_request_count
+                    - 1
+                    - automatic_retries
+                )
                 if automatic_retries is not None
+                and selected_agent_request_count is not None
                 else None
             ),
             "selector_requests": stages.count("agent_selector"),
             "resolver_requests": sum("resolver" in stage for stage in stages),
-            "second_agent_requests": _metadata_int(
-                final_meta, "second_agent_request_count"
-            ),
+            "second_agent_requests": second_agent_requests,
             "automatic_retries": automatic_retries,
+            "other_provider_requests": other_provider_request_count,
         },
         "context_loading": {
             "router_session_message_count": _metadata_int(
@@ -3993,6 +4108,8 @@ def _trace_cost_quality_control(
             ),
             "tool_schema_exposed_count": tool_schema_exposed_count,
             "tool_actual_call_count": actual_tool_count,
+            "mcp_call_count": len(mcp_calls),
+            "business_tool_call_count": business_tool_call_count,
             "tool_result_characters": recorded_tool_result_characters,
             "non_selected_agent_capabilities_loaded": frozen_meta.get(
                 "non_selected_agent_capabilities_loaded"
@@ -4002,7 +4119,8 @@ def _trace_cost_quality_control(
         },
         "quality_evidence": {
             "answer_status": answer_status,
-            "rag_evidence_count": loaded_chunks,
+            "rag_evidence_count": rag_citation_used_count,
+            "rag_citation_used_count": rag_citation_used_count,
             "citation_validation": citation_validation,
             "tool_statuses": [
                 {
@@ -4072,6 +4190,7 @@ def _trace_detail_compact(trace_id: str) -> Dict[str, Any]:
         list_trace_events(trace_id), model_calls
     )
     mcp_calls = get_mcp_call_audits_for_trace(trace_id)
+    evidence_ledger_record = get_evidence_ledger(trace_id)
     router_event = next(
         (item for item in events if item.get("span_name") == "router"), {}
     )
@@ -4125,7 +4244,7 @@ def _trace_detail_compact(trace_id: str) -> Dict[str, Any]:
                 "cost_scope": cost_explanation.get("cost_scope"),
             },
             "cost_quality_control": _trace_cost_quality_control(
-                events, model_calls, mcp_calls
+                events, model_calls, mcp_calls, evidence_ledger_record
             ),
             "advanced_available": True,
         }

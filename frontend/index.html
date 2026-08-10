@@ -745,6 +745,17 @@
       return `平台价格快照直接成本：不可得（${reason || 'cause_unconfirmed'}；不按0元处理）`;
     }
 
+    function traceModelSelectionReason(stage, requestedModel, actualModel, recordedReason = '') {
+      const model = String(actualModel || requestedModel || '').toLowerCase();
+      if (model === 'deepseek-v4-flash') {
+        return '普通高频业务，控制成本和响应时间；物业事实仍受实际Skill/RAG/MCP/Tool证据约束。';
+      }
+      if (model === 'deepseek-v4-pro' && String(stage || '').toLowerCase() === 'darwin') {
+        return '仅低频Darwin深度分析，优先复杂分析质量，成本和耗时更高。';
+      }
+      return recordedReason || '历史Trace未记录';
+    }
+
     function renderProviderAttemptCard(call, stageNames = {}) {
       const accounting = call.provider_token_accounting || {};
       const identity = call.provider_identity_evidence || {};
@@ -770,10 +781,17 @@
         : (reconciliation.sdk_stream_exhausted === true
           ? 'SDK流正常耗尽（未宣称捕获字面DONE）'
           : '完成证据未采集');
-      const requestedModel = identity.requested_model_collected ? identity.requested_model : '未采集';
-      const responseModel = identity.provider_actual_model_collected ? identity.provider_actual_model : '未返回/未采集';
+      const requestedModelRaw = identity.requested_model_collected ? identity.requested_model : '';
+      const responseModelRaw = identity.provider_actual_model_collected ? identity.provider_actual_model : '';
+      const requestedModel = requestedModelRaw || '未采集';
+      const responseModel = responseModelRaw || '未返回/未采集';
       const thinking = identity.thinking_collected ? (identity.thinking_enabled ? '开启' : '关闭') : '未采集';
-      const selectionReason = identity.model_selection_reason_collected ? identity.model_selection_reason : '未采集';
+      const selectionReason = traceModelSelectionReason(
+        call.stage,
+        requestedModelRaw,
+        responseModelRaw,
+        identity.model_selection_reason_collected ? identity.model_selection_reason : ''
+      );
       const inconsistent = call.provider_usage_inconsistent
         ? '<div class="text-xs text-rose-700">告警：Provider原始Usage字段不一致；保留原值，未静默改数。</div>'
         : '';
@@ -1453,10 +1471,6 @@
             <div class="border-t border-slate-200 bg-white p-4">
               <div class="w-full">
                 <form id="chat-form" class="relative flex items-end gap-2 bg-slate-50 border border-slate-200 rounded-2xl p-2 focus-within:border-brand-400 focus-within:ring-2 focus-within:ring-brand-100 transition-all">
-                  <button type="button" id="chat-handoff" title="转人工" aria-label="转人工" class="mb-0.5 px-3 py-2.5 text-slate-500 hover:text-brand-600 hover:bg-brand-50 rounded-xl transition-colors shrink-0 inline-flex items-center gap-1.5 text-xs font-medium">
-                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z"></path></svg>
-                    <span>转人工</span>
-                  </button>
                   <textarea id="chat-input" rows="1" placeholder="请输入您的问题..." class="flex-1 bg-transparent px-3 py-2.5 text-sm text-slate-700 placeholder-slate-400 resize-none outline-none max-h-32" style="min-height: 44px;"></textarea>
                   <button type="submit" id="chat-send" class="mb-0.5 p-2.5 bg-brand-600 hover:bg-brand-700 text-white rounded-xl transition-colors disabled:opacity-50 disabled:cursor-not-allowed">
                     <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8"></path></svg>
@@ -1498,15 +1512,6 @@
         input.value = '';
         input.style.height = 'auto';
         await sendChatMessage(text);
-      });
-
-      $('#chat-handoff').addEventListener('click', async () => {
-        if (STATE.chatHandoff) {
-          showToast('已经处于转人工状态，请等待工作人员回复', 'success');
-          return;
-        }
-        if (!confirm('确定要转接人工服务吗？')) return;
-        await sendChatMessage('请安排工作人员接手本次对话');
       });
 
       $('#chat-refresh-btn').addEventListener('click', async () => {
@@ -3915,34 +3920,42 @@
           const actions = Array.isArray(bc.actions) ? bc.actions : [];
           const suggestions = actions.filter(item => item.action_type === 'ai-suggestion');
           const latestSuggestion = suggestions.length ? (suggestions[suggestions.length - 1].action_detail_parsed || {}) : {};
+          const darwinAdvice = bc.darwin_analysis_parsed || {};
+          const suggestedCategory = darwinAdvice.recommended_category || latestSuggestion.category || 'other';
+          const suggestedRootCause = darwinAdvice.root_cause_hypothesis || latestSuggestion.reason || '';
+          const suggestedActions = Array.isArray(darwinAdvice.suggested_actions)
+            ? darwinAdvice.suggested_actions.map(item => String(item || '').trim()).filter(Boolean)
+            : [];
           const occurrenceCount = Number(context.occurrence_count || 1);
           const why = bc.feedback_reason || bc.symptom || bc.description || '等待人工核对';
           const status = String(bc.status || 'pending');
           const hasRetest = Boolean(bc.retest_trace_id);
           let controls = '';
           if (status === 'pending') {
-            const options = Object.entries(categories).map(([value, label]) => `<option value="${value}" ${latestSuggestion.category === value ? 'selected' : ''}>${label}</option>`).join('');
-            controls = `<div class="space-y-3"><div class="text-sm font-medium text-slate-900">人工处理</div><div class="grid grid-cols-1 md:grid-cols-2 gap-3"><label class="text-xs text-slate-600">人工分类<select id="badcase-human-category" class="mt-1 w-full px-3 py-2 border border-slate-200 rounded-xl bg-white">${options}</select></label><label class="text-xs text-slate-600">采用依据<input id="badcase-human-reason" value="${escapeHtml(latestSuggestion.reason || '')}" placeholder="写明人工判断" class="mt-1 w-full px-3 py-2 border border-slate-200 rounded-xl"></label></div><div class="flex flex-wrap gap-2"><button id="badcase-ai-suggest" class="px-3 py-2 rounded-xl bg-violet-600 text-white text-sm">生成 AI 处理建议</button><button id="badcase-adopt" class="px-3 py-2 rounded-xl bg-brand-600 text-white text-sm">采用建议并进入处理</button><button id="badcase-reject" class="px-3 py-2 rounded-xl bg-slate-100 text-slate-700 text-sm">人工驳回并关闭</button></div><p class="text-xs text-slate-500">AI 只生成建议，不改变分类、状态或配置；只有人工按钮会推进状态。</p></div>`;
+            const options = Object.entries(categories).map(([value, label]) => `<option value="${value}" ${suggestedCategory === value ? 'selected' : ''}>${label}</option>`).join('');
+            controls = `<div class="space-y-3"><div class="text-sm font-medium text-slate-900">人工处理</div><div class="grid grid-cols-1 md:grid-cols-2 gap-3"><label class="text-xs text-slate-600">人工分类<select id="badcase-human-category" class="mt-1 w-full px-3 py-2 border border-slate-200 rounded-xl bg-white">${options}</select></label><label class="text-xs text-slate-600">采用依据<input id="badcase-human-reason" value="${escapeHtml(suggestedRootCause)}" placeholder="写明人工判断" class="mt-1 w-full px-3 py-2 border border-slate-200 rounded-xl"></label></div><div class="flex flex-wrap gap-2"><button id="badcase-ai-suggest" class="px-3 py-2 rounded-xl bg-violet-600 text-white text-sm">生成AI处理建议（Darwin · Pro）</button><button id="badcase-adopt" class="px-3 py-2 rounded-xl bg-brand-600 text-white text-sm">采用建议并进入处理</button><button id="badcase-reject" class="px-3 py-2 rounded-xl bg-slate-100 text-slate-700 text-sm">人工驳回并关闭</button></div><p class="text-xs text-slate-500">AI 只生成建议，不改变分类、状态或配置；只有人工按钮会推进状态。</p></div>`;
           } else if (processingStatuses.has(status)) {
-            controls = `<div class="space-y-3"><div class="text-sm font-medium text-slate-900">处理中</div><div class="flex flex-wrap gap-2"><button id="badcase-darwin-suggest" class="px-3 py-2 rounded-xl bg-violet-600 text-white text-sm">Darwin 深度建议</button><button id="badcase-to-verify" class="px-3 py-2 rounded-xl bg-brand-600 text-white text-sm">人工进入待验证</button><button id="badcase-reject" class="px-3 py-2 rounded-xl bg-slate-100 text-slate-700 text-sm">人工关闭</button></div><p class="text-xs text-slate-500">Darwin 不创建修复 Draft、不修改配置，也不自动推进状态。</p></div>`;
+            controls = `<div class="space-y-3"><div class="text-sm font-medium text-slate-900">处理中</div><div class="flex flex-wrap gap-2"><button id="badcase-to-verify" class="px-3 py-2 rounded-xl bg-brand-600 text-white text-sm">人工进入待验证</button><button id="badcase-reject" class="px-3 py-2 rounded-xl bg-slate-100 text-slate-700 text-sm">人工关闭</button></div><p class="text-xs text-slate-500">AI 建议仅供人工参考；状态仍由人工操作推进。</p></div>`;
           } else if (verifyingStatuses.has(status)) {
             controls = `<div class="space-y-3"><div class="text-sm font-medium text-slate-900">待验证</div><div class="flex flex-wrap gap-2"><button id="badcase-retest" class="px-3 py-2 rounded-xl bg-indigo-600 text-white text-sm">人工复测真实链路</button><button id="badcase-close" class="px-3 py-2 rounded-xl bg-emerald-600 text-white text-sm disabled:opacity-40" ${hasRetest ? '' : 'disabled'}>人工确认并关闭</button></div><p class="text-xs text-slate-500">先由人工主动复测并查看新 Trace；系统不自动判定，最终结论仍由人工确认。</p></div>`;
           } else if (terminalStatuses.has(status)) {
             controls = '<div class="text-sm text-slate-500">该记录已关闭，仅保留历史证据。</div>';
           }
-          const suggestionHtml = suggestions.length ? `<div class="space-y-2">${suggestions.slice(-3).reverse().map(item => { const detail = item.action_detail_parsed || {}; return `<div class="rounded-xl border border-violet-100 bg-violet-50 p-3"><div class="text-xs font-medium text-violet-800">${escapeHtml(detail.suggestion_type === 'darwin' ? 'Darwin 处理建议' : 'AI 处理建议')}</div><div class="mt-1 text-sm text-violet-950 whitespace-pre-wrap">${escapeHtml(detail.reason || detail.analysis || (bc.darwin_analysis_parsed || {}).root_cause_hypothesis || '建议已生成，请人工查看后决定是否采用')}</div></div>`; }).join('')}</div>` : '<div class="text-sm text-slate-400">尚无 AI 建议</div>';
-          $('#badcase-detail-content').innerHTML = `<div class="space-y-4"><div class="bg-white border border-slate-200 rounded-2xl p-5"><div class="flex flex-wrap items-start justify-between gap-3"><div><div class="text-xs text-slate-400">疑似 Badcase #${bc.id}</div><h2 class="mt-1 text-xl font-semibold text-slate-900">${escapeHtml(bc.title || '未命名问题')}</h2></div><span class="px-2.5 py-1 rounded-full bg-slate-100 text-slate-700 text-xs">${escapeHtml(bc.user_status_label || '待处理')}</span></div><div class="mt-4 grid grid-cols-1 md:grid-cols-3 gap-3 text-sm"><div class="rounded-xl bg-slate-50 p-3"><div class="text-xs text-slate-500">来源</div><div class="mt-1 text-slate-900">${escapeHtml(bc.source_label || bc.source || '-')}</div></div><div class="rounded-xl bg-slate-50 p-3"><div class="text-xs text-slate-500">为什么被抓</div><div class="mt-1 text-slate-900 whitespace-pre-wrap">${escapeHtml(why)}</div></div><div class="rounded-xl bg-slate-50 p-3"><div class="text-xs text-slate-500">发生次数</div><div class="mt-1 text-slate-900">${occurrenceCount}</div></div></div><div class="mt-3 grid grid-cols-1 md:grid-cols-2 gap-3"><div class="rounded-xl border border-slate-200 p-3"><div class="text-xs text-slate-500">原问题</div><div class="mt-1 text-sm text-slate-800 whitespace-pre-wrap">${escapeHtml(bc.original_query || bc.query || '-')}</div></div><div class="rounded-xl border border-slate-200 p-3"><div class="text-xs text-slate-500">原回答</div><div class="mt-1 text-sm text-slate-800 whitespace-pre-wrap">${escapeHtml(bc.ai_response || '-')}</div></div></div><div class="mt-3 flex flex-wrap gap-3 text-xs">${bc.trace_id ? `<a class="text-brand-600 font-mono" href="#observability?trace_id=${encodeURIComponent(bc.trace_id)}">原 Trace ${escapeHtml(bc.trace_id)}</a>` : '<span class="text-slate-400">无原 Trace</span>'}${bc.retest_trace_id ? `<a class="text-indigo-600 font-mono" href="#observability?trace_id=${encodeURIComponent(bc.retest_trace_id)}">复测 Trace ${escapeHtml(bc.retest_trace_id)}</a>` : ''}</div></div><div class="bg-white border border-slate-200 rounded-2xl p-5">${controls}</div><div class="bg-white border border-slate-200 rounded-2xl p-5"><div class="font-medium text-slate-900 mb-3">处理建议</div>${suggestionHtml}</div><details class="bg-white border border-slate-200 rounded-2xl p-4"><summary class="cursor-pointer text-sm font-medium text-slate-700">高级证据与历史动作</summary><pre class="mt-3 text-xs whitespace-pre-wrap overflow-auto max-h-96">${escapeHtml(JSON.stringify({ trigger_code: context.trigger_code, component: context.component, release_id: context.release_id, actions }, null, 2))}</pre></details></div>`;
+          const suggestionHtml = Object.keys(darwinAdvice).length ? `<div class="rounded-xl border border-violet-100 bg-violet-50 p-3 space-y-2"><div class="text-xs font-medium text-violet-800">Darwin · Pro 处理建议（待人工决定）</div><div class="text-sm text-violet-950"><span class="font-medium">建议分类：</span>${escapeHtml(categories[suggestedCategory] || suggestedCategory)}</div><div class="text-sm text-violet-950 whitespace-pre-wrap"><span class="font-medium">根因：</span>${escapeHtml(suggestedRootCause || '未提供')}</div><div class="text-sm text-violet-950 whitespace-pre-wrap"><span class="font-medium">处理建议：</span>${escapeHtml(darwinAdvice.repair_path_suggestion || '未提供')}</div>${suggestedActions.length ? `<ul class="list-disc list-inside text-sm text-violet-950">${suggestedActions.map(item => `<li>${escapeHtml(item)}</li>`).join('')}</ul>` : ''}</div>` : (suggestions.length ? `<div class="space-y-2">${suggestions.slice(-3).reverse().map(item => { const detail = item.action_detail_parsed || {}; return `<div class="rounded-xl border border-violet-100 bg-violet-50 p-3"><div class="text-xs font-medium text-violet-800">${escapeHtml(detail.suggestion_type === 'darwin' ? 'Darwin 处理建议' : 'AI 处理建议')}</div><div class="mt-1 text-sm text-violet-950 whitespace-pre-wrap">${escapeHtml(detail.reason || detail.analysis || '建议已生成，请人工查看后决定是否采用')}</div></div>`; }).join('')}</div>` : '<div class="text-sm text-slate-400">尚无 AI 建议</div>');
+          $('#badcase-detail-content').innerHTML = `<div class="space-y-4"><div class="bg-white border border-slate-200 rounded-2xl p-5"><div class="flex flex-wrap items-start justify-between gap-3"><div><div class="text-xs text-slate-400">疑似 Badcase #${bc.id}</div><h2 class="mt-1 text-xl font-semibold text-slate-900">${escapeHtml(bc.title || '未命名问题')}</h2></div><span class="px-2.5 py-1 rounded-full bg-slate-100 text-slate-700 text-xs">${escapeHtml(bc.user_status_label || '待处理')}</span></div><div class="mt-4 grid grid-cols-1 md:grid-cols-3 gap-3 text-sm"><div class="rounded-xl bg-slate-50 p-3"><div class="text-xs text-slate-500">来源</div><div class="mt-1 text-slate-900">${escapeHtml(bc.source_label || bc.source || '-')}</div></div><div class="rounded-xl bg-slate-50 p-3"><div class="text-xs text-slate-500">为什么被抓</div><div class="mt-1 text-slate-900 whitespace-pre-wrap">${escapeHtml(why)}</div></div><div class="rounded-xl bg-slate-50 p-3"><div class="text-xs text-slate-500">发生次数</div><div class="mt-1 text-slate-900">${occurrenceCount}</div></div></div><div class="mt-3 grid grid-cols-1 md:grid-cols-2 gap-3"><div class="rounded-xl border border-slate-200 p-3"><div class="text-xs text-slate-500">原问题</div><div class="mt-1 text-sm text-slate-800 whitespace-pre-wrap">${escapeHtml(bc.original_query || bc.query || '-')}</div></div><div class="rounded-xl border border-slate-200 p-3"><div class="text-xs text-slate-500">原回答</div><div class="mt-1 text-sm text-slate-800 whitespace-pre-wrap">${escapeHtml(bc.ai_response || '-')}</div></div></div><div class="mt-3 flex flex-wrap gap-3 text-xs">${bc.trace_id ? `<button type="button" data-badcase-trace-id="${escapeHtml(bc.trace_id)}" class="text-brand-600 font-mono hover:underline">原 Trace ${escapeHtml(bc.trace_id)}</button>` : '<span class="text-slate-400">无原 Trace</span>'}${bc.retest_trace_id ? `<button type="button" data-badcase-trace-id="${escapeHtml(bc.retest_trace_id)}" class="text-indigo-600 font-mono hover:underline">复测 Trace ${escapeHtml(bc.retest_trace_id)}</button>` : ''}</div></div><div class="bg-white border border-slate-200 rounded-2xl p-5">${controls}</div><div class="bg-white border border-slate-200 rounded-2xl p-5"><div class="font-medium text-slate-900 mb-3">处理建议</div>${suggestionHtml}</div><details class="bg-white border border-slate-200 rounded-2xl p-4"><summary class="cursor-pointer text-sm font-medium text-slate-700">高级证据与历史动作</summary><pre class="mt-3 text-xs whitespace-pre-wrap overflow-auto max-h-96">${escapeHtml(JSON.stringify({ trigger_code: context.trigger_code, component: context.component, release_id: context.release_id, actions }, null, 2))}</pre></details></div>`;
+
+          $('#badcase-detail-content').querySelectorAll('[data-badcase-trace-id]').forEach(button => {
+            button.addEventListener('click', () => openTraceDrawer(button.dataset.badcaseTraceId));
+          });
 
           const aiSuggest = $('#badcase-ai-suggest');
-          if (aiSuggest) aiSuggest.addEventListener('click', () => mutate(`/api/badcases/${id}/classify`, { auto: true }, 'AI 建议已生成，状态未改变'));
+          if (aiSuggest) aiSuggest.addEventListener('click', () => mutate(`/api/badcases/${id}/darwin`, {}, 'Darwin · Pro 建议已生成，状态未改变'));
           const adopt = $('#badcase-adopt');
           if (adopt) adopt.addEventListener('click', () => {
             const reason = $('#badcase-human-reason').value.trim();
             if (!reason) { showToast('请填写人工判断依据', 'error'); return; }
             mutate(`/api/badcases/${id}/classify`, { auto: false, category: $('#badcase-human-category').value, reason, root_cause_domain: 'unknown' }, '已由人工采用并进入处理');
           });
-          const darwin = $('#badcase-darwin-suggest');
-          if (darwin) darwin.addEventListener('click', () => mutate(`/api/badcases/${id}/darwin`, {}, 'Darwin 建议已生成，状态未改变'));
           const verify = $('#badcase-to-verify');
           if (verify) verify.addEventListener('click', () => mutate(`/api/badcases/${id}/transition`, { status: 'verifying', note: 'operator moved case to verification' }, '已进入待验证'));
           const close = $('#badcase-close');
@@ -4793,10 +4806,10 @@
               : '平台价格快照直接成本不可得（不显示¥0）';
           const requestText = `${providerRequestCount}次证据确认且纳入汇总的Provider请求${unresolvedAttemptCount ? `，另${unresolvedAttemptCount}条attempt未决或被排除` : ''}`;
           const selectionText = hasDarwin
-            ? '这是AI专家根因分析，因此按策略使用Pro。Thinking表示开启深度思考，不代表模型自动变成Pro。'
+            ? 'Pro：仅低频Darwin深度分析，优先复杂分析质量，成本和耗时更高。'
             : hasPro
-              ? '本轮使用了Pro，请核对是否属于AI专家分析；Thinking只是思考模式，不会改变模型身份。'
-              : '普通业务使用Flash即可满足质量要求；本轮没有使用Pro。Thinking只是思考模式，不会改变Flash模型身份。';
+              ? '本轮Provider实际模型为Pro；该阶段并非Darwin时，以逐请求持久化理由为准。'
+              : 'Flash：普通高频业务，控制成本和响应时间；物业事实仍受实际Skill/RAG/MCP/Tool证据约束。';
           const happenedText = hasDarwin
             ? `本轮执行AI专家根因分析，涉及${agentStageCount}个业务阶段，记录${requestText}；${tokenText}；${costText}。`
             : narrativeCalls.some(c => c.stage === 'router') && narrativeCalls.some(c => c.stage === 'vertical_agent')
@@ -4974,13 +4987,22 @@
               ? `${fmtCost(providerSummary.known_partial_cost_cny)}（仅已知部分）`
               : '不可得');
           const providerTotalRow = requests.length ? `<tr class="border-t-2 border-slate-200 bg-slate-50 font-medium text-slate-800"><td class="px-2 py-2">Trace合计</td><td class="px-2 py-2" colspan="3">${traceRecordedValue(providerSummary.provider_request_count, ' 次物理请求')}</td><td class="px-2 py-2 text-right">${traceRecordedValue(providerUsage.cache_hit_input_tokens)}</td><td class="px-2 py-2 text-right">${traceRecordedValue(providerUsage.cache_miss_input_tokens)}</td><td class="px-2 py-2 text-right">${traceRecordedValue(providerUsage.input_tokens)}</td><td class="px-2 py-2 text-right">${traceRecordedValue(providerUsage.output_tokens)}</td><td class="px-2 py-2 text-right">${traceRecordedValue(providerUsage.reasoning_tokens)}</td><td class="px-2 py-2 text-right">${traceRecordedValue(providerUsage.total_tokens)}</td><td class="px-2 py-2 text-right">${providerTotalCost}</td><td class="px-2 py-2 text-right">—</td><td class="px-2 py-2">${providerSummary.complete === true ? '完整' : '部分不可得'}</td></tr>` : '';
-          const modelReasons = models.length ? models.map(item => `<li>${escapeHtml(item.stage || '模型请求')}：请求 ${escapeHtml(item.requested_model || '未记录')}，Provider实际 ${escapeHtml(item.provider_actual_model || '未记录')}，Thinking ${item.thinking_enabled === null || item.thinking_enabled === undefined ? '未记录' : (item.thinking_enabled ? '开启' : '关闭')}；理由：${escapeHtml(item.reason || item.model_selection_reason || '历史Trace未记录')}</li>`).join('') : '<li>本轮未调用Provider。</li>';
+          const modelReasons = models.length ? models.map(item => `<li>${escapeHtml(item.stage || '模型请求')}：请求 ${escapeHtml(item.requested_model || '未记录')}，Provider实际 ${escapeHtml(item.provider_actual_model || '未记录')}，Thinking ${item.thinking_enabled === null || item.thinking_enabled === undefined ? '未记录' : (item.thinking_enabled ? '开启' : '关闭')}；理由：${escapeHtml(traceModelSelectionReason(item.stage, item.requested_model, item.provider_actual_model, item.reason || item.model_selection_reason || ''))}</li>`).join('') : '<li>本轮未调用Provider。</li>';
           const toolStatuses = Array.isArray(quality.tool_statuses) && quality.tool_statuses.length ? quality.tool_statuses.map(item => `${item.server || '—'}/${item.tool || '—'}=${item.status || '—'}`).join('；') : '无实际调用';
+          const breakdownValues = [providerSummary.provider_request_count, calls.router_requests, calls.agent_requests, calls.second_agent_requests, calls.other_provider_requests];
+          const breakdownRecorded = breakdownValues.every(value => value !== null && value !== undefined && Number.isFinite(Number(value)));
+          const simpleChatBreakdown = breakdownRecorded
+            && Number(calls.second_agent_requests) === 0
+            && Number(calls.other_provider_requests) === 0
+            && Number(providerSummary.provider_request_count) === Number(calls.router_requests) + Number(calls.agent_requests);
+          const providerBreakdownText = simpleChatBreakdown
+            ? `Provider共 ${traceRecordedValue(providerSummary.provider_request_count)} 次＝Router ${traceRecordedValue(calls.router_requests)} 次＋同一个${escapeHtml(trace.agent_name || '垂直Agent')} ${traceRecordedValue(calls.agent_requests)} 次`
+            : `Provider共 ${traceRecordedValue(providerSummary.provider_request_count)} 次；Router ${traceRecordedValue(calls.router_requests)} 次；同一个${escapeHtml(trace.agent_name || '垂直Agent')} ${traceRecordedValue(calls.agent_requests)} 次；第二Agent ${traceRecordedValue(calls.second_agent_requests)} 次；其他Provider阶段 ${traceRecordedValue(calls.other_provider_requests)} 次`;
           const html = `<div class="space-y-5 max-h-[76vh] overflow-y-auto pr-1">
             <section class="rounded-xl border border-blue-200 bg-blue-50 p-4"><h4 class="font-semibold text-blue-950">本轮结果摘要</h4><div class="mt-2 grid gap-2 sm:grid-cols-3 text-xs"><div><span class="text-blue-700">A/B/C</span><div class="font-medium text-slate-900">${escapeHtml(laneLabels[trace.lane] || '历史Trace未记录')}</div></div><div><span class="text-blue-700">Agent</span><div class="font-medium text-slate-900">${escapeHtml(trace.agent_name || trace.agent_id || '—')}</div></div><div><span class="text-blue-700">answer_status</span><div class="font-medium text-slate-900">${escapeHtml(result.answer_status || '历史Trace未记录')}</div></div></div><p class="mt-3 text-sm text-blue-950 whitespace-pre-wrap">${escapeHtml(result.answer_excerpt || '历史Trace未记录结果摘要')}</p><p class="mt-2 text-[10px] text-blue-700">Trace ${escapeHtml(traceId)} · Snapshot ${escapeHtml(trace.snapshot_hash || '历史Trace未记录')}</p></section>
             <section><h4 class="font-semibold text-slate-900 mb-2">真实执行链</h4>${chainHtml}</section>
             <section><h4 class="font-semibold text-slate-900 mb-2">每个物理Provider请求</h4><p class="mb-2 text-xs text-slate-500">Input = Hit + Miss；Total = Input + Output；Reasoning 是 Output 子集，不重复相加。</p><div class="overflow-x-auto"><table class="w-full text-xs min-w-[1180px]"><thead><tr class="bg-slate-50 text-left text-slate-500"><th class="px-2 py-2">节点</th><th class="px-2 py-2">请求模型</th><th class="px-2 py-2">实际模型</th><th class="px-2 py-2">Thinking</th><th class="px-2 py-2 text-right">Hit</th><th class="px-2 py-2 text-right">Miss</th><th class="px-2 py-2 text-right">Input</th><th class="px-2 py-2 text-right">Output</th><th class="px-2 py-2 text-right">其中Reasoning</th><th class="px-2 py-2 text-right">Total</th><th class="px-2 py-2 text-right">快照成本</th><th class="px-2 py-2 text-right">耗时</th><th class="px-2 py-2">状态</th></tr></thead><tbody>${requestRows || '<tr><td colspan="13" class="px-3 py-4 text-slate-500">本轮未调用Provider，无Provider Token。</td></tr>'}${providerTotalRow}</tbody></table></div></section>
-            <section class="rounded-xl border border-cyan-200 bg-cyan-50 p-4"><h4 class="font-semibold text-cyan-950">本轮成本与质量控制</h4><div class="mt-3 grid gap-3 md:grid-cols-2 text-xs text-cyan-950"><div class="rounded-lg bg-white/70 p-3"><div class="font-medium">减少调用</div><p class="mt-1">Router ${traceRecordedValue(calls.router_requests)} 次；Agent ${traceRecordedValue(calls.agent_requests)} 次；同Agent Tool follow-up ${traceRecordedValue(calls.tool_follow_up_requests)} 次；Selector ${traceRecordedValue(calls.selector_requests)} 次；Resolver ${traceRecordedValue(calls.resolver_requests)} 次；第二Agent ${traceRecordedValue(calls.second_agent_requests)} 次；自动重试 ${traceRecordedValue(calls.automatic_retries)} 次。</p></div><div class="rounded-lg bg-white/70 p-3"><div class="font-medium">减少装载</div><p class="mt-1">Router会话消息 ${traceRecordedValue(loading.router_session_message_count)}；最小Agent卡 ${traceRecordedValue(loading.router_minimal_agent_card_count)}；Skill bound/used ${traceRecordedValue(loading.skill_bound_count)} / ${traceRecordedValue(loading.skill_used_count)}；RAG候选/装载/字符 ${traceRecordedValue(loading.rag_candidate_count)} / ${traceRecordedValue(loading.rag_loaded_chunk_count)} / ${traceRecordedValue(loading.rag_loaded_characters)}；Tool schema/调用/结果字符 ${traceRecordedValue(loading.tool_schema_exposed_count)} / ${traceRecordedValue(loading.tool_actual_call_count)} / ${traceRecordedValue(loading.tool_result_characters)}。</p><p class="mt-1 text-cyan-700">Provider Input Token是权威总量；组件仅展示数量和字符，不伪装精确Token拆分。</p></div><div class="rounded-lg bg-white/70 p-3"><div class="font-medium">质量依据</div><p class="mt-1">answer_status=${escapeHtml(String(quality.answer_status || '历史Trace未记录'))}；RAG Evidence=${traceRecordedValue(quality.rag_evidence_count)}；Citation=${escapeHtml(String(quality.citation_validation || '历史Trace未记录'))}；Tool=${escapeHtml(toolStatuses)}；Proposal=${escapeHtml(String(quality.proposal_status || '不适用'))}；人工评价=${escapeHtml(String(quality.human_evaluation || '尚未评价'))}。</p></div><div class="rounded-lg bg-white/70 p-3"><div class="font-medium">模型选择</div><ul class="mt-1 list-disc list-inside space-y-1">${modelReasons}</ul></div></div></section>
+            <section class="rounded-xl border border-cyan-200 bg-cyan-50 p-4"><h4 class="font-semibold text-cyan-950">本轮成本与质量控制</h4><div class="mt-3 grid gap-3 md:grid-cols-2 text-xs text-cyan-950"><div class="rounded-lg bg-white/70 p-3"><div class="font-medium">Provider请求构成</div><p class="mt-1">${providerBreakdownText}；其中同Agent能力续答 ${traceRecordedValue(calls.tool_follow_up_requests)} 次${simpleChatBreakdown ? `；第二Agent ${traceRecordedValue(calls.second_agent_requests)} 次` : ''}；重试 ${traceRecordedValue(calls.automatic_retries)} 次。</p><p class="mt-1 text-cyan-700">按需读取Skill或调用MCP/Tool后，同一个Agent需要再次基于结果回答，因此可能多一次Provider请求，不代表换Agent。</p></div><div class="rounded-lg bg-white/70 p-3"><div class="font-medium">能力与RAG</div><p class="mt-1">Skill已使用 ${traceRecordedValue(loading.skill_used_count)} 项（绑定 ${traceRecordedValue(loading.skill_bound_count)} 项）；MCP实际调用 ${traceRecordedValue(loading.mcp_call_count)} 次；业务Tool实际调用 ${traceRecordedValue(loading.business_tool_call_count)} 次；Tool schema暴露 ${traceRecordedValue(loading.tool_schema_exposed_count)} 项。</p><p class="mt-1">RAG装载 ${traceRecordedValue(loading.rag_loaded_chunk_count)} 个分片；回答实际采用 ${traceRecordedValue(quality.rag_citation_used_count)} 条RAG Citation；装载字符 ${traceRecordedValue(loading.rag_loaded_characters)}。</p><p class="mt-1 text-cyan-700">Provider Input Token是权威总量；组件仅展示数量和字符，不伪装精确Token拆分。</p></div><div class="rounded-lg bg-white/70 p-3"><div class="font-medium">质量依据</div><p class="mt-1">answer_status=${escapeHtml(String(quality.answer_status || '历史Trace未记录'))}；Citation=${escapeHtml(String(quality.citation_validation || '历史Trace未记录'))}；MCP=${escapeHtml(toolStatuses)}；Proposal=${escapeHtml(String(quality.proposal_status || '不适用'))}；人工评价=${escapeHtml(String(quality.human_evaluation || '尚未评价'))}。</p></div><div class="rounded-lg bg-white/70 p-3"><div class="font-medium">模型选择</div><ul class="mt-1 list-disc list-inside space-y-1">${modelReasons}</ul></div></div></section>
             <details id="cg-trace-advanced" class="rounded-xl border border-slate-200 bg-slate-50 p-4"><summary class="cursor-pointer font-medium text-slate-800">高级诊断（展开后加载Evidence、Tool结果与Raw JSON）</summary><div id="cg-trace-advanced-body" class="mt-3 text-sm text-slate-500">尚未加载。</div></details>
           </div>`;
           openModal('Trace详情', html, null, '关闭');

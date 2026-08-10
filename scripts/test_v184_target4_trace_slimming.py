@@ -356,6 +356,7 @@ def test_compact_detail_and_true_cost_control() -> None:
         "fetch": observability._fetch_reporting_model_calls,
         "events": observability.list_trace_events,
         "mcp": observability.get_mcp_call_audits_for_trace,
+        "ledger": observability.get_evidence_ledger,
     }
     observability.get_chat_trace = lambda _trace_id: {
         "trace_id": "trace-symbolic-detail",
@@ -371,6 +372,9 @@ def test_compact_detail_and_true_cost_control() -> None:
     observability._fetch_reporting_model_calls = lambda *args, **kwargs: [raw_call]
     observability.list_trace_events = lambda _trace_id: events
     observability.get_mcp_call_audits_for_trace = lambda _trace_id: []
+    observability.get_evidence_ledger = lambda _trace_id: {
+        "ledger": {"citation_links": []}
+    }
     try:
         detail = observability._trace_detail_compact("trace-symbolic-detail")
     finally:
@@ -378,6 +382,7 @@ def test_compact_detail_and_true_cost_control() -> None:
         observability._fetch_reporting_model_calls = originals["fetch"]
         observability.list_trace_events = originals["events"]
         observability.get_mcp_call_audits_for_trace = originals["mcp"]
+        observability.get_evidence_ledger = originals["ledger"]
 
     assert detail["provider_requests"] == [
         {
@@ -423,6 +428,7 @@ def test_compact_detail_and_true_cost_control() -> None:
         "resolver_requests": 0,
         "second_agent_requests": 0,
         "automatic_retries": 0,
+        "other_provider_requests": 0,
     }
     assert detail["cost_quality_control"]["context_loading"][
         "router_session_message_count"

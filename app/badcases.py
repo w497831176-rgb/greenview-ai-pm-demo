@@ -142,6 +142,58 @@ def _enforce_background_budget(strategy: str) -> Dict[str, Any]:
     return budget_gate
 
 
+def _budget_threshold_enabled(value: Any) -> bool:
+    try:
+        return value is not None and float(value) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def _darwin_budget_gate() -> Dict[str, Any]:
+    """Keep reconciliation attention advisory when no Darwin budget is enabled."""
+    budget_gate = _background_budget_gate("darwin")
+    daily_enabled = _budget_threshold_enabled(
+        budget_gate.get("daily_threshold_cny")
+    )
+    monthly_enabled = _budget_threshold_enabled(
+        budget_gate.get("monthly_threshold_cny")
+    )
+    if (
+        budget_gate.get("allowed") is False
+        and budget_gate.get("reason_code") == "budget_reconciliation_attention"
+        and not daily_enabled
+        and not monthly_enabled
+    ):
+        logger.warning(
+            "Darwin budget reconciliation needs attention, but daily/monthly "
+            "budgets are disabled; continuing as an advisory warning"
+        )
+        return {
+            **budget_gate,
+            "allowed": True,
+            "alert_level": "warning",
+            "http_status": None,
+            "detail": None,
+            "warning_code": "budget_reconciliation_attention",
+        }
+    return budget_gate
+
+
+def _complete_darwin_suggestion(value: Dict[str, Any]) -> bool:
+    category = str(value.get("recommended_category") or "").strip()
+    root_cause = str(value.get("root_cause_hypothesis") or "").strip()
+    repair_path = str(value.get("repair_path_suggestion") or "").strip()
+    suggested_actions = value.get("suggested_actions")
+    return bool(
+        category in VALID_CATEGORIES
+        and category != "pending"
+        and root_cause
+        and repair_path
+        and isinstance(suggested_actions, list)
+        and any(str(item).strip() for item in suggested_actions)
+    )
+
+
 class BadcaseCreate(BaseModel):
     title: str
     description: str = ""
@@ -1484,8 +1536,8 @@ async def darwin_fix(case_id: int, request: DarwinFixRequest = DarwinFixRequest(
     case = db_get_badcase(case_id)
     if not case:
         raise HTTPException(status_code=404, detail="not found")
-    if case["status"] not in {"classified", "investigating", "fixing"}:
-        raise HTTPException(status_code=400, detail=f"Darwin suggestion requires a processing status, got {case['status']}")
+    if case["status"] not in {"pending", "classified", "investigating", "fixing"}:
+        raise HTTPException(status_code=400, detail=f"Darwin suggestion is unavailable for status {case['status']}")
 
     context = case.get("context_json") or ""
     if isinstance(context, str) and context:
@@ -1551,7 +1603,7 @@ async def darwin_fix(case_id: int, request: DarwinFixRequest = DarwinFixRequest(
     usage = {}
 
     # Darwin uses Pro and is an extra evaluation step; enforce the daily budget.
-    budget_gate = _background_budget_gate("darwin")
+    budget_gate = _darwin_budget_gate()
     if not budget_gate.get("allowed"):
         blocked_reason = budget_gate.get("reason") or _BUDGET_BLOCKED_DETAIL
         persist_darwin_operation(
@@ -1577,7 +1629,7 @@ async def darwin_fix(case_id: int, request: DarwinFixRequest = DarwinFixRequest(
             trace_id=darwin_trace_id,
             session_id=f"badcase-darwin:{case_id}:{darwin_trace_id}",
             stage="darwin",
-            model_selection_reason="Darwin deep analysis uses Pro",
+            model_selection_reason="仅低频Darwin深度分析，优先复杂分析质量，成本和耗时更高。",
         )
     except Exception as e:
         analysis_text = ""
@@ -1601,7 +1653,7 @@ async def darwin_fix(case_id: int, request: DarwinFixRequest = DarwinFixRequest(
         raise HTTPException(status_code=502, detail="Darwin Provider call failed")
 
     analysis_obj = _extract_json(analysis_text) or {}
-    if not analysis_obj:
+    if not _complete_darwin_suggestion(analysis_obj):
         persist_darwin_operation(
             trace_id=darwin_trace_id,
             badcase_id=case_id,
@@ -1691,6 +1743,7 @@ async def darwin_fix(case_id: int, request: DarwinFixRequest = DarwinFixRequest(
         "calculated_direct_cost": model_call.get("estimated_cost_cny") if model_call else None,
         "cost_source": model_call.get("cost_source") if model_call else None,
         "cost_disclaimer": "platform_price_snapshot_not_provider_final_bill",
+        "budget_warning_code": budget_gate.get("warning_code"),
     }
 
     # Legacy draft generation is deliberately unreachable. Historical draft
