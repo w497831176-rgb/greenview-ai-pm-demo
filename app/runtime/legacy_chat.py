@@ -8,8 +8,11 @@ contains no Router, Agent, Skill, RAG, MCP, action or cost execution path.
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 import uuid
+from dataclasses import dataclass
 from typing import Any, AsyncIterator, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException, Query
@@ -46,6 +49,26 @@ from db.property_db import (
 
 
 router = APIRouter(prefix="/api/chat", tags=["chat"])
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class _BackgroundStreamRun:
+    """One accepted owner bubble whose execution outlives its SSE consumer."""
+
+    session_id: str
+    queue: asyncio.Queue[object]
+    task: Optional[asyncio.Task[None]] = None
+    consumer_attached: bool = True
+
+
+@dataclass(frozen=True)
+class _StreamFailure:
+    error: Exception
+
+
+_STREAM_END = object()
+_ACTIVE_STREAM_RUNS: Dict[str, _BackgroundStreamRun] = {}
 
 
 def _latest_ai_evidence(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -219,6 +242,117 @@ async def _stream_agent_response(
     yield ": transport-flush " + (" " * 4096) + "\n\n"
 
 
+def _observe_stream_producer(
+    run: _BackgroundStreamRun,
+    task: asyncio.Task[None],
+) -> None:
+    """Release the strong reference and retrieve every producer outcome."""
+
+    try:
+        if not task.cancelled():
+            error = task.exception()
+            if error is not None:
+                logger.error(
+                    "Background chat producer failed for session %s",
+                    run.session_id,
+                    exc_info=(type(error), error, error.__traceback__),
+                )
+    finally:
+        if _ACTIVE_STREAM_RUNS.get(run.session_id) is run:
+            _ACTIVE_STREAM_RUNS.pop(run.session_id, None)
+
+
+async def _produce_stream(
+    run: _BackgroundStreamRun,
+    message: str,
+    user_id: str,
+) -> None:
+    """Own and exhaust the governed runtime independently of HTTP delivery."""
+
+    try:
+        async for frame in _stream_agent_response(message, run.session_id, user_id):
+            if run.consumer_attached:
+                run.queue.put_nowait(frame)
+    except asyncio.CancelledError:
+        # Only process shutdown should cancel this task. A disconnected SSE
+        # consumer never calls cancel() or aclose() on the runtime producer.
+        raise
+    except Exception as exc:
+        if run.consumer_attached:
+            run.queue.put_nowait(_StreamFailure(exc))
+        raise
+    finally:
+        if run.consumer_attached:
+            run.queue.put_nowait(_STREAM_END)
+
+
+def _start_stream_run(
+    message: str,
+    session_id: str,
+    user_id: str,
+) -> _BackgroundStreamRun:
+    """Atomically accept one active producer per Session."""
+
+    if _ACTIVE_STREAM_RUNS.get(session_id) is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="该会话已有回答正在后台生成，请等待完成后再发送。",
+        )
+
+    run = _BackgroundStreamRun(session_id=session_id, queue=asyncio.Queue())
+    _ACTIVE_STREAM_RUNS[session_id] = run
+    task = asyncio.create_task(
+        _produce_stream(run, message, user_id),
+        name=f"chat-producer:{session_id}",
+    )
+    run.task = task
+    task.add_done_callback(lambda done: _observe_stream_producer(run, done))
+    return run
+
+
+async def _consume_stream_run(run: _BackgroundStreamRun) -> AsyncIterator[str]:
+    """Forward queued frames; detaching never cancels the accepted run."""
+
+    try:
+        while True:
+            item = await run.queue.get()
+            if item is _STREAM_END:
+                return
+            if isinstance(item, _StreamFailure):
+                raise item.error
+            yield str(item)
+    finally:
+        run.consumer_attached = False
+
+
+class _DetachedStreamingResponse(StreamingResponse):
+    """Detach delivery on every ASGI exit without touching the producer."""
+
+    def __init__(self, run: _BackgroundStreamRun) -> None:
+        self._run = run
+        super().__init__(
+            _consume_stream_run(run),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    async def stream_response(self, send: Any) -> None:
+        try:
+            await super().stream_response(send)
+        finally:
+            # ASGI 2.4 reports disconnect at send(), outside body_iterator.
+            # Mark only the delivery side detached; never cancel/close runtime.
+            self._run.consumer_attached = False
+
+
+def _streaming_response(run: _BackgroundStreamRun) -> StreamingResponse:
+    return _DetachedStreamingResponse(run)
+
+
 @router.post("/stream")
 async def chat_stream(request: ChatRequest):
     """Stream an agent response via Server-Sent Events."""
@@ -226,14 +360,8 @@ async def chat_stream(request: ChatRequest):
     session_id = request.session_id or f"web-{uuid.uuid4().hex[:12]}"
     user_id = request.user_id or "web-user"
 
-    return StreamingResponse(
-        _stream_agent_response(request.message, session_id, user_id),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
+    return _streaming_response(
+        _start_stream_run(request.message, session_id, user_id)
     )
 
 
@@ -266,15 +394,7 @@ async def chat_stream_get(
     session_id = session_id or f"web-{uuid.uuid4().hex[:12]}"
     user_id = user_id or "web-user"
 
-    return StreamingResponse(
-        _stream_agent_response(message, session_id, user_id),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
-    )
+    return _streaming_response(_start_stream_run(message, session_id, user_id))
 
 
 @router.get("/history")
